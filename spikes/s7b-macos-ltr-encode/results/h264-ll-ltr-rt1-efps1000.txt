@@ -1,0 +1,24 @@
+2026-11-07 16:50:22.603 s7probe[4622:57935447] WARNING: AVCaptureDeviceTypeExternal is deprecated for Continuity Cameras. Please use AVCaptureDeviceTypeContinuityCamera and add NSCameraUseContinuityCameraDeviceType to your Info.plist.
+encoder: H.264, low-latency rate control on
+  RealTime = 1
+  AllowFrameReordering = 0
+  ProfileLevel = H264_ConstrainedHigh_AutoLevel
+  AverageBitRate = 20000000
+  ExpectedFrameRate = 1000
+  MaxKeyFrameInterval = 2147483647
+  MaxKeyFrameIntervalDuration = 0
+  PrioritizeEncodingSpeedOverQuality = 1 (err -12900)
+  MaximizePowerEfficiency = 0
+  EnableLTR = 1
+  encoder id: com.apple.videotoolbox.videoencoder.h264.rtvc
+  hardware encoder: no
+capture: display 1 (1512x982 pt), scaled to 1920x1080
+LTR: loss every 300 frames, 5 lost, ack delay 3; 1157 frames with tokens, 0 sync frames after frame 0, 0 full-stream decode errors
+  loss 300-304 refresh@308: P 67.1 KB (mean P 40.6 KB) encode 7.51 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+  loss 600-604 refresh@608: P 73.2 KB (mean P 40.4 KB) encode 7.56 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+  loss 900-904 refresh@908: P 69.7 KB (mean P 40.8 KB) encode 7.33 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+LTR RESULT: 3/3 loss events recovered bit-exact with a non-IDR refresh
+frames: 1169 submitted, 1109 measured after 1 s warmup, 0 not encoded, 0 keyframes; 58.5 fps delivered; avg 40.6 KB/frame
+  capture  n=1109  mean= -1.84 p50= -1.51 p95=  0.59 p99=  0.77 max=  8.95 ms
+  encode   n=1109  mean=  7.57 p50=  7.57 p95=  7.91 p99=  8.05 max=  8.26 ms   [FAIL vs 8 ms bar at p99; 20 frames >= bar]
+  glass2enc n=1109  mean=  5.73 p50=  6.19 p95=  8.04 p99=  8.41 max= 16.58 ms

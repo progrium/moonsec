@@ -1,0 +1,26 @@
+2026-11-07 16:49:43.185 s7probe[4012:57931183] WARNING: AVCaptureDeviceTypeExternal is deprecated for Continuity Cameras. Please use AVCaptureDeviceTypeContinuityCamera and add NSCameraUseContinuityCameraDeviceType to your Info.plist.
+encoder: H.264, low-latency rate control on
+  RealTime = 1
+  AllowFrameReordering = 0
+  ProfileLevel = H264_ConstrainedHigh_AutoLevel
+  AverageBitRate = 20000000
+  ExpectedFrameRate = 480
+  MaxKeyFrameInterval = 2147483647
+  MaxKeyFrameIntervalDuration = 0
+  PrioritizeEncodingSpeedOverQuality = 1 (err -12900)
+  MaximizePowerEfficiency = 0
+  EnableLTR = 1
+  encoder id: com.apple.videotoolbox.videoencoder.h264.rtvc
+  hardware encoder: no
+capture: display 1 (1512x982 pt), scaled to 1920x1080
+LTR: loss every 300 frames, 5 lost, ack delay 3; 1740 frames with tokens, 0 sync frames after frame 0, 0 full-stream decode errors
+  loss 300-304 refresh@308: P 74.9 KB (mean P 40.4 KB) encode 7.47 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+  loss 600-604 refresh@608: P 72.9 KB (mean P 40.5 KB) encode 7.71 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+  loss 900-904 refresh@908: P 69.7 KB (mean P 40.6 KB) encode 7.44 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+  loss 1200-1204 refresh@1208: P 73.7 KB (mean P 40.5 KB) encode 7.72 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+  loss 1500-1504 refresh@1508: P 70.2 KB (mean P 40.5 KB) encode 12.06 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+LTR RESULT: 5/5 loss events recovered bit-exact with a non-IDR refresh
+frames: 1742 submitted, 1682 measured after 1 s warmup, 0 not encoded, 0 keyframes; 58.1 fps delivered; avg 40.5 KB/frame
+  capture  n=1682  mean= -1.94 p50= -1.66 p95=  0.56 p99=  0.73 max=  7.07 ms
+  encode   n=1682  mean=  8.37 p50=  7.62 p95= 12.17 p99= 12.36 max= 12.69 ms   [FAIL vs 8 ms bar at p99; 331 frames >= bar]
+  glass2enc n=1682  mean=  6.43 p50=  6.63 p95= 11.48 p99= 12.51 max= 14.89 ms

@@ -151,9 +151,11 @@ The pipeline never buffers: every frame is encoded, sent, decoded and presented 
 **Rate control**
 
 - The client sends transport-wide feedback every 5 to 10 ms with per-packet arrival times.
-- The host runs a delay-gradient estimator (GCC-style) on our own one-way delay timestamps, not QUIC RTT, and responds in order: bitrate, then resolution, then frame rate.
-- It produces two numbers: a capacity estimate, which becomes the shim's pacing rate, and an encoder target kept below it.
-- Streams start below target and ramp up, since there is no QUIC slow start to probe for them.
+- The host runs a delay-gradient estimator (GCC-style) on our own one-way delay timestamps, not QUIC RTT, and responds in order: bitrate, then resolution, then frame rate. It keeps libwebrtc's burst grouping, without which Wi-Fi aggregation reads as overuse and halves the rate (S11, simulated).
+- It produces two numbers: a capacity estimate, which becomes the shim's pacing rate, and an encoder target kept below it. The capacity estimate comes from frame packet trains: when a frame is paced faster than the bottleneck, its receive dispersion is the bottleneck rate (a 300 ms median read 1.00–1.02x capacity in S11's simulation). It measures the link, not our share of it, so it sets pacing but never the target alone.
+- Stock GCC is not enough (S11, simulated): with no probing it ramps at 8%/s and holds 24–35% of capacity, and a delay gradient cannot see a queue that has stopped growing, so it leaves 40–70 ms of queue for ~4 s after a capacity drop. Two additions fix that: the target jumps to 0.85x the train estimate when there is no recent congestion (the job WebRTC's padding probes do), and an absolute standing-queue check (min OWD over 20 ms against the 10 s minimum) cuts the rate to drain the queue in ~200 ms when it stays above 30 ms for 150 ms, but backs off for 10 s if the queue doesn't fall within 1.5 s, since a loss-based flow is then filling it. Simulated, this holds 0.86x capacity on wired links and 0.74–0.76x on Wi-Fi, reaches 80% of capacity in 1.3–1.7 s, and drains a capacity drop in 0.7–0.9 s with 10.8 ms queueing p99 (wired). Thresholds are hand-tuned starting points; real Wi-Fi validation is pending.
+- At a given utilization, frame transport time is about (encoder rate / capacity) x the frame interval, whatever the pacing, so the encoder target's share of the estimate trades bitrate for frame delay (S11: 88% gives a 16 ms frame p50 at 60 fps, 60% about 10 ms). The controller must be told that share, or its acked-rate rules read an app-limited stream as a smaller link and spiral down.
+- Streams start below target and ramp up, since there is no QUIC slow start to probe for them. The train estimate ramps in about 1.5 s, versus over 20 s for GCC's multiplicative increase.
 - Targets are bounded by user settings and by what the path reports, including shim-counted drops.
 
 **Pacing and presentation**
@@ -184,7 +186,7 @@ Each OS implements the same small host and client interfaces; frames stay on the
 | Function | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | Capture | Desktop Duplication / Windows.Graphics.Capture (D3D11 textures) | ScreenCaptureKit (IOSurface); late-frame tail needs handling | PipeWire portal; KMS grab optional |
-| Encode | NVENC (runtime-loaded), AMF, oneVPL; Media Foundation fallback (all untested) | VideoToolbox: regular encoder, RealTime off, per-frame size cap; HEVC preferred | VAAPI, NVENC; Vulkan Video later |
+| Encode | NVENC (runtime-loaded), AMF, oneVPL; Media Foundation fallback (all untested) | VideoToolbox: low-latency encoder with LTR, RealTime on, ExpectedFrameRate 1000 (S7b); HEVC preferred | VAAPI, NVENC; Vulkan Video later |
 | Audio capture | WASAPI loopback | ScreenCaptureKit audio | PipeWire |
 | Input injection | SendInput; virtual gamepad needs a signed driver | CGEvent (Accessibility permission); gamepad limited | uinput |
 | Virtual display | IddCx driver (signing required) | CGVirtualDisplay (private API) | Compositor headless output |
@@ -192,11 +194,11 @@ Each OS implements the same small host and client interfaces; frames stay on the
 | Present | Flip-model swapchain, waitable object, tearing allowed | CAMetalLayer | Wayland/EGL or Vulkan |
 | Input capture | Raw Input; gamepads via SDL3 or GameInput | NSEvent / GameController | evdev via SDL3 |
 
-**macOS encode and capture (S7, S8)**
+**macOS encode and capture (S7, S7b, S8)**
 
 - On an M3 Max at 1080p60, the regular encoder with `RealTime=false` and low-latency rate control off encodes at 6.75 ms p99 (H.264) and 4.99 ms (HEVC). With RealTime on, or on the low-latency path, it is 15.5 ms.
 - Without low-latency rate control, frame sizes spike up to 3×; a `DataRateLimits` cap of one frame's budget fixes the spikes but undershoots the average bitrate.
-- Long-term references were only seen working on the low-latency path, so these settings may not combine with LTR recovery; see the open questions.
+- Long-term references exist only on the low-latency path (S8). There, `RealTime=false` does not help (it adds long tails), but `ExpectedFrameRate=1000` with `RealTime=true` brings encode with LTR on to 8.6 ms p99 (HEVC) and 8.1–10.9 ms (H.264), about 2–4 ms slower than the regular encoder. LTR recovery stays bit-exact there (S7b).
 - ScreenCaptureKit sometimes delivers a frame late (capture p99 9.6 ms), which is now the largest contributor to p99. The capture stage has to time-stamp and tolerate late frames rather than assume a steady cadence.
 - Intel Macs untested.
 
@@ -262,7 +264,7 @@ Static linking is the default and works on all five targets (S1); a dynamic libr
 
 Nine time-boxed spikes, roughly three to four weeks in total, settle the decisions that are expensive to reverse; the transport spikes (S2 to S5) decide whether Rust iroh stays. Pass thresholds are proposed starting points to confirm in review.
 
-As of Nov 7, 2026, S1 to S5, S7 and S10 have run and iroh stays (for media too: S10), with the shim changes described under Transport. S8 has run on VideoToolbox only. S6, S9 and S8's Windows rows need a Windows GPU host. The table below is the original plan; results are under Spike status.
+As of Nov 7, 2026, S1 to S5, S7 and its follow-up S7b, and S10 have run and iroh stays (for media too: S10), with the shim changes described under Transport. S8 has run on VideoToolbox only. S11 (capacity estimation, added after the original plan) has run in simulation; its real Wi-Fi run is pending. S6, S9 and S8's Windows rows need a Windows GPU host. The table below is the original plan; results are under Spike status.
 
 | # | Question | Method | Pass | If it fails | Box |
 | --- | --- | --- | --- | --- | --- |
@@ -290,10 +292,12 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 | S4 | Pass with the fallback | FFI call is free (p99 ≤ 0.4 µs); handoff to a shared multi-thread runtime fails under load (1–4 ms p99), a dedicated pinned current-thread runtime passes (≤ 0.4 ms p99) |
 | S5 | Pass, with one config change | Path events arrive within 1 ms and per-path RTT/loss and direct vs relayed are all public API; a dead direct path takes 15 s to detect on defaults, 300 ms with a lower idle timeout |
 | S6 | Pending | Needs a Windows GPU host |
-| S7 | Pass, with non-obvious settings | M3 Max, real SCK capture at 1080p60: encode p99 6.75 ms (H.264) and 4.99 ms (HEVC), but only with `RealTime=false` and low-latency rate control off; with them on, 15.5 ms. Code only on Jeff's Mac |
+| S7 | Pass, with non-obvious settings | M3 Max, real SCK capture at 1080p60: encode p99 6.75 ms (H.264) and 4.99 ms (HEVC), but only with `RealTime=false` and low-latency rate control off; with them on, 15.5 ms |
+| S7b | Close, not quite | Low-latency encoder with LTR on (S7/S8 follow-up): 8.6 ms p99 HEVC, 8.1–10.9 ms H.264 with `RealTime=true` and `ExpectedFrameRate=1000`; 101/101 simulated losses recovered bit-exact |
 | S8 | VideoToolbox done; NVENC, AMF, oneVPL pending | VideoToolbox: per-frame bitrate without IDR passes, intra-refresh fails, long-term refs pass on the low-latency path |
 | S9 | Pending | Needs the S6 Windows host |
 | S10 | Done: keep iroh for media | noq-proto driven from Zig (Zig owns socket, timers, pacer, drops) beats iroh + `AppRate` on its pinned runtime by ~0.9 ms p99 on frame bursts (1.3 vs 2.2 ms over raw UDP; 0.6 ms with one frame of pacer credit), counts every drop, and halves the hand-off tail (62–202 µs; 11–30 µs when the media thread sends inline). But iroh's socket can't be shared without a fork, and a second socket's hole punch only worked through port-preserving NATs, so a relay path over iroh is still needed. Not worth a second traversal path. Found along the way: the 64 KiB send buffer evicts 62% of an 85 Mbit/s frame stream, and S2's pacer stalls are host scheduling, not tokio |
+| S11 | Simulation done; real Wi-Fi pending | Stock GCC holds only 24–35% of capacity and leaves a standing queue after drops. GCC plus a frame-train capacity estimate and a standing-queue drain holds 0.86x capacity wired and 0.74–0.76x on simulated Wi-Fi, reaches it in ~1.5 s and drains a drop in 0.7–0.9 s at 10.8 ms queueing p99; it still gets only ~55% of its fair share against a Reno flow |
 
 **S1: shim builds and links** ([`spikes/s1-shim`](../spikes/s1-shim/README.md), [`shim/README.md`](../shim/README.md))
 
@@ -323,15 +327,19 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 
 **S7: macOS host encode baseline** ([`spikes/s7-macos-encode`](../spikes/s7-macos-encode/README.md))
 
-- Findings: on an M3 Max with real SCK capture at 1080p60, encode p50/p95/p99 is 6.24/6.57/6.75 ms (H.264) and 4.47/4.80/4.99 ms (HEVC) with `RealTime=false` and low-latency rate control off; with them on, 14.1/14.9/15.5 ms. SCK capture has a late tail (p99 9.6 ms) that drives vsync-to-encoded p99 to 15.7 ms. Without low-latency rate control, frames spike up to 3x; a `DataRateLimits` cap of one frame's budget fixes the spikes but undershoots the average bitrate. The probe and raw data live only on Jeff's Mac.
-- Implications: the macOS backend uses the regular hardware encoder, RealTime off, a per-frame size cap, and HEVC where the client supports it. The capture tail is now the largest p99 contributor and needs its own look. Intel Macs untested.
+- Findings: on an M3 Max with real SCK capture at 1080p60, encode p50/p95/p99 is 6.24/6.57/6.75 ms (H.264) and 4.47/4.80/4.99 ms (HEVC) with `RealTime=false` and low-latency rate control off; with them on, 14.1/14.9/15.5 ms. SCK capture has a late tail (p99 9.6 ms) that drives vsync-to-encoded p99 to 15.7 ms. Without low-latency rate control, frames spike up to 3x; a `DataRateLimits` cap of one frame's budget fixes the spikes but undershoots the average bitrate.
+- Implications: the regular encoder is the fastest, but it has no long-term references; S7b settles which path the backend uses. The capture tail is now the largest p99 contributor and needs its own look. Intel Macs untested.
 
 **S8: encoder feature matrix** ([`spikes/s8-encoder-controls`](../spikes/s8-encoder-controls/README.md))
 
 - Findings (VideoToolbox, H.264 and HEVC): bitrate changes between frames take effect with no IDR and settle within 0–11 frames. Intra-refresh fails on both: there is no public key, the private HEVC key is ignored, and the low-latency refresh setting emits periodic IDRs. Long-term refs pass on both, but only on the low-latency encoder path: recovery frames are 52–90 KB versus about 320 KB for an IDR, and the output is bit-exact afterwards. Apple's HEVC decoder breaks permanently if fed frames after a gap. NVENC, AMF and oneVPL are pending a Windows GPU host.
 - Implications: no periodic keyframes and no intra-refresh on macOS; loss recovery is LTR ack plus `ForceLTRRefresh`, IDR as last resort. The protocol needs a client-to-host ack message carrying each frame's LTR token, which is a VideoToolbox sample attachment and so must travel in our video header, not the bitstream. Clients freeze decode on a gap until the recovery frame arrives (required for VT HEVC, harmless elsewhere).
 
-**Open conflict between S7 and S8.** S7's fast settings use the regular encoder, but S8 found long-term refs exist only on the low-latency path, which S7 measured at 15.5 ms p99 with RealTime on. Before the macOS backend is built, measure the low-latency path with `RealTime=false` and real capture. If it stays slow, macOS has to choose per session between fast encode with IDR recovery and slower encode with LTR recovery.
+**S7b: macOS encode with long-term references** ([`spikes/s7b-macos-ltr-encode`](../spikes/s7b-macos-ltr-encode/README.md))
+
+- Question: S7's fast settings use the regular encoder, but S8 found long-term refs only on the low-latency path. How fast is that path with LTR on and real capture, and does recovery still work?
+- Findings: `RealTime=false` does not help on the low-latency encoder (14.5 ms p50 and tails up to 86 ms p99). The knob that matters is `ExpectedFrameRate`: at 1000 with `RealTime=true`, encode p50/p99 is 8.0/8.6 ms for HEVC (stable over two 30 s runs) and 7.6 ms / 8.1–10.9 ms for H.264 (bimodal between runs). The regular encoder in the same session was 6.55 ms (H.264) and 4.56 ms (HEVC) p99. With simulated loss and acks, 101 of 101 loss events recovered bit-exact from a non-IDR refresh frame of 63–81 KB (about 1.8x a P frame). On full-screen noise the low-latency encoder drops half its frames rather than overshoot.
+- Implications: LTR on macOS costs about 2–4 ms of encode and misses the 8 ms bar by about 0.6 ms at p99 (HEVC). Decided (Nov 7, 2026): take it as the default anyway, since a loss then costs a ~1.8x P frame instead of an IDR at about 8x, and keep the regular encoder with IDR recovery as an option for near-lossless links. The backend has to handle frames the encoder drops.
 
 **S10: media over noq-proto from Zig** ([`spikes/s10-noq-proto`](../spikes/s10-noq-proto/README.md))
 
@@ -339,7 +347,14 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 - Findings: S2 and S4 were rerun against a sans-I/O shim (noq-proto 1.4.0, the version iroh pins) and against iroh + `AppRate` on S4's pinned current-thread runtime, two runs per case. Frame bursts below the cap add 1.3 ms p99 over raw UDP with noq, against 2.2 ms with iroh. Raising the Zig pacer's credit to one frame brings it to 0.6 ms. noq's own pacer driven from the same loop scores within 0.1 ms of the Zig pacer, so the gain comes from removing tokio and from the burst policy, not from where the pacer sits. Every datagram is accounted for in all 98 noq runs (Zig queue drops + QUIC loss = TBF drops). Hand-off p99 is 62–202 µs through a pinned network thread and 11–30 µs when the media thread drives QUIC itself (iroh: 102–398 µs). iroh owns its sockets, with no demux or raw-send hook, so sharing its path needs a fork. A demo with a second Zig socket, rendezvous and cert pinning over an iroh stream, and a hole punch works through two port-preserving NATs, but only after adding TTL-limited opening probes (the naive version failed on conntrack port clashes). It fails through a port-randomizing NAT.
 - Implications: media stays on iroh. Two changes come out of it. (1) The shim's datagram send buffer must hold at least the largest frame: with 64 KiB, iroh silently evicted 62% of datagrams at 85 Mbit/s 60 fps, well below the cap. The shim counts evictions (`sent − frame_tx.datagram`), and a time-based limit stays in the core's own queue. (2) Give `AppRate` about a frame of burst credit, or pace slightly above capacity, and remeasure. S2's open item is answered: the 5–23 ms stalls also hit a pinned SCHED_FIFO Zig thread with no tokio, so they come from host scheduling, to recheck on bare metal. Revisit noq-proto only if Phase 2's LAN gate misses by about 1 ms because of the transport, and then through a small iroh fork that shares the socket, not a second socket.
 
-**Still to run:** S6 and S9 need a Windows GPU host, which also fills in S8's NVENC, AMF and oneVPL rows and reruns S4 on target hardware.
+**S11: capacity estimation and rate control** ([`spikes/s11-capacity-estimation`](../spikes/s11-capacity-estimation/README.md))
+
+- Question: every transport option paces at the core's capacity estimate (S2), and nothing had tested that estimate. How accurately and how fast does a delay-gradient estimator track capacity, and how much queue builds, with Wi-Fi jitter and cross traffic?
+- Method: a deterministic Zig simulator (60 fps sender with scene-change frames, pacer, one droptail bottleneck with a 500 KB buffer, A-MPDU-like delivery batching and 5–60 ms radio stalls for Wi-Fi, 5 ms transport-wide feedback) over eight scenarios: capacity steps 50→20→80 Mbit/s on wired and Wi-Fi, a 2 ms-RTT LAN, random MCS fades, on/off UDP, a Reno flow and line-rate bursts. A port of libwebrtc's delay-based GCC was compared with variants and with a queue-delay-target controller, 5 seeds each. The same estimator code runs over real UDP (`s11net`).
+- Findings: stock GCC holds 24–35% of capacity: it climbs at 8%/s, backs off at every scene-change frame and needs over 20 s to fill a link. Frame trains measure link capacity within 2%. Pacing at that estimate instead of 2.5x the target cuts wired queueing p99 from 35 to 10 ms, and pacing at the encoder rate backs frames up 0.5–1.4 s in the pacer. After a capacity drop, GCC's one cut leaves a standing queue the gradient can't see. An absolute standing-queue drain with a hold (ignores stalls and bursts) and a give-up (yields to loss-based flows) fixes that. That combination (`gcc-hybrid`) holds 0.86x capacity on wired, 0.74–0.76x on simulated Wi-Fi and 0.68x beside on/off UDP. It reaches 80% of capacity in 1.3–1.7 s and cuts below a new lower capacity in 300 ms, but in those 300 ms the old pacing rate fills the AP buffer to 170–200 ms. Against Reno it gets 55% of its fair share. The queue-delay controller fills the link better (0.85–0.92x) at 2.5x the wired queueing p99.
+- Implications: the core's rate controller is GCC's trendline detector with burst grouping, plus the frame-train capacity estimate (pacing rate and upward jumps) and the standing-queue drain, behind one interface so the queue-delay controller can still be compared. The encoder target is a share of the controller's target that the controller knows about. The real Wi-Fi run, AQM (fq_codel) bottlenecks and Cubic/BBR competition are still open.
+
+**Still to run:** S11's real Wi-Fi run needs a far-end receiver. S6 and S9 need a Windows GPU host, which also fills in S8's NVENC, AMF and oneVPL rows and reruns S4 on target hardware.
 
 
 ## Implementation plan
@@ -410,13 +425,15 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 ## Risks, open questions and decisions
 
-The original top risk, QUIC congestion control fighting our rate controller, is retired: S3's controller in the shim removes the hidden queue (S2). The biggest open risks are now on the encoder side: whether macOS can have fast encode and long-term references at once, and whether the Windows encoders support long-term references at all.
+The original top risk, QUIC congestion control fighting our rate controller, is retired: S3's controller in the shim removes the hidden queue (S2). The biggest open risks are now on the encoder side: the 2–4 ms that long-term references cost on macOS (S7b), and whether the Windows encoders support long-term references at all.
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | ~~QUIC congestion control and our rate controller conflict~~ | Latency spikes or capped bitrate | Retired by S2/S3: `AppRate` in the shim, paced at the core's capacity estimate |
-| macOS fast encode settings may not support long-term references (S7 vs S8) | macOS hosts choose between ~7 ms encode with IDR recovery and ~15 ms encode with LTR recovery | Measure the low-latency path with RealTime off before building the backend; per-session choice if it stays slow |
+| Long-term references on macOS cost 2–4 ms of encode (S7b) | LTR encode is 8.6 ms p99 (HEVC) vs 4.6 ms on the regular encoder; just over the 8 ms bar | Default to the low-latency encoder with LTR and `ExpectedFrameRate=1000`; regular encoder with IDR recovery as a per-session option; recheck on newer macOS and other M-series chips |
 | NVENC, AMF or oneVPL lack usable long-term references | Keyframe spikes on loss for that backend | S8 Windows rows; IDR recovery per backend as fallback |
+| Capacity estimation validated only in simulation (S11) | Real Wi-Fi stalls or aggregation could fool the train estimate or trigger needless drains | S11 real Wi-Fi run; keep thresholds configurable and log estimator state in field builds |
+| Delay-based control loses to loss-based flows (S11: ~55% of fair share against Reno) | Lower bitrate on links shared with downloads | Drain give-up already avoids starvation; consider a loss-based floor while a foreign queue persists; test Cubic/BBR and fq_codel |
 | Shim pacer stalls (5–23 ms, seen in S2 on a shared runtime) | Occasional frame delay on smooth traffic | Rerun on the dedicated runtime; else more burst credit or pace slightly above capacity |
 | iroh/noq internals we depend on (drop counting, per-path controllers) change on upgrade | Silent drops or a lost pacing rate | Pin iroh; shim tests for drop counts and path-change rate handoff; upstream the uncounted-drop and `datagram_send_buffer_space()` issues |
 | 300 ms path idle timeout flaps at real internet RTTs | Spurious path closes | Re-check through real NATs and long-RTT paths in Phase 3 field tests |
@@ -428,12 +445,14 @@ The original top risk, QUIC congestion control fighting our rate controller, is 
 
 **Open questions**
 
-- Can VideoToolbox's low-latency path run fast enough with `RealTime=false` and real capture to keep long-term references? If not, which recovery mode is the macOS default? (S7/S8 follow-up.)
+- ~~Can VideoToolbox's low-latency path run fast enough with `RealTime=false` and real capture to keep long-term references?~~ Answered by S7b: `RealTime=false` doesn't help, but `ExpectedFrameRate=1000` gets LTR encode to 8.6 ms p99 (HEVC), 2–4 ms over the regular encoder. Decided Nov 7, 2026: the low-latency encoder with LTR is the macOS default for now, accepting the ~0.6 ms miss on the S7 bar; revisit if newer macOS or chips change the numbers.
 - Do NVENC, AMF and oneVPL support per-frame bitrate changes and long-term references, and which must for launch? (S8 Windows rows.)
 - What is our Windows glass-to-glass baseline against Moonlight and Parsec? (S6.)
 - Is the web client usable over a relay? (S9.)
 - ~~Do the shim's pacer stalls go away on the dedicated runtime?~~ No: S10 saw them on a pinned SCHED_FIFO thread with no tokio as well, so they are host scheduling on the VM. Recheck on bare metal.
 - Does a frame's worth of burst credit in `AppRate` get iroh's frame overhead under 2 ms p99 like it did for the Zig pacer? (S10 follow-up.)
+- Does S11's simulated result hold on a real Wi-Fi link, and does `gcc-hybrid` or the queue-delay controller win there? (S11 real run.)
+- What encoder share of the capacity estimate should each mode use (game vs desktop)? S11 shows the frame-delay vs bitrate trade but not the right point.
 - Do we run our own discovery (DNS/pkarr) or rely on n0's public services?
 - Multi-user sessions: one shared input owner, or input from all guests?
 - License for the project itself?
@@ -457,7 +476,7 @@ The original top risk, QUIC congestion control fighting our rate controller, is 
 | Static shim linking by default | Works on all five targets (S1); dynamic build kept as an option |
 | Loss recovery is LTR-first with client acks; no intra-refresh baseline | VideoToolbox has no working intra-refresh; LTR recovery frames are 3–6× smaller than IDRs (S8) |
 | Clients drop frames after a gap until the recovery frame | Required for Apple's HEVC decoder, harmless elsewhere (S8) |
-| macOS encoder: regular path, RealTime off, per-frame size cap (pending the S7/S8 question) | 6.75 ms p99 vs 15.5 ms with RealTime on (S7) |
+| macOS encoder: low-latency path with LTR, RealTime on, `ExpectedFrameRate=1000`, HEVC preferred (Nov 2026; accepts ~0.6 ms over the S7 bar) | Only path with long-term refs (S8); 8.6 ms p99 with LTR vs 15.5 ms on defaults; `RealTime=false` adds tails there (S7b) |
 
 **Sources**
 
