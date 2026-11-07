@@ -35,6 +35,12 @@ typedef struct IrohBindOpts {
     const char *bind_addr;     /* e.g. "127.0.0.1:0"; NULL = default (all interfaces) */
 } IrohBindOpts;
 
+/* iroh runs on one shim-owned thread (current-thread tokio runtime). Optionally call
+ * iroh_shim_init first to run a hook on that thread at startup, e.g. to pin it and raise
+ * its priority. Returns IROH_ERR_INVALID if the runtime has already started. */
+typedef void (*IrohThreadStartFn)(void *ctx);
+int32_t iroh_shim_init(IrohThreadStartFn on_thread_start, void *ctx);
+
 uint32_t iroh_shim_version(void);
 const char *iroh_last_error(void);
 

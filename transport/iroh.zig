@@ -36,6 +36,12 @@ fn cstr(buf: []u8) [:0]const u8 {
     return buf[0..n :0];
 }
 
+/// Optional; call before anything else. `hook(ctx)` runs on the shim's single runtime
+/// thread at startup so the host can pin it and raise its priority.
+pub fn init(hook: ?*const fn (?*anyopaque) callconv(.c) void, ctx: ?*anyopaque) Error!void {
+    try check(c.iroh_shim_init(hook, ctx));
+}
+
 pub fn version() u32 {
     return c.iroh_shim_version();
 }

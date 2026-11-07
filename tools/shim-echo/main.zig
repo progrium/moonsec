@@ -32,6 +32,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    iroh.init(onShimThread, null) catch |e| return die("init", e);
     std.debug.print("iroh shim ABI v{x}\n", .{iroh.version()});
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "selftest")) {
@@ -46,6 +47,11 @@ pub fn main(init: std.process.Init) !void {
         defer conn.deinit(0);
         try pingLoop(init.io, conn, count);
     } else return usage();
+}
+
+fn onShimThread(_: ?*anyopaque) callconv(.c) void {
+    // A real host pins this thread and raises its priority here (see spike S4).
+    std.debug.print("shim runtime thread started\n", .{});
 }
 
 fn usage() error{Usage} {

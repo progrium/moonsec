@@ -52,26 +52,73 @@ fn fail(code: i32, msg: impl std::fmt::Display) -> i32 {
     code
 }
 
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("iroh-shim")
-            .enable_all()
-            .build()
-            .expect("failed to start tokio runtime")
+/// Called on the shim's runtime thread before it starts driving iroh, so the host can pin
+/// it to a core and raise its priority (MMCSS, QoS class, SCHED_FIFO...).
+pub type IrohThreadStartFn = Option<unsafe extern "C" fn(ctx: *mut std::ffi::c_void)>;
+
+struct ThreadHook(IrohThreadStartFn, usize);
+
+static THREAD_HOOK: Mutex<Option<ThreadHook>> = Mutex::new(None);
+static RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
+/// The shim runs iroh on one dedicated thread with a current-thread tokio runtime.
+/// S4 measured a shared multi-thread runtime at 1-4 ms p99 handoff under CPU load;
+/// one pinned, high-priority shim thread stayed at 100-400 us.
+fn runtime() -> &'static tokio::runtime::Handle {
+    RUNTIME.get_or_init(|| {
+        let hook = THREAD_HOOK.lock().unwrap().take();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("iroh-shim".into())
+            .spawn(move || {
+                if let Some(ThreadHook(Some(f), ctx)) = hook {
+                    unsafe { f(ctx as *mut std::ffi::c_void) };
+                }
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to start tokio runtime");
+                tx.send(rt.handle().clone()).unwrap();
+                rt.block_on(std::future::pending::<()>());
+            })
+            .expect("failed to spawn iroh-shim thread");
+        rx.recv().expect("iroh-shim thread died during startup")
     })
 }
 
-/// Runs `fut` on the shim runtime with a timeout. The timer must be created inside the
-/// runtime, so wrap it in an async block rather than building it on the caller's thread.
-fn block_on_timeout<F: std::future::Future>(
-    timeout_ms: u32,
-    fut: F,
-) -> Result<F::Output, tokio::time::error::Elapsed> {
+/// Runs `fut` on the shim thread and blocks the calling thread until it finishes.
+fn run<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    runtime().spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    rx.recv().expect("iroh-shim runtime stopped")
+}
+
+/// Runs `fut` on the shim thread with a timeout.
+fn block_on_timeout<F>(timeout_ms: u32, fut: F) -> Result<F::Output, tokio::time::error::Elapsed>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     let d = Duration::from_millis(timeout_ms as u64);
-    runtime().block_on(async move { tokio::time::timeout(d, fut).await })
+    run(async move { tokio::time::timeout(d, fut).await })
+}
+
+/// Optional. Registers a callback run on the shim's runtime thread when it starts.
+/// Must be called before any other shim call; returns IROH_ERR_INVALID afterwards.
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_shim_init(on_thread_start: IrohThreadStartFn, ctx: *mut std::ffi::c_void) -> i32 {
+    if RUNTIME.get().is_some() {
+        return fail(IROH_ERR_INVALID, "shim runtime already started");
+    }
+    *THREAD_HOOK.lock().unwrap() = Some(ThreadHook(on_thread_start, ctx as usize));
+    runtime();
+    IROH_OK
 }
 
 pub struct IrohEndpoint {
@@ -164,7 +211,7 @@ pub unsafe extern "C" fn iroh_endpoint_bind(
             let sa = SocketAddr::from_str(addr).map_err(|e| format!("bad bind_addr {addr}: {e}"))?;
             b = b.clear_ip_transports().bind_addr(sa).map_err(|e| e.to_string())?;
         }
-        runtime().block_on(b.bind()).map_err(|e| e.to_string())
+        run(b.bind()).map_err(|e| e.to_string())
     })();
     match built {
         Ok(ep) => {
@@ -179,7 +226,8 @@ pub unsafe extern "C" fn iroh_endpoint_bind(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn iroh_endpoint_online(ep: *const IrohEndpoint, timeout_ms: u32) -> i32 {
     let Some(ep) = (unsafe { ep.as_ref() }) else { return fail(IROH_ERR_INVALID, "null endpoint") };
-    let r = block_on_timeout(timeout_ms, ep.ep.online());
+    let endpoint = ep.ep.clone();
+    let r = block_on_timeout(timeout_ms, async move { endpoint.online().await });
     match r {
         Ok(()) => IROH_OK,
         Err(_) => fail(IROH_ERR_TIMEOUT, "timed out waiting for relay"),
@@ -264,7 +312,9 @@ pub unsafe extern "C" fn iroh_endpoint_connect(
         Err(e) => return fail(IROH_ERR_INVALID, format!("bad ticket: {e}")),
     };
     let alpn = unsafe { bytes_arg(alpn, alpn_len) }.to_vec();
-    let fut = ep.ep.connect(ticket.endpoint_addr().clone(), &alpn);
+    let endpoint = ep.ep.clone();
+    let addr = ticket.endpoint_addr().clone();
+    let fut = async move { endpoint.connect(addr, &alpn).await };
     match block_on_timeout(timeout_ms, fut) {
         Ok(Ok(conn)) => {
             unsafe { *out = wrap_conn(conn) };
@@ -308,7 +358,7 @@ pub unsafe extern "C" fn iroh_endpoint_free(ep: *mut IrohEndpoint) {
         return;
     }
     let ep = unsafe { Box::from_raw(ep) };
-    runtime().block_on(ep.ep.close());
+    run(async move { ep.ep.close().await });
 }
 
 /// Queues one unreliable datagram. Never blocks; the shim copies the bytes.

@@ -8,6 +8,7 @@ A thin Rust crate over iroh 1.x (`=1.4.1`) exposing the C ABI in
 
 | Call | Notes |
 | --- | --- |
+| `iroh_shim_init(hook, ctx)` | optional; hook runs on the shim runtime thread at startup |
 | `iroh_endpoint_bind(opts, &ep)` | secret key (or fresh), ALPN, relay mode (n0 default / disabled / custom URLs), optional bind address |
 | `iroh_endpoint_online(ep, ms)` | wait for home relay |
 | `iroh_endpoint_id`, `iroh_endpoint_ticket` | write into caller buffers; ticket is an iroh `EndpointTicket` string |
@@ -18,15 +19,21 @@ A thin Rust crate over iroh 1.x (`=1.4.1`) exposing the C ABI in
 | `iroh_conn_max_datagram_size`, `iroh_conn_local_drops`, `iroh_conn_remote_id` | |
 | `iroh_*_free` | close and free handles |
 
+Threading: iroh runs on **one shim-owned thread** with a current-thread tokio
+runtime. `iroh_shim_init(hook, ctx)` (optional, before any other call) runs
+`hook(ctx)` on that thread at startup so the host can pin it and raise its
+priority. Spike S4 measured 1–4 ms p99 handoff on a shared multi-thread runtime
+under load versus 100–400 µs on one pinned high-priority thread.
+`send_datagram` calls `Connection::send_datagram` directly from the caller's thread.
+
 Rules: status codes are `int32_t` (0 ok, negative error) with a thread-local
-`iroh_last_error()`; Zig owns every buffer; the shim owns one tokio runtime
-(2 worker threads); `panic = "abort"`.
+`iroh_last_error()`; Zig owns every buffer; `panic = "abort"`.
 
 `iroh_conn_local_drops` counts datagrams the shim dropped because its inbound
 queue (4096) was full. It does **not** yet see drops inside iroh/noq's own
 datagram buffers; S2 extends stats for that.
 
-Not in v0.1 (later spikes): wakeup fd/handle for recv (S4), reliable streams,
+Not in v0.1 (later spikes): wakeup fd/handle for recv, reliable streams,
 path stats/events (S5), transport config and custom congestion controller (S3),
 `path_max_idle_timeout`.
 
