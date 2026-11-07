@@ -17,7 +17,7 @@ def key(n):
     p = n.split('_'); return (p[4], p[3], int(p[1][3:]), int(p[2][2:]), n)
 for n in sorted((n for n in rows if n.startswith('iroh')), key=key):
     r = rows[n]; base = n.replace('iroh', 'udp', 1).split('_sbuf')[0].replace('_wait', '')
-    u = rows.get(base)
+    u = rows.get(base.split('_apprate')[0])
     p = n.split('_'); cap = int(p[1][3:]); tx = int(p[2][2:])
     wire = tx * (1100 + 30 + 28 + 14) / 1100 / cap * 100  # % of TBF rate incl. QUIC+UDP/IP+eth
     added = ms(r['owd_p99'] - u['owd_p99']) if u else '-'

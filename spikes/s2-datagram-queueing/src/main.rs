@@ -29,6 +29,8 @@ use iroh::{
     endpoint::{QuicTransportConfig, presets},
 };
 
+mod apprate;
+
 const ALPN: &[u8] = b"moonsec/s2bench/0";
 const HDR: usize = 32;
 
@@ -126,6 +128,12 @@ enum Cmd {
         /// Datagram send buffer in bytes (noq default 1 MiB).
         #[arg(long)]
         sbuf: Option<usize>,
+        /// Congestion controller: `cubic` (iroh default) or `apprate` (S3's app-driven pacer).
+        #[arg(long, default_value = "cubic")]
+        cc: String,
+        /// AppRate target in Mbit/s of QUIC payload; default is 1.05x the offered load.
+        #[arg(long)]
+        target_mbps: Option<f64>,
         /// Seconds of warm-up traffic at the target rate before measured traffic starts.
         #[arg(long, default_value_t = 2.0)]
         warmup: f64,
@@ -207,7 +215,20 @@ fn schedule(a: &SendArgs, warmup: f64, mut emit: impl FnMut(u64, u64, u64, bool)
 }
 
 fn endpoint_builder(seed: u8, bind: SocketAddr, rbuf: Option<usize>, sbuf: Option<usize>) -> Result<iroh::endpoint::Builder> {
+    endpoint_builder_cc(seed, bind, rbuf, sbuf, None)
+}
+
+fn endpoint_builder_cc(
+    seed: u8,
+    bind: SocketAddr,
+    rbuf: Option<usize>,
+    sbuf: Option<usize>,
+    cc: Option<Arc<apprate::AppRateFactory>>,
+) -> Result<iroh::endpoint::Builder> {
     let mut tc = QuicTransportConfig::builder();
+    if let Some(f) = cc {
+        tc = tc.congestion_controller_factory(f);
+    }
     if let Some(r) = rbuf {
         tc = tc.datagram_receive_buffer_size(Some(r));
     }
@@ -283,8 +304,29 @@ async fn run_recv(bind: SocketAddr, seed: u8, csv: String, out: String, rbuf: Op
     Ok(())
 }
 
-async fn run_send(a: SendArgs, bind: SocketAddr, seed: u8, mode: SendMode, sbuf: Option<usize>, warmup: f64) -> Result<()> {
-    let ep = endpoint_builder(seed.wrapping_add(1), bind, None, sbuf)?.bind().await?;
+#[allow(clippy::too_many_arguments)]
+async fn run_send(
+    a: SendArgs,
+    bind: SocketAddr,
+    seed: u8,
+    mode: SendMode,
+    sbuf: Option<usize>,
+    warmup: f64,
+    cc: String,
+    target_mbps: Option<f64>,
+) -> Result<()> {
+    let factory = match cc.as_str() {
+        "cubic" => None,
+        "apprate" => {
+            let knob = Arc::new(apprate::RateKnob::default());
+            // The knob paces QUIC packet bytes; scale payload Mbit/s by the ~30 B/datagram overhead.
+            let t = target_mbps.unwrap_or(a.mbps * 1.05) * 1e6 * (a.size as f64 + 30.0) / a.size as f64;
+            knob.set_target_bps(t as u64);
+            Some(apprate::AppRateFactory::new(knob))
+        }
+        other => bail!("unknown cc {other}"),
+    };
+    let ep = endpoint_builder_cc(seed.wrapping_add(1), bind, None, sbuf, factory.clone())?.bind().await?;
     let peer = SecretKey::from_bytes(&[seed; 32]).public();
     let addr = EndpointAddr::from_parts(peer, [TransportAddr::Ip(a.to)]);
     let conn = ep.connect(addr, ALPN).await?;
@@ -332,6 +374,8 @@ async fn run_send(a: SendArgs, bind: SocketAddr, seed: u8, mode: SendMode, sbuf:
         "send_buffer_would_drop": would_drop.load(Ordering::Relaxed),
         "send_buffer_min_space": min_space.load(Ordering::Relaxed),
         "max_datagram": max,
+        "cc": cc,
+        "cc_paths_built": factory.as_ref().map(|f| f.built_count()),
         "conn": conn_summary(&conn),
     });
     std::fs::write(&a.out, serde_json::to_string_pretty(&j)?)?;
@@ -442,7 +486,7 @@ fn main() -> Result<()> {
             rt.block_on(async move {
                 match cmd {
                     Cmd::Recv { bind, seed, csv, out, rbuf } => run_recv(bind, seed, csv, out, rbuf).await,
-                    Cmd::Send { a, bind, seed, mode, sbuf, warmup } => run_send(a, bind, seed, mode, sbuf, warmup).await,
+                    Cmd::Send { a, bind, seed, mode, sbuf, warmup, cc, target_mbps } => run_send(a, bind, seed, mode, sbuf, warmup, cc, target_mbps).await,
                     _ => unreachable!(),
                 }
             })
