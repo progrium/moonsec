@@ -4,7 +4,7 @@ Nov 7, 2026 · @Jeff Lindsay
 
 ## Summary
 
-We build a low-latency remote desktop and game streaming core library in Zig, with both host and client, that pairs Parsec's internet-first networking with Moonlight/Sunshine's media quality and openness. Networking uses Rust iroh through a small in-repo shim; everything latency-critical (capture, encode, packetization, FEC, rate control, pacing, decode, present) is Zig.
+We build a low-latency remote desktop and game streaming core library in Zig, with both host and client, that pairs Parsec's internet-first networking with Moonlight/Sunshine's media quality and openness. Networking uses Rust iroh through an in-repo shim that also owns QUIC congestion control and packet pacing; the rest of the latency-critical path (capture, encode, packetization, FEC, rate control, decode, present) is Zig. The Zig core decides the sending rate and the shim paces to it.
 
 **Goals**
 
@@ -24,7 +24,7 @@ We build a low-latency remote desktop and game streaming core library in Zig, wi
 **Non-goals for v1**
 
 - Voice chat and microphone passthrough (the protocol keeps stream IDs so they can be added later).
-- A Zig port of iroh or noq; revisit only if the transport spike fails.
+- A Zig port of iroh or noq; the transport spikes passed, so this stays off the table.
 - WebRTC or WebTransport browser paths.
 - Moonlight/GameStream protocol compatibility.
 - Mobile clients and a hosted account service.
@@ -35,12 +35,12 @@ Both products run the same basic pipeline; Parsec wins over the internet because
 
 | Idea | From | How we use it |
 | --- | --- | --- |
-| Transport feeds the encoder within milliseconds | Parsec ([BUD](https://blog.parsec.app/a-networking-protocol-built-for-the-lowest-latency-interactive-game-streaming-1fd5a03a6007/)) | Delay-based rate controller in the Zig core drives per-frame encoder reconfiguration |
+| Transport feeds the encoder within milliseconds | Parsec ([BUD](https://blog.parsec.app/a-networking-protocol-built-for-the-lowest-latency-interactive-game-streaming-1fd5a03a6007/)) | Delay-based rate controller in the Zig core drives per-frame encoder reconfiguration and the shim's pacing rate |
 | Priority order: latency, then frame rate, then quality | Parsec | Encoded in the rate controller's response ladder |
 | Zero-copy capture into the hardware encoder | Parsec ([overview](https://support.parsec.app/hc/en-us/articles/32361354307348-Overview)) | GPU textures/surfaces go straight to the encoder on every host OS |
 | Peer-to-peer with NAT traversal and relay fallback, no setup | Parsec | iroh: dial by Ed25519 key, QUIC hole punching, relays |
 | Reed-Solomon FEC per frame | Moonlight ([protocol notes](https://games-on-whales.github.io/wolf/stable/protocols/index.html)) | Adaptive FEC on WAN paths |
-| Reference frame invalidation instead of keyframes | Moonlight | Long-term references plus intra-refresh; IDR only as last resort |
+| Reference frame invalidation instead of keyframes | Moonlight | Long-term references acked by the client; IDR only as last resort (no intra-refresh) |
 | Broad encoder support, AV1, HDR, high bitrates | Sunshine | Per-OS encoder backends behind one interface |
 | Per-stage latency overlay | Moonlight | Telemetry API and debug overlay from the first milestone |
 | Open, documented protocol | Moonlight/Sunshine | Versioned wire spec lives in the repo |
@@ -62,16 +62,16 @@ The core talks to the transport in packets and path stats, and to the platform i
    - `proto`: framing, versioned messages, stream IDs, timestamps.
    - `media`: packetizer, Reed-Solomon FEC, NACK/retransmit, reassembly.
    - `rate`: delay-gradient controller that outputs bitrate, resolution and frame rate.
-   - `recovery`: long-term reference bookkeeping, RFI, intra-refresh, IDR fallback.
-   - `pacing`: sender pacing and the client's present policy.
+   - `recovery`: long-term reference bookkeeping, LTR acks, RFI, IDR fallback.
+   - `pacing`: the pacing rate handed to the transport (the shim does the pacing) and the client's present policy.
    - `input`: event model, redundancy, gamepad state snapshots.
    - `clock`: host/client clock offset for one-way delay and end-to-end latency.
-3. **Transport** (`PacketPipe`: send, receive, path stats). Implementations: iroh shim (production), simulated pipe (tests), and a native UDP pipe reserved as a fallback.
+3. **Transport** (`PacketPipe`: send, receive, set pacing rate, path stats and drop counts). Implementations: iroh shim (production), simulated pipe (tests), and a native UDP pipe reserved as a fallback.
 4. **Platform**: host (capture, encode, audio in, input injection, virtual display, cursor) and client (decode, present, audio out, input capture).
 
 **Threading**
 
-Each pipeline stage gets a dedicated OS thread connected by lock-free single-producer/single-consumer rings: capture, encode, network, decode, present, audio. Threads run at elevated priority (MMCSS on Windows, QoS classes on macOS). We do not depend on Zig's `std.Io` evented backends; Zig 0.16 shipped only the threaded implementation for production use ([release notes summary](https://www.youngju.dev/transcribe/2026-07-16-zig-016-io-interface.en)).
+Each pipeline stage gets a dedicated OS thread connected by lock-free single-producer/single-consumer rings: capture, encode, network, decode, present, audio. Threads run at elevated priority (MMCSS on Windows, QoS classes on macOS). iroh runs on its own single-threaded (current-thread) tokio runtime on a thread the shim creates; a start hook lets the host pin that thread and give it real-time priority. The network stage calls `send_datagram` directly on its own thread. S4 measured this hop at 0.1–0.4 ms p99; a shared multi-thread runtime added 1–4 ms under load. We do not depend on Zig's `std.Io` evented backends; Zig 0.16 shipped only the threaded implementation for production use ([release notes summary](https://www.youngju.dev/transcribe/2026-07-16-zig-016-io-interface.en)).
 
 **Why sans-I/O**
 
@@ -81,7 +81,7 @@ Each pipeline stage gets a dedicated OS thread connected by lock-free single-pro
 
 ## Transport
 
-We use Rust iroh 1.x through a thin Rust shim that lives in the repo and exposes exactly the C ABI we need. iroh gives us key-based identity, discovery, QUIC NAT traversal, multipath and relays with a stable wire protocol ([iroh 1.0](https://pinggy.io/amp/blog/iroh_1_0_dial_keys_not_ips/)).
+We use Rust iroh 1.x (pinned at 1.4.1) through a Rust shim that lives in the repo and exposes exactly the C ABI we need. iroh gives us key-based identity, discovery, QUIC NAT traversal, multipath and relays with a stable wire protocol ([iroh 1.0](https://pinggy.io/amp/blog/iroh_1_0_dial_keys_not_ips/)). Spikes S2 to S5 confirmed iroh works for media, but only with the shim doing more than wrapping it, so the shim is thicker than first planned.
 
 **What iroh carries**
 
@@ -90,25 +90,36 @@ We use Rust iroh 1.x through a thin Rust shim that lives in the repo and exposes
 - Control: reliable QUIC streams for session setup, clipboard, display config and file transfer.
 - Media: unreliable QUIC datagrams, tagged with stream IDs.
 
+**What the shim owns**
+
+- **Congestion control.** iroh's default controller (Cubic) let a 1 MiB datagram send buffer hide 100–140 ms of queueing while QUIC's RTT stayed flat (S2). The shim installs our own controller (S3's `AppRate`) through iroh's public transport-config builder. It paces at a target rate the core sets, sizes the window at 2× BDP and counts loss without cutting the rate.
+- **Pacing.** The target rate is the core's estimate of link capacity, not the encoder bitrate; pacing at the encoder bitrate stretches every frame across the whole frame interval. The core keeps the encoder below that rate. iroh builds one controller per network path, so the shim applies the target to whichever path is selected and moves it when the path changes.
+- **Drop accounting.** iroh counts neither send-buffer evictions nor receive-buffer drops. The shim counts its own (datagrams sent minus datagrams on the wire, datagrams received minus datagrams read) and reports them with path stats; media sequence numbers catch the rest.
+- **Buffers and timeouts.** 64 KiB datagram send buffer, so an encoder that outruns the target queues at most ~15 ms instead of ~90 ms. Per-path idle timeout 300 ms (iroh's default is 15 s, during which a dead direct path looks healthy) and keep-alive 100 ms.
+- **Runtime threading.** One dedicated current-thread runtime per process, started through `iroh_shim_init` with the host's thread-start hook (see Threading).
+
+The core still owns the rate decision. Its controller uses our own one-way delay from capture and send timestamps, not QUIC's RTT, which stays flat while the send buffer fills.
+
 **Shim C ABI (draft)**
 
 - Endpoint: `bind(secret_key, alpns, relay_urls)`, `connect(ticket)`, `accept()`, `close()`.
 - Datagrams: `send_datagram(conn, buf, len)`, `recv_datagram(conn, buf, cap)` (non-blocking, with a wakeup fd/handle).
 - Streams: open/accept bidirectional, read, write, finish.
-- Path stats: RTT, loss, congestion window, direct vs relayed, path changes as events.
-- Config: datagram buffer sizes, congestion controller choice, pacing, keep-alive.
+- Rate: `set_target_bitrate(conn, bps)`, applied to the selected path's controller.
+- Path stats: RTT, loss, congestion window, direct vs relayed, per-path controller counters, shim-counted send and receive drops, a "no ack progress" signal; path changes (opened, selected, closed) as events, which S5 saw arrive within 1 ms.
+- Config: datagram buffer sizes, path idle timeout and keep-alive.
+- Runtime: `iroh_shim_init(on_thread_start, ctx)` before anything else.
 - Built with `panic = "abort"`; Zig owns every buffer that crosses the boundary.
 
 **Relay mode**
 
 Relayed paths run over HTTPS/WebSocket on TCP, so there is head-of-line blocking but no packet loss. When the path is relayed the core turns FEC off, caps bitrate, prefers lower resolution, and shows a relay badge in the overlay. Browser clients are always in this mode.
 
-**Fallbacks if the transport spike fails**
+**Fallback**
 
-1. Shim over `noq-proto` (sans-I/O QUIC with multipath and n0 NAT traversal) with a Zig driver and Zig congestion controller ([noq-proto](https://docs.rs/noq-proto/latest/noq_proto/)).
-2. Native Zig UDP media pipe, with iroh kept for signaling and control.
+If iroh later stops working for media, a native Zig UDP media pipe can replace it behind `PacketPipe`, with iroh kept for signaling and control.¹
 
-The `PacketPipe` boundary means either fallback replaces only the transport.
+¹ The original plan also listed a shim over `noq-proto` with a Zig driver and Zig congestion controller ([noq-proto](https://docs.rs/noq-proto/latest/noq_proto/)). S3 showed a custom controller installs through iroh's public API, so that fallback is no longer needed.
 
 ## Media pipeline
 
@@ -118,32 +129,36 @@ The pipeline never buffers: every frame is encoded, sent, decoded and presented 
 
 - Every datagram carries a stream ID (video, audio, input, control-fast; mic reserved), so new streams need no protocol bump.
 - Video packets are about 1150 bytes to fit any QUIC datagram path.
-- Video header: frame ID, slice, shard index, FEC group, capture timestamp, encode-done timestamp.
+- Video header: frame ID, slice, shard index, FEC group, capture timestamp, encode-done timestamp, long-term reference token.
+- Frame ack (client to host, control-fast stream): the LTR tokens of frames the client decoded. VideoToolbox returns the token as a sample attachment, not in the bitstream, so it has to travel in our header.
 
 **Encoder settings**
 
 - No B-frames, no lookahead, one-frame VBV.
 - Multiple slices per frame so packetizing starts before encode finishes.
-- Intra-refresh instead of periodic keyframes; long-term references for RFI.
-- Per-frame bitrate reconfiguration without forcing a keyframe.
+- No periodic keyframes; long-term references for recovery. No intra-refresh as a baseline: VideoToolbox has none that works (S8), and the Windows encoders are untested.
+- Per-frame bitrate reconfiguration without forcing a keyframe (VideoToolbox settles within 0–11 frames).
 - Codecs: H.264 and HEVC first, AV1 where the encoder supports it; 4:4:4 and HDR later.
 
 **Loss recovery**
 
 - RTT under about a quarter of the frame interval: NACK and selective retransmit.
 - Otherwise: Reed-Solomon FEC, overhead set from measured loss (0 to 30%).
-- Unrecoverable frame: reference frame invalidation; IDR only as last resort.
+- Unrecoverable frame: the client stops decoding at the gap. The host encodes the next frame against the newest acked long-term reference (`ForceLTRRefresh` on VideoToolbox), which was 52–90 KB in S8 versus about 320 KB for an IDR. IDR only as last resort, or for a backend without long-term references.
+- The client drops every frame after a gap until that recovery frame arrives. Apple's HEVC decoder breaks permanently if fed frames after a gap, and dropping is harmless on other decoders, so all clients do it.
 - Relayed path: no FEC (TCP underneath).
 
 **Rate control**
 
 - The client sends transport-wide feedback every 5 to 10 ms with per-packet arrival times.
-- The host runs a delay-gradient estimator (GCC-style) and responds in order: bitrate, then resolution, then frame rate.
-- Targets are bounded by user settings and by what the path reports.
+- The host runs a delay-gradient estimator (GCC-style) on our own one-way delay timestamps, not QUIC RTT, and responds in order: bitrate, then resolution, then frame rate.
+- It produces two numbers: a capacity estimate, which becomes the shim's pacing rate, and an encoder target kept below it.
+- Streams start below target and ramp up, since there is no QUIC slow start to probe for them.
+- Targets are bounded by user settings and by what the path reports, including shim-counted drops.
 
 **Pacing and presentation**
 
-- WAN and Wi-Fi: spread a frame's packets over 50 to 70% of the frame interval; LAN: send in bursts.
+- The shim paces every path at the capacity estimate, so a frame leaves at link rate instead of in a burst. S2 measured 0.9–2.6 ms added p99 over raw UDP for this; occasional 5–23 ms pacer stalls on a shared runtime are still to recheck on the dedicated one.
 - Client present modes: lowest latency (present on decode, tearing/VRR allowed) or smooth (pace to vsync).
 - Desktop mode renders the cursor on the client to hide perceived lag.
 
@@ -168,14 +183,22 @@ Each OS implements the same small host and client interfaces; frames stay on the
 
 | Function | Windows | macOS | Linux |
 | --- | --- | --- | --- |
-| Capture | Desktop Duplication / Windows.Graphics.Capture (D3D11 textures) | ScreenCaptureKit (IOSurface) | PipeWire portal; KMS grab optional |
-| Encode | NVENC (runtime-loaded), AMF, oneVPL; Media Foundation fallback | VideoToolbox, low-latency mode | VAAPI, NVENC; Vulkan Video later |
+| Capture | Desktop Duplication / Windows.Graphics.Capture (D3D11 textures) | ScreenCaptureKit (IOSurface); late-frame tail needs handling | PipeWire portal; KMS grab optional |
+| Encode | NVENC (runtime-loaded), AMF, oneVPL; Media Foundation fallback (all untested) | VideoToolbox: regular encoder, RealTime off, per-frame size cap; HEVC preferred | VAAPI, NVENC; Vulkan Video later |
 | Audio capture | WASAPI loopback | ScreenCaptureKit audio | PipeWire |
 | Input injection | SendInput; virtual gamepad needs a signed driver | CGEvent (Accessibility permission); gamepad limited | uinput |
 | Virtual display | IddCx driver (signing required) | CGVirtualDisplay (private API) | Compositor headless output |
 | Decode | D3D11VA | VideoToolbox | VAAPI; Vulkan Video later |
 | Present | Flip-model swapchain, waitable object, tearing allowed | CAMetalLayer | Wayland/EGL or Vulkan |
 | Input capture | Raw Input; gamepads via SDL3 or GameInput | NSEvent / GameController | evdev via SDL3 |
+
+**macOS encode and capture (S7, S8)**
+
+- On an M3 Max at 1080p60, the regular encoder with `RealTime=false` and low-latency rate control off encodes at 6.75 ms p99 (H.264) and 4.99 ms (HEVC). With RealTime on, or on the low-latency path, it is 15.5 ms.
+- Without low-latency rate control, frame sizes spike up to 3×; a `DataRateLimits` cap of one frame's budget fixes the spikes but undershoots the average bitrate.
+- Long-term references were only seen working on the low-latency path, so these settings may not combine with LTR recovery; see the open questions.
+- ScreenCaptureKit sometimes delivers a frame late (capture p99 9.6 ms), which is now the largest contributor to p99. The capture stage has to time-stamp and tolerate late frames rather than assume a steady cadence.
+- Intel Macs untested.
 
 **Zig interop**
 
@@ -218,14 +241,18 @@ The shim's source lives in the repo, but its built libraries are CI release arti
 - CI builds each target (Windows x64/arm64, macOS universal, Linux x64/arm64) and publishes a tagged release, e.g. `shim-v0.1.0`.
 - `build.zig.zon` lists each archive by URL and hash as a lazy dependency; a build downloads only its own target.
 - `-Dshim=source` runs `cargo` locally for anyone changing the shim.
-- Release profile: `opt-level = "s"`, fat LTO, one codegen unit, `panic = "abort"`, debug info stripped; iroh default features off, needed ones added back.
+- Release profile: `opt-level = "s"`, fat LTO, one codegen unit, `panic = "abort"`, debug info stripped; iroh default features off, `tls-ring`, `portmapper` and `fast-apple-datapath` added back.
+- Compressed archives (S1): Linux 8.6–9.0 MB, Windows 6.5–6.9 MB, macOS universal 14.3 MB.
 - Crypto backend: ring (simpler to cross-compile than aws-lc-rs).
 
 **Linking rules**
 
-- Windows: match ABIs (Zig `-target x86_64-windows-msvc` or Rust `*-windows-gnullvm`), or ship the shim as a DLL; link `ws2_32`, `bcrypt`, `ntdll`, `userenv`.
+Static linking is the default and works on all five targets (S1); a dynamic library is also built and tested, for anyone who needs it.
+
+- Windows: Zig `*-windows-gnu` pairs with Rust `*-pc-windows-gnullvm`; link `ws2_32`, `bcrypt`, `ntdll`, `userenv`.
 - macOS: same `MACOSX_DEPLOYMENT_TARGET` on both sides; `lipo` into a universal library.
-- Linux: build against an old glibc or musl.
+- Linux: build against an old glibc or musl; link Zig's bundled libunwind instead of `libgcc_s`.
+- CI on Windows arm64 runs the x86_64 Zig under emulation, because the native Zig 0.16.0 binary segfaults there. Revisit on each Zig upgrade.
 
 **Licensing**
 
@@ -234,6 +261,8 @@ The shim's source lives in the repo, but its built libraries are CI release arti
 ## Initial spikes
 
 Nine time-boxed spikes, roughly three to four weeks in total, settle the decisions that are expensive to reverse; the transport spikes (S2 to S5) decide whether Rust iroh stays. Pass thresholds are proposed starting points to confirm in review.
+
+As of Nov 7, 2026, S1 to S5 and S7 have run and iroh stays, with the shim changes described under Transport. S8 has run on VideoToolbox only. S6, S9 and S8's Windows rows need a Windows GPU host. The table below is the original plan; results are under Spike status.
 
 | # | Question | Method | Pass | If it fails | Box |
 | --- | --- | --- | --- | --- | --- |
@@ -317,7 +346,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 ### Phase 1: Foundations (about 3 weeks)
 
 - Repo layout, `build.zig`, CI matrix for all targets, shim release pipeline and `build.zig.zon` wiring.
-- Shim v0.1 with the draft C ABI; `PacketPipe` with iroh and simulated implementations.
+- Shim v0.1 with the draft C ABI, including `AppRate`, `set_target_bitrate`, drop counters, path events and the dedicated runtime; `PacketPipe` with iroh and simulated implementations.
 - Core skeleton: `proto` with stream IDs, wire spec v0 in `/spec`, `clock`, telemetry types.
 - Simulation harness: seeded loss, jitter, reordering, bandwidth steps; runs in CI.
 
@@ -336,7 +365,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 - Delay-gradient rate controller with the bitrate, resolution, frame-rate ladder.
 - Adaptive Reed-Solomon FEC and path-based choice between NACK and FEC.
-- Sender pacing; relay mode; reconnect and path-change handling.
+- Capacity estimate driving the shim's pacing rate; relay mode; reconnect and path-change handling.
 - Pairing with tickets and PIN/QR, host allowlist, self-hosted relay deployment.
 
 **Gate:** sim suite passes (no freeze over 500 ms at 5% random loss; bitrate recovers within 2 s after a bandwidth halving); field tests on cable, LTE and hotel-grade Wi-Fi.
@@ -351,7 +380,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 ### Phase 5: Quality and recovery (about 5 weeks)
 
-- Reference frame invalidation and intra-refresh per encoder backend; AV1 where available.
+- Long-term reference recovery with client acks per encoder backend; AV1 where available.
 - 4:4:4 and HDR; AMF and oneVPL encoders.
 - Virtual displays (IddCx on Windows, CGVirtualDisplay on macOS); multi-monitor; clipboard; multi-user sessions.
 
@@ -374,20 +403,29 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 ## Risks, open questions and decisions
 
-The biggest risk is QUIC congestion control fighting our rate controller; spikes S2 and S3 retire it first.
+The original top risk, QUIC congestion control fighting our rate controller, is retired: S3's controller in the shim removes the hidden queue (S2). The biggest open risks are now on the encoder side: whether macOS can have fast encode and long-term references at once, and whether the Windows encoders support long-term references at all.
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| QUIC congestion control and our rate controller conflict | Latency spikes or capped bitrate | S2/S3; custom controller in shim; noq-proto fallback |
+| ~~QUIC congestion control and our rate controller conflict~~ | Latency spikes or capped bitrate | Retired by S2/S3: `AppRate` in the shim, paced at the core's capacity estimate |
+| macOS fast encode settings may not support long-term references (S7 vs S8) | macOS hosts choose between ~7 ms encode with IDR recovery and ~15 ms encode with LTR recovery | Measure the low-latency path with RealTime off before building the backend; per-session choice if it stays slow |
+| NVENC, AMF or oneVPL lack usable long-term references | Keyframe spikes on loss for that backend | S8 Windows rows; IDR recovery per backend as fallback |
+| Shim pacer stalls (5–23 ms, seen in S2 on a shared runtime) | Occasional frame delay on smooth traffic | Rerun on the dedicated runtime; else more burst credit or pace slightly above capacity |
+| iroh/noq internals we depend on (drop counting, per-path controllers) change on upgrade | Silent drops or a lost pacing rate | Pin iroh; shim tests for drop counts and path-change rate handoff; upstream the uncounted-drop and `datagram_send_buffer_space()` issues |
+| 300 ms path idle timeout flaps at real internet RTTs | Spurious path closes | Re-check through real NATs and long-RTT paths in Phase 3 field tests |
 | Windows virtual gamepad and IddCx display drivers need signing | No gamepads or headless host on Windows | Decide driver route by Phase 3; ship without until signed |
 | macOS private API (CGVirtualDisplay) changes | Headless macOS host breaks on an OS update | Feature-flag it; test on every macOS beta |
 | Relay quality for browsers | Stutter on lossy networks | Self-hosted regional relays; set expectations in UI |
 | Zig stdlib churn | Rework on upgrade | Pin one Zig version per release; sans-I/O core limits exposure |
-| Rust/Zig ABI and linking on Windows | Build breakage | S1 decides static vs DLL |
+| ~~Rust/Zig ABI and linking on Windows~~ | Build breakage | Retired by S1: static linking works on all targets; Windows arm64 CI uses x64 Zig under emulation |
 
 **Open questions**
 
-- Which encoders must support RFI and intra-refresh for launch? (S8 answers.)
+- Can VideoToolbox's low-latency path run fast enough with `RealTime=false` and real capture to keep long-term references? If not, which recovery mode is the macOS default? (S7/S8 follow-up.)
+- Do NVENC, AMF and oneVPL support per-frame bitrate changes and long-term references, and which must for launch? (S8 Windows rows.)
+- What is our Windows glass-to-glass baseline against Moonlight and Parsec? (S6.)
+- Is the web client usable over a relay? (S9.)
+- Do the shim's pacer stalls go away on the dedicated runtime? (S2 rerun.)
 - Do we run our own discovery (DNS/pkarr) or rely on n0's public services?
 - Multi-user sessions: one shared input owner, or input from all guests?
 - License for the project itself?
@@ -401,6 +439,16 @@ The biggest risk is QUIC congestion control fighting our rate controller; spikes
 | Sans-I/O Zig core with dedicated threads | Deterministic simulation, WASM reuse, no dependence on Zig async |
 | Web client relay-only over iroh | One transport and one stack; no WebRTC on the host |
 | Voice chat out of scope | Reserved stream ID keeps it addable later |
+| Keep iroh; noq-proto fallback dropped (Nov 2026) | S3 installs a custom controller through iroh's public API; S5 found path stats and events public |
+| Shim owns congestion control, pacing, drop counts and its runtime; core sets the rate | iroh's Cubic hid 100–140 ms of queue and iroh counts no datagram drops (S2); pacing must live where packets leave |
+| Pace at the capacity estimate, not the encoder bitrate | Encoder-rate pacing spreads each frame over the whole interval (S2) |
+| Rate controller uses our one-way timestamps, not QUIC RTT | QUIC RTT stays flat while the send buffer fills (S2) |
+| 64 KiB send buffer, 300 ms path idle timeout | Bounds hidden queue to ~15 ms; detects a dead direct path in 300 ms instead of 15 s (S2, S5) |
+| Dedicated current-thread iroh runtime on a pinned real-time thread | Shared multi-thread runtime added 1–4 ms p99 under load; dedicated one 0.1–0.4 ms (S4) |
+| Static shim linking by default | Works on all five targets (S1); dynamic build kept as an option |
+| Loss recovery is LTR-first with client acks; no intra-refresh baseline | VideoToolbox has no working intra-refresh; LTR recovery frames are 3–6× smaller than IDRs (S8) |
+| Clients drop frames after a gap until the recovery frame | Required for Apple's HEVC decoder, harmless elsewhere (S8) |
+| macOS encoder: regular path, RealTime off, per-frame size cap (pending the S7/S8 question) | 6.75 ms p99 vs 15.5 ms with RealTime on (S7) |
 
 **Sources**
 
