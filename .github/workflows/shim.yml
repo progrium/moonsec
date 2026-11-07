@@ -4,10 +4,10 @@ name: shim
 # run the datagram echo, and record artifact sizes. Tags `shim-v*` publish a release.
 
 on:
+  # Every branch push runs the matrix (also covers PR branches in this repo).
   push:
-    branches: [main]
+    branches: ["**"]
     tags: ["shim-v*"]
-  pull_request:
   workflow_dispatch:
 
 permissions:
