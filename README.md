@@ -3,6 +3,9 @@
 Low-latency remote desktop and game streaming core in Zig, with networking from
 Rust [iroh](https://github.com/n0-computer/iroh) through a small in-repo shim.
 
+Design and plan: [docs/design.md](docs/design.md). Spike write-ups, code and results:
+[spikes/](spikes) (status table in the design doc's "Spike status" section).
+
 Zig is pinned to **0.16.0** (`build.zig.zon` `minimum_zig_version`).
 
 ```
@@ -15,6 +18,8 @@ Zig is pinned to **0.16.0** (`build.zig.zon` `minimum_zig_version`).
 /spec          versioned wire protocol spec
 /sim           simulation harness and scenarios
 /tools         latency probe, netem scripts, interop harness
+/docs          design doc
+/spikes        time-boxed spikes S1–S9
 ```
 
 ## Quick start

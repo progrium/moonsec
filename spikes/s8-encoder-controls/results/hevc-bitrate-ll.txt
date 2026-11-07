@@ -1,0 +1,32 @@
+2026-11-07 15:41:21.260 s8[41767:57613162] WARNING: AVCaptureDeviceTypeExternal is deprecated for Continuity Cameras. Please use AVCaptureDeviceTypeContinuityCamera and add NSCameraUseContinuityCameraDeviceType to your Info.plist.
+# encoder=com.apple.videotoolbox.videoencoder.hevc.rtvc
+# frame 120 set AverageBitRate=4000000 -> 00
+# frame 240 set AverageBitRate=30000000 -> 00
+# frame 300 set AverageBitRate=8000000 -> 00
+ 115    29640      lat=8.03ms 1,
+ 116    22026      lat=7.92ms 1,
+ 117    63733      lat=8.07ms 1,
+ 118    27435      lat=8.01ms 1,
+ 119    68811      lat=8.25ms 1,
+ 120     8082      lat=8.10ms 1,
+ 121     4537      lat=8.00ms 1,
+ 122     4691      lat=7.88ms 1,
+ 123     3773      lat=7.96ms 1,
+ 124     3646      lat=7.61ms 1,
+ 125     4570      lat=8.06ms 1,
+ 126     4035      lat=8.15ms 1,
+ 127     4497      lat=8.81ms 1,
+ 128     4379      lat=8.24ms 1,
+ 129     4939      lat=8.01ms 1,
+ 236     6691      lat=13.03ms 1,
+ 237     7554      lat=13.05ms 1,
+ 238     7110      lat=13.00ms 1,
+ 239     7118      lat=12.95ms 1,
+ 240   111203      lat=13.16ms 1,
+ 241   336026      lat=13.18ms 1,
+ 242   181887      lat=12.91ms 1,
+ 243    14990      lat=12.79ms 1,
+ 244     7832      lat=12.07ms 1,
+ 245     9606      lat=7.31ms 1,
+RESULT bitrate lowlat=1 limits=0 sync_after_0=0 | Mbps 60-120=20.0 125-240=3.7 245-300=27.5 305-360=8.0 | frames-to-settle-after-120: 11 | mean lat 10.20ms
+# cpu user=2.11s sys=0.17s

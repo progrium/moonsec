@@ -1,0 +1,20 @@
+2026-11-07 15:42:31.237 s8[42950:57618487] WARNING: AVCaptureDeviceTypeExternal is deprecated for Continuity Cameras. Please use AVCaptureDeviceTypeContinuityCamera and add NSCameraUseContinuityCameraDeviceType to your Info.plist.
+# encoder=com.apple.videotoolbox.videoencoder.h264.rtvc
+# set MaxRefreshFrameIntervalDuration=1 -> 0
+#   readback 0 1
+   0   310716 SYNC lat=56.69ms ltr-token 5,
+   1   138638      lat=8.19ms ltr-token 1,
+   2    28773      lat=7.07ms ltr-token 1,
+   3     6537      lat=6.35ms 1,
+   4     4585      lat=7.17ms 1,
+   5     8549      lat=7.04ms 1,
+   6    10325      lat=6.73ms 1,
+   7    15809      lat=7.45ms 1,
+  58    31691      lat=7.38ms 1,
+  59    49881      lat=7.17ms 1,
+  60    93149 SYNC lat=6.63ms ltr-token 5,
+  61     7419      lat=7.48ms ltr-token 1,
+  62    30554      lat=7.17ms ltr-token 1,
+  63    26790      lat=7.11ms 1,
+RESULT irefresh lowlat=1 {    MaxRefreshFrameIntervalDuration = 1;} sync_after_0=3 frames_with_SEI=0 frame0=310716 mean=40984 max(10..)=97245 peak/mean=2.37
+# cpu user=1.34s sys=0.15s

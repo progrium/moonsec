@@ -1,0 +1,17 @@
+# encoder=com.apple.videotoolbox.videoencoder.ave.hevc
+   0   374352 SYNC lat=22.96ms SEI39(5),20,
+   1   154331      lat=7.40ms 1,
+   2    45024      lat=7.71ms 1,
+   3    12941      lat=7.85ms 1,
+   4    17944      lat=7.85ms 1,
+   5    25916      lat=7.59ms 1,
+   6    39092      lat=8.88ms 1,
+   7    53497      lat=8.08ms 1,
+  58    40744      lat=8.20ms 1,
+  59    28008      lat=8.02ms 1,
+  60    22577      lat=7.93ms 1,
+  61    33983      lat=8.21ms 1,
+  62    59144      lat=8.08ms 1,
+  63    48336      lat=8.14ms 1,
+RESULT irefresh lowlat=0 {} sync_after_0=0 frames_with_SEI=0 frame0=374352 mean=40941 max(10..)=147014 peak/mean=3.59
+# cpu user=1.41s sys=0.04s

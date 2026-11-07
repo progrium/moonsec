@@ -1,0 +1,31 @@
+# encoder=com.apple.videotoolbox.videoencoder.ave.hevc
+# frame 120 set AverageBitRate=4000000 -> 00
+# frame 240 set AverageBitRate=30000000 -> 00
+# frame 300 set AverageBitRate=8000000 -> 00
+ 115    19392      lat=8.09ms 1,
+ 116    33554      lat=7.99ms 1,
+ 117    60887      lat=7.95ms 1,
+ 118    63084      lat=9.31ms 1,
+ 119    37662      lat=7.93ms 1,
+ 120     8481      lat=7.98ms 1,
+ 121    27926      lat=8.16ms 1,
+ 122     7064      lat=7.80ms 1,
+ 123     8972      lat=7.98ms 1,
+ 124    19444      lat=8.15ms 1,
+ 125     4674      lat=7.86ms 1,
+ 126     6253      lat=7.83ms 1,
+ 127    15949      lat=8.20ms 1,
+ 128     6523      lat=7.96ms 1,
+ 129     3309      lat=7.77ms 1,
+ 236     2924      lat=14.46ms 1,
+ 237     3578      lat=14.62ms 1,
+ 238    13559      lat=14.87ms 1,
+ 239     3759      lat=14.95ms 1,
+ 240    13929      lat=14.78ms 1,
+ 241     3219      lat=17.19ms 1,
+ 242     5198      lat=14.66ms 1,
+ 243     9149      lat=14.63ms 1,
+ 244    73614      lat=15.10ms 1,
+ 245     8976      lat=16.94ms 1,
+RESULT bitrate lowlat=0 limits=0 sync_after_0=0 | Mbps 60-120=19.7 125-240=4.1 245-300=30.6 305-360=7.6 | frames-to-settle-after-120: 1 | mean lat 11.61ms
+# cpu user=2.34s sys=0.08s

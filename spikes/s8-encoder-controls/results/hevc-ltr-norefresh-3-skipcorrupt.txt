@@ -1,0 +1,25 @@
+2026-11-07 15:44:26.386 s8[44878:57627166] WARNING: AVCaptureDeviceTypeExternal is deprecated for Continuity Cameras. Please use AVCaptureDeviceTypeContinuityCamera and add NSCameraUseContinuityCameraDeviceType to your Info.plist.
+# encoder=com.apple.videotoolbox.videoencoder.hevc.rtvc
+# set EnableLTR=1 -> 0
+#   readback 0 1
+# lost 100..104, detect/refresh at 108 (refresh=0), ack delay 3 frames
+   0   326138 SYNC lat=50.41ms ltr-token 20,
+   1   146378      lat=8.26ms 1,
+   2     8812      lat=8.22ms 1,
+   3     3686      lat=8.23ms ltr-token 1,
+  98    23481      lat=8.04ms ltr-token 1,
+  99    67150      lat=7.95ms ltr-token 1,
+ 100    31887      lat=7.81ms ltr-token 1,
+ 101    21860      lat=8.00ms ltr-token 1,
+ 102    63694      lat=7.80ms ltr-token 1,
+ 103    27260      lat=8.07ms ltr-token 1,
+ 104    34219      lat=7.92ms ltr-token 1,
+ 105    65340      lat=7.98ms ltr-token 1,
+ 106    29291      lat=7.98ms ltr-token 1,
+ 107    23946      lat=8.01ms ltr-token 1,
+ 108    66120      lat=7.91ms ltr-token 1,
+ 109    27981      lat=7.84ms ltr-token 1,
+ 110    20067      lat=8.09ms ltr-token 1,
+ 111    61857      lat=7.93ms ltr-token 1,
+RESULT ltr refresh=0 ackDelay=3 tokens=238 sync_after_0=0 refresh_frame_bytes=0 mean_P=40501 frame0=326138 | lossy-decode: dec_errors_after_loss=135 first_bitexact_frame=-1 mismatches_after_that=0 prefix_ok=1
+# cpu user=1.76s sys=0.19s
