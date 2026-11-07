@@ -167,7 +167,8 @@ jobs:
             echo "| shim-echo$exe (dynamic, ReleaseSafe) | $(size out-dynamic/bin/shim-echo$exe) |"
             echo
             echo '```'; cat "$DIST/native-static-libs.txt" 2>/dev/null || true; echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY" > "dist/sizes-${{ matrix.name }}.md"
+          } > "dist/sizes-${{ matrix.name }}.md"
+          cat "dist/sizes-${{ matrix.name }}.md" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
