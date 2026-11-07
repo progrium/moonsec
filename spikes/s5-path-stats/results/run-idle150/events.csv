@@ -1,0 +1,11 @@
+t,side,kind,id,relay,addr,extra
+1794083426.914914,client,opened,PathId(1),false,"Ip(127.0.0.1:47001)",""
+1794083426.914932,client,selected,PathId(1),false,"Ip(127.0.0.1:47001)",""
+1794083426.914973,host,opened,PathId(1),false,"Ip(127.0.0.1:47002)",""
+1794083426.914987,host,selected,PathId(1),false,"Ip(127.0.0.1:47002)",""
+1794083436.109594,client,closed,PathId(1),false,"Ip(127.0.0.1:47001)","rtt=90.636µs sent=18276 lost=360"
+1794083436.109619,client,selected,PathId(0),true,"Relay(https://127.0.0.1:37563/)",""
+1794083436.110388,host,closed,PathId(1),false,"Ip(127.0.0.1:47002)","rtt=109.504µs sent=7499 lost=169"
+1794083436.110403,host,selected,PathId(0),true,"Relay(https://127.0.0.1:37563/)",""
+1794083438.122687,client,closed,PathId(0),true,"Relay(https://127.0.0.1:37563/)","rtt=300.503µs sent=12777 lost=0"
+1794083438.122888,host,closed,PathId(0),true,"Relay(https://127.0.0.1:37563/)","rtt=2.157631ms sent=5279 lost=0"
