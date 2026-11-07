@@ -1,0 +1,21 @@
+mode=custom server=c7ea0b9bef sockets=[0.0.0.0:59068]
+connected; max_datagram_size=Some(1162) send_buffer_space=262112
+controllers built on client so far: 1
+
+phase           target  rx Mbit/s   rx pkts    p50 us    p99 us
+unlimited            -      93.72     20387        99       234
+  [unlimited] path PathId(0) remote=Ip(192.0.2.2:59068) selected=true relay=false rtt=54.701µs cwnd=67108864 bw_est=None controller=AppRate (custom) path#0 sent_calls=3434 acks=23459 cong_events=0 srtt=55us
+40 Mbit/s           40      35.46      7712        61       180
+  [40 Mbit/s] path PathId(0) remote=Ip(192.0.2.2:59068) selected=true relay=false rtt=40.151µs cwnd=50000 bw_est=Some(40000000) controller=AppRate (custom) path#0 sent_calls=8200 acks=32340 cong_events=0 srtt=42us
+10 Mbit/s           10       9.50      2066        32       144
+  [10 Mbit/s] path PathId(0) remote=Ip(192.0.2.2:59068) selected=true relay=false rtt=23.829µs cwnd=12500 bw_est=Some(10000000) controller=AppRate (custom) path#0 sent_calls=9796 acks=34716 cong_events=0 srtt=24us
+2 Mbit/s             2       1.90       414        65       138
+  [2 Mbit/s] path PathId(0) remote=Ip(192.0.2.2:59068) selected=true relay=false rtt=30.584µs cwnd=5808 bw_est=Some(2000000) controller=AppRate (custom) path#0 sent_calls=10272 acks=35192 cong_events=0 srtt=31us
+25 Mbit/s           25      22.08      4801        36       132
+  [25 Mbit/s] path PathId(0) remote=Ip(192.0.2.2:59068) selected=true relay=false rtt=25.712µs cwnd=31250 bw_est=Some(25000000) controller=AppRate (custom) path#0 sent_calls=13706 acks=40721 cong_events=0 srtt=25us
+
+app datagrams: queued=40709 received=40709 (gap=0); quic lost_packets=0 congestion_events path-level shown above
+  [final] path PathId(0) remote=Ip(192.0.2.2:59068) selected=true relay=false rtt=25.712µs cwnd=31250 bw_est=Some(25000000) controller=AppRate (custom) path#0 sent_calls=13706 acks=40721 cong_events=0 srtt=25us
+client controllers built: 1
+  path#0 sent=48026257B acked=48030574B cong_events=0 lost=0B mtu=1452
+server controllers built: endpoint-wide factory=0 per-connection factory=1
