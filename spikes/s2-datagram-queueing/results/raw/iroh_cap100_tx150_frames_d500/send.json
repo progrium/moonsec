@@ -1,0 +1,28 @@
+{
+  "app_sent": 204480,
+  "conn": {
+    "frame_rx_datagram": 0,
+    "frame_tx_datagram": 129558,
+    "lost_bytes": 514640,
+    "lost_packets": 455,
+    "paths": [
+      {
+        "congestion_events": 233,
+        "cwnd": 550468,
+        "lost_packets": 455,
+        "mtu": 1452,
+        "rtt_us": 45642,
+        "sent_packets": 129566,
+        "udp_rx": 64239,
+        "udp_tx": 129574
+      }
+    ],
+    "sent_packets": 129566,
+    "udp_rx": 64239,
+    "udp_tx": 129574
+  },
+  "max_datagram": 1162,
+  "send_buffer_min_space": 29944,
+  "send_buffer_would_drop": 0,
+  "warmup_sent": 34080
+}
