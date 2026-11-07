@@ -184,7 +184,7 @@ Each OS implements the same small host and client interfaces; frames stay on the
 | Function | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | Capture | Desktop Duplication / Windows.Graphics.Capture (D3D11 textures) | ScreenCaptureKit (IOSurface); late-frame tail needs handling | PipeWire portal; KMS grab optional |
-| Encode | NVENC (runtime-loaded), AMF, oneVPL; Media Foundation fallback (all untested) | VideoToolbox: low-latency encoder with LTR, RealTime on, ExpectedFrameRate 1000 (proposed, S7b); HEVC preferred | VAAPI, NVENC; Vulkan Video later |
+| Encode | NVENC (runtime-loaded), AMF, oneVPL; Media Foundation fallback (all untested) | VideoToolbox: low-latency encoder with LTR, RealTime on, ExpectedFrameRate 1000 (S7b); HEVC preferred | VAAPI, NVENC; Vulkan Video later |
 | Audio capture | WASAPI loopback | ScreenCaptureKit audio | PipeWire |
 | Input injection | SendInput; virtual gamepad needs a signed driver | CGEvent (Accessibility permission); gamepad limited | uinput |
 | Virtual display | IddCx driver (signing required) | CGVirtualDisplay (private API) | Compositor headless output |
@@ -335,7 +335,7 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 
 - Question: S7's fast settings use the regular encoder, but S8 found long-term refs only on the low-latency path. How fast is that path with LTR on and real capture, and does recovery still work?
 - Findings: `RealTime=false` does not help on the low-latency encoder (14.5 ms p50 and tails up to 86 ms p99). The knob that matters is `ExpectedFrameRate`: at 1000 with `RealTime=true`, encode p50/p99 is 8.0/8.6 ms for HEVC (stable over two 30 s runs) and 7.6 ms / 8.1–10.9 ms for H.264 (bimodal between runs). The regular encoder in the same session was 6.55 ms (H.264) and 4.56 ms (HEVC) p99. With simulated loss and acks, 101 of 101 loss events recovered bit-exact from a non-IDR refresh frame of 63–81 KB (about 1.8x a P frame). On full-screen noise the low-latency encoder drops half its frames rather than overshoot.
-- Implications: LTR on macOS costs about 2–4 ms of encode and misses the 8 ms bar by about 0.6 ms at p99 (HEVC). The recommendation is to take it as the default anyway, since a loss then costs a ~1.8x P frame instead of an IDR at about 8x, and keep the regular encoder with IDR recovery as an option for near-lossless links. The backend has to handle frames the encoder drops.
+- Implications: LTR on macOS costs about 2–4 ms of encode and misses the 8 ms bar by about 0.6 ms at p99 (HEVC). Decided (Nov 7, 2026): take it as the default anyway, since a loss then costs a ~1.8x P frame instead of an IDR at about 8x, and keep the regular encoder with IDR recovery as an option for near-lossless links. The backend has to handle frames the encoder drops.
 
 **Still to run:** S6 and S9 need a Windows GPU host, which also fills in S8's NVENC, AMF and oneVPL rows and reruns S4 on target hardware.
 
@@ -426,7 +426,7 @@ The original top risk, QUIC congestion control fighting our rate controller, is 
 
 **Open questions**
 
-- ~~Can VideoToolbox's low-latency path run fast enough with `RealTime=false` and real capture to keep long-term references?~~ Answered by S7b: `RealTime=false` doesn't help, but `ExpectedFrameRate=1000` gets LTR encode to 8.6 ms p99 (HEVC), 2–4 ms over the regular encoder. Still open: is that 0.6 ms miss on the S7 bar acceptable for the macOS default (S7b recommends yes), or should the default be the regular encoder with IDR recovery?
+- ~~Can VideoToolbox's low-latency path run fast enough with `RealTime=false` and real capture to keep long-term references?~~ Answered by S7b: `RealTime=false` doesn't help, but `ExpectedFrameRate=1000` gets LTR encode to 8.6 ms p99 (HEVC), 2–4 ms over the regular encoder. Decided Nov 7, 2026: the low-latency encoder with LTR is the macOS default for now, accepting the ~0.6 ms miss on the S7 bar; revisit if newer macOS or chips change the numbers.
 - Do NVENC, AMF and oneVPL support per-frame bitrate changes and long-term references, and which must for launch? (S8 Windows rows.)
 - What is our Windows glass-to-glass baseline against Moonlight and Parsec? (S6.)
 - Is the web client usable over a relay? (S9.)
@@ -453,7 +453,7 @@ The original top risk, QUIC congestion control fighting our rate controller, is 
 | Static shim linking by default | Works on all five targets (S1); dynamic build kept as an option |
 | Loss recovery is LTR-first with client acks; no intra-refresh baseline | VideoToolbox has no working intra-refresh; LTR recovery frames are 3–6× smaller than IDRs (S8) |
 | Clients drop frames after a gap until the recovery frame | Required for Apple's HEVC decoder, harmless elsewhere (S8) |
-| macOS encoder: low-latency path with LTR, RealTime on, `ExpectedFrameRate=1000`, HEVC preferred (proposed, pending review) | Only path with long-term refs (S8); 8.6 ms p99 with LTR vs 15.5 ms on defaults; `RealTime=false` adds tails there (S7b) |
+| macOS encoder: low-latency path with LTR, RealTime on, `ExpectedFrameRate=1000`, HEVC preferred (Nov 2026; accepts ~0.6 ms over the S7 bar) | Only path with long-term refs (S8); 8.6 ms p99 with LTR vs 15.5 ms on defaults; `RealTime=false` adds tails there (S7b) |
 
 **Sources**
 

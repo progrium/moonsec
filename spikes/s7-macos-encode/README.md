@@ -83,4 +83,4 @@ Needs Screen Recording permission for the terminal running it.
 recovery) exist only on the low-latency encoder path, the slow path here. The follow-up
 [`s7b-macos-ltr-encode`](../s7b-macos-ltr-encode/README.md) measured that path with LTR on:
 `RealTime=false` does not help there, but `ExpectedFrameRate=1000` brings it to 8.6 ms p99
-(HEVC), and S7b recommends it as the macOS default over the recommendation above.
+(HEVC), and it is now the macOS default, replacing the recommendation above.
