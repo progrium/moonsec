@@ -134,6 +134,11 @@ fn linkShim(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarge
             for ([_][]const u8{ "util", "rt", "pthread", "m", "dl" }) |l| m.linkSystemLibrary(l, .{});
         },
         .macos => {
+            // Zig does not search the macOS SDK on its own; point it at Xcode's SDK.
+            if (b.sysroot orelse macosSdk(b, t)) |sdk| {
+                m.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
+                m.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+            }
             for ([_][]const u8{ "CoreFoundation", "Security", "SystemConfiguration" }) |f| m.linkFramework(f, .{});
             m.linkSystemLibrary("iconv", .{});
         },
@@ -145,6 +150,11 @@ fn linkShim(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarge
         },
         else => {},
     }
+}
+
+fn macosSdk(b: *std.Build, t: std.Target) ?[]const u8 {
+    if (@import("builtin").os.tag != .macos) return null;
+    return std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &t);
 }
 
 fn sharedName(t: std.Target) []const u8 {

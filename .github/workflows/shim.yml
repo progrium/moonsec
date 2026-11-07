@@ -52,8 +52,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: mlugg/setup-zig@v2
+        if: matrix.name != 'windows-aarch64'
         with:
           version: ${{ env.ZIG_VERSION }}
+
+      # The native aarch64-windows Zig 0.16.0 build segfaults on start on windows-11-arm;
+      # run the x86_64 build under Windows' x64 emulation instead (targets stay explicit).
+      - name: Zig (x86_64 under emulation)
+        if: matrix.name == 'windows-aarch64'
+        shell: bash
+        run: |
+          curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-windows-${ZIG_VERSION}.zip" -o "$RUNNER_TEMP/zig.zip"
+          unzip -q "$RUNNER_TEMP/zig.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-windows-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
       - name: Rust toolchain (pinned by shim/rust-toolchain.toml)
         shell: bash
