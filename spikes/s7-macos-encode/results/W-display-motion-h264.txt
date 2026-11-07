@@ -1,0 +1,16 @@
+encoder: H.264, low-latency rate control off
+  RealTime = 0
+  AllowFrameReordering = 0
+  ProfileLevel = H264_ConstrainedHigh_AutoLevel
+  AverageBitRate = 20000000
+  ExpectedFrameRate = 60
+  MaxKeyFrameInterval = 2147483647
+  MaxKeyFrameIntervalDuration = 0
+  PrioritizeEncodingSpeedOverQuality = 1
+  MaximizePowerEfficiency = 0
+  hardware encoder: yes
+capture: display 1 (1512x982 pt), scaled to 1920x1080
+frames: 1728 submitted, 1668 measured after 1 s warmup, 0 not encoded, 0 keyframes; 57.6 fps delivered; avg 40.7 KB/frame
+  capture  n=1668  mean= -0.00 p50= -0.13 p95=  6.79 p99=  9.60 max= 10.08 ms
+  encode   n=1668  mean=  6.25 p50=  6.24 p95=  6.57 p99=  6.75 max=  7.28 ms   [PASS vs 8 ms bar at p99; 0 frames >= bar]
+  glass2enc n=1668  mean=  6.25 p50=  6.12 p95= 12.95 p99= 15.71 max= 16.50 ms

@@ -1,0 +1,17 @@
+encoder: H.264, low-latency rate control off
+  RealTime = 0
+  AllowFrameReordering = 0
+  ProfileLevel = H264_ConstrainedHigh_AutoLevel
+  AverageBitRate = 20000000
+  ExpectedFrameRate = 60
+  MaxKeyFrameInterval = 2147483647
+  MaxKeyFrameIntervalDuration = 0
+  PrioritizeEncodingSpeedOverQuality = 1
+  MaximizePowerEfficiency = 0
+  encoder id: com.apple.videotoolbox.videoencoder.ave.avc
+  hardware encoder: yes
+capture: display 1 (1512x982 pt), scaled to 1920x1080
+frames: 1154 submitted, 1094 measured after 1 s warmup, 0 not encoded, 0 keyframes; 57.7 fps delivered; avg 40.6 KB/frame
+  capture  n=1094  mean= -1.76 p50= -1.63 p95=  0.82 p99=  1.58 max=  9.30 ms
+  encode   n=1094  mean=  5.95 p50=  5.91 p95=  6.35 p99=  6.55 max=  7.34 ms   [PASS vs 8 ms bar at p99; 0 frames >= bar]
+  glass2enc n=1094  mean=  4.20 p50=  4.14 p95=  7.00 p99=  7.70 max= 15.59 ms

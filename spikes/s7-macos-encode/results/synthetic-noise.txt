@@ -1,0 +1,4 @@
+capture: synthetic IOSurface frames (8-frame ring)
+frames: 598 submitted, 47 measured after 1 s warmup, 491 not encoded, 0 keyframes; 59.8 fps delivered; avg 181.8 KB/frame
+  encode   n=47    mean= 14.18 p50= 13.24 p95= 25.87 p99= 30.73 max= 30.73 ms   [FAIL vs 8 ms bar at p99; 39 frames >= bar]
+  total    n=47    mean= 14.19 p50= 13.24 p95= 25.88 p99= 30.73 max= 30.73 ms

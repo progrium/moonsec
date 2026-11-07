@@ -5,11 +5,9 @@
 
 **Status: pass, with non-obvious encoder settings.**
 
-> The probe (Zig driver plus an Objective-C ScreenCaptureKit → VideoToolbox core), its
-> full results table and the raw CSVs live only on Jeff's MacBook, in
-> `/tmp/moonsec-spikes/s7` and `/tmp/moonsec-spikes/s7-screencapture-encode.tar.gz`.
-> The upload to the project was blocked, so they are not in this repo yet. This README
-> records the reported results. Copy the tarball here before `/tmp` is cleared.
+> The probe is here: a Zig 0.16 driver (`src/main.zig`) and an Objective-C
+> ScreenCaptureKit → VideoToolbox core (`src/probe.m`). Raw output and per-frame CSVs for
+> every run are in `results/`. Follow-up on the S8 conflict: [`../s7b-macos-ltr-encode`](../s7b-macos-ltr-encode/README.md).
 
 Machine: MacBook Pro, Apple M3 Max, macOS 15.8.1. Real ScreenCaptureKit capture of the
 desktop at 1920x1080, 60 Hz. Intel Macs were not tested.
@@ -42,6 +40,37 @@ Other stages, passing H.264 config:
   encode at 6.8 ms p99, but it undershoots the average bitrate. Needs tuning.
 - About 3 of 25 runs exited with no output; the cause was not found.
 
+## Full results (real capture, 1080p60)
+
+Capture is signed (callback minus vsync); glass2enc is vsync to encoded frame. "LL-RC" is
+`EnableLowLatencyRateControl`. All times ms, p50/p95/p99.
+
+| Config | Scene | capture p50/p95/p99 | encode p50/p95/p99 | glass2enc p50/p95/p99 | Pass |
+| --- | --- | --- | --- | --- | --- |
+| **H.264, RealTime off, LL-RC off** | motion | -0.13 / 6.79 / 9.60 | **6.24 / 6.57 / 6.75** | 6.12 / 12.95 / 15.71 | ✅ |
+| H.264, RealTime off, LL-RC off | noise | -1.48 / 0.74 / 1.14 | 5.87 / 6.25 / 6.35 | 4.36 / 6.90 / 7.20 | ✅ |
+| H.264, RealTime off, LL-RC off | idle desktop | -1.03 / 1.37 / 6.00 | 6.26 / 6.55 / 6.67 | 5.25 / 7.79 / 12.30 | ✅ |
+| H.264, RealTime off, LL-RC off, window capture | motion | 0.73 / 1.32 / 2.04 | 6.12 / 6.46 / 6.73 | 6.89 / 7.65 / 8.30 | ✅ |
+| **HEVC, RealTime off, LL-RC off** | motion | -0.49 / 7.67 / 9.69 | **4.47 / 4.80 / 4.99** | 4.00 / 12.33 / 14.36 | ✅ |
+| H.264, RealTime off, LL-RC off, 1-frame VBV (1.0x) | motion (20 s) | – | 6.25 / 6.63 / 6.81 | 6.04 / 12.99 / 15.44 | ✅ |
+| H.264, RealTime on, LL-RC on (the "low-latency" setup) | motion (20 s) | -1.07 / 1.41 / 2.84 | 14.09 / 14.90 / 15.45 | 12.72 / 15.81 / 17.22 | ❌ |
+| H.264, RealTime on, LL-RC off | motion (12 s) | -0.89 / 1.44 / 3.48 | 12.40 / 12.94 / 13.13 | 10.84 / 14.21 / 15.35 | ❌ |
+| H.264, RealTime off, LL-RC on | motion (12 s) | – | 11.84 / 12.25 / 12.51 | 9.62 / 12.36 / 12.50 | ❌ |
+| H.264, RealTime on, LL-RC on, ExpectedFrameRate=240 | motion (12 s) | – | 7.63 / 9.96 / 10.52 | 6.30 / 9.42 / 11.40 | ❌ |
+| HEVC, RealTime on, LL-RC off | motion (12 s) | -1.06 / 1.39 / 2.40 | 10.51 / 11.08 / 11.36 | 8.90 / 12.00 / 12.80 | ❌ |
+| H.264, RealTime on, LL-RC on | idle desktop (12 s) | -1.42 / 1.24 / 1.90 | 13.76 / 14.90 / 15.17 | 11.50 / 15.69 / 16.82 | ❌ |
+
+
+## Reproduce
+
+```sh
+zig build --release=fast
+S7_REALTIME=0 ./zig-out/bin/s7probe --source display --no-lowlat --seconds 30 --csv out.csv
+./zig-out/bin/s7probe --help   # env knobs: S7_REALTIME, S7_VBV, S7_EXPECTED_FPS, S7_BASELINE
+```
+
+Needs Screen Recording permission for the terminal running it.
+
 ## Recommendation for the macOS backend
 
 - Regular hardware encoder (not the low-latency rate control path), `RealTime=false`.
@@ -50,6 +79,8 @@ Other stages, passing H.264 config:
 - HEVC where the client can decode it (about 1.3 ms faster than H.264 at p50).
 - Investigate the SCK late-capture tail; it is now the largest contributor to p99.
 
-**Conflict with S8:** S8 found long-term references (the design's loss recovery) exist only
-on the low-latency encoder path, which is the slow path here. See `docs/design.md` for how
-the two results are reconciled.
+**Conflict with S8, resolved in S7b:** S8 found long-term references (the design's loss
+recovery) exist only on the low-latency encoder path, the slow path here. The follow-up
+[`s7b-macos-ltr-encode`](../s7b-macos-ltr-encode/README.md) measured that path with LTR on:
+`RealTime=false` does not help there, but `ExpectedFrameRate=1000` brings it to 8.6 ms p99
+(HEVC), and S7b recommends it as the macOS default over the recommendation above.

@@ -1,0 +1,26 @@
+2026-11-07 16:51:34.689 s7probe[5715:57943092] WARNING: AVCaptureDeviceTypeExternal is deprecated for Continuity Cameras. Please use AVCaptureDeviceTypeContinuityCamera and add NSCameraUseContinuityCameraDeviceType to your Info.plist.
+encoder: HEVC, low-latency rate control on
+  RealTime = 1
+  AllowFrameReordering = 0
+  ProfileLevel = HEVC_Main_AutoLevel
+  AverageBitRate = 20000000
+  ExpectedFrameRate = 1000
+  MaxKeyFrameInterval = 2147483647
+  MaxKeyFrameIntervalDuration = 0
+  PrioritizeEncodingSpeedOverQuality = 1 (err -12900)
+  MaximizePowerEfficiency = 0
+  EnableLTR = 1
+  encoder id: com.apple.videotoolbox.videoencoder.hevc.rtvc
+  hardware encoder: no
+capture: display 1 (1512x982 pt), scaled to 1920x1080
+LTR: loss every 300 frames, 5 lost, ack delay 3; 1728 frames with tokens, 0 sync frames after frame 0, 0 full-stream decode errors
+  loss 300-304 refresh@308: P 81.4 KB (mean P 40.6 KB) encode 7.97 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+  loss 600-604 refresh@608: P 76.4 KB (mean P 40.5 KB) encode 8.20 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+  loss 900-904 refresh@908: P 76.3 KB (mean P 40.5 KB) encode 8.01 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+  loss 1200-1204 refresh@1208: P 70.3 KB (mean P 40.6 KB) encode 8.18 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+  loss 1500-1504 refresh@1508: P 79.7 KB (mean P 40.2 KB) encode 8.44 ms | bit-exact after refresh: yes (0 mismatches, 0 decode errors, first bad -1)
+LTR RESULT: 5/5 loss events recovered bit-exact with a non-IDR refresh
+frames: 1740 submitted, 1680 measured after 1 s warmup, 0 not encoded, 0 keyframes; 58.0 fps delivered; avg 40.5 KB/frame
+  capture  n=1680  mean= -2.00 p50= -2.21 p95=  0.56 p99=  0.74 max=  3.23 ms
+  encode   n=1680  mean=  8.06 p50=  8.03 p95=  8.47 p99=  8.64 max=  8.82 ms   [FAIL vs 8 ms bar at p99; 916 frames >= bar]
+  glass2enc n=1680  mean=  6.06 p50=  6.00 p95=  8.76 p99=  9.00 max= 10.87 ms

@@ -1,0 +1,16 @@
+encoder: HEVC, low-latency rate control off
+  RealTime = 0
+  AllowFrameReordering = 0
+  ProfileLevel = HEVC_Main_AutoLevel
+  AverageBitRate = 20000000
+  ExpectedFrameRate = 60
+  MaxKeyFrameInterval = 2147483647
+  MaxKeyFrameIntervalDuration = 0
+  PrioritizeEncodingSpeedOverQuality = 1
+  MaximizePowerEfficiency = 0
+  hardware encoder: yes
+capture: display 1 (1512x982 pt), scaled to 1920x1080
+frames: 1720 submitted, 1660 measured after 1 s warmup, 0 not encoded, 0 keyframes; 57.3 fps delivered; avg 40.8 KB/frame
+  capture  n=1660  mean= -0.13 p50= -0.49 p95=  7.67 p99=  9.69 max= 10.66 ms
+  encode   n=1660  mean=  4.46 p50=  4.47 p95=  4.80 p99=  4.99 max=  5.96 ms   [PASS vs 8 ms bar at p99; 0 frames >= bar]
+  glass2enc n=1660  mean=  4.34 p50=  4.00 p95= 12.33 p99= 14.36 max= 15.06 ms
