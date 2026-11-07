@@ -17,6 +17,10 @@
 //!   5 RAW_THREAD  baseline without tokio: std mpsc -> blocking recv on a plain OS thread -> send()
 //!   6 RAW_SPIN    baseline without wakeups: plain OS thread busy-polls std mpsc -> send()
 //!
+//! Platforms: Linux (SCHED_FIFO + CPU affinity) and macOS. macOS has no CPU
+//! pinning on Apple Silicon, and the `prio` argument selects a scheduling
+//! policy instead of a SCHED_FIFO priority (see `pin_and_prio`).
+//!
 //! Payload header: [u64 seq][u64 t0][u64 magic]. In RAW modes the interposer reads the
 //! seq straight from the iov. In IROH modes the payload is encrypted, so the interposer
 //! records every large send and the analysis matches by time (sends are spaced).
@@ -42,11 +46,80 @@ pub const IROH_CT: c_int = 4;
 pub const RAW_THREAD: c_int = 5;
 pub const RAW_SPIN: c_int = 6;
 
+// macOS: CLOCK_UPTIME_RAW is mach_absolute_time in ns (CLOCK_MONOTONIC there is
+// only microsecond-granular).
+#[cfg(target_os = "macos")]
+const CLOCK: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
+#[cfg(not(target_os = "macos"))]
+const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+
 #[inline(always)]
 pub fn now_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    unsafe { libc::clock_gettime(CLOCK, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc points at mach2 for mach_timebase_info
+mod mac {
+    use std::ffi::c_int;
+    extern "C" {
+        pub fn mach_wait_until(deadline: u64) -> c_int;
+    }
+    #[repr(C)]
+    pub struct TcPolicy {
+        pub period: u32,
+        pub computation: u32,
+        pub constraint: u32,
+        pub preemptible: u32,
+    }
+    pub fn timebase() -> (u64, u64) {
+        let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
+        unsafe { libc::mach_timebase_info(&mut tb) };
+        (tb.numer as u64, tb.denom as u64)
+    }
+    pub fn ns_to_abs(ns: u64) -> u64 {
+        let (n, d) = timebase();
+        ns * d / n
+    }
+    fn env_us(k: &str, d: u64) -> u64 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    }
+    /// Mach real-time ("time-constraint") policy, the one Core Audio uses. The
+    /// thread is promised `computation` of CPU within `constraint` of waking,
+    /// every `period`. Tunable via S4_TC_{PERIOD,COMP,CONSTR}_US.
+    pub fn time_constraint() -> c_int {
+        let p = TcPolicy {
+            period: ns_to_abs(env_us("S4_TC_PERIOD_US", 1000) * 1000) as u32,
+            computation: ns_to_abs(env_us("S4_TC_COMP_US", 250) * 1000) as u32,
+            constraint: ns_to_abs(env_us("S4_TC_CONSTR_US", 1000) * 1000) as u32,
+            preemptible: 1,
+        };
+        unsafe {
+            libc::thread_policy_set(
+                libc::pthread_mach_thread_np(libc::pthread_self()),
+                libc::THREAD_TIME_CONSTRAINT_POLICY as u32,
+                &p as *const TcPolicy as *mut i32,
+                4,
+            )
+        }
+    }
+}
+
+/// Sleep until `now_ns() >= t` (absolute). Exported for the Zig harness.
+#[no_mangle]
+pub extern "C" fn s4_sleep_until(t: u64) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        // CLOCK_UPTIME_RAW ns -> mach absolute ticks
+        mac::mach_wait_until(mac::ns_to_abs(t));
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
+        let ts = libc::timespec { tv_sec: (t / 1_000_000_000) as _, tv_nsec: (t % 1_000_000_000) as _ };
+        while libc::clock_nanosleep(CLOCK, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut()) != 0 {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,9 +201,17 @@ fn real(name: &CStr, cell: &OnceLock<usize>) -> usize {
     })
 }
 
+#[allow(dead_code)]
 const SOL_UDP: c_int = 17;
+#[allow(dead_code)]
 const UDP_SEGMENT: c_int = 103;
 
+#[cfg(target_os = "macos")]
+fn gso_segment(_msg: &libc::msghdr) -> Option<usize> {
+    None // no UDP GSO on macOS
+}
+
+#[cfg(not(target_os = "macos"))]
 fn gso_segment(msg: &libc::msghdr) -> Option<usize> {
     unsafe {
         let mut c = libc::CMSG_FIRSTHDR(msg);
@@ -244,6 +325,36 @@ pub unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: usize, flags: 
 // ---------------------------------------------------------------------------
 // Thread placement helpers (also exported so Zig and the shim use the same code).
 
+/// macOS: no CPU pinning on Apple Silicon (THREAD_AFFINITY_POLICY is only a
+/// hint, and unsupported on arm64), so `cpu` is ignored. `rt_prio` picks the
+/// policy:
+///   0  leave the thread alone (inherits the process default QoS)
+///   1  QOS_CLASS_USER_INTERACTIVE
+///   2  Mach time-constraint (real-time) policy
+///   3  pthread SCHED_FIFO at max priority
+///   4  QOS_CLASS_USER_INTERACTIVE, then time-constraint
+#[cfg(target_os = "macos")]
+fn pin_and_prio(_cpu: c_int, rt_prio: c_int) -> c_int {
+    unsafe {
+        match rt_prio {
+            0 => 0,
+            1 => libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0),
+            2 => mac::time_constraint(),
+            3 => {
+                let mut p: libc::sched_param = std::mem::zeroed();
+                p.sched_priority = libc::sched_get_priority_max(libc::SCHED_FIFO);
+                libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &p)
+            }
+            4 => {
+                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+                    | mac::time_constraint()
+            }
+            _ => -1,
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn pin_and_prio(cpu: c_int, rt_prio: c_int) -> c_int {
     let mut rc = 0;
     unsafe {
@@ -397,6 +508,13 @@ pub extern "C" fn s4_init(cfg: *const S4Config) -> *mut Shim {
         let mut b = tokio::runtime::Builder::new_multi_thread();
         if cfg.mt_workers > 0 {
             b.worker_threads(cfg.mt_workers as usize);
+        }
+        // Optional: apply a scheduling policy to every worker (S4_MT_PRIO, same
+        // codes as rt_prio). Stock shims leave workers alone; default unset.
+        if let Some(pr) = std::env::var("S4_MT_PRIO").ok().and_then(|v| v.parse::<c_int>().ok()) {
+            b.on_thread_start(move || {
+                pin_and_prio(-1, pr);
+            });
         }
         b.enable_all().build().unwrap()
     };

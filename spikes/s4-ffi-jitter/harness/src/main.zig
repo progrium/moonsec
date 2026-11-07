@@ -2,7 +2,6 @@
 //! Rust shim and stamps t0 right before each call. Everything after that is
 //! measured inside the shim (see shim/src/lib.rs).
 const std = @import("std");
-const c = std.c;
 
 const S4Config = extern struct {
     mode: c_int,
@@ -18,18 +17,19 @@ extern fn s4_dump(shim: *Shim, prefix: [*:0]const u8) c_int;
 extern fn s4_received(shim: *Shim) u64;
 extern fn s4_max_datagram(shim: *Shim) c_int;
 extern fn s4_pin_current_thread(cpu: c_int, prio: c_int) c_int;
+// Clock and sleep come from the shim so both sides use the same clock
+// (CLOCK_MONOTONIC on Linux, CLOCK_UPTIME_RAW on macOS).
+extern fn s4_now_ns() u64;
+extern fn s4_sleep_until(t: u64) void;
 
 const MAGIC: u64 = 0x5334_4a49_5454_4552;
 
 inline fn nowNs() u64 {
-    var ts: c.timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    return s4_now_ns();
 }
 
 fn sleepUntil(t: u64) void {
-    const ts: c.timespec = .{ .sec = @intCast(t / 1_000_000_000), .nsec = @intCast(t % 1_000_000_000) };
-    while (c.clock_nanosleep(c.CLOCK.MONOTONIC, .{ .ABSTIME = true }, &ts, null) != 0) {}
+    s4_sleep_until(t);
 }
 
 const Opts = struct {
@@ -39,7 +39,7 @@ const Opts = struct {
     burst: usize = 1,
     size: usize = 1150,
     cpu: c_int = -1, // sender thread pin
-    prio: c_int = 0, // sender SCHED_FIFO prio
+    prio: c_int = 0, // sender SCHED_FIFO prio (Linux) or policy code (macOS, see shim pin_and_prio)
     rt_cpu: c_int = -1, // shim runtime thread pin (CT modes)
     rt_prio: c_int = 0,
     workers: c_int = 0,

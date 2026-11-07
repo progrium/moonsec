@@ -13,7 +13,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.addObjectFile(.{ .cwd_relative = shim });
-    for ([_][]const u8{ "pthread", "dl", "m", "rt", "util", "gcc_s" }) |l| mod.linkSystemLibrary(l, .{});
+    if (target.result.os.tag == .macos) {
+        // from `cargo rustc --release -- --print native-static-libs`
+        for ([_][]const u8{ "SystemConfiguration", "Security", "CoreFoundation", "Foundation" }) |f| mod.linkFramework(f, .{});
+        for ([_][]const u8{ "objc", "iconv" }) |l| mod.linkSystemLibrary(l, .{});
+    } else {
+        for ([_][]const u8{ "pthread", "dl", "m", "rt", "util", "gcc_s" }) |l| mod.linkSystemLibrary(l, .{});
+    }
 
     const exe = b.addExecutable(.{ .name = "s4", .root_module = mod });
     b.installArtifact(exe);
