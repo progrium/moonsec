@@ -1,0 +1,3 @@
+qdisc tbf 80df: root refcnt 5 rate 160Mbit burst 32Kb lat 50ms 
+ Sent 239826650 bytes 204559 pkt (dropped 0, overlimits 282095 requeues 0) 
+ backlog 0b 0p requeues 0

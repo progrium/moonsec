@@ -1,0 +1,5 @@
+shim/target/
+shim/target-rv/
+harness/zig-out/
+harness/zig-out-rv/
+harness/.zig-cache/
