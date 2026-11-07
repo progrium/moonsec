@@ -41,6 +41,12 @@ def load(prefix, warmup):
         syscall=stats([r[5] - r[4] for r in rows]),
         unmatched=missing,
     )
+    # In burst runs, later packets of a burst also wait for earlier packets' syscalls
+    # (serialization, not handoff). Report the burst's first packet separately.
+    firsts = [b for a, b in zip(rows, rows[1:]) if b[1] - a[1] > 5_000_000]
+    gaps = sorted(b[1] - a[1] for a, b in zip(rows, rows[1:]))
+    if gaps and gaps[len(gaps) // 2] < 100_000:  # burst run: most datagrams sent back-to-back
+        out['handoff_burst_first'] = stats([r[4] - r[1] for r in firsts])
     if any(r[3] for r in rows):
         out['task_pickup'] = stats([r[3] - r[2] for r in rows])
     return out

@@ -14,14 +14,16 @@ run() { # tag args...
   $BIN "$@" out="$OUT/$tag" 2>&1 | sed 's/^/   /'
   python3 analyze.py "$OUT/$tag" > "$OUT/$tag.json"
 }
+MODES=${MODES:-0 1 2 3 4 5 6}
 for load in 0 6; do
   for pat in iso burst; do
     if [ $pat = iso ]; then P="n=20000 interval_us=1000 burst=1"; else P="n=43200 interval_us=16667 burst=36"; fi
-    for m in 0 1 2 3 4 5 6; do
-      run "${NAMES[$m]}.$pat.load$load" mode=$m $P load=$load $SENDER $DED
+    for m in $MODES; do
+      D=$DED; [ $m = 6 ] && D="rt_cpu=1"  # SCHED_FIFO spinning gets RT-throttled; spin at normal prio
+      run "${NAMES[$m]}.$pat.load$load" mode=$m $P load=$load $SENDER $D
     done
     # dedicated runtime thread without pinning / RT priority, for contrast
-    run "iroh_ct_noprio.$pat.load$load" mode=4 $P load=$load $SENDER
+    [ -n "${SKIP_NOPRIO:-}" ] || run "iroh_ct_noprio.$pat.load$load" mode=4 $P load=$load $SENDER
   done
 done
 rm -f "$OUT"/*.csv.gz; gzip -f "$OUT"/*.csv
