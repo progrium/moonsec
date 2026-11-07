@@ -344,6 +344,9 @@ async fn run_send(
     let wd = would_drop.clone();
     let ms = min_space.clone();
     let res = tokio::task::spawn_blocking(move || -> Result<(u64, u64)> {
+        if let Some(cpu) = std::env::var("S2_GEN_CPU").ok().and_then(|v| v.parse().ok()) {
+            pin_current(Some(cpu), 0);
+        }
         let mut buf = vec![0u8; a2.size];
         let mut warm = 0u64;
         let sent = schedule(&a2, warmup, |seq, f, ft, is_warm| {
@@ -475,6 +478,25 @@ fn run_proxy(a_bind: SocketAddr, b_bind: SocketAddr, b: SocketAddr, delay_us: u6
     }
 }
 
+fn pin_current(cpu: Option<usize>, prio: i32) {
+    unsafe {
+        if let Some(cpu) = cpu {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+                eprintln!("warning: affinity");
+            }
+        }
+        // prio 0 resets to SCHED_OTHER: the generator thread would otherwise inherit the
+        // runtime thread's SCHED_FIFO, spin, and get RT-throttled 50 ms every second.
+        let p = libc::sched_param { sched_priority: prio.max(0) };
+        let pol = if prio > 0 { libc::SCHED_FIFO } else { libc::SCHED_OTHER };
+        if libc::pthread_setschedparam(libc::pthread_self(), pol, &p) != 0 {
+            eprintln!("warning: sched");
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -482,7 +504,16 @@ fn main() -> Result<()> {
         Cmd::UdpRecv { bind, csv, secs } => run_udp_recv(bind, csv, secs),
         Cmd::UdpSend { a, bind } => run_udp_send(a, bind),
         cmd => {
-            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+            // S10 baseline: S2_CT_CPU / S2_CT_PRIO run iroh on one current-thread runtime on this
+            // (pinned, SCHED_FIFO) thread, the shim's design since S4. Default: 2-worker runtime.
+            let ct_cpu: Option<usize> = std::env::var("S2_CT_CPU").ok().and_then(|v| v.parse().ok());
+            let rt = if let Some(cpu) = ct_cpu {
+                let prio: i32 = std::env::var("S2_CT_PRIO").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                pin_current(Some(cpu), prio);
+                tokio::runtime::Builder::new_current_thread().enable_all().build()?
+            } else {
+                tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?
+            };
             rt.block_on(async move {
                 match cmd {
                     Cmd::Recv { bind, seed, csv, out, rbuf } => run_recv(bind, seed, csv, out, rbuf).await,

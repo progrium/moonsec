@@ -95,7 +95,7 @@ We use Rust iroh 1.x (pinned at 1.4.1) through a Rust shim that lives in the rep
 - **Congestion control.** iroh's default controller (Cubic) let a 1 MiB datagram send buffer hide 100–140 ms of queueing while QUIC's RTT stayed flat (S2). The shim installs our own controller (S3's `AppRate`) through iroh's public transport-config builder. It paces at a target rate the core sets, sizes the window at 2× BDP and counts loss without cutting the rate.
 - **Pacing.** The target rate is the core's estimate of link capacity, not the encoder bitrate; pacing at the encoder bitrate stretches every frame across the whole frame interval. The core keeps the encoder below that rate. iroh builds one controller per network path, so the shim applies the target to whichever path is selected and moves it when the path changes.
 - **Drop accounting.** iroh counts neither send-buffer evictions nor receive-buffer drops. The shim counts its own (datagrams sent minus datagrams on the wire, datagrams received minus datagrams read) and reports them with path stats; media sequence numbers catch the rest.
-- **Buffers and timeouts.** 64 KiB datagram send buffer, so an encoder that outruns the target queues at most ~15 ms instead of ~90 ms. Per-path idle timeout 300 ms (iroh's default is 15 s, during which a dead direct path looks healthy) and keep-alive 100 ms.
+- **Buffers and timeouts.** The datagram send buffer holds at least the largest frame at the top bitrate (S10: a 64 KiB buffer evicted 62% of an 85 Mbit/s 60 fps stream). The core's own queue bounds delay by age, so an encoder that outruns the target cannot build a ~90 ms queue, and the shim counts every eviction. Per-path idle timeout 300 ms (iroh's default is 15 s, during which a dead direct path looks healthy) and keep-alive 100 ms.
 - **Runtime threading.** One dedicated current-thread runtime per process, started through `iroh_shim_init` with the host's thread-start hook (see Threading).
 
 The core still owns the rate decision. Its controller uses our own one-way delay from capture and send timestamps, not QUIC's RTT, which stays flat while the send buffer fills.
@@ -262,7 +262,7 @@ Static linking is the default and works on all five targets (S1); a dynamic libr
 
 Nine time-boxed spikes, roughly three to four weeks in total, settle the decisions that are expensive to reverse; the transport spikes (S2 to S5) decide whether Rust iroh stays. Pass thresholds are proposed starting points to confirm in review.
 
-As of Nov 7, 2026, S1 to S5 and S7 have run and iroh stays, with the shim changes described under Transport. S8 has run on VideoToolbox only. S6, S9 and S8's Windows rows need a Windows GPU host. The table below is the original plan; results are under Spike status.
+As of Nov 7, 2026, S1 to S5, S7 and S10 have run and iroh stays (for media too: S10), with the shim changes described under Transport. S8 has run on VideoToolbox only. S6, S9 and S8's Windows rows need a Windows GPU host. The table below is the original plan; results are under Spike status.
 
 | # | Question | Method | Pass | If it fails | Box |
 | --- | --- | --- | --- | --- | --- |
@@ -293,6 +293,7 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 | S7 | Pass, with non-obvious settings | M3 Max, real SCK capture at 1080p60: encode p99 6.75 ms (H.264) and 4.99 ms (HEVC), but only with `RealTime=false` and low-latency rate control off; with them on, 15.5 ms. Code only on Jeff's Mac |
 | S8 | VideoToolbox done; NVENC, AMF, oneVPL pending | VideoToolbox: per-frame bitrate without IDR passes, intra-refresh fails, long-term refs pass on the low-latency path |
 | S9 | Pending | Needs the S6 Windows host |
+| S10 | Done: keep iroh for media | noq-proto driven from Zig (Zig owns socket, timers, pacer, drops) beats iroh + `AppRate` on its pinned runtime by ~0.9 ms p99 on frame bursts (1.3 vs 2.2 ms over raw UDP; 0.6 ms with one frame of pacer credit), counts every drop, and halves the hand-off tail (62–202 µs; 11–30 µs when the media thread sends inline). But iroh's socket can't be shared without a fork, and a second socket's hole punch only worked through port-preserving NATs, so a relay path over iroh is still needed. Not worth a second traversal path. Found along the way: the 64 KiB send buffer evicts 62% of an 85 Mbit/s frame stream, and S2's pacer stalls are host scheduling, not tokio |
 
 **S1: shim builds and links** ([`spikes/s1-shim`](../spikes/s1-shim/README.md), [`shim/README.md`](../shim/README.md))
 
@@ -303,7 +304,7 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 
 - Findings (Cubic, iroh default): median overhead 30–50 µs; added p99 under 2 ms up to ~91% of wire capacity, failing at 96–98% on 1 ms RTT (2.2–3.0 ms). Once Cubic backs off below the offered rate, the 1 MiB datagram send buffer fills and adds 100–140 ms one-way while QUIC's RTT stays flat; send-buffer evictions and receive-buffer drops are not counted anywhere. Slow start overshoots in the first ~200 ms. `datagram_send_buffer_space()` over-reports (noq bug, worth an upstream issue).
 - Findings (S3's `AppRate`): at and above the cap iroh now behaves like raw UDP. Overload lands in the network queue (37–76 ms p99 instead of Cubic’s 60–147; a 50% overload still evicts), there are no send-buffer evictions, and QUIC `lost_packets` matches the bottleneck's drop count exactly. If the encoder outruns the target, the send buffer is the queue again (86–97 ms at 1 MiB, 15–17 ms at 64 KiB, evictions uncounted). Below the cap, pacing at the encoder rate stretches each 60 fps frame over ~16 ms (frame p99 up to 3× Cubic's); pacing at the capacity estimate fixes most of that but still adds 0.9–2.6 ms p99 over UDP (Cubic: 0.5–0.8). Smooth runs show occasional 5–23 ms sender-side stalls with no loss, probably the rate-mode pacer losing credit when the shared tokio runtime wakes late (unverified).
-- Implications: use `AppRate`, with its pacing rate set from the core's capacity estimate (not the encoder bitrate) and the encoder kept under it. The rate controller uses our own one-way delay timestamps, not QUIC RTT. The shim keeps a 64 KiB send buffer and still counts evictions (`sent − frame_tx.datagram`, `frame_rx.datagram − read`, plus media sequence numbers). Streams start below target. Open item: rerun S2's smooth cases on S4's pinned current-thread runtime to confirm the pacer stalls go away; if they don't, give the pacer more burst credit or pace a little above capacity.
+- Implications: use `AppRate`, with its pacing rate set from the core's capacity estimate (not the encoder bitrate) and the encoder kept under it. The rate controller uses our own one-way delay timestamps, not QUIC RTT. The shim keeps a 64 KiB send buffer and still counts evictions (`sent − frame_tx.datagram`, `frame_rx.datagram − read`, plus media sequence numbers). Streams start below target. S10 reran these cases on the pinned runtime: the stalls remain and also hit a Zig thread with no tokio (host scheduling), and S10 found that 64 KiB is too small for frame bursts.
 
 **S3: custom congestion control** ([`spikes/s3-congestion`](../spikes/s3-congestion/README.md))
 
@@ -331,6 +332,12 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 - Implications: no periodic keyframes and no intra-refresh on macOS; loss recovery is LTR ack plus `ForceLTRRefresh`, IDR as last resort. The protocol needs a client-to-host ack message carrying each frame's LTR token, which is a VideoToolbox sample attachment and so must travel in our video header, not the bitstream. Clients freeze decode on a gap until the recovery frame arrives (required for VT HEVC, harmless elsewhere).
 
 **Open conflict between S7 and S8.** S7's fast settings use the regular encoder, but S8 found long-term refs exist only on the low-latency path, which S7 measured at 15.5 ms p99 with RealTime on. Before the macOS backend is built, measure the low-latency path with `RealTime=false` and real capture. If it stays slow, macOS has to choose per session between fast encode with IDR recovery and slower encode with LTR recovery.
+
+**S10: media over noq-proto from Zig** ([`spikes/s10-noq-proto`](../spikes/s10-noq-proto/README.md))
+
+- Question: should media datagrams move from iroh to `noq-proto` driven by the Zig core (the original fallback 1), with iroh kept for dialing and hole punching?
+- Findings: S2 and S4 were rerun against a sans-I/O shim (noq-proto 1.4.0, the version iroh pins) and against iroh + `AppRate` on S4's pinned current-thread runtime, two runs per case. Frame bursts below the cap add 1.3 ms p99 over raw UDP with noq, against 2.2 ms with iroh. Raising the Zig pacer's credit to one frame brings it to 0.6 ms. noq's own pacer driven from the same loop scores within 0.1 ms of the Zig pacer, so the gain comes from removing tokio and from the burst policy, not from where the pacer sits. Every datagram is accounted for in all 98 noq runs (Zig queue drops + QUIC loss = TBF drops). Hand-off p99 is 62–202 µs through a pinned network thread and 11–30 µs when the media thread drives QUIC itself (iroh: 102–398 µs). iroh owns its sockets, with no demux or raw-send hook, so sharing its path needs a fork. A demo with a second Zig socket, rendezvous and cert pinning over an iroh stream, and a hole punch works through two port-preserving NATs, but only after adding TTL-limited opening probes (the naive version failed on conntrack port clashes). It fails through a port-randomizing NAT.
+- Implications: media stays on iroh. Two changes come out of it. (1) The shim's datagram send buffer must hold at least the largest frame: with 64 KiB, iroh silently evicted 62% of datagrams at 85 Mbit/s 60 fps, well below the cap. The shim counts evictions (`sent − frame_tx.datagram`), and a time-based limit stays in the core's own queue. (2) Give `AppRate` about a frame of burst credit, or pace slightly above capacity, and remeasure. S2's open item is answered: the 5–23 ms stalls also hit a pinned SCHED_FIFO Zig thread with no tokio, so they come from host scheduling, to recheck on bare metal. Revisit noq-proto only if Phase 2's LAN gate misses by about 1 ms because of the transport, and then through a small iroh fork that shares the socket, not a second socket.
 
 **Still to run:** S6 and S9 need a Windows GPU host, which also fills in S8's NVENC, AMF and oneVPL rows and reruns S4 on target hardware.
 
@@ -425,7 +432,8 @@ The original top risk, QUIC congestion control fighting our rate controller, is 
 - Do NVENC, AMF and oneVPL support per-frame bitrate changes and long-term references, and which must for launch? (S8 Windows rows.)
 - What is our Windows glass-to-glass baseline against Moonlight and Parsec? (S6.)
 - Is the web client usable over a relay? (S9.)
-- Do the shim's pacer stalls go away on the dedicated runtime? (S2 rerun.)
+- ~~Do the shim's pacer stalls go away on the dedicated runtime?~~ No: S10 saw them on a pinned SCHED_FIFO thread with no tokio as well, so they are host scheduling on the VM. Recheck on bare metal.
+- Does a frame's worth of burst credit in `AppRate` get iroh's frame overhead under 2 ms p99 like it did for the Zig pacer? (S10 follow-up.)
 - Do we run our own discovery (DNS/pkarr) or rely on n0's public services?
 - Multi-user sessions: one shared input owner, or input from all guests?
 - License for the project itself?
@@ -440,10 +448,11 @@ The original top risk, QUIC congestion control fighting our rate controller, is 
 | Web client relay-only over iroh | One transport and one stack; no WebRTC on the host |
 | Voice chat out of scope | Reserved stream ID keeps it addable later |
 | Keep iroh; noq-proto fallback dropped (Nov 2026) | S3 installs a custom controller through iroh's public API; S5 found path stats and events public |
+| Media stays on iroh datagrams, not noq-proto driven from Zig (Nov 2026) | S10: ~0.9 ms p99 better on frames and exact drop counts, but no shared socket without forking iroh, and a second socket needs its own NAT traversal plus the iroh relay path anyway |
 | Shim owns congestion control, pacing, drop counts and its runtime; core sets the rate | iroh's Cubic hid 100–140 ms of queue and iroh counts no datagram drops (S2); pacing must live where packets leave |
 | Pace at the capacity estimate, not the encoder bitrate | Encoder-rate pacing spreads each frame over the whole interval (S2) |
 | Rate controller uses our one-way timestamps, not QUIC RTT | QUIC RTT stays flat while the send buffer fills (S2) |
-| 64 KiB send buffer, 300 ms path idle timeout | Bounds hidden queue to ~15 ms; detects a dead direct path in 300 ms instead of 15 s (S2, S5) |
+| Send buffer sized to the largest frame (not 64 KiB), evictions counted; 300 ms path idle timeout | 64 KiB bounded smooth-traffic queueing (S2) but evicted 62% of an 85 Mbit/s frame stream (S10); dead direct path detected in 300 ms instead of 15 s (S5) |
 | Dedicated current-thread iroh runtime on a pinned real-time thread | Shared multi-thread runtime added 1–4 ms p99 under load; dedicated one 0.1–0.4 ms (S4) |
 | Static shim linking by default | Works on all five targets (S1); dynamic build kept as an option |
 | Loss recovery is LTR-first with client acks; no intra-refresh baseline | VideoToolbox has no working intra-refresh; LTR recovery frames are 3–6× smaller than IDRs (S8) |

@@ -1,0 +1,5 @@
+{"app_sent": 68181, "warmup_sent": 11363, "zig_queue_dropped": 0, "ring_full_dropped": 0, "handed_to_quic": 68181,
+ "send_blocked": 0, "pacer_waits": 0, "max_zig_queue_delay_us": 1695, "udp_send_errors": 0, "loop_iterations": 83756, "pacer_deadline_already_past": 0,
+ "send_buffer_would_drop": 0, "cc": "noq-rate", "pace_payload_mbps": 90.0, "credit_us": 2000, "maxq_us": 30000,
+ "conn": {"frame_tx_datagram": 68181, "frame_rx_datagram": 0, "udp_tx": 68183, "udp_tx_bytes": 77000517, "udp_rx": 33969,
+ "sent_packets": 68185, "lost_packets": 0, "lost_bytes": 0, "paths": [{"rtt_us": 1068, "cwnd": 115568, "congestion_events": 0, "mtu": 1200}]}}
