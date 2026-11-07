@@ -1,0 +1,18 @@
+mode=builtin server=6de5dc4c14 sockets=[0.0.0.0:53471]
+via proxy 127.0.0.1:35054: loss=2.0% one-way delay=10ms
+connected; max_datagram_size=Some(1162) send_buffer_space=262112
+
+phase           target  rx Mbit/s   rx pkts    p50 us    p99 us
+unlimited            -       4.13       899    454067    660809
+  [unlimited] path PathId(0) remote=Ip(127.0.0.1:35054) selected=true relay=false rtt=22.315371ms cwnd=13956 bw_est=None controller=built-in 
+40 Mbit/s           40       4.15       903    495607    542086
+  [40 Mbit/s] path PathId(0) remote=Ip(127.0.0.1:35054) selected=true relay=false rtt=22.519064ms cwnd=12374 bw_est=None controller=built-in 
+10 Mbit/s           10       4.02       875    510846    635700
+  [10 Mbit/s] path PathId(0) remote=Ip(127.0.0.1:35054) selected=true relay=false rtt=22.21199ms cwnd=12011 bw_est=None controller=built-in 
+2 Mbit/s             2       2.35       511     11346    434595
+  [2 Mbit/s] path PathId(0) remote=Ip(127.0.0.1:35054) selected=true relay=false rtt=22.674008ms cwnd=9222 bw_est=None controller=built-in 
+25 Mbit/s           25       3.31       720    649944    724124
+  [25 Mbit/s] path PathId(0) remote=Ip(127.0.0.1:35054) selected=true relay=false rtt=22.442815ms cwnd=10061 bw_est=None controller=built-in 
+
+app datagrams: queued=5137 received=4895 (gap=242); quic lost_packets=105 congestion_events path-level shown above
+  [final] path PathId(0) remote=Ip(127.0.0.1:35054) selected=true relay=false rtt=22.338826ms cwnd=12560 bw_est=None controller=built-in 

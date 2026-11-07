@@ -1,0 +1,22 @@
+mode=custom server=c20705a1fb sockets=[0.0.0.0:59906]
+via proxy 127.0.0.1:33080: loss=2.0% one-way delay=10ms
+connected; max_datagram_size=Some(1162) send_buffer_space=262112
+controllers built on client so far: 1
+
+phase           target  rx Mbit/s   rx pkts    p50 us    p99 us
+unlimited            -      92.38     20093     11510     12178
+  [unlimited] path PathId(0) remote=Ip(127.0.0.1:33080) selected=true relay=false rtt=22.246235ms cwnd=67108864 bw_est=None controller=AppRate (custom) path#0 sent_calls=3493 acks=22865 cong_events=399 srtt=22342us
+40 Mbit/s           40      34.54      7512     11297     12178
+  [40 Mbit/s] path PathId(0) remote=Ip(127.0.0.1:33080) selected=true relay=false rtt=22.380988ms cwnd=224392 bw_est=Some(40000000) controller=AppRate (custom) path#0 sent_calls=8295 acks=31641 cong_events=580 srtt=22439us
+10 Mbit/s           10       9.32      2028     11191     12181
+  [10 Mbit/s] path PathId(0) remote=Ip(127.0.0.1:33080) selected=true relay=false rtt=22.206178ms cwnd=55532 bw_est=Some(10000000) controller=AppRate (custom) path#0 sent_calls=9980 acks=34040 cong_events=626 srtt=22213us
+2 Mbit/s             2       1.85       403     11170     12098
+  [2 Mbit/s] path PathId(0) remote=Ip(127.0.0.1:33080) selected=true relay=false rtt=22.456571ms cwnd=11208 bw_est=Some(2000000) controller=AppRate (custom) path#0 sent_calls=10454 acks=34525 cong_events=637 srtt=22419us
+25 Mbit/s           25      21.45      4667     11332     12145
+  [25 Mbit/s] path PathId(0) remote=Ip(127.0.0.1:33080) selected=true relay=false rtt=22.160214ms cwnd=138810 bw_est=Some(25000000) controller=AppRate (custom) path#0 sent_calls=13901 acks=39854 cong_events=723 srtt=22209us
+
+app datagrams: queued=40700 received=39898 (gap=802); quic lost_packets=802 congestion_events path-level shown above
+  [final] path PathId(0) remote=Ip(127.0.0.1:33080) selected=true relay=false rtt=22.279236ms cwnd=139200 bw_est=Some(25000000) controller=AppRate (custom) path#0 sent_calls=13901 acks=39907 cong_events=723 srtt=22272us
+client controllers built: 1
+  path#0 sent=48030019B acked=47087891B cong_events=723 lost=946327B mtu=1452
+server controllers built: endpoint-wide factory=0 per-connection factory=1
