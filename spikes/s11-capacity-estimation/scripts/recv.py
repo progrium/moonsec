@@ -3,11 +3,18 @@
 
 Timestamps each media packet (CLOCK_MONOTONIC, microseconds) and every 5 ms
 sends the sender feedback: u8 2, u16 n, n x (u64 seq, i64 recv_us).
-Usage: python3 recv.py [port]   (default 9711). Ctrl-C to stop.
+Usage: python3 recv.py [port] [punch_ip:port]   (default 9711). Ctrl-C to stop.
+With punch_ip:port (both ends behind NAT), it sends a 1-byte hello there every
+100 ms until media arrives, so its own NAT opens a mapping for the sender.
 """
 import select, socket, struct, sys, time
 
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 9711
+punch = None
+if len(sys.argv) > 2:
+    h, p = sys.argv[2].rsplit(":", 1)
+    punch = (h, int(p))
+last_hello = 0
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
 s.bind(("0.0.0.0", port))
@@ -31,6 +38,9 @@ while True:
         count += 1
         pending.append((struct.unpack_from("<Q", d, 1)[0], t))
     t = now()
+    if punch and peer is None and t - last_hello > 100_000:
+        s.sendto(b"\x03", punch)
+        last_hello = t
     if peer and t - last_media > 3_000_000:
         print(f"recv: stream ended after {count} packets", flush=True)
         peer, count = None, 0
