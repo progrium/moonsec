@@ -1,0 +1,26 @@
+{
+  "app_received": 125280,
+  "conn": {
+    "frame_rx_datagram": 125280,
+    "frame_tx_datagram": 0,
+    "lost_bytes": 0,
+    "lost_packets": 0,
+    "paths": [
+      {
+        "congestion_events": 0,
+        "cwnd": 13200,
+        "lost_packets": 0,
+        "mtu": 1452,
+        "rtt_us": 1332,
+        "sent_packets": 22397,
+        "udp_rx": 125289,
+        "udp_tx": 22406
+      }
+    ],
+    "sent_packets": 22397,
+    "udp_rx": 125289,
+    "udp_rx_bytes": 141483885,
+    "udp_tx": 22406,
+    "udp_tx_bytes": 794800
+  }
+}
