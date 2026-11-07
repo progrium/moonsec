@@ -1,0 +1,12 @@
+[package]
+name = "s5-path-stats"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+iroh = { version = "1.4.1", features = ["test-utils"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tokio-stream = "0.1"
+bytes = "1"
