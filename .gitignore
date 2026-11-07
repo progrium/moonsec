@@ -2,4 +2,6 @@
 zig-out/
 out-*/
 dist/
+target/
 shim/target/
+spikes/s4-ffi-jitter/harness/out/

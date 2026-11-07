@@ -1,0 +1,18 @@
+[package]
+name = "s4shim"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+iroh = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "net", "time", "macros"] }
+anyhow = "1"
+libc = "0.2"
+bytes = "1"
+
+[profile.release]
+panic = "abort"
+debug = 1
