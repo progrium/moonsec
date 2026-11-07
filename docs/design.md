@@ -255,7 +255,7 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 
 | # | Status | Headline |
 | --- | --- | --- |
-| S1 | Partial pass, CI pending | Shim links into Zig 0.16 statically and dynamically; echo passes on Linux x64; CI green on Linux x64/arm64 and Windows x64, macOS and Windows arm64 still being fixed; archive sizes not yet recorded |
+| S1 | Pass | Shim links into Zig 0.16 statically and dynamically; 500/500 datagram echo passes on all five targets (Linux x64/arm64, Windows x64/arm64, macOS universal). Release archives are 6.5–14.3 MB compressed |
 | S2 | Pass with `AppRate`, one open item | With Cubic, a 1 MiB send buffer hides 100–140 ms of queueing at the cap and evictions are uncounted. With S3's `AppRate` the hidden queue is gone and every bottleneck drop is counted, but its pacer adds 1–3 ms p99 to frame bursts and stalls 5–23 ms now and then on smooth traffic; likely the shared runtime (see S4), to recheck |
 | S3 | Pass | A custom congestion controller installs through iroh's public builder and holds a target rate on a live connection; under 2% loss it keeps 12 ms p99 where Cubic collapses to ~4 Mbit/s and 500+ ms |
 | S4 | Pass with the fallback | FFI call is free (p99 ≤ 0.4 µs); handoff to a shared multi-thread runtime fails under load (1–4 ms p99), a dedicated pinned current-thread runtime passes (≤ 0.4 ms p99) |
@@ -268,7 +268,7 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 **S1: shim builds and links** ([`spikes/s1-shim`](../spikes/s1-shim/README.md), [`shim/README.md`](../shim/README.md))
 
 - Findings: iroh pinned at 1.4.1 with default features off (`tls-ring`, `portmapper`, `fast-apple-datapath` added back). Linux links Zig's bundled libunwind instead of `libgcc_s`; Zig `*-windows-gnu` maps to Rust `*-pc-windows-gnullvm`. `iroh_conn_local_drops` counts only the shim's own inbound queue.
-- Implications: static linking stays the default with a dynamic option already built in. Still owed: macOS and Windows arm64 CI, and archive sizes, before the "ship as DLL" fallback can be ruled out.
+- Implications: static linking stays the default with a dynamic option already built and tested, so the "ship as DLL" fallback is not needed. Compressed release archives: Linux 8.6–9.0 MB, Windows 6.5–6.9 MB, macOS universal 14.3 MB; static `shim-echo` executables are 5.4–13.9 MB. Windows arm64 CI runs the x86_64 Zig under emulation, because the native Zig 0.16.0 binary segfaults there. Next: tag `shim-v0.1.0` and wire `-Dshim=prebuilt`.
 
 **S2: datagram queueing and drops** ([`spikes/s2-datagram-queueing`](../spikes/s2-datagram-queueing/README.md))
 
