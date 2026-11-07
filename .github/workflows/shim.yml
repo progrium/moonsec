@@ -1,0 +1,187 @@
+name: shim
+
+# Spike S1: build the iroh shim for every target, link it into Zig (static and dynamic),
+# run the datagram echo, and record artifact sizes. Tags `shim-v*` publish a release.
+
+on:
+  push:
+    branches: [main]
+    tags: ["shim-v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            rust: [x86_64-unknown-linux-gnu]
+            zig_target: x86_64-linux-gnu
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            rust: [aarch64-unknown-linux-gnu]
+            zig_target: aarch64-linux-gnu
+          - name: windows-x86_64
+            os: windows-2022
+            rust: [x86_64-pc-windows-msvc]
+            zig_target: x86_64-windows-msvc
+          - name: windows-aarch64
+            os: windows-11-arm
+            rust: [aarch64-pc-windows-msvc]
+            zig_target: aarch64-windows-msvc
+          - name: macos-universal
+            os: macos-15
+            rust: [aarch64-apple-darwin, x86_64-apple-darwin]
+            zig_target: aarch64-macos.11.0
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      DIST: dist/iroh-shim-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Rust toolchain (pinned by shim/rust-toolchain.toml)
+        shell: bash
+        working-directory: shim
+        run: |
+          if ! command -v rustup >/dev/null; then
+            case "$RUNNER_OS-$RUNNER_ARCH" in
+              Windows-ARM64) curl -sSfL https://win.rustup.rs/aarch64 -o "$RUNNER_TEMP/rustup-init.exe" ;;
+              Windows-*) curl -sSfL https://win.rustup.rs/x86_64 -o "$RUNNER_TEMP/rustup-init.exe" ;;
+              *) curl -sSfL https://sh.rustup.rs -o "$RUNNER_TEMP/rustup-init.sh" ;;
+            esac
+            if [ -f "$RUNNER_TEMP/rustup-init.exe" ]; then "$RUNNER_TEMP/rustup-init.exe" -y --default-toolchain none --profile minimal
+            else sh "$RUNNER_TEMP/rustup-init.sh" -y --default-toolchain none --profile minimal; fi
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add ${{ join(matrix.rust, ' ') }}
+          rustc -Vv
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            shim/target
+          key: shim-${{ matrix.name }}-${{ hashFiles('shim/Cargo.lock', 'shim/rust-toolchain.toml') }}
+
+      - name: Build shim
+        shell: bash
+        working-directory: shim
+        run: |
+          for t in ${{ join(matrix.rust, ' ') }}; do
+            cargo build --release --locked --target "$t"
+            # Record what the static archive needs from the system linker.
+            cargo rustc --release --locked --target "$t" --lib --crate-type staticlib -- --print native-static-libs 2>&1 \
+              | grep native-static-libs | tee "target/$t/native-static-libs.txt" || true
+          done
+
+      - name: Package shim
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIST/lib" "$DIST/include"
+          cp shim/include/iroh_shim.h "$DIST/include/"
+          case "${{ matrix.name }}" in
+            macos-*)
+              a=shim/target/aarch64-apple-darwin/release; x=shim/target/x86_64-apple-darwin/release
+              lipo -create "$a/libiroh_shim.a" "$x/libiroh_shim.a" -output "$DIST/lib/libiroh_shim.a"
+              lipo -create "$a/libiroh_shim.dylib" "$x/libiroh_shim.dylib" -output "$DIST/lib/libiroh_shim.dylib"
+              lipo -info "$DIST/lib/libiroh_shim.a" ;;
+            windows-*)
+              r=shim/target/${{ matrix.rust[0] }}/release
+              cp "$r/iroh_shim.lib" "$r/iroh_shim.dll" "$r/iroh_shim.dll.lib" "$DIST/lib/" ;;
+            linux-*)
+              r=shim/target/${{ matrix.rust[0] }}/release
+              cp "$r/libiroh_shim.a" "$r/libiroh_shim.so" "$DIST/lib/" ;;
+          esac
+          cat shim/target/*/native-static-libs.txt > "$DIST/native-static-libs.txt" || true
+          tar -C dist -czf "dist/iroh-shim-${{ matrix.name }}.tar.gz" "iroh-shim-${{ matrix.name }}"
+
+      - name: Link into Zig (static) and run echo
+        shell: bash
+        run: |
+          zig build -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -p out-static
+          out-static/bin/shim-echo selftest -n 500
+
+      - name: Link into Zig (dynamic) and run echo
+        shell: bash
+        run: |
+          zig build -Dshim=dir -Dshim-dir="$DIST" -Dshim-link=dynamic -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -p out-dynamic
+          out-dynamic/bin/shim-echo selftest -n 500
+
+      - name: macOS x86_64 slice (link, run under Rosetta if present)
+        if: startsWith(matrix.name, 'macos')
+        shell: bash
+        run: |
+          zig build -Dshim=dir -Dshim-dir="$DIST" -Dtarget=x86_64-macos.11.0 -Doptimize=ReleaseSafe -p out-x86_64
+          file out-x86_64/bin/shim-echo
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then arch -x86_64 out-x86_64/bin/shim-echo selftest -n 200; else echo "Rosetta not available; link-only"; fi
+
+      - name: Echo over n0 relays (informational)
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: bash
+        run: out-static/bin/shim-echo selftest --relay -n 50
+
+      - name: Record sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          size() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else echo 0; fi; }
+          exe=""; case "${{ matrix.name }}" in windows-*) exe=".exe";; esac
+          {
+            echo "### ${{ matrix.name }}"
+            echo "| artifact | bytes |"
+            echo "| --- | ---: |"
+            for f in "$DIST"/lib/*; do echo "| lib/$(basename "$f") | $(size "$f") |"; done
+            echo "| iroh-shim-${{ matrix.name }}.tar.gz | $(size dist/iroh-shim-${{ matrix.name }}.tar.gz) |"
+            echo "| shim-echo$exe (static, ReleaseSafe) | $(size out-static/bin/shim-echo$exe) |"
+            echo "| shim-echo$exe (dynamic, ReleaseSafe) | $(size out-dynamic/bin/shim-echo$exe) |"
+            echo
+            echo '```'; cat "$DIST/native-static-libs.txt" 2>/dev/null || true; echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY" > "dist/sizes-${{ matrix.name }}.md"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iroh-shim-${{ matrix.name }}
+          path: |
+            dist/iroh-shim-${{ matrix.name }}.tar.gz
+            dist/sizes-${{ matrix.name }}.md
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/shim-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > SHA256SUMS
+          cat sizes-*.md > SIZES.md
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" --notes-file SIZES.md *.tar.gz SHA256SUMS

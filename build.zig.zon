@@ -1,0 +1,8 @@
+.{
+    .name = .moonsec,
+    .version = "0.0.0",
+    .fingerprint = 0xd4b256715008befa,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "core", "transport", "platform", "shim", "tools" },
+}

@@ -1,0 +1,31 @@
+[package]
+name = "moonsec-iroh-shim"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+description = "Thin C ABI over iroh for the moonsec Zig core"
+publish = false
+
+[lib]
+name = "iroh_shim"
+# staticlib is the primary artifact; cdylib is the S1 fallback ("ship the shim as a DLL/dylib/so").
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# Default features off (drops metrics); add back only what we need.
+iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring", "portmapper", "fast-apple-datapath"] }
+iroh-tickets = "=1.0.0"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time", "sync"] }
+bytes = "1.11"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+debug = false
+
+[profile.dev]
+panic = "abort"
