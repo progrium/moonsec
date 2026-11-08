@@ -38,6 +38,9 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = platform_mod })).step);
 
+    // Client platform backends (platform/client/build.zig).
+    @import("platform/client/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
+
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
     const pipe_mod = b.addModule("pipe", .{ .root_source_file = b.path("transport/pipe.zig"), .target = target, .optimize = optimize });
@@ -232,6 +235,8 @@ pub fn build(b: *std.Build) void {
     } else {
         test_win.dependOn(&b.addFail("test-win needs a Windows host; use check-win to cross-compile").step);
     }
+    // Windows client backend tests join both steps (platform/client/build.zig).
+    @import("platform/client/build.zig").addWindowsTests(b, target, optimize, check_win, test_win);
 }
 
 /// Compiler flags for every C file under platform/ on Windows.
