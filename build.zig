@@ -46,6 +46,9 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = synthetic_mod })).step);
 
+    // System clipboard backends (platform/clipboard), for clipboard sync over the control channel.
+    const clipboard_mod = @import("platform/clipboard/build.zig").add(b, target, optimize, test_step);
+
     // Client platform backends (platform/client/build.zig).
     @import("platform/client/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
 
@@ -263,6 +266,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "simnet", .module = simnet_mod },
         .{ .name = "simlink", .module = simlink_mod },
         .{ .name = "audio_stage", .module = audio_stage_mod },
+        .{ .name = "clipboard", .module = clipboard_mod },
     };
     const app_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("app/test.zig"), .target = target, .optimize = optimize, .imports = &app_imports }) });
     const test_app = b.step("test-app", "Host and client apps end to end over the in-process sim");

@@ -21,6 +21,8 @@ const ClientSession = @import("client_session.zig").ClientSession;
 const host_session = @import("host_session.zig");
 const client_session = @import("client_session.zig");
 const audio_stage = @import("audio_stage");
+const clipboard = @import("clipboard");
+const clipsync = @import("clipsync.zig");
 
 const proto = core.proto;
 
@@ -43,6 +45,12 @@ pub const HostOptions = struct {
     session: struct { peer_timeout_us: Micros = 5_000_000, pace: bool = true, rate_control: bool = false, loss_policy: bool = false } = .{},
     /// Hold video while the path is stalled (host_session.Config.pause_on_stall).
     pause_on_stall: bool = true,
+    /// The reliable control stream next to the pipe (spec/control-v0.md). Null: no
+    /// control channel, so no clipboard sync.
+    control_stream: ?pipe_mod.ByteStream = null,
+    /// The system clipboard to sync over the control channel (platform/clipboard).
+    clipboard: ?clipboard.Clipboard = null,
+    clipboard_poll_us: Micros = 250_000,
 };
 
 pub const HostApp = struct {
@@ -52,6 +60,7 @@ pub const HostApp = struct {
     size: api.Size,
     last_frame_us: ?Micros = null,
     audio: ?*HostAudio = null,
+    clip: ?clipsync.Sync = null,
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: HostOptions, p: pipe_mod.PacketPipe) !HostApp {
@@ -77,6 +86,8 @@ pub const HostApp = struct {
         }, p);
         var app: HostApp = .{ .be = be, .s = s, .opts = o, .size = size };
         errdefer app.s.deinit();
+        if (o.control_stream) |cs| try app.s.control.attach(cs);
+        if (o.clipboard) |cb| app.clip = .{ .cb = cb, .interval_us = o.clipboard_poll_us };
         if (o.audio) if (be.audio) |src| {
             app.audio = try HostAudio.init(gpa, src);
         };
@@ -92,6 +103,7 @@ pub const HostApp = struct {
     /// Network stage: pipe, timers, input injection. Call with the session lock held.
     fn network(a: *HostApp, now: Micros) void {
         a.s.step(now);
+        if (a.clip) |*y| y.pump(a.s.gpa, &a.s.control, now);
         if (a.audio) |au| au.pump(&a.s, now);
         while (a.s.popAction()) |p| {
             if (a.be.input) |inj| inj.inject(p.action) catch {
@@ -190,6 +202,12 @@ pub const ClientOptions = struct {
     overlay_interval_us: Micros = 100_000,
     /// Play the audio stream into the backend's sink, if it has one.
     audio: bool = true,
+    /// The reliable control stream next to the pipe (spec/control-v0.md). Null: no
+    /// control channel, so no clipboard sync.
+    control_stream: ?pipe_mod.ByteStream = null,
+    /// The system clipboard to sync over the control channel (platform/clipboard).
+    clipboard: ?clipboard.Clipboard = null,
+    clipboard_poll_us: Micros = 250_000,
 };
 
 pub const ClientApp = struct {
@@ -201,6 +219,7 @@ pub const ClientApp = struct {
     overlay: api.Overlay = .{ .telemetry = .{} },
     next_overlay: Micros = 0,
     audio: ?*ClientAudio = null,
+    clip: ?clipsync.Sync = null,
     stats: struct { decode_errors: u64 = 0, present_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.ClientBackend, o: ClientOptions, p: pipe_mod.PacketPipe) !ClientApp {
@@ -213,7 +232,11 @@ pub const ClientApp = struct {
             cfg.onAudio = ClientAudio.onAudio;
         };
         errdefer if (au) |x| x.deinit();
-        return .{ .be = be, .s = try ClientSession.init(gpa, cfg, p), .opts = o, .audio = au };
+        var app: ClientApp = .{ .be = be, .s = try ClientSession.init(gpa, cfg, p), .opts = o, .audio = au };
+        errdefer app.s.deinit();
+        if (o.control_stream) |cs| try app.s.control.attach(cs);
+        if (o.clipboard) |cb| app.clip = .{ .cb = cb, .interval_us = o.clipboard_poll_us };
+        return app;
     }
 
     pub fn deinit(a: *ClientApp) void {
@@ -233,6 +256,7 @@ pub const ClientApp = struct {
         };
         if (a.quit) a.s.close(now);
         a.s.step(now);
+        if (a.clip) |*y| y.pump(a.s.gpa, &a.s.control, now);
         if (a.audio) |au| if (a.s.state == .streaming) au.render(a.be.clock.now());
     }
 
