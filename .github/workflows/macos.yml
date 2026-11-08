@@ -31,7 +31,7 @@ jobs:
         run: zig build build-test-mac --summary all
       # Run the binary directly so every test's report (encoders, timings, skips) is in the log.
       - name: macOS host backend tests
-        run: ./zig-out/mac-test/mac-host-test 2>&1 | tee test-mac.log; exit ${PIPESTATUS[0]}
+        run: sw_vers; ./zig-out/mac-test/mac-host-test 2>&1 | tee test-mac.log; exit ${PIPESTATUS[0]}
         shell: bash
       - name: VideoToolbox on this runner
         if: always()

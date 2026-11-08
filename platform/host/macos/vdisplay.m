@@ -88,14 +88,50 @@ static int index_of(uint32_t id, uint32_t *index) {
     return mh_fail(MH_ERR_UNSUPPORTED, "virtual display %u not active", id);
 }
 
+// The display's current mode in pixels (0x0 when it has none yet).
+static void current_pixels(uint32_t id, uint32_t *w, uint32_t *h) {
+    *w = *h = 0;
+    CGDisplayModeRef m = CGDisplayCopyDisplayMode(id);
+    if (!m) return;
+    *w = (uint32_t)CGDisplayModeGetPixelWidth(m);
+    *h = (uint32_t)CGDisplayModeGetPixelHeight(m);
+    CGDisplayModeRelease(m);
+}
+
+// Selects the w x h mode for this session. The window server may bring a display up in
+// a mode it remembers instead of the one applySettings asked for.
+static void select_mode(uint32_t id, uint32_t w, uint32_t h) {
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(id, NULL);
+    if (!modes) return;
+    for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
+        CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+        if (CGDisplayModeGetPixelWidth(m) != w || CGDisplayModeGetPixelHeight(m) != h) continue;
+        CGDisplayConfigRef cfg;
+        if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess) break;
+        CGConfigureDisplayWithDisplayMode(cfg, id, m, NULL);
+        CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession);
+        break;
+    }
+    CFRelease(modes);
+}
+
 static int wait_mode(uint32_t id, uint32_t w, uint32_t h, uint32_t timeout_ms) {
-    int64_t deadline = mh_now_us() + (int64_t)timeout_ms * 1000;
+    int64_t start = mh_now_us();
+    int64_t deadline = start + (int64_t)timeout_ms * 1000;
+    int selected = 0;
     for (;;) {
-        uint32_t index;
-        if (index_of(id, &index) == MH_OK && CGDisplayPixelsWide(id) == w && CGDisplayPixelsHigh(id) == h) return MH_OK;
-        if (mh_now_us() >= deadline)
-            return mh_fail(MH_ERR, "virtual display %u not active at %ux%u after %u ms (now %zux%zu)", id, w, h, timeout_ms,
-                           CGDisplayPixelsWide(id), CGDisplayPixelsHigh(id));
+        uint32_t index, cw, ch;
+        int active = index_of(id, &index) == MH_OK;
+        current_pixels(id, &cw, &ch);
+        if (active && cw == w && ch == h) return MH_OK;
+        int64_t now = mh_now_us();
+        if (active && !selected && now - start > 500000) {
+            select_mode(id, w, h);
+            selected = 1;
+        }
+        if (now >= deadline)
+            return mh_fail(MH_ERR, "virtual display %u not active at %ux%u after %u ms (now %ux%u)", id, w, h, timeout_ms,
+                           cw, ch);
         usleep(20000);
     }
 }
@@ -116,7 +152,9 @@ int mh_vdisplay_create(uint32_t width, uint32_t height, uint32_t refresh_hz, uin
         desc.sizeInMillimeters = CGSizeMake(width * 25.4 / 96.0, height * 25.4 / 96.0);
         desc.vendorID = 0x6d73; // "ms"
         desc.productID = 0x0001;
-        desc.serialNum = (unsigned int)getpid();
+        // A new identity each time, so the window server has no remembered mode for it.
+        static unsigned int created;
+        desc.serialNum = ((unsigned int)getpid() << 8) | (++created & 0xff);
         desc.terminationHandler = ^(id a, id b) {
           (void)a;
           (void)b;
