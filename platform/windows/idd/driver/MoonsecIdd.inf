@@ -1,0 +1,73 @@
+;
+; moonsec virtual display driver (IddCx, UMDF 2). See ../README.md.
+;
+; Matches two hardware IDs: "MoonsecIdd" for the software device the moonsec host
+; creates while it runs (SwDeviceCreate), and "Root\MoonsecIdd" for a root device made
+; once with devcon (for hosts that run without the rights to create software devices).
+;
+
+[Version]
+PnpLockDown=1
+Signature="$Windows NT$"
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+Class=Display
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=MoonsecIdd.cat
+DriverVer=
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$.10.0...17134
+
+[Standard.NT$ARCH$.10.0...17134]
+%DeviceName%=MoonsecIdd_Install, MoonsecIdd
+%DeviceName%=MoonsecIdd_Install, Root\MoonsecIdd
+
+[SourceDisksFiles]
+MoonsecIdd.dll=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[DestinationDirs]
+UMDriverCopy=13
+
+[UMDriverCopy]
+MoonsecIdd.dll
+
+[MoonsecIdd_Install.NT]
+CopyFiles=UMDriverCopy
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
+
+[MoonsecIdd_Install.NT.hw]
+AddReg=MoonsecIdd_HardwareDeviceSettings
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
+
+[MoonsecIdd_HardwareDeviceSettings]
+HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
+HKR,"WUDF","DeviceGroupId",%REG_SZ%,"MoonsecIddGroup"
+
+[MoonsecIdd_Install.NT.Services]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
+
+[MoonsecIdd_Install.NT.Wdf]
+UmdfService=MoonsecIdd,MoonsecIdd_Install
+UmdfServiceOrder=MoonsecIdd
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfHostProcessSharing=ProcessSharingDisabled
+
+[MoonsecIdd_Install]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%13%\MoonsecIdd.dll
+UmdfExtensions=IddCx0102
+
+[Strings]
+ManufacturerName="moonsec"
+DiskName="moonsec virtual display driver"
+DeviceName="moonsec virtual display"
+
+REG_MULTI_SZ=0x00010000
+REG_SZ=0x00000000
