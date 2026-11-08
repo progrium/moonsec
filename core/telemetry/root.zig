@@ -266,3 +266,10 @@ test "input latency across clocks" {
     t.reset();
     try testing.expectEqual(@as(u32, 0), t.snapshot().stage(.input).count);
 }
+
+/// Freeze detector (no new content on screen for too long) for the gate and the soak.
+pub const freeze = @import("freeze.zig");
+
+test {
+    _ = freeze;
+}
