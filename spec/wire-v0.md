@@ -125,13 +125,16 @@ repeated.
 
 | Offset | Size | Field | Meaning |
 | ---: | ---: | --- | --- |
-| 0 | 1 | `flags` | Bit 0 `recovery_needed`; others reserved. |
+| 0 | 1 | `flags` | Bit 0 `recovery_needed`; bit 1 `want_idr` (answer with an IDR, not an LTR refresh: the client has no keyframe yet, or an `ltr_refresh` frame failed to decode; only with `recovery_needed`); others reserved. |
 | 1 | 4 | `gap_frame` | First frame the client could not decode; must be 0 unless `recovery_needed`. |
 | 5 | 1 | `count` | Number of entries, 0–255. |
 | 6 | 12·count | entries | `frame_id u32`, `ltr_token u64` per decoded long-term reference. |
 
 No trailing bytes. On `recovery_needed` the host encodes its next frame against the newest
-acked long-term reference (`ltr_refresh`), or sends an IDR if it has none.
+acked long-term reference (`ltr_refresh`), or sends an IDR if it has none or `want_idr` is
+set. The client repeats the request if no recovery frame arrives within about RTT + 2 frames;
+the host treats repeats for a gap it answered less than about one RTT ago as copies in flight,
+and falls back to an IDR after repeated refreshes for the same gap (`core/recovery`).
 
 ### `control_fast` kind 2: transport-wide feedback (client → host)
 

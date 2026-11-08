@@ -17,6 +17,8 @@
 pub const types = @import("types.zig");
 pub const host = @import("host.zig");
 pub const client = @import("client.zig");
+/// Conversions to and from `proto` (frame ack, shard header flags).
+pub const wire = @import("wire.zig");
 
 pub const FrameId = types.FrameId;
 pub const LtrToken = types.LtrToken;
@@ -34,5 +36,6 @@ test {
     _ = types;
     _ = host;
     _ = client;
+    _ = wire;
     _ = @import("sim_test.zig");
 }

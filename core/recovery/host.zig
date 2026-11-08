@@ -96,7 +96,7 @@ pub fn Host(comptime history_len: usize) type {
         /// A frame ack from the client: decoded long-term references, and a recovery request
         /// while the client is frozen.
         pub fn onAck(self: *Self, ack: *const types.Ack) void {
-            for (ack.slice()) |e| self.ackOne(e);
+            for (ack.slice()) |e| self.onAckEntry(e);
             if (ack.recovery) |r| self.onRecoveryRequest(r);
         }
 
@@ -104,7 +104,8 @@ pub fn Host(comptime history_len: usize) type {
             self.cfg.retry_window = frames;
         }
 
-        fn ackOne(self: *Self, e: types.AckEntry) void {
+        /// One decoded long-term reference from a frame ack.
+        pub fn onAckEntry(self: *Self, e: types.AckEntry) void {
             const slot = &self.history[e.frame_id % history_len];
             const s = if (slot.*) |*s| s else return self.stale();
             if (s.id != e.frame_id or s.token == null or s.token.? != e.token) return self.stale();
