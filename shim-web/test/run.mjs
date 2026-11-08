@@ -4,7 +4,7 @@
 //   node shim-web/test/run.mjs [--browsers chromium,firefox,webkit] [--json out.json] [--rates 2000,10000,25000,50000]
 //
 // Needs, from the repo root: shim-web/pkg (shim-web/build.sh), zig-out/web/moonsec-pair.wasm
-// (`zig build web-pair`), zig-out/bin/{shim-echo,moonsec} (`zig build install-moonsec`),
+// (`zig build web-pair`), zig-out/bin/{shim-echo,moonsec} (`zig build install install-moonsec`),
 // iroh-relay 1.4.1 on PATH (or IROH_RELAY=path), openssl, and Playwright with its browsers.
 //
 // What it runs, per browser:

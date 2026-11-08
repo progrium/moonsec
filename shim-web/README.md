@@ -82,7 +82,7 @@ no `wasm-opt` yet), plus 56 KB of JS bindings and the 35 KB pairing module.
 cargo install wasm-bindgen-cli@0.2.106 --locked      # must match Cargo.lock
 cargo install iroh-relay@1.4.1 --features server --locked
 shim-web/build.sh                                    # pkg/: wasm, bindings, moonsec-pair.wasm
-zig build install-moonsec -Doptimize=ReleaseSafe     # native peers: shim-echo, moonsec
+zig build install install-moonsec -Doptimize=ReleaseSafe   # native peers: shim-echo, moonsec
 (cd shim-web/test && npm install && npx playwright install chromium firefox webkit)
 node shim-web/test/run.mjs --browsers chromium,firefox,webkit
 ```
