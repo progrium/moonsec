@@ -10,6 +10,11 @@
 //! rate controller, which sets pacing), NACKs, frame acks (to core/recovery), clock pings
 //! and reports, input events, bye.
 //!
+//! With `loss_policy` on, `core.media.Policy` picks the loss recovery per path: NACK on
+//! short RTTs, Reed-Solomon parity sized from transport-feedback loss on long ones, and
+//! relay mode (no FEC, caps for the rate ladder) on relayed paths. `lossDecision` is the
+//! current choice. Off, every NACK is answered and no parity is sent (Phase 2).
+//!
 //! Path changes and drops (Phase 3): when the pipe reports the selected path stalled (no
 //! ack progress), video stops going out, since it would only be lost or queue up stale
 //! behind a dead path; when acks resume or the path changes, the next frame is a recovery
@@ -25,7 +30,7 @@
 //! With `rate_control` (Phase 3) the controller drives the encoder through the ladder
 //! (core/rate/ladder.zig): bitrate changes go out in `EncodeParams.bitrate_bps`, and
 //! resolution or frame-rate steps wait in `takeReconfigure` for the app to apply with
-//! `Encoder.configure`. Relay mode and FEC cap it through `setLimits`. Every frame also goes
+//! `Encoder.configure`. With `loss_policy`, relay mode's caps and the FEC share bound it (`setLimits` otherwise). Every frame also goes
 //! through `Controller.onFrame`, so probe frames leave at the probe rate.
 const std = @import("std");
 const core = @import("core");
@@ -66,6 +71,9 @@ pub const Config = struct {
     /// A shard is resent at most once per this long, however many NACKs name it: after an
     /// outage the NACKs repeat every RTT while the resends are still queued in the pacer.
     retransmit_interval_us: u64 = 20_000,
+    /// Choose NACK, FEC or relay mode per path (`core.media.policy`).
+    loss_policy: bool = false,
+    policy: media.policy.Config = .{},
     /// End the session when nothing arrives from the client for this long.
     peer_timeout_us: Micros = 5_000_000,
     /// ...or this long when the pipe can reconnect (the client redials after a drop).
@@ -93,7 +101,10 @@ pub const Stats = struct {
     repeats: u64 = 0,
     bytes: u64 = 0,
     shards: u64 = 0,
+    parity_shards: u64 = 0,
     nacks: u64 = 0,
+    /// NACKs not answered because the policy said FEC only.
+    nacks_ignored: u64 = 0,
     retransmits: u64 = 0,
     feedback: u64 = 0,
     frame_acks: u64 = 0,
@@ -147,6 +158,9 @@ pub const HostSession = struct {
     path_changed_at: ?Micros = null,
 
     packetizer: media.Packetizer = .{},
+    parity_buf: *media.ParityBuffer,
+    policy: media.Policy,
+    decision: ?media.policy.Decision = null,
     history: media.History,
     ctl: *rate.Controller,
     ladder: rate.Ladder,
@@ -173,8 +187,23 @@ pub const HostSession = struct {
         errdefer gpa.destroy(rec);
         rec.* = recovery.Host.init(.{ .ltr = cfg.ltr });
         const tele = try gpa.create(telemetry.Telemetry(512));
+        errdefer gpa.destroy(tele);
         tele.* = .init();
-        return .{ .gpa = gpa, .cfg = cfg, .pipe = p, .history = history, .ctl = ctl, .ladder = ladder, .bitrate_bps = cfg.bitrate_bps, .rec = rec, .tele = tele };
+        const pb = try gpa.create(media.ParityBuffer);
+        return .{
+            .gpa = gpa,
+            .cfg = cfg,
+            .pipe = p,
+            .history = history,
+            .ctl = ctl,
+            .ladder = ladder,
+            .bitrate_bps = cfg.bitrate_bps,
+            .rec = rec,
+            .tele = tele,
+            .parity_buf = pb,
+            .packetizer = .{ .parity_buf = pb },
+            .policy = .init(cfg.policy),
+        };
     }
 
     pub fn deinit(s: *HostSession) void {
@@ -182,6 +211,7 @@ pub const HostSession = struct {
         s.gpa.destroy(s.ctl);
         s.gpa.destroy(s.rec);
         s.gpa.destroy(s.tele);
+        s.gpa.destroy(s.parity_buf);
         s.actions.deinit(s.gpa);
     }
 
@@ -342,6 +372,7 @@ pub const HostSession = struct {
         switch (m) {
             .feedback => |f| {
                 s.ctl.onFeedbackMsg(now, f.feedback);
+                s.policy.onCounts(@intCast(now), f.feedback.count, f.feedback.count - f.feedback.received);
                 s.stats.feedback += 1;
                 if (s.cfg.rate_control) s.updateLadder(now);
                 s.applyPacing(now);
@@ -367,6 +398,12 @@ pub const HostSession = struct {
     }
 
     fn updateLadder(s: *HostSession, now: Micros) void {
+        // With the loss policy on, its caps and FEC share bound the ladder.
+        if (s.decision) |d| s.limits = .{
+            .max_bitrate_bps = d.caps.max_bitrate_bps,
+            .max_height = d.caps.max_height,
+            .fec_overhead = d.overhead,
+        };
         const req = s.ladder.update(now, s.ctl.encoderBps(), s.limits);
         if (req.bitrate_bps != 0) {
             s.bitrate_bps = req.bitrate_bps;
@@ -378,7 +415,8 @@ pub const HostSession = struct {
         }
     }
 
-    /// Caps from relay mode and FEC (core/media's policy) for the ladder.
+    /// Caps for the ladder. With `loss_policy`, each update takes them from
+    /// `lossDecision` (relay caps and the FEC share) instead.
     pub fn setLimits(s: *HostSession, l: rate.ladder.Limits) void {
         s.limits = l;
     }
@@ -399,6 +437,10 @@ pub const HostSession = struct {
                 }) |it_| {
                     var it = it_;
                     s.stats.nacks += 1;
+                    if (s.decision) |d| if (!d.nack) {
+                        s.stats.nacks_ignored += 1;
+                        return;
+                    };
                     while (it.next()) |mseq| if (s.history.resend(mseq, @intCast(now))) |shard| {
                         s.sendShard(shard, now);
                         s.stats.retransmits += 1;
@@ -518,6 +560,14 @@ pub const HostSession = struct {
             if (flags.refresh) s.stats.refreshes += 1;
             return;
         }
+        if (s.cfg.loss_policy) {
+            s.decision = s.policy.update(@intCast(now), .{
+                .rtt_us = @intCast(@max(s.path.rtt_us, 0)),
+                .frame_interval_us = 1_000_000 / @max(s.cfg.fps, 1),
+                .relayed = s.path.relayed,
+            });
+            s.packetizer.parity = s.policy.parity;
+        }
         if (s.cfg.rate_control) {
             var total: usize = 0;
             for (ef.slices) |sl| total += sl.len;
@@ -539,6 +589,7 @@ pub const HostSession = struct {
                 s.history.record(shard, @intCast(now));
                 s.sendShard(shard, now);
                 s.stats.shards += 1;
+                if (shard.header.shard >= shard.header.data_shards) s.stats.parity_shards += 1;
             }
             s.stats.bytes += sl.len;
         }
@@ -557,7 +608,7 @@ pub const HostSession = struct {
         const dg = proto.encodeVideoShard(&buf, s.envSeq(), shard.header, shard.payload) catch unreachable;
         const last = shard.header.slice + 1 == shard.header.slice_count and
             shard.header.group + 1 == shard.header.group_count and
-            shard.header.shard + 1 == shard.header.data_shards;
+            shard.header.shard + 1 == shard.header.shardCount();
         s.ctl.onSent(s.seq, now, @intCast(dg.len), shard.header.frame_id, last);
         s.sendRaw(dg);
     }
@@ -567,6 +618,12 @@ pub const HostSession = struct {
     pub fn sendAudio(s: *HostSession, kind: u8, payload: []const u8, now: Micros) void {
         if (s.state != .streaming) return;
         s.sendOther(.audio, kind, payload, now);
+    }
+
+    /// The loss policy's current choice (null before the first frame, or with
+    /// `loss_policy` off): the mode, the FEC overhead and the caps for the rate ladder.
+    pub fn lossDecision(s: *const HostSession) ?media.policy.Decision {
+        return s.decision;
     }
 
     // --- input stage ----------------------------------------------------
@@ -588,6 +645,7 @@ pub const HostSession = struct {
         const st = s.stats;
         try w.print("host: {s}{s}{s}\n", .{ @tagName(s.end), if (s.reason.len > 0) ": " else "", s.reason });
         try w.print("  frames {d} (keyframes {d}, refreshes {d}, repeats {d}, encoder drops {d}), {d} MB in {d} shards\n", .{ st.frames, st.keyframes, st.refreshes, st.repeats, st.encode_drops, st.bytes / 1_000_000, st.shards });
+        if (s.decision) |d| try w.print("  loss policy: {s}, loss {d:.2}%, FEC overhead {d:.0}%, {d} parity shards, {d} NACKs ignored, {d} mode switches\n", .{ @tagName(d.mode), d.loss * 100, d.overhead * 100, st.parity_shards, st.nacks_ignored, s.policy.switches });
         try w.print("  NACKs {d} -> retransmits {d}; feedback {d}; frame acks {d} (recovery requests {d}); pings {d}; inputs {d}\n", .{ st.nacks, st.retransmits, st.feedback, st.frame_acks, st.recovery_requests, st.pings, st.inputs_applied });
         if (st.path_changes + st.reconnects + st.stall_pauses > 0)
             try w.print("  path changes {d}, reconnects {d}; stalls {d} ({d} frames held, longest {d:.0} ms)\n", .{ st.path_changes, st.reconnects, st.stall_pauses, st.stall_frames, ms(st.stall_longest_us) });
