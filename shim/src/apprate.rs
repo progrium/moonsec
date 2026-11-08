@@ -10,20 +10,26 @@
 //! one paces at the target. The others pace at [`IDLE_PATH_BPS`] (or the target, if lower), so
 //! the rate moves with the path when iroh switches.
 //!
-//! Burst credit: a frame arrives all at once. Credit accumulates at the target rate up to
-//! `burst_us` worth of bytes; once it is full, the controller reports a pacing rate of
-//! [`BURST_GAIN`] x the target until the credit is spent, so a frame leaves at close to line rate and the bottleneck
-//! queue, not the pacer, absorbs it (S10: 2.2 -> ~0.6 ms added p99 for one frame of credit).
+//! Burst credit (spike S10b): a frame arrives all at once, and noq's own pacer bucket holds only
+//! ~2 ms of the rate (`send_quantum` is just the GSO batch size), so the controller keeps its
+//! own token bucket. It holds `burst_us` of traffic at the target and refills at the target.
+//! While it holds at least one packet, `metrics()` reports [`BURST_PACING_RATE`] so noq lets
+//! the frame out at line rate; once it is spent, it reports the target. The bucket carries
+//! debt (it goes negative): noq sends a 2-packet batch once one packet's credit is there, and
+//! forgiving that overdraft lifted the sustained rate to 93.8 Mbit/s on a 90 target in S10b.
+//! S10b: 2.37 -> 0.41-0.48 ms added p99 over UDP for 60 fps frames with 10-20 ms of credit.
 
 use std::any::Any;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use iroh::endpoint::{Controller, ControllerFactory, ControllerMetrics, RttEstimator};
 
-/// Pacing rate multiplier while burst credit is available.
-pub const BURST_GAIN: u64 = 10;
+/// Pacing rate (bytes/s) reported while the burst bucket has credit: 10 Gbit/s, so noq's pacer
+/// (whose bucket then holds its 256-packet maximum) releases the burst at line rate and the
+/// controller's own bucket is what bounds it (S10b).
+pub const BURST_PACING_RATE: u64 = 10_000_000_000 / 8;
 /// Pacing rate of a path that is not selected (keep-alives, probes), unless the target is lower.
 pub const IDLE_PATH_BPS: u64 = 1_000_000;
 /// Window used when no target is set (no pacing rate either).
@@ -122,9 +128,8 @@ impl ControllerFactory for AppRateFactory {
             counters,
             mtu: current_mtu,
             srtt: Duration::from_millis(1),
-            credit: 0,
+            credit: 0.0,
             credit_at: now,
-            bursting: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -137,13 +142,9 @@ pub struct AppRate {
     pub counters: Arc<PathCounters>,
     mtu: u16,
     srtt: Duration,
-    /// Burst credit in bytes as of `credit_at`.
-    credit: u64,
+    /// Burst credit in bytes as of `credit_at`; negative while in debt.
+    credit: f64,
     credit_at: Instant,
-    /// Reporting the boosted rate. Turns on only once the credit is full again and off when it
-    /// runs out: noq's pacer refills at whatever rate is reported for the whole time since it
-    /// last refilled, so flipping on at every MTU of credit would leak rate above the target.
-    bursting: Arc<AtomicBool>,
 }
 
 impl AppRate {
@@ -164,10 +165,11 @@ impl AppRate {
         (rate as u128 * us as u128 / 1_000_000) as u64
     }
 
-    fn credit_at(&self, rate: u64, now: Instant) -> u64 {
-        let dt = now.saturating_duration_since(self.credit_at);
-        let earned = (rate as u128 * dt.as_nanos() / 1_000_000_000) as u64;
-        self.credit.saturating_add(earned).min(self.burst_cap(rate))
+    /// Credit on hand at `now`, refilled at `rate` and capped at the bucket size. `metrics()`
+    /// only has `&self`, so this is computed lazily from the last `on_sent`.
+    fn credit_at(&self, rate: u64, now: Instant) -> f64 {
+        let dt = now.saturating_duration_since(self.credit_at).as_secs_f64();
+        (self.credit + dt * rate as f64).min(self.burst_cap(rate) as f64)
     }
 }
 
@@ -175,11 +177,13 @@ impl Controller for AppRate {
     fn on_sent(&mut self, now: Instant, bytes: u64, _largest_pn: u64) {
         self.counters.sent_bytes.fetch_add(bytes, Relaxed);
         let rate = self.rate_bytes();
-        self.credit = self.credit_at(rate, now).saturating_sub(bytes);
-        self.credit_at = now;
-        if self.credit < self.mtu as u64 {
-            self.bursting.store(false, Relaxed);
+        if rate > 0 && self.knob.burst_us.load(Relaxed) > 0 {
+            // No floor at zero: the debt keeps the sustained rate at the target (S10b).
+            self.credit = self.credit_at(rate, now) - bytes as f64;
+        } else {
+            self.credit = 0.0;
         }
+        self.credit_at = now;
     }
 
     /// Only ack-eliciting packets: pure ACKs never get acked, so they must not start a stall.
@@ -235,13 +239,10 @@ impl Controller for AppRate {
         m.congestion_window = self.window();
         let rate = self.rate_bytes();
         if rate > 0 {
-            let cap = self.burst_cap(rate);
-            let mut bursting = self.bursting.load(Relaxed);
-            if !bursting && cap >= self.mtu as u64 && self.credit_at(rate, Instant::now()) >= cap {
-                bursting = true;
-                self.bursting.store(true, Relaxed);
-            }
-            let paced = if bursting { rate * BURST_GAIN } else { rate };
+            // noq re-reads this on every poll and pacing timer, so the switch is per packet.
+            let bursting = self.burst_cap(rate) >= self.mtu as u64
+                && self.credit_at(rate, Instant::now()) >= self.mtu as f64;
+            let paced = if bursting { rate.max(BURST_PACING_RATE) } else { rate };
             self.counters.pacing_bps.store(rate * 8, Relaxed);
             m.pacing_rate = Some(paced);
             m.send_quantum = Some(2 * self.mtu as u64);

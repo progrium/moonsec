@@ -37,11 +37,12 @@ transport config, so each connection has its own factory and rate knob. It paces
 sizes the window at 2x BDP plus the burst, never cuts on loss, and counts acks, loss and stalls.
 iroh builds one controller per path; the shim maps path IDs to controllers via
 `Connection::congestion_state`, and on `Selected` moves the target to that controller (other
-paths pace at 1 Mbit/s or the target, if lower). Burst credit: credit fills at the target up to
-`burst_us`; once full, the controller reports 10x the target until it is spent, so a frame
-leaves at once (loopback: a 19 KB frame at 8 Mbit/s arrives within ~5 µs instead of 10 ms).
-It only turns on when the credit is full because noq's pacer refills at the reported rate for
-the whole time since its last refill.
+paths pace at 1 Mbit/s or the target, if lower). Burst credit
+follows spike S10b: noq's own pacer bucket holds only ~2 ms of the rate, so the controller keeps
+its own token bucket of `burst_us` at the target, refilled at the target. While it holds at least
+one packet, the controller reports a 10 Gbit/s pacing rate, so a frame leaves at line rate;
+once spent, it reports the target. The bucket carries debt (goes negative), which keeps the
+sustained rate at the target (S10b measured 93.8 Mbit/s on a 90 target with a zero floor).
 
 **Drop accounting.** Send side: noq's datagram buffer is a FIFO that transmission and eviction
 both pop from the front, so its contents are always the newest suffix of what the shim

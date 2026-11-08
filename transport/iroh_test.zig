@@ -329,6 +329,43 @@ test "drops: a full receive queue is counted" {
     try std.testing.expectEqual(@as(u64, 0), after.dgram_recv_queued);
 }
 
+test "rate: with burst credit, frames above the target are still paced at the target" {
+    // S10b: a bucket floored at zero forgives noq's 2-packet overdraft and drifts ~4% above
+    // the target. With the debt carried, the sustained rate holds the target.
+    const target: u64 = 20_000_000;
+    const p = try Pair.open(.{}, .{ .initial_target_bps = target, .burst_us = 16_700 });
+    defer p.close();
+    var pbuf: [8]iroh.PathStats = undefined;
+    var out: [dgram_len]u8 = undefined;
+    // 60 fps frames at 1.25x the target, each handed over at once; measure from 0.5 s to 2.5 s.
+    const per_frame = 5 * target / 4 / 60 / (dgram_len * 8);
+    const t0 = iroh.nowUs();
+    var frames: u64 = 0;
+    var mark: ?struct { t: u64, bytes: u64 } = null;
+    var seq: u32 = 0;
+    while (true) {
+        const now = iroh.nowUs() - t0;
+        if (now >= 2_500_000) break;
+        if (mark == null and now >= 500_000) {
+            mark = .{ .t = iroh.nowUs(), .bytes = (try selectedPath(p.client, &pbuf)).?.sent_bytes };
+        }
+        while (frames * 1_000_000 / 60 <= now) : (frames += 1) {
+            for (0..per_frame) |_| {
+                fill(&out, seq);
+                seq += 1;
+                try p.client.sendDatagram(&out);
+            }
+        }
+        sleepMs(1);
+    }
+    const m = mark.?;
+    const bytes = (try selectedPath(p.client, &pbuf)).?.sent_bytes - m.bytes;
+    const bps = bytes * 8 * 1_000_000 / (iroh.nowUs() - m.t);
+    std.debug.print("rate: frames at 1.25x a {d} kbit/s target with 16.7 ms credit: sent {d} kbit/s\n", .{ target / 1000, bps / 1000 });
+    try std.testing.expect(bps < target * 102 / 100);
+    try std.testing.expect(bps > target * 95 / 100);
+}
+
 test "rate: burst credit lets a frame leave at once" {
     const target: u64 = 8_000_000;
     const p = try Pair.open(.{}, .{ .initial_target_bps = target });
