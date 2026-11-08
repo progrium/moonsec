@@ -88,11 +88,16 @@ static int index_of(uint32_t id, uint32_t *index) {
     return mh_fail(MH_ERR_UNSUPPORTED, "virtual display %u not active", id);
 }
 
-// The display's current mode in pixels (0x0 when it has none yet).
+// The display's current size in pixels.
 static void current_pixels(uint32_t id, uint32_t *w, uint32_t *h) {
-    *w = *h = 0;
     CGDisplayModeRef m = CGDisplayCopyDisplayMode(id);
-    if (!m) return;
+    if (!m) {
+        // Some VMs (the macos-15 runner) give a virtual display no CGDisplayMode; with
+        // hiDPI off its size in points is its size in pixels.
+        *w = (uint32_t)CGDisplayPixelsWide(id);
+        *h = (uint32_t)CGDisplayPixelsHigh(id);
+        return;
+    }
     *w = (uint32_t)CGDisplayModeGetPixelWidth(m);
     *h = (uint32_t)CGDisplayModeGetPixelHeight(m);
     CGDisplayModeRelease(m);
