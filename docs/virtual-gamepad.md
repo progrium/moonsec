@@ -36,14 +36,24 @@ inbox `xusb22.sys` loads on it, so XInput sees a real XUSB device) or a DualShoc
   the ViGEm name ([README][vigem-readme], [EOL statement][vigem-eol]). The last release
   is v1.22.0 (Sep 2023).
 - **Signing:** the release binaries are "production-signed" by Microsoft for Windows
-  10/11 ([README][vigem-readme]). They keep installing as long as Microsoft doesn't revoke
-  them or block the driver; nothing in the EOL statement suggests either. Whether they
-  load on Windows Server 2022 is what the new `vigem` CI job finds out (see
-  [Status](#status)).
+  10/11 ([README][vigem-readme]). The CI job shows how: the catalog and `.sys` of 1.22.0
+  are signed by "Microsoft Windows Hardware Compatibility Publisher" with the
+  *Windows Hardware Driver Attested Verification* EKU, so they are **attestation-signed**,
+  not HLK-certified. They keep installing as long as Microsoft doesn't revoke them or
+  block the driver; nothing in the EOL statement suggests either.
+- **Windows Server:** the release installer refuses every Server edition in its launch
+  conditions (MSI error 1603 on the windows-2022 runner). Installing the driver package
+  directly (pnputil plus a root device, as `.github/scripts/install-vigembus.ps1` does)
+  works: on Windows Server 2022 the attestation-signed bus loaded and started, despite
+  Microsoft's docs saying Server only loads HLK-signed drivers. But Server has no
+  `xusb22.sys`, so a plugged Xbox 360 controller never starts there (the bus gives up
+  after its ~1 s wait with `ERROR_DEVICE_HARDWARE_ERROR`). Xbox 360 targets, and so
+  XInput, need a client edition of Windows.
 - **Install UX:** a separate installer, `ViGEmBus_1.22.0_x64_x86_arm64.exe` (Advanced
   Installer, admin, silent with `/exenoui /qn /norestart`). Sunshine and DS4Windows ask
   users to install it the same way. We can bundle it or link to it; the installer is
-  6.3 MB, covers x64, x86 and arm64, and its SHA-256 is pinned in CI.
+  6.3 MB, covers x64, x86 and arm64 (one MSI per architecture inside), and its SHA-256
+  is pinned in CI.
 - **Old updater:** ViGEmBus v1.21.442 and older ship an updater that calls home to the
   `vigem.org` domain, which no longer belongs to the author; the EOL page says to fix the
   updater config or run its Legacinator tool. v1.22.0 is newer than the affected versions,
@@ -125,7 +135,7 @@ anti-cheat bans it, and it needs per-game setup. Rejected for a streaming host.
 | --- | --- | --- | --- | --- |
 | XInput | Yes (XUSB) | No; maybe via XInputHID (unverified) | Yes (XUSB) | No |
 | DualShock 4 | Yes | If we write a DS4 descriptor | Yes, if kept | No |
-| Signing | Done (Microsoft-signed release) | EV cert + attestation; HLK for Server | EV cert + attestation; HLK for Server | None |
+| Signing | Done (attestation-signed release) | EV cert + attestation; HLK for Server | EV cert + attestation; HLK for Server | None |
 | Install | Separate installer, admin | Our installer, admin | Our installer, admin | Packaged app + restricted capability |
 | Maintenance | None possible (archived) | Ours | Ours | Microsoft's |
 | Licence | BSD-3 driver; we use only the IOCTL protocol (from MIT headers) | Ours | BSD-3 (keep notice) | n/a |
@@ -148,9 +158,9 @@ anti-cheat bans it, and it needs per-game setup. Rejected for a streaming host.
 4. Don't build a HID-only driver (2a): it costs as much as 2b and loses XInput.
 
 Things that would change this: Microsoft blocking ViGEmBus (watch the vulnerable driver
-blocklist), the `vigem` CI job showing it won't load on Windows Server (only matters if
-we target Server hosts), or Jeff wanting DS4 gyro and touchpad, which needs a wire format
-change before any driver choice matters.
+blocklist), wanting gamepads on Windows Server hosts (the bus loads there but Xbox 360
+targets don't start; a DS4 target might, untested), or Jeff wanting DS4 gyro and
+touchpad, which needs a wire format change before any driver choice matters.
 
 ## Status
 
@@ -167,8 +177,11 @@ Built in `platform/host/windows`:
   `pad` actions to `Pads`. Button bits are XInput's (`XINPUT_GAMEPAD_*`); triggers go from
   16 to 8 bits.
 - CI: `test (windows-2022)` checks pads are dropped cleanly with no driver. The new
-  `vigem (windows-2022)` job installs ViGEmBus 1.22.0 (hash pinned), plugs a controller,
-  and reads the snapshot back through `XInputGetState`.
+  `vigem (windows-2022)` job installs the ViGEmBus 1.22.0 driver package (installer hash
+  pinned), prints its signature, and requires the bus to open and accept our protocol
+  version. The XInput round-trip test (plug, snapshot read back with `XInputGetState`,
+  unplug) skips there for lack of `xusb22.sys`; run it on a desktop with
+  `MOONSEC_REQUIRE=vigem,xinput zig build test-win`.
 
 Still needs Jeff's Windows GPU machine:
 

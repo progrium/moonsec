@@ -166,6 +166,9 @@ msw_hr msw_vigem_update_x360(msw_vigem *v, uint32_t serial, const msw_xusb_repor
 msw_hr msw_vigem_unplug(msw_vigem *v, uint32_t serial);
 /* The XInput user index (0..3) Windows gave the controller. */
 msw_hr msw_vigem_user_index(msw_vigem *v, uint32_t serial, uint32_t *index);
+/* Whether Windows' Xbox 360 controller driver (xusb22.sys) is installed. Windows Server
+ * has none, so a plugged controller never starts there. */
+uint32_t msw_xusb_driver_present(void);
 /* XInputGetState through xinput1_4.dll (tests read back what a controller reports). */
 msw_hr msw_xinput_state(uint32_t user, msw_xusb_report *out, uint32_t *packet);
 

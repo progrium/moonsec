@@ -1,7 +1,7 @@
 //! Windows host backend tests (zig build test-win). They run on the GPU-less windows-2022
 //! runner: WARP for the device, Media Foundation's software encoder, and skips for
 //! hardware that is not there. Set MOONSEC_REQUIRE to a comma list (dup, mf, nvenc, audio,
-//! input, vigem) to turn those skips into failures; CI requires what its runner has.
+//! input, vigem, xinput) to turn those skips into failures; CI requires what its runner has.
 const std = @import("std");
 const api = @import("platform");
 const win = @import("win");
@@ -275,11 +275,20 @@ fn xinputUntil(user: u32, want: ?c.msw_xusb_report, timeout_us: i64) !?c.msw_xus
     }
 }
 
+test "ViGEmBus: the bus opens and speaks our protocol version" {
+    var bus: ?*c.msw_vigem = null;
+    const hr = c.msw_vigem_open(&bus);
+    if (hr < 0) return skip("vigem", "ViGEmBus not installed:", hr);
+    c.msw_vigem_close(bus);
+}
+
 test "ViGEmBus: a pad's snapshots reach XInput, disconnect unplugs" {
     var probe: ?*c.msw_vigem = null;
     const hr = c.msw_vigem_open(&probe);
     if (hr < 0) return skip("vigem", "ViGEmBus not installed:", hr);
     c.msw_vigem_close(probe);
+    // The bus plugs an Xbox 360 USB device; Windows' xusb22.sys has to drive it.
+    if (c.msw_xusb_driver_present() == 0) return skip("xinput", "no xusb22.sys (Windows Server has no Xbox 360 driver)", 0);
 
     var inj: host.Injector = .{};
     inj.pads.backend = host.pads.bind(host.Vigem, &inj.vigem);

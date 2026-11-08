@@ -13,6 +13,7 @@
 
 #include <setupapi.h>
 #include <stdlib.h>
+#include <wchar.h>
 #include <winioctl.h>
 
 /* GUID_DEVINTERFACE_BUSENUM_VIGEM {96E42B22-F5E9-42F8-B043-ED0F932F014F} */
@@ -186,6 +187,14 @@ msw_hr msw_vigem_user_index(msw_vigem *v, uint32_t serial, uint32_t *index) {
     HRESULT hr = ioctl(v, IOCTL_XUSB_GET_USER_INDEX, &r, sizeof(r), &r, sizeof(r));
     *index = r.UserIndex;
     return hr;
+}
+
+uint32_t msw_xusb_driver_present(void) {
+    wchar_t path[MAX_PATH];
+    UINT n = GetSystemDirectoryW(path, MAX_PATH);
+    if (n == 0 || n + 24 >= MAX_PATH) return 0;
+    wcscat(path, L"\\drivers\\xusb22.sys");
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
 /* XInputGetState from xinput1_4.dll, loaded at run time (tests only). */

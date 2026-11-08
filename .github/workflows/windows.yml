@@ -35,10 +35,10 @@ jobs:
         run: zig build test-win --summary all
 
   vigem:
-    # The virtual gamepad path end to end (docs/virtual-gamepad.md): install the last
-    # signed ViGEmBus release, plug an Xbox 360 controller and read it back with XInput.
-    # The release installer refuses Windows Server, so the script installs the driver
-    # package directly.
+    # The virtual gamepad path (docs/virtual-gamepad.md): install the last signed ViGEmBus
+    # release and require the bus to open. The release installer refuses Windows Server,
+    # so the script installs the driver package directly. Server has no Xbox 360 driver
+    # (xusb22.sys), so the XInput round-trip test skips here; it needs a desktop.
     name: vigem (windows-2022)
     runs-on: windows-2022
     steps:

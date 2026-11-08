@@ -2,7 +2,8 @@
 # windows.yml. The release installer refuses Windows Server in its launch conditions, so
 # this unpacks its MSI with an administrative install, adds the signed driver package
 # with pnputil and creates the root-enumerated bus device (what `devcon install` does).
-# It prints how the package is signed and whether the device started.
+# It prints how the package is signed and whether the device started. On windows-2022
+# the bus starts; xusb22.sys (the Xbox 360 driver) is absent on Server.
 param([Parameter(Mandatory)][string]$Exe)
 $ErrorActionPreference = 'Stop'
 
@@ -83,4 +84,4 @@ Get-PnpDevice -Class System | Where-Object { $_.HardwareID -contains 'Nefarius\V
 Get-Service ViGEmBus -ErrorAction SilentlyContinue | Format-List Name, Status
 Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 10 -ErrorAction SilentlyContinue |
     Where-Object { $_.Message -match 'ViGEm' } | Format-List TimeCreated, Id, Message
-Get-ChildItem "$env:WINDIR\System32\drivers\xusb22.sys" -ErrorAction SilentlyContinue | Format-Table Name, Length
+"xusb22.sys present: $(Test-Path "$env:WINDIR\System32\drivers\xusb22.sys")"

@@ -41,7 +41,7 @@ the encoder runs on textures the caller fills (`msw_texture_create` / `msw_textu
 
 `zig build test-win` runs [test.zig](test.zig). Tests for missing hardware print `skip`;
 `MOONSEC_REQUIRE=mf,input` (set in CI) turns the named skips into failures. The names are
-`dup`, `mf`, `nvenc`, `audio`, `input` and `vigem`.
+`dup`, `mf`, `nvenc`, `audio`, `input`, `vigem` (ViGEmBus installed) and `xinput` (a plugged pad reads back through XInput; needs a client edition of Windows).
 
 ## Not done yet
 
