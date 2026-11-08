@@ -1,4 +1,4 @@
-/* Encoder dispatch: one msw_enc API over the NVENC and Media Foundation backends. */
+/* Encoder dispatch: one msw_enc API over the NVENC, AMF, oneVPL and Media Foundation backends. */
 #include "enc_internal.h"
 
 #include <string.h>
@@ -8,6 +8,8 @@ msw_hr msw_enc_create(msw_d3d *d, msw_enc_kind kind, msw_enc **out) {
     switch (kind) {
     case MSW_ENC_NVENC: return msw_enc_nvenc_create(d, out);
     case MSW_ENC_MF_SOFTWARE: return msw_enc_mf_create(d, out);
+    case MSW_ENC_AMF: return msw_enc_amf_create(d, out);
+    case MSW_ENC_VPL: return msw_enc_vpl_create(d, out);
     default: return E_INVALIDARG;
     }
 }

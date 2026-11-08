@@ -50,7 +50,7 @@ void *msw_dup_last_texture(const msw_dup *dup);
 msw_hr msw_dup_pointer_shape(msw_dup *dup, void *buf, uint32_t len, uint32_t *needed, uint32_t *type,
                              uint32_t *width, uint32_t *height, uint32_t *pitch, int32_t *hot_x, int32_t *hot_y);
 
-/* ---- Video encoders (enc_mf.c, enc_nvenc.c) -------------------------------- */
+/* ---- Video encoders (enc_mf.c, enc_nvenc.c, enc_amf.c, enc_vpl.c) -------------------------------- */
 
 typedef enum msw_enc_kind {
     /* NVENC through nvEncodeAPI64.dll, loaded at run time; takes the BGRA texture. */
@@ -58,6 +58,12 @@ typedef enum msw_enc_kind {
     /* Media Foundation's software H.264 encoder (sync MFT); converts to NV12 on the CPU.
      * The CI path, and the last fallback on any machine. */
     MSW_ENC_MF_SOFTWARE = 2,
+    /* AMD AMF through amfrt64.dll, loaded at run time; takes the BGRA texture. */
+    MSW_ENC_AMF = 3,
+    /* Intel oneVPL (Quick Sync) through libvpl.dll (the dispatcher) or the GPU runtime
+     * libmfx64-gen.dll, loaded at run time; takes the BGRA texture. The device must be
+     * created with MSW_D3D_VIDEO. */
+    MSW_ENC_VPL = 4,
 } msw_enc_kind;
 
 enum { MSW_CODEC_H264 = 1, MSW_CODEC_HEVC = 2 };
@@ -98,8 +104,9 @@ typedef struct msw_enc_output {
 
 typedef struct msw_enc msw_enc;
 
-/* MSW_E_NOTFOUND when the backend is not on this machine (no NVIDIA driver, no Media
- * Foundation, no software H.264 MFT). */
+/* MSW_E_NOTFOUND when the backend is not on this machine (no NVIDIA, AMD or Intel
+ * driver, the device is on another vendor's adapter, no Media Foundation, no software
+ * H.264 MFT). */
 msw_hr msw_enc_create(msw_d3d *d, msw_enc_kind kind, msw_enc **out);
 void msw_enc_caps_get(const msw_enc *e, msw_enc_caps *out);
 msw_hr msw_enc_configure(msw_enc *e, const msw_enc_config *cfg);

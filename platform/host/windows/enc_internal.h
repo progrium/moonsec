@@ -1,4 +1,4 @@
-/* Shared by the encoder backends (enc.c, enc_mf.c, enc_nvenc.c). */
+/* Shared by the encoder backends (enc.c, enc_mf.c, enc_nvenc.c, enc_amf.c, enc_vpl.c). */
 #ifndef ENC_INTERNAL_H
 #define ENC_INTERNAL_H
 
@@ -25,6 +25,8 @@ struct msw_enc {
 
 HRESULT msw_enc_mf_create(msw_d3d *d, msw_enc **out);
 HRESULT msw_enc_nvenc_create(msw_d3d *d, msw_enc **out);
+HRESULT msw_enc_amf_create(msw_d3d *d, msw_enc **out);
+HRESULT msw_enc_vpl_create(msw_d3d *d, msw_enc **out);
 
 /* Appends to e->out. */
 HRESULT msw_enc_append(msw_enc *e, const void *data, size_t len);
