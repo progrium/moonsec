@@ -19,7 +19,7 @@ sudo ONEWAY_MS=125 tools/netlab/run.sh blackouts                   # 250 ms RTT
 sudo PEER_ARGS=--no-stall-pause tools/netlab/run.sh flaps          # without holding video on a stall
 ```
 
-Needs Linux, root, iproute2, iptables, openssl, and `iroh-relay` 1.4.1
+Needs Linux, root, iproute2, iptables, ethtool, openssl, and `iroh-relay` 1.4.1
 (`cargo install iroh-relay@1.4.1 --features server --locked`). `lab.sh up|down` brings the
 lab up and down on its own; the relay's TLS comes from a throwaway CA in `$LAB_DIR`
 (default `/tmp/moonsec-netlab`), which the peers trust with `--relay-ca`.

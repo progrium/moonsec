@@ -71,6 +71,11 @@ pub fn main(init: std.process.Init) !void {
     var buf: [65536]u8 = undefined;
     var fwd: u64 = 0;
     var errs: u64 = 0;
+    // Frames longer than an Ethernet frame: GSO/GRO super-packets, which the other side
+    // can't take. lab.sh turns the offloads off; this says if that didn't work.
+    var oversize: u64 = 0;
+    var max_len: usize = 0;
+    var first_err: linux.E = .SUCCESS;
     var last_report = monoNs();
     std.debug.print("delayline {s} <-> {s}, one-way {d} ms\n", .{ argv[1], argv[2], oneway_ms });
     while (true) {
@@ -79,13 +84,17 @@ pub fn main(init: std.process.Init) !void {
             while (q.front()) |f| {
                 if (f.due_ns > now) break;
                 const rc = linux.write(fds[1 - i], f.data.ptr, f.data.len);
-                if (linux.errno(rc) != .SUCCESS) errs += 1 else fwd += 1;
+                const e = linux.errno(rc);
+                if (e != .SUCCESS) {
+                    if (errs == 0) first_err = e;
+                    errs += 1;
+                } else fwd += 1;
                 gpa.free(f.data);
                 _ = q.popFront();
             }
         }
         if (now - last_report > 10 * std.time.ns_per_s) {
-            std.debug.print("delayline fwd={d} send_errs={d} queued={d}/{d}\n", .{ fwd, errs, queues[0].len, queues[1].len });
+            std.debug.print("delayline fwd={d} send_errs={d} (first {t}) oversize={d} max_len={d} queued={d}/{d}\n", .{ fwd, errs, first_err, oversize, max_len, queues[0].len, queues[1].len });
             last_report = now;
         }
         var next: ?u64 = null;
@@ -100,6 +109,8 @@ pub fn main(init: std.process.Init) !void {
             while (true) {
                 const rc = linux.read(fd, &buf, buf.len);
                 if (linux.errno(rc) != .SUCCESS) break;
+                if (rc > 1514) oversize += 1;
+                max_len = @max(max_len, rc);
                 const data = try gpa.dupe(u8, buf[0..rc]);
                 try queues[i].pushBack(gpa, .{ .due_ns = monoNs() + delay_ns, .data = data });
             }

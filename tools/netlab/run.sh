@@ -66,9 +66,21 @@ expect() { # expect <description> <condition...>
   if "$@"; then echo "  ok: $what"; else echo "  FAIL: $what"; FAILS=$((FAILS + 1)); fi
 }
 
+diag() { # where the packets went, when a peer fails
+  for n in x3h x3c; do
+    echo "  $n udp: $(ip netns exec $n awk '/^Udp:/ { if (h) { for (i = 2; i <= NF; i++) printf "%s=%s ", k[i], $i } else { for (i = 2; i <= NF; i++) k[i] = $i; h = 1 } }' /proc/net/snmp)"
+  done
+  for l in "x3c vc0" "x3cn vci" "x3cn vcn" "x3d dc" "x3d di" "x3hn vhi" "x3h vh0"; do set -- $l
+    echo "  $1 $2: $(ip -n $1 -s -o link show $2 | sed 's/.*RX: *//; s/\\ */ /g' | cut -c1-200)"
+  done
+  echo "  rmem_max $(sysctl -n net.core.rmem_max) wmem_max $(sysctl -n net.core.wmem_max) cpus $(nproc)"
+}
+
 summary() {
   echo "== $1: host $( [ $HOST_OK = 0 ] && echo pass || echo FAIL ), client $( [ $CLIENT_OK = 0 ] && echo pass || echo FAIL ), longest gap $(gap_ms) ms, host path changes $(num host 'path changes') reconnects $(num host 'reconnects') stalls $(num host 'stalls'), client reconnects $(num client 'reconnects')"
   grep "path log" "$OUT/host.log" "$OUT/client.log" | sed 's/^/  /'
+  tail -1 "$LAB_DIR/delayline.log" 2>/dev/null | sed 's/^/  /'
+  [ "$HOST_OK" = 0 -a "$CLIENT_OK" = 0 ] || diag
   expect "both peers pass" [ "$HOST_OK" = 0 -a "$CLIENT_OK" = 0 ]
 }
 

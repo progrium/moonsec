@@ -67,6 +67,7 @@ TOML
 
 case "${1:-}" in
 up)
+  command -v ethtool >/dev/null || { echo "lab.sh: needs ethtool (to turn the veth offloads off)" >&2; exit 1; }
   mkdir -p "$LAB_DIR"
   for n in $NS; do ip netns add $n; ip -n $n link set lo up; done
   veth x3h vh0 x3hn vhi
@@ -81,7 +82,11 @@ up)
   ip -n x3i addr add 10.80.9.1/32 dev lo
   for l in "x3h vh0" "x3hn vhi" "x3hn vhn" "x3i vih" "x3i vic" "x3cn vcn" "x3cn vci" "x3c vc0" "x3d dc" "x3d di"; do
     set -- $l; ip -n $1 link set $2 up
-    ip netns exec $1 ethtool -K $2 tso off gso off gro off tx off rx off >/dev/null 2>&1 || true
+    # One feature at a time: ethtool -K gives up on the rest when one can't change, and a
+    # GSO or GRO super-packet is more than the delay line can write to the other side.
+    for f in tso gso gro lro tx rx tx-udp-segmentation rx-udp-gro-forwarding rx-gro-list; do
+      ip netns exec $1 ethtool -K $2 $f off >/dev/null 2>&1 || true
+    done
   done
   ip -n x3d link set dc promisc on; ip -n x3d link set di promisc on
   ip -n x3h route add default via 172.16.5.1
