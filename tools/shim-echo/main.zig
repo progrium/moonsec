@@ -1,9 +1,12 @@
 //! S1 echo harness for the iroh shim.
 //!
 //!   shim-echo selftest [--relay] [-n COUNT]   two endpoints in one process, datagram echo
+//!   shim-echo selftest --relay-url URL [--relay-ca PEM_FILE] [-n COUNT]
+//!                                             same, both endpoints on one relay only (a smoke
+//!                                             test for a self-hosted relay, see relay/README.md)
 //!   shim-echo listen                          print a ticket, echo datagrams until killed
 //!   shim-echo dial TICKET [-n COUNT]          send COUNT datagrams to a listener, check echoes
-//!   shim-echo sink BIND_ADDR TICKET_FILE [--relay-url URL]
+//!   shim-echo sink BIND_ADDR TICKET_FILE [--relay-url URL] [--relay-ca PEM_FILE]
 //!                                             relays off (or only URL); write the ticket to TICKET_FILE, then
 //!                                             count datagrams and report counts every 20 ms
 //!                                             (peer for transport/iroh_netns_test.zig)
@@ -25,6 +28,7 @@ pub fn main(init: std.process.Init) !void {
     var ticket: ?[:0]const u8 = null;
     var extra: ?[:0]const u8 = null;
     var relay_url: ?[:0]const u8 = null;
+    var relay_ca: ?[:0]const u8 = null;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -34,6 +38,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--relay-url") and i + 1 < args.len) {
             i += 1;
             relay_url = args[i];
+        } else if (std.mem.eql(u8, a, "--relay-ca") and i + 1 < args.len) {
+            i += 1;
+            relay_ca = std.Io.Dir.cwd().readFileAllocOptions(init.io, args[i], arena, .limited(1 << 20), .of(u8), 0) catch |e| {
+                std.debug.print("cannot read --relay-ca {s}: {t}\n", .{ args[i], e });
+                return e;
+            };
         } else if (std.mem.eql(u8, a, "--relay")) {
             relay = true;
         } else if (ticket == null) {
@@ -47,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("iroh shim ABI v{x}\n", .{iroh.version()});
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "selftest")) {
-        try selftest(init.io, relay, count);
+        if (relay_url) |u| try selftestOwnRelay(init.io, u, relay_ca, count) else try selftest(init.io, relay, count);
     } else if (std.mem.eql(u8, cmd, "listen")) {
         try listen();
     } else if (std.mem.eql(u8, cmd, "dial")) {
@@ -58,18 +68,19 @@ pub fn main(init: std.process.Init) !void {
         defer conn.deinit(0);
         try pingLoop(init.io, conn, count);
     } else if (std.mem.eql(u8, cmd, "sink")) {
-        try sink(init.io, ticket orelse return usage(), extra orelse return usage(), relay_url);
+        try sink(init.io, ticket orelse return usage(), extra orelse return usage(), relay_url, relay_ca);
     } else return usage();
 }
 
 /// Report datagram the sink sends back: magic, then little-endian u64 counters.
 pub const sink_magic = "RPT1";
 
-fn sink(io: std.Io, bind_addr: [:0]const u8, ticket_file: []const u8, relay_url: ?[:0]const u8) !void {
+fn sink(io: std.Io, bind_addr: [:0]const u8, ticket_file: []const u8, relay_url: ?[:0]const u8, relay_ca: ?[:0]const u8) !void {
     const ep = try bindOrDie(.{
         .alpn = alpn,
         .relay_mode = if (relay_url != null) .custom_only else .disabled,
         .relay_urls = if (relay_url) |u| u.ptr else null,
+        .relay_ca_pem = if (relay_ca) |p| p.ptr else null,
         .bind_addr = bind_addr,
     });
     if (relay_url != null) ep.online(10_000) catch |e| return die("online", e);
@@ -115,7 +126,7 @@ fn onShimThread(_: ?*anyopaque) callconv(.c) void {
 }
 
 fn usage() error{Usage} {
-    std.debug.print("usage: shim-echo selftest [--relay] [-n COUNT] | listen | dial TICKET [-n COUNT] | sink BIND_ADDR TICKET_FILE [--relay-url URL]\n", .{});
+    std.debug.print("usage: shim-echo selftest [--relay | --relay-url URL [--relay-ca PEM_FILE]] [-n COUNT] | listen | dial TICKET [-n COUNT] | sink BIND_ADDR TICKET_FILE [--relay-url URL] [--relay-ca PEM_FILE]\n", .{});
     return error.Usage;
 }
 
@@ -185,6 +196,33 @@ fn selftest(io: std.Io, relay: bool, count: u32) !void {
     std.debug.print("connected to {s}\n", .{try conn.remoteId(&idbuf)});
 
     const result = pingLoop(io, conn, count);
+    conn.deinit(0);
+    thread.join();
+    return result;
+}
+
+/// Both endpoints use only `url` (no n0 relays or discovery) and must register with it, so this
+/// checks a relay's TLS, hostname and ports. On one machine the connection may then go direct.
+fn selftestOwnRelay(io: std.Io, url: [:0]const u8, ca: ?[:0]const u8, count: u32) !void {
+    const base: iroh.BindOptions = .{ .relay_mode = .custom_only, .relay_urls = url.ptr, .relay_ca_pem = if (ca) |p| p.ptr else null };
+    var server_opts = base;
+    server_opts.alpn = alpn;
+    const server = try bindOrDie(server_opts);
+    defer server.deinit();
+    server.online(15_000) catch |e| return die("server online", e);
+    var tbuf: [4096]u8 = undefined;
+    const t = try server.ticket(&tbuf);
+    std.debug.print("server online at {s}\n", .{url});
+
+    const thread = try std.Thread.spawn(.{}, echoServer, .{server});
+    const client = try bindOrDie(base);
+    defer client.deinit();
+    client.online(15_000) catch |e| return die("client online", e);
+    const conn = client.connect(t, alpn, 30_000) catch |e| return die("connect", e);
+    const result = pingLoop(io, conn, count);
+    var pbuf: [8]iroh.PathStats = undefined;
+    const paths = conn.pathStats(&pbuf) catch &.{};
+    for (paths) |p| std.debug.print("path {d} {s} relay={d} selected={d}\n", .{ p.path_id, iroh.pathRemoteAddr(&p), p.is_relay, p.is_selected });
     conn.deinit(0);
     thread.join();
     return result;

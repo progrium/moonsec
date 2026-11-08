@@ -1,0 +1,45 @@
+# iroh-relay 1.4.1 config for a public moonsec relay (the systemd unit and container read it
+# from /etc/iroh-relay/iroh-relay.toml). Replace relay.example.com and the contact address.
+# Clients use it as relay URL https://relay.example.com (see relay/README.md).
+#
+# Ports: 80/tcp (HTTP; captive-portal probe), 443/tcp (HTTPS + WebSocket relay; also Let's
+# Encrypt's TLS-ALPN-01 challenge), 7842/udp (QUIC address discovery, which tells each
+# endpoint its public address for hole punching).
+
+# IPv4 binds work on every host and container network. Where the host (or the container
+# network) has IPv6, use "[::]:80", "[::]:443" and "[::]:7842" instead: dual-stack, so
+# endpoints on IPv6 also get QUIC address discovery for their IPv6 addresses.
+http_bind_addr = "0.0.0.0:80"
+
+# Lets endpoints learn their NAT-mapped address over QUIC (iroh tries port 7842 on every relay).
+enable_quic_addr_discovery = true
+
+# Endpoint keys to cache for the relay handshake.
+key_cache_capacity = 4096
+
+# Prometheus metrics, on loopback only. Inside a container 127.0.0.1 is the container's own
+# loopback; publish the port explicitly if you scrape from outside.
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9090"
+
+[tls]
+cert_mode = "LetsEncrypt"
+hostname = "relay.example.com"
+contact = "admin@example.com"
+prod_tls = true
+https_bind_addr = "0.0.0.0:443"
+quic_bind_addr = "0.0.0.0:7842"
+# Let's Encrypt account and certificate cache (the unit's StateDirectory, the container's volume).
+cert_dir = "/var/lib/iroh-relay"
+
+# Per-client cap on what one endpoint may push through the relay, so one stream can't take the
+# uplink. Media over a relay is capped by the core well below this (design doc, relay mode).
+[limits.client.rx]
+bytes_per_second = 6250000 # 50 Mbit/s
+max_burst_bytes = 1048576
+
+# Who may use the relay. "everyone" is iroh's default; the shim does not send relay auth
+# tokens yet, so `access.shared_token` would lock moonsec clients out. An allowlist of endpoint
+# ids works for a private relay:
+# access.allowlist = ["<host endpoint id>", "<client endpoint id>"]
+access = "everyone"

@@ -79,9 +79,13 @@ zig build test-shim                         # echo selftest + loopback ABI tests
 zig build netns-test && sudo IROH_RELAY=$(which iroh-relay) zig-out/bin/iroh-netns-test
 ```
 
-The netns tests need root, iproute2 (tc with tbf), iptables, and `iroh-relay` for the path
-change test (`cargo install iroh-relay@1.4.1 --features server --locked`); without it that test
-skips. CI runs both on linux-x86_64.
+The netns tests need root, iproute2 (tc with tbf), iptables, openssl, curl, and `iroh-relay`
+for the relay tests (`cargo install iroh-relay@1.4.1 --features server --locked`); without it
+those tests skip. They run the relay with the packaged lab config ([relay/lab.toml](../relay/lab.toml):
+HTTPS with a lab CA, QUIC address discovery), and endpoints trust the CA through
+`relay_ca_pem`. With `MOONSEC_RELAY_URL` (and `MOONSEC_RELAY_CA`) they use a running relay
+instead, which is how CI runs them through the container and the systemd unit
+([relay/README.md](../relay/README.md)). The shim workflow runs them on linux-x86_64.
 
 ## Build modes
 

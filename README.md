@@ -18,6 +18,7 @@ Zig is pinned to **0.16.0** (`build.zig.zon` `minimum_zig_version`).
 /web           browser client glue (TypeScript)
 /spec          versioned wire protocol spec
 /sim           simulation harness and scenarios
+/relay         self-hosted iroh-relay: config, container, systemd unit
 /tools         latency probe, netem scripts, interop harness
 /docs          design doc
 /spikes        time-boxed spikes S1–S9
@@ -40,6 +41,8 @@ zig build moonsec -- run all   # host and client processes over iroh and the sim
 zig build echo            # builds the shim with cargo, links it, runs the loopback datagram echo
 zig build echo -- selftest --relay -n 50   # same, but through n0's public relays
 ```
+
+To run your own relay (container or systemd), see [relay/README.md](relay/README.md).
 
 See [shim/README.md](shim/README.md) for the shim ABI, build modes and the S1 results.
 
