@@ -1,0 +1,135 @@
+--- a/src/socket/remote_map/remote_state.rs	2026-11-08 01:30:51.932092428 +0000
++++ b/src/socket/remote_map/remote_state.rs	2026-11-08 01:30:51.946641946 +0000
+@@ -65,6 +65,30 @@
+ /// Even if we have some non-relay route that works.
+ const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
+ 
++// moonsec S5c patch: re-punch as soon as the last direct path is abandoned.
++//
++// Stock iroh only re-runs NAT traversal on candidate changes, on the 60 s upgrade check
++// or on a major network change, and rate-limits rounds to one per
++// HOLEPUNCH_ATTEMPTS_INTERVAL when candidates did not change. After an idle-timeout
++// close caused by a short outage, nothing changed, so the next round can be up to 60 s
++// away. With this patch, losing the last IP path starts a round immediately and retries
++// with exponential backoff, ignoring the 5 s rate limit, until an IP path is
++// established again or REPUNCH_WINDOW has passed.
++
++/// Delay before the first retry after the immediate round.
++const REPUNCH_FIRST_RETRY: Duration = Duration::from_millis(250);
++/// Upper bound on the delay between retries.
++const REPUNCH_MAX_RETRY: Duration = Duration::from_secs(2);
++/// How long after the close to keep retrying before falling back to stock behaviour.
++const REPUNCH_WINDOW: Duration = Duration::from_secs(15);
++
++/// State of a re-punch after the last direct path was abandoned.
++#[derive(Debug)]
++struct Repunch {
++    started: Instant,
++    next_retry: Duration,
++}
++
+ /// The time after which an idle [`RemoteStateActor`] stops.
+ ///
+ /// The actor only enters the idle state if no connections are active and no inbox senders exist
+@@ -146,6 +170,8 @@
+     paths: RemotePathState,
+     /// Information about the last holepunching attempt.
+     last_holepunch: Option<HolepunchAttempt>,
++    /// moonsec S5c patch: active re-punch after the last direct path was abandoned.
++    repunch: Option<Repunch>,
+ 
+     /// The path we currently consider the preferred path to the remote endpoint.
+     ///
+@@ -197,6 +223,7 @@
+                 addr_events: Default::default(),
+                 paths: RemotePathState::new(metrics),
+                 last_holepunch: None,
++                repunch: None,
+                 selected_path: Default::default(),
+                 scheduled_holepunch: None,
+                 scheduled_open_path: None,
+@@ -312,7 +339,11 @@
+                 _ = &mut scheduled_hp => {
+                     trace!("triggering scheduled holepunching");
+                     self.state.scheduled_holepunch = None;
+-                    self.trigger_holepunching();
++                    if self.state.repunch.is_some() {
++                        self.repunch_step();
++                    } else {
++                        self.trigger_holepunching();
++                    }
+                 }
+                 Some(item) = maybe_next(self.state.address_lookup_stream.as_mut()), if self.state.address_lookup_stream.is_some() => {
+                     self.state.handle_address_lookup_item(item);
+@@ -569,6 +600,35 @@
+         self.state.do_holepunching(conn);
+     }
+ 
++    /// moonsec S5c patch: one re-punch round, then schedule the next one with backoff.
++    fn repunch_step(&mut self) {
++        let Some(rp) = self.state.repunch.as_mut() else {
++            return;
++        };
++        let any_ip = self
++            .connections
++            .values()
++            .any(|c| c.paths.values().any(|p| p.is_ip()));
++        if any_ip || rp.started.elapsed() > REPUNCH_WINDOW {
++            debug!(any_ip, "moonsec repunch: done");
++            self.state.repunch = None;
++            self.trigger_holepunching();
++            return;
++        }
++        let delay = rp.next_retry;
++        rp.next_retry = (rp.next_retry * 2).min(REPUNCH_MAX_RETRY);
++        // Forget the last attempt so trigger_holepunching does not rate-limit this round.
++        self.state.last_holepunch = None;
++        self.trigger_holepunching();
++        let next = Instant::now() + delay;
++        // do_holepunching may already have scheduled a sooner retry (e.g. no CIDs yet).
++        self.state.scheduled_holepunch = Some(match self.state.scheduled_holepunch {
++            Some(t) if t < next => t,
++            _ => next,
++        });
++        debug!(?delay, "moonsec repunch: round started, next retry scheduled");
++    }
++
+     #[instrument(skip(self))]
+     fn handle_path_event(&mut self, conn_id: ConnId, event: Result<NoqPathEvent, noq::Lagged>) {
+         let Ok(event) = event else {
+@@ -593,8 +653,12 @@
+                     return;
+                 };
+ 
+-                self.state
++                let network_path = self
++                    .state
+                     .register_and_configure_path(conn_id, conn_state, &path);
++                if network_path.as_ref().is_some_and(|p| p.is_ip()) && self.state.repunch.take().is_some() {
++                    debug!("moonsec repunch: direct path established again");
++                }
+                 self.select_path();
+             }
+             NoqPathEvent::Abandoned { id, reason, .. } => {
+@@ -628,6 +692,21 @@
+ 
+                 // If the remote closed our selected path, select a new one.
+                 self.select_path();
++
++                // moonsec S5c patch: if that was the last IP path on every connection,
++                // re-punch now instead of waiting for the next scheduled check.
++                let any_ip_left = self
++                    .connections
++                    .values()
++                    .any(|c| c.paths.values().any(|p| p.is_ip()));
++                if network_path.is_ip() && !any_ip_left && self.state.repunch.is_none() {
++                    debug!("moonsec repunch: last direct path abandoned, re-punching");
++                    self.state.repunch = Some(Repunch {
++                        started: Instant::now(),
++                        next_retry: REPUNCH_FIRST_RETRY,
++                    });
++                    self.repunch_step();
++                }
+             }
+             NoqPathEvent::Discarded { id, path_stats, .. } => {
+                 trace!(%id, ?path_stats, "path discarded");

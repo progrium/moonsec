@@ -18,6 +18,39 @@ pub fn build(b: *std.Build) void {
     const shim_link = b.option(ShimLink, "shim-link", "Link the shim statically or as a shared library (default: static)") orelse .static;
     const shim_dir_opt = b.option([]const u8, "shim-dir", "Prebuilt shim directory for -Dshim=dir");
 
+    // Core: pure Zig, no shim, no libc. Other modules import it as "core".
+    const core_mod = b.addModule("core", .{
+        .root_source_file = b.path("core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const test_step = b.step("test", "Run the core unit tests (no Rust needed)");
+    const core_tests = b.addTest(.{ .root_module = core_mod });
+    test_step.dependOn(&b.addRunArtifact(core_tests).step);
+
+    // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
+    // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
+    const pipe_mod = b.addModule("pipe", .{ .root_source_file = b.path("transport/pipe.zig"), .target = target, .optimize = optimize });
+
+    // The core must build for the browser unchanged: compile it (and its tests) for wasm32.
+    const wasm_step = b.step("check-wasm", "Compile the core for wasm32-freestanding and its tests for wasm32-wasi");
+    const wasm_lib = b.addLibrary(.{
+        .name = "moonsec-core",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("core/wasm.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm_step.dependOn(&wasm_lib.step);
+    const wasm_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("core/root.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi }),
+        .optimize = optimize,
+    }) });
+    wasm_step.dependOn(&wasm_tests.step);
+
     const shim = resolveShim(b, target, shim_source, shim_link, shim_dir_opt);
 
     // C header -> Zig module (the shim's ABI as Zig sees it).
@@ -45,6 +78,26 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(echo);
+
+    // Reed-Solomon FEC (core/media/fec.zig): pure Zig, no shim needed.
+    const fec_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("core/media/fec.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.step("fec-test", "Run the Reed-Solomon FEC tests").dependOn(&b.addRunArtifact(fec_tests).step);
+    test_step.dependOn(&b.addRunArtifact(fec_tests).step);
+    wasm_step.dependOn(&b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("core/media/fec.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi }),
+        .optimize = optimize,
+    }) }).step);
+    const fec_bench = b.addExecutable(.{ .name = "fec-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("core/media/fec_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }) });
+    b.step("fec-bench", "Benchmark the Reed-Solomon FEC codec (ReleaseFast)").dependOn(&b.addRunArtifact(fec_bench).step);
     if (shim_link == .dynamic) {
         // Ship the shared shim next to the executable.
         const ext = sharedName(target.result);
@@ -57,7 +110,99 @@ pub fn build(b: *std.Build) void {
 
     const run_test = b.addRunArtifact(echo);
     run_test.addArg("selftest");
-    b.step("test", "Run the shim echo selftest").dependOn(&run_test.step);
+    b.step("test-shim", "Run the shim echo selftest (builds the shim)").dependOn(&run_test.step);
+
+    // Shim ABI tests over loopback (transport/iroh_test.zig); part of test-shim.
+    const iroh_tests = b.addTest(.{
+        .name = "iroh-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("transport/iroh_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "iroh", .module = iroh_mod }},
+        }),
+    });
+    const run_iroh_tests = b.addRunArtifact(iroh_tests);
+    b.top_level_steps.get("test-shim").?.step.dependOn(&run_iroh_tests.step);
+
+    // Linux netns tests (root): `zig build netns-test` installs zig-out/bin/iroh-netns-test,
+    // run it with sudo. It drives zig-out/bin/shim-echo as the peer in another namespace.
+    const netns_tests = b.addTest(.{
+        .name = "iroh-netns-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("transport/iroh_netns_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "iroh", .module = iroh_mod }},
+        }),
+    });
+    const netns_step = b.step("netns-test", "Install the Linux netns shim tests (run zig-out/bin/iroh-netns-test as root)");
+    netns_step.dependOn(&b.addInstallArtifact(netns_tests, .{}).step);
+    netns_step.dependOn(b.getInstallStep());
+
+    // Simulated network behind PacketPipe (transport/sim.zig) and its scenario harness (sim/).
+    // Pure Zig: none of these steps build the shim.
+    const simnet_mod = b.addModule("simnet", .{ .root_source_file = b.path("transport/sim.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "pipe", .module = pipe_mod }} });
+    const sim_imports: []const std.Build.Module.Import = &.{.{ .name = "simnet", .module = simnet_mod }};
+    const sim_exe = b.addExecutable(.{ .name = "sim", .root_module = b.createModule(.{ .root_source_file = b.path("sim/main.zig"), .target = target, .optimize = optimize, .imports = sim_imports }) });
+    const run_sim = b.addRunArtifact(sim_exe);
+    if (b.args) |a| run_sim.addArgs(a);
+    b.step("sim", "Run the simulated-network scenarios (options: see sim/main.zig)").dependOn(&run_sim.step);
+    const check_sim = b.addRunArtifact(sim_exe);
+    check_sim.addArg("--check");
+    check_sim.addFileArg(b.path("sim/golden.txt"));
+    b.step("sim-check", "Run every scenario and compare digests with sim/golden.txt").dependOn(&check_sim.step);
+    const test_sim = b.step("test-sim", "Unit tests for PacketPipe, the sim network and the scenarios");
+    test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = simnet_mod })).step);
+    test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = pipe_mod })).step);
+    test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("sim/test.zig"), .target = target, .optimize = optimize, .imports = sim_imports }) })).step);
+    test_step.dependOn(test_sim);
+
+    // Phase 1 gate (tools/gate): two processes exchange stream-tagged datagrams through
+    // the core, over iroh and over the simulated network. `gate-sim` is built without the
+    // shim so the sim half runs without Rust; `gate` (part of test-shim) runs both.
+    const simlink_mod = b.addModule("simlink", .{ .root_source_file = b.path("transport/simlink.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "pipe", .module = pipe_mod } } });
+    const iroh_pipe_mod = b.addModule("iroh_pipe", .{ .root_source_file = b.path("transport/iroh_pipe.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "iroh", .module = iroh_mod }, .{ .name = "pipe", .module = pipe_mod } } });
+    const gate_imports = [_]std.Build.Module.Import{
+        .{ .name = "core", .module = core_mod },
+        .{ .name = "pipe", .module = pipe_mod },
+        .{ .name = "simnet", .module = simnet_mod },
+        .{ .name = "simlink", .module = simlink_mod },
+    };
+    const gate_args: []const []const u8 = if (b.args) |a| a else &.{ "run", "all" };
+    for ([_]bool{ false, true }) |with_iroh| {
+        const opts = b.addOptions();
+        opts.addOption(bool, "iroh", with_iroh);
+        const m = b.createModule(.{ .root_source_file = b.path("tools/gate/main.zig"), .target = target, .optimize = optimize, .imports = &gate_imports });
+        m.addOptions("gate_options", opts);
+        if (with_iroh) {
+            m.addImport("iroh", iroh_mod);
+            m.addImport("iroh_pipe", iroh_pipe_mod);
+        }
+        if (target.result.os.tag == .windows) m.linkSystemLibrary("winmm", .{});
+        const exe = b.addExecutable(.{ .name = if (with_iroh) "gate" else "gate-sim", .root_module = m });
+        const run = b.addRunArtifact(exe);
+        if (with_iroh) {
+            run.addArgs(gate_args);
+            b.step("gate", "Run the Phase 1 gate over iroh and the sim (builds the shim; args: see tools/gate/main.zig)").dependOn(&run.step);
+            const run_all = b.addRunArtifact(exe);
+            run_all.addArgs(&.{ "run", "all" });
+            b.top_level_steps.get("test-shim").?.step.dependOn(&run_all.step);
+        } else {
+            run.addArgs(if (b.args) |a| a else &.{ "run", "sim" });
+            b.step("gate-sim", "Run the Phase 1 gate over the simulated network only (no Rust needed)").dependOn(&run.step);
+        }
+    }
+    const gate_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tools/gate/test.zig"), .target = target, .optimize = optimize, .imports = &gate_imports }) });
+    test_sim.dependOn(&b.addRunArtifact(gate_tests).step);
+    test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = simlink_mod })).step);
+
+    // core/rate driving the simulated network with S11's metrics (sim/rate.zig).
+    const sim_rate = b.addExecutable(.{ .name = "sim-rate", .root_module = b.createModule(.{ .root_source_file = b.path("sim/rate.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod } } }) });
+    b.installArtifact(sim_rate);
+    const run_sim_rate = b.addRunArtifact(sim_rate);
+    if (b.args) |a| run_sim_rate.addArgs(a);
+    b.step("sim-rate", "Run core/rate over the S11 scenarios and print S11's metrics").dependOn(&run_sim_rate.step);
 }
 
 const Shim = struct {
@@ -96,7 +241,14 @@ fn resolveShim(
             return .{ .lib_dir = root.path(b, "lib"), .include_dir = root.path(b, "include") };
         },
         .prebuilt => {
-            const dep_name = b.fmt("iroh_shim_{s}", .{artifactSuffix(target.result)});
+            const t = target.result;
+            // Releases ship MSVC archives for Windows; Zig's *-windows-gnu needs -Dshim=source.
+            if (t.os.tag == .windows and t.abi != .msvc)
+                @panic("-Dshim=prebuilt has Windows archives for *-windows-msvc only; use -Dtarget=<arch>-windows-msvc or -Dshim=source");
+            const dep_name = b.fmt("iroh_shim_{s}", .{artifactSuffix(t)});
+            if (!hasDependency(b, dep_name)) {
+                std.debug.panic("-Dshim=prebuilt: build.zig.zon has no '{s}'; pin a shim-v* release (see shim/README.md) or use -Dshim=source", .{dep_name});
+            }
             const dep = b.lazyDependency(dep_name, .{}) orelse {
                 // Lazy fetch pending: zig re-runs build() once it is downloaded.
                 return .{ .lib_dir = b.path("shim"), .include_dir = b.path("shim/include") };
@@ -104,6 +256,13 @@ fn resolveShim(
             return .{ .lib_dir = dep.path("lib"), .include_dir = dep.path("include") };
         },
     }
+}
+
+fn hasDependency(b: *std.Build, name: []const u8) bool {
+    for (b.available_deps) |d| {
+        if (std.mem.eql(u8, d[0], name)) return true;
+    }
+    return false;
 }
 
 fn linkShim(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget, shim: Shim, link: ShimLink) void {

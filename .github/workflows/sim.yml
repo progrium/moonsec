@@ -1,0 +1,41 @@
+name: sim
+
+# Simulated network: every scenario run at full length and checked against
+# sim/golden.txt. Matching digests on every OS and architecture show the runs are
+# deterministic by seed and platform-independent. (The unit tests run as part of
+# `zig build test` in core.yml.)
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  sim:
+    name: sim-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: zig fmt
+        if: runner.os == 'Linux'
+        run: zig fmt --check transport/pipe.zig transport/sim.zig transport/simlink.zig transport/iroh_pipe.zig tools/gate sim
+      - name: Scenarios against sim/golden.txt
+        run: zig build sim-check -Doptimize=ReleaseSafe
+      - name: core/rate against S11's numbers
+        run: zig build sim-rate -Doptimize=ReleaseSafe -- --check
+      - name: Phase 1 gate over the sim (two processes)
+        timeout-minutes: 5
+        run: zig build gate-sim -Doptimize=ReleaseSafe

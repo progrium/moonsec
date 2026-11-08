@@ -1,0 +1,26 @@
+# Same binary, linked against iroh 1.4.1 with the re-punch-on-close patch
+# (../iroh-repunch.patch). Run ../scripts/vendor.sh first to create ../vendor/iroh-1.4.1.
+[package]
+name = "s5c-idle-timeout-patched"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "s5c"
+path = "../src/main.rs"
+
+[dependencies]
+iroh = { version = "=1.4.1", features = ["test-utils"] }
+iroh-relay = { version = "=1.4.1", features = ["server", "test-utils"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tokio-stream = "0.1"
+bytes = "1"
+libc = "0.2"
+
+[patch.crates-io]
+iroh = { path = "../vendor/iroh-1.4.1" }
+
+[profile.release]
+debug = false
