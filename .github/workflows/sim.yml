@@ -34,3 +34,5 @@ jobs:
         run: zig fmt --check transport/pipe.zig transport/sim.zig sim
       - name: Scenarios against sim/golden.txt
         run: zig build sim-check -Doptimize=ReleaseSafe
+      - name: core/rate against S11's numbers
+        run: zig build sim-rate -Doptimize=ReleaseSafe -- --check
