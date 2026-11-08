@@ -90,7 +90,8 @@ export class WebClient {
       const ch = new MessageChannel();
       node.port.postMessage({ port: ch.port1 }, [ch.port1]);
       audioPort = ch.port2;
-      void ctx.resume();
+      // Firefox without an audio device never finishes resuming; closing then rejects this.
+      ctx.resume().catch(() => {});
       c.audioContext = ctx;
     }
     worker.onmessage = (ev: MessageEvent<FromWorker>) => {
