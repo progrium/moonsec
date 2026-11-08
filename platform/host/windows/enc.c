@@ -63,3 +63,18 @@ HRESULT msw_enc_append(msw_enc *e, const void *data, size_t len) {
     e->out_len += len;
     return S_OK;
 }
+
+int msw_annexb_has_idr(const uint8_t *p, size_t len, uint32_t codec) {
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (p[i] != 0 || p[i + 1] != 0 || p[i + 2] != 1) continue;
+        const uint8_t h = p[i + 3];
+        if (codec == MSW_CODEC_HEVC) {
+            const uint8_t t = (h >> 1) & 0x3f;
+            if (t == 19 || t == 20) return 1; /* IDR_W_RADL, IDR_N_LP */
+        } else if ((h & 0x1f) == 5) {
+            return 1;
+        }
+        i += 2;
+    }
+    return 0;
+}

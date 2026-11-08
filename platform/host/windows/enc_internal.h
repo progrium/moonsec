@@ -28,6 +28,9 @@ HRESULT msw_enc_nvenc_create(msw_d3d *d, msw_enc **out);
 HRESULT msw_enc_amf_create(msw_d3d *d, msw_enc **out);
 HRESULT msw_enc_vpl_create(msw_d3d *d, msw_enc **out);
 
+/* Whether an Annex B access unit holds an IDR slice (for encoders that do not say). */
+int msw_annexb_has_idr(const uint8_t *p, size_t len, uint32_t codec);
+
 /* Appends to e->out. */
 HRESULT msw_enc_append(msw_enc *e, const void *data, size_t len);
 

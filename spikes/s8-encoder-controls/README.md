@@ -1,6 +1,6 @@
 # S8 — Encoder capability matrix (VideoToolbox half)
 
-**Status: VideoToolbox done (2 of 3 pass); NVENC, AMF and oneVPL pending a Windows GPU host.**
+**Status: VideoToolbox done (2 of 3 pass); NVENC, AMF and oneVPL implemented in the Windows host backend (platform/host/windows) from their SDK docs, pending a run on each vendor's GPU.**
 Run on Jeff's M3 Max MacBook in `/tmp/moonsec-spikes/s8`; the harness, probe and raw logs here were copied
 from that run (`s8-results.tgz`).
 
@@ -32,9 +32,16 @@ Two encoder paths exist on Apple silicon:
 |---|---|---|---|---|
 | VideoToolbox H.264 (M3 Max) | **PASS** (both paths) | **FAIL** — no working knob | **PASS** (low-latency path) | tested |
 | VideoToolbox HEVC (M3 Max) | **PASS** (both paths) | **FAIL** — private key accepted but ignored | **PASS** (low-latency path; client must drop frames until refresh) | tested |
-| NVENC | vendor docs: yes (`nvEncReconfigureEncoder`, no IDR needed) | vendor docs: yes (`enableIntraRefresh`) | vendor docs: yes (LTR + `nvEncInvalidateRefFrames`) | **pending, untested** |
-| AMF | vendor docs: yes (dynamic bitrate property) | vendor docs: yes (intra-refresh MBs per slot) | vendor docs: yes (LTR slots, `MarkCurrentWithLTRIndex`/`ForceLTRReferenceBitfield`) | **pending, untested** |
-| oneVPL | vendor docs: yes (`MFXVideoENCODE_Reset` w/o IDR) | vendor docs: yes (`mfxExtCodingOption2.IntRefType`) | vendor docs: yes (`mfxExtAVCRefListCtrl` LongTermRefList) | **pending, untested** |
+| NVENC | vendor docs: yes (`nvEncReconfigureEncoder`, no IDR needed) | vendor docs: yes (`enableIntraRefresh`) | vendor docs: yes (LTR + `nvEncInvalidateRefFrames`) | **implemented (enc_nvenc.c), untested** |
+| AMF | SDK docs: yes (`TargetBitrate`/`PeakBitrate` are dynamic properties; no IDR) | SDK docs: yes (`IntraRefreshMBsNumberPerSlot`; not used) | SDK docs: yes (`MaxOfLTRFrames`, per-frame `MarkCurrentWithLTRIndex` / `ForceLTRReferenceBitfield`, output `MarkedLTRIndex`) | **implemented (enc_amf.c), untested** |
+| oneVPL | SDK docs: yes (`MFXVideoENCODE_Reset` with `StartNewSequence` off) | SDK docs: yes (`mfxExtCodingOption2.IntRefType`; not used) | SDK docs: yes (`mfxExtAVCRefListCtrl`: `LongTermRefList` + `ApplyLongTermIdx` to mark, `PreferredRefList`/`RejectedRefList` to refresh; H.264 and HEVC; support found by Query mode 1) | **implemented (enc_vpl.c), untested** |
+
+The Windows rows are what each SDK documents, as the backends use it; none has run on its
+GPU yet. To fill them in on hardware, run the Phase 5 recovery gate
+([tools/recovery](../../tools/recovery/README.md)), which checks per-frame bitrate
+changes (in the backend tests, `zig build test-win`) and LTR recovery without IDRs:
+`zig build recovery -Doptimize=ReleaseSafe -- --backend win-nvenc` (or `win-amf`,
+`win-vpl`; add `--codec hevc`).
 
 Gate ("at least NVENC and VideoToolbox pass"): VideoToolbox passes on bitrate + LTR, fails on intra-refresh.
 Since the design uses LTR/RFI for loss and intra-refresh only to avoid periodic keyframes, VideoToolbox is

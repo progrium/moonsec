@@ -218,26 +218,22 @@ static void vpl_params(vpl_enc *v, uint32_t codec, uint32_t w, uint32_t h, uint3
     p->NumExtParam = 2;
 }
 
-/* Query mode 1 for LongTermIdx support (mfxExtAVCRefListCtrl's note). */
+/* Query mode 1 (in = NULL: the runtime sets every field it can configure to non-zero)
+ * with mfxExtAVCRefListCtrl attached, as its documentation says to check LongTermIdx and
+ * ApplyLongTermIdx support. */
 static int vpl_ltr_query(vpl_enc *v, uint32_t codec) {
-    mfxExtAVCRefListCtrl in_rl, out_rl;
-    memset(&in_rl, 0, sizeof in_rl);
-    in_rl.Header.BufferId = MFX_EXTBUFF_AVC_REFLIST_CTRL;
-    in_rl.Header.BufferSz = sizeof in_rl;
-    in_rl.ApplyLongTermIdx = 1;
-    in_rl.LongTermRefList[0].LongTermIdx = 1;
-    out_rl = in_rl;
-    mfxVideoParam in, out;
-    memset(&in, 0, sizeof in);
-    in.mfx.CodecId = codec == MSW_CODEC_HEVC ? MFX_CODEC_HEVC : MFX_CODEC_AVC;
-    out = in;
-    mfxExtBuffer *ie[1] = {&in_rl.Header}, *oe[1] = {&out_rl.Header};
-    in.ExtParam = ie;
-    in.NumExtParam = 1;
+    mfxExtAVCRefListCtrl rl;
+    memset(&rl, 0, sizeof rl);
+    rl.Header.BufferId = MFX_EXTBUFF_AVC_REFLIST_CTRL;
+    rl.Header.BufferSz = sizeof rl;
+    mfxVideoParam out;
+    memset(&out, 0, sizeof out);
+    out.mfx.CodecId = codec == MSW_CODEC_HEVC ? MFX_CODEC_HEVC : MFX_CODEC_AVC;
+    mfxExtBuffer *oe[1] = {&rl.Header};
     out.ExtParam = oe;
     out.NumExtParam = 1;
-    mfxStatus s = v->fn.Query(v->session, &in, &out);
-    return s == MFX_ERR_NONE && out_rl.ApplyLongTermIdx != 0;
+    mfxStatus s = v->fn.Query(v->session, NULL, &out);
+    return s == MFX_ERR_NONE && rl.ApplyLongTermIdx != 0;
 }
 
 /* Whether `codec` initializes at a small size with these settings. */

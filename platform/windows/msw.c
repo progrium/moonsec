@@ -276,3 +276,8 @@ msw_hr msw_texture_noise(msw_d3d *d, void *texture, uint32_t seed) {
     free(px);
     return S_OK;
 }
+
+msw_hr msw_texture_write(msw_d3d *d, void *texture, const uint8_t *src, uint32_t stride) {
+    ID3D11DeviceContext_UpdateSubresource(d->context, (ID3D11Resource *)texture, 0, NULL, src, stride, 0);
+    return S_OK;
+}

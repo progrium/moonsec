@@ -335,6 +335,16 @@ pub fn build(b: *std.Build) void {
     }
     // Windows client backend tests join both steps (platform/client/build.zig).
     @import("platform/client/build.zig").addWindowsTests(b, target, optimize, check_win, test_win);
+
+    // Phase 5 recovery gate (tools/recovery/build.zig): recovery, test-recovery; check-win
+    // also cross-compiles it.
+    @import("tools/recovery/build.zig").add(b, target, optimize, .{
+        .core = core_mod,
+        .platform = platform_mod,
+        .synthetic = synthetic_mod,
+        .check_win = check_win,
+        .test_step = test_step,
+    });
 }
 
 /// Compiler flags for every C file under platform/ on Windows.

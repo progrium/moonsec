@@ -104,6 +104,8 @@ msw_hr msw_texture_fill(msw_d3d *d, void *texture, uint32_t x, uint32_t y, uint3
 /* Fills a BGRA texture with deterministic noise from `seed` (opaque), in one upload:
  * content no encoder can compress below its bitrate, for rate-control tests. */
 msw_hr msw_texture_noise(msw_d3d *d, void *texture, uint32_t seed);
+/* Uploads a whole BGRA image (rows of `stride` bytes) into subresource 0. */
+msw_hr msw_texture_write(msw_d3d *d, void *texture, const uint8_t *src, uint32_t stride);
 /* Copies subresource `index` of a BGRA texture to `dst` (rows of `stride` bytes). */
 msw_hr msw_texture_read(msw_d3d *d, void *texture, uint32_t index, uint8_t *dst, uint32_t stride);
 

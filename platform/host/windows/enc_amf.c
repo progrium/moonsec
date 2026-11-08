@@ -304,7 +304,10 @@ static HRESULT amf_drain_one(amf_enc *a, const amf_names *n, msw_enc_output *out
         buf->pVtbl->Release(buf);
     }
     amf_int64 v = 0;
-    if (get_i64(data, n->out_type, &v)) out->keyframe = v == n->v_out_idr;
+    if (get_i64(data, n->out_type, &v))
+        out->keyframe = v == n->v_out_idr;
+    else
+        out->keyframe = (uint32_t)msw_annexb_has_idr(a->base.out, a->base.out_len, a->hevc_active ? MSW_CODEC_HEVC : MSW_CODEC_H264);
     amf_int64 m = -1;
     if (get_i64(data, n->out_marked, &m)) *marked = (int)m;
     data->pVtbl->Release(data);
