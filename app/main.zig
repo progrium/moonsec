@@ -80,6 +80,8 @@ const Args = struct {
     repunch_ms: ?i64 = null,
     relay_delay_ms: ?i64 = null,
     no_stall_pause: bool = false,
+    /// peer iroh: sync the system clipboard instead of the scripted in-memory one.
+    system_clipboard: bool = false,
     path_idle_ms: u32 = 0,
     relay_url: ?[:0]const u8 = null,
     relay_ca: ?[:0]const u8 = null,
@@ -123,6 +125,7 @@ fn usage() error{Usage} {
         \\       --loss-policy (sim, soak: NACK/FEC/relay chosen per path)
         \\sim:   --flaps T:D,.. --drops T:D,.. --idle-ms N --repunch-ms N --relay-delay-ms N --no-stall-pause
         \\iroh:  --relay-url URL --relay-ca PEM --bind IP:PORT --path-idle-ms N --conn-idle-ms N --min-presented PCT
+        \\       --clipboard (sync the system clipboard over the control channel; default: a scripted check)
         \\
     , .{});
     return error.Usage;
@@ -145,6 +148,10 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         }
         if (std.mem.eql(u8, s, "--loss-policy")) {
             a.loss_policy = true;
+            continue;
+        }
+        if (std.mem.eql(u8, s, "--clipboard")) {
+            a.system_clipboard = true;
             continue;
         }
         if (std.mem.eql(u8, s, "--no-stall-pause")) {
@@ -543,7 +550,17 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
         .copy_after_us = if (role == .host) 1_000_000 else 2_000_000,
     };
     defer clip.mem.deinit();
-    const clip_opt: ?clipboard.Clipboard = if (ctl_stream != null) clip.clip() else null;
+    var sys: ?clipboard.System = null;
+    if (a.system_clipboard and ctl_stream != null) {
+        sys = clipboard.System.open() orelse {
+            std.debug.print("{s}: no system clipboard here (Linux: build with -Dlinux-clipboard, and run under Wayland or X11)\n", .{@tagName(role)});
+            return false;
+        };
+        std.debug.print("{s}: syncing the system clipboard ({s}); copy on either machine and paste on the other\n", .{ @tagName(role), sys.?.name() });
+    }
+    defer if (sys) |*sy| sy.close();
+    const scripted = ctl_stream != null and sys == null;
+    const clip_opt: ?clipboard.Clipboard = if (sys) |*sy| sy.clipboard() else if (scripted) clip.clip() else null;
     const seconds = a.seconds orelse 10;
     var buf: [16384]u8 = undefined;
     var w = Io.Writer.fixed(&buf);
@@ -565,7 +582,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             ok = app.s.end == .client_bye and (sh.injector.wrong == 0 or lost_input > 0) and sh.injector.keys > 0 and app.s.stats.frames > 0;
             if (ctl_stream != null) {
                 const cs = app.s.control.stats;
-                const clip_ok = clip.got(client_copy);
+                const clip_ok = !scripted or clip.got(client_copy);
                 try w.print("  control: {d} channels, {d} up, {d} resets, {d} errors; clipboard {s} (sent {d}, applied {d}, echoes {d})\n", .{ cs.channels, cs.ups, cs.resets, cs.errors, if (clip_ok) "ok" else "MISSING the client's copy", app.s.control.clip.stats.sent, app.s.control.clip.stats.applied, app.s.control.clip.stats.echoes });
                 ok = ok and clip_ok;
             }
@@ -598,7 +615,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             if (ctl_stream != null) {
                 const cs = app.s.control.stats;
                 // The host's copy arrived before ours replaced it.
-                const clip_ok = clip.mem.writes >= 1 and app.s.control.clip.stats.applied >= 1 and std.mem.eql(u8, clip.mem.get() orelse "", client_copy);
+                const clip_ok = !scripted or (clip.mem.writes >= 1 and app.s.control.clip.stats.applied >= 1 and std.mem.eql(u8, clip.mem.get() orelse "", client_copy));
                 try w.print("  control: {d} channels, {d} up, {d} resets, {d} errors; clipboard {s} (sent {d}, applied {d}, echoes {d})\n", .{ cs.channels, cs.ups, cs.resets, cs.errors, if (clip_ok) "ok" else "MISSING the host's copy", app.s.control.clip.stats.sent, app.s.control.clip.stats.applied, app.s.control.clip.stats.echoes });
                 ok = ok and clip_ok;
             }

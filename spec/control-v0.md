@@ -147,6 +147,9 @@ for images and HTML.
 | 9 | 3 | reserved | 0. |
 | 12 | | `data` | The content, to the end of the frame. Empty = the clipboard holds nothing syncable. |
 
+Text uses **LF** line breaks on the wire; platforms that use CRLF (Windows) convert on read
+and write.
+
 Sent with `version` 0 and `required` clear. A receiver drops (and counts) a `clip_set`
 whose `format` it does not know, whose text is not valid UTF-8, whose `data` is longer
 than its own text cap, or whose `clock` is 0.
@@ -172,9 +175,13 @@ goes to what they copied there).
 When both sides copy at about the same time, each receives the other's `clip_set`; both
 apply the same comparison to the same two stamps, so both end up holding the same content.
 
-On a reconnect both sides keep `L` and the current stamp, and the client re-sends its
-current content (with its existing stamp) once the new channel is up, so a copy made
-while the connection was down is not lost; the host applies it only if it is newer.
+On a reconnect both sides keep `L` and the current stamp. When a new channel comes up,
+each side re-sends its current content with its existing stamp if it copied it itself
+(origin = own role) since the app started, so a copy made while the connection was down
+is not lost; the peer applies it only if it is newer than what it holds.
+
+The content a side's clipboard holds when the app starts is not a copy: it is remembered
+(stamp clock 0), never sent, so connecting does not overwrite the peer's clipboard.
 
 ### Echo suppression
 

@@ -7,8 +7,11 @@
 //!
 //! Backends: `Memory` (tests, sim, headless hosts), Win32 (`win32.zig`), NSPasteboard
 //! (`macos.zig` + `pasteboard.m`), Wayland data-control with an X11 fallback (`linux.zig`).
-//! `system()` picks the one for the build target.
+//! `System` picks the one for the build target.
 const std = @import("std");
+
+pub const System = @import("system.zig").System;
+pub const system_available = @import("system.zig").available;
 
 pub const Error = error{
     /// The clipboard is busy (another process holds it) or the call failed; try later.
@@ -104,4 +107,8 @@ test "memory clipboard" {
     const t = (try c.readText(gpa)).?;
     defer gpa.free(t);
     try std.testing.expectEqualStrings("hi", t);
+}
+
+test {
+    _ = @import("text.zig");
 }
