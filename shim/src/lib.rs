@@ -606,6 +606,7 @@ struct Shared {
     /// A selected path whose controller could not be found yet: the monitor retries, so the
     /// target never stays on the old path's controller.
     pending_select: Mutex<Option<PathId>>,
+    selected_id: Mutex<Option<PathId>>,
     events: Mutex<VecDeque<IrohEvent>>,
     events_dropped: AtomicU64,
     closed: AtomicBool,
@@ -666,6 +667,7 @@ impl Shared {
     /// reports) that controller yet, the move is retried by `retry_select`.
     fn select(&self, conn: &Connection, id: PathId) {
         self.selected_path.store(path_u32(id), Relaxed);
+        *self.selected_id.lock().unwrap() = Some(id);
         let mut pending = self.pending_select.lock().unwrap();
         match self.counters(conn, id) {
             Some(c) => {
@@ -682,6 +684,24 @@ impl Shared {
             && path_u32(id) == self.selected_path.load(Relaxed)
         {
             self.select(conn, id);
+        }
+    }
+
+    /// Keeps the target on the selected path's live controller. noq can replace a path's
+    /// controller (a new one from the factory, with a new index) without a path event, which
+    /// would leave the target on the old one and the path paced at `IDLE_PATH_BPS`.
+    fn check_selected(&self, conn: &Connection) {
+        let Some(id) = *self.selected_id.lock().unwrap() else { return };
+        if self.pending_select.lock().unwrap().is_some() {
+            return;
+        }
+        let key = path_u32(id);
+        let Some(ctl) = conn.congestion_state(id).and_then(|c| c.into_any().downcast::<AppRate>().ok()) else { return };
+        let index = ctl.counters.ctl_index;
+        if self.knob.selected.load(Relaxed) != index {
+            self.paths.lock().unwrap().insert(key, ctl.counters.clone());
+            self.knob.selected.store(index, Relaxed);
+            eprintln!("iroh-shim: path {key} has a new congestion controller ({index}); the target moved to it");
         }
     }
 
@@ -741,6 +761,7 @@ fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Ar
         selected_path: AtomicU32::new(IROH_PATH_NONE),
         selections: AtomicU32::new(0),
         pending_select: Mutex::new(None),
+        selected_id: Mutex::new(None),
         events: Mutex::new(VecDeque::new()),
         events_dropped: AtomicU64::new(0),
         closed: AtomicBool::new(false),
@@ -846,6 +867,7 @@ fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Ar
                             return;
                         }
                         sh.retry_select(&conn);
+                        sh.check_selected(&conn);
                         let sel = sh.knob.selected.load(Relaxed);
                         let ctl = {
                             let built = sh.factory.built.lock().unwrap();
