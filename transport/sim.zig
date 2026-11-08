@@ -20,7 +20,7 @@
 //! source of randomness (loss, jitter, Wi-Fi, cross traffic, fades) has its own
 //! stream per direction, so changing one knob does not reshuffle the others.
 const std = @import("std");
-pub const pipe = @import("pipe.zig");
+pub const pipe = @import("pipe");
 
 pub const US: i64 = 1;
 pub const MS: i64 = 1000;

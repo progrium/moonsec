@@ -161,7 +161,7 @@ jobs:
           zig build -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -p out-static
           out-static/bin/shim-echo selftest -n 500
 
-      - name: Shim ABI tests (loopback)
+      - name: Shim ABI tests and Phase 1 gate (loopback; gate over iroh and the sim)
         shell: bash
         run: zig build test-shim -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe --summary all
 

@@ -31,8 +31,11 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - name: zig fmt
         if: runner.os == 'Linux'
-        run: zig fmt --check transport/pipe.zig transport/sim.zig sim
+        run: zig fmt --check transport/pipe.zig transport/sim.zig transport/simlink.zig transport/iroh_pipe.zig tools/gate sim
       - name: Scenarios against sim/golden.txt
         run: zig build sim-check -Doptimize=ReleaseSafe
       - name: core/rate against S11's numbers
         run: zig build sim-rate -Doptimize=ReleaseSafe -- --check
+      - name: Phase 1 gate over the sim (two processes)
+        timeout-minutes: 5
+        run: zig build gate-sim -Doptimize=ReleaseSafe
