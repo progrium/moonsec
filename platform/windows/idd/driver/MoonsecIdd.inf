@@ -37,16 +37,21 @@ MoonsecIdd.dll
 
 [MoonsecIdd_Install.NT]
 CopyFiles=UMDriverCopy
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
 
 [MoonsecIdd_Install.NT.hw]
 AddReg=MoonsecIdd_HardwareDeviceSettings
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
 
 [MoonsecIdd_HardwareDeviceSettings]
 HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
 HKR,"WUDF","DeviceGroupId",%REG_SZ%,"MoonsecIddGroup"
 
 [MoonsecIdd_Install.NT.Services]
-AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
 
 [MoonsecIdd_Install.NT.Wdf]
 UmdfService=MoonsecIdd,MoonsecIdd_Install
@@ -59,17 +64,9 @@ UmdfLibraryVersion=$UMDFVERSION$
 ServiceBinary=%13%\MoonsecIdd.dll
 UmdfExtensions=IddCx0102
 
-[WUDFRD_ServiceInstall]
-DisplayName=%WudfRdDisplayName%
-ServiceType=1
-StartType=3
-ErrorControl=1
-ServiceBinary=%12%\WUDFRd.sys
-
 [Strings]
 ManufacturerName="moonsec"
 DiskName="moonsec virtual display driver"
-WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
 DeviceName="moonsec virtual display"
 
 REG_MULTI_SZ=0x00010000
