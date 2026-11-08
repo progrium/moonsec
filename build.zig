@@ -82,6 +82,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     b.step("fec-test", "Run the Reed-Solomon FEC tests").dependOn(&b.addRunArtifact(fec_tests).step);
+    test_step.dependOn(&b.addRunArtifact(fec_tests).step);
+    wasm_step.dependOn(&b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("core/media/fec.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi }),
+        .optimize = optimize,
+    }) }).step);
     const fec_bench = b.addExecutable(.{ .name = "fec-bench", .root_module = b.createModule(.{
         .root_source_file = b.path("core/media/fec_bench.zig"),
         .target = target,
