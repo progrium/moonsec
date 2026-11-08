@@ -5,11 +5,9 @@ name: shim
 # sizes. Tags `shim-v*` publish a release; shim/pin-release.sh then pins it in
 # build.zig.zon, and the `prebuilt` job builds from those pinned archives without Rust.
 
+# Automatic triggers are off (turned off on request); run it from the Actions tab.
+# To publish a shim release, run it on the shim-v* tag.
 on:
-  # Every branch push runs the matrix (also covers PR branches in this repo).
-  push:
-    branches: ["**"]
-    tags: ["shim-v*"]
   workflow_dispatch:
 
 permissions:
@@ -179,6 +177,16 @@ jobs:
           command -v iroh-relay || (cd shim && cargo install iroh-relay@1.4.1 --features server --locked)
           zig build netns-test -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
           sudo SHIM_ECHO=zig-out/bin/shim-echo IROH_RELAY="$(command -v iroh-relay)" zig-out/bin/iroh-netns-test
+
+      # The S5c lab (two NATs, lab relay, delay line): blackouts, a path switch, flaps and a
+      # dropped connection under the moonsec host and client (tools/netlab/run.sh).
+      - name: Netns lab (path changes and reconnect)
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        run: |
+          command -v ethtool && command -v strace || (sudo apt-get update -q && sudo apt-get install -yq ethtool strace)
+          zig build install-moonsec delayline -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+          sudo IROH_RELAY="$(command -v iroh-relay)" tools/netlab/run.sh all
 
       - name: Link into Zig (dynamic) and run echo
         shell: bash

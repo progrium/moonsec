@@ -3,6 +3,10 @@
 //! must be bit-exact; with NACK on, every frame must arrive under the loss we expect
 //! NACK to cover.
 //!
+//! With `policy` on, the host runs `media.Policy` (fed the forward channel's packet and
+//! drop counts, standing in for transport feedback), sends the parity it asks for and
+//! answers NACKs only when it says so.
+//!
 //! The channel is a small seeded model kept here so core/media does not depend on the
 //! sim harness (item D); scenarios can move onto transport/sim.zig once it lands.
 const std = @import("std");
@@ -31,6 +35,9 @@ const Scenario = struct {
     backward: Link,
     nack: bool = true,
     frame_timeout_us: u64 = 100_000,
+    /// Host runs the loss policy (NACK vs FEC, parity from loss).
+    policy: bool = false,
+    relayed: bool = false,
 };
 
 const Result = struct {
@@ -39,6 +46,11 @@ const Result = struct {
     packets: u64 = 0,
     retransmits: u64 = 0,
     nack_msgs: u64 = 0,
+    parity: u64 = 0,
+    fec_groups: u64 = 0,
+    mode: media.policy.Mode = .nack,
+    /// Longest run of consecutive lost frames.
+    worst_gap: u32 = 0,
 };
 
 const InFlight = struct { arrive_us: u64, order: u64, data: []u8 };
@@ -50,6 +62,8 @@ const Channel = struct {
     bad: bool = false,
     q: std.ArrayList(InFlight) = .empty,
     order: u64 = 0,
+    sent: u64 = 0,
+    drops: u64 = 0,
 
     fn deinit(c: *Channel) void {
         for (c.q.items) |p| c.gpa.free(p.data);
@@ -70,7 +84,11 @@ const Channel = struct {
     }
 
     fn send(c: *Channel, data: []const u8, now_us: u64, lossless: bool) !void {
-        if (c.dropped() and !lossless) return;
+        c.sent += 1;
+        if (c.dropped() and !lossless) {
+            c.drops += 1;
+            return;
+        }
         const jitter = if (c.link.jitter_us > 0) c.rnd.uintAtMost(u64, c.link.jitter_us) else 0;
         try c.q.append(c.gpa, .{ .arrive_us = now_us + c.link.one_way_us + jitter, .order = c.order, .data = try c.gpa.dupe(u8, data) });
         c.order += 1;
@@ -96,7 +114,12 @@ fn run(gpa: std.mem.Allocator, sc: Scenario) !Result {
     var back: Channel = .{ .gpa = gpa, .link = sc.backward, .rnd = rnd };
     defer back.deinit();
 
-    var pz: media.Packetizer = .{};
+    var pbuf: media.ParityBuffer = .{};
+    var pz: media.Packetizer = .{ .parity_buf = &pbuf };
+    var pol = media.Policy.init(.{});
+    var answer_nacks = true;
+    var counted: struct { sent: u64 = 0, drops: u64 = 0 } = .{};
+    var run_lost: u32 = 0;
     var hist = try media.History.init(gpa, .{});
     defer hist.deinit(gpa);
     var rx = try media.Receiver.init(gpa, .{
@@ -130,8 +153,18 @@ fn run(gpa: std.mem.Allocator, sc: Scenario) !Result {
     var now: u64 = 0;
     while (now <= end_us) : (now += step_us) {
         const lossless = now < warmup_us;
+        if (sc.policy) {
+            pol.onCounts(now, fwd.sent - counted.sent, fwd.drops - counted.drops);
+            counted = .{ .sent = fwd.sent, .drops = fwd.drops };
+        }
         // Host: encode a frame on schedule, in 1-4 slices, and send it.
         if (next_frame < sc.frames and now >= @as(u64, next_frame) * interval_us) {
+            if (sc.policy) {
+                const d = pol.update(now, .{ .rtt_us = rtt_us, .frame_interval_us = interval_us, .relayed = sc.relayed });
+                pz.parity = pol.parity;
+                answer_nacks = d.nack;
+                res.mode = d.mode;
+            }
             const size = rnd.intRangeAtMost(usize, 1, sc.max_frame);
             const data = try gpa.alloc(u8, size);
             rnd.bytes(data);
@@ -154,6 +187,7 @@ fn run(gpa: std.mem.Allocator, sc: Scenario) !Result {
                     try fwd.send(try proto.encodeVideoShard(&pkt, host_seq, shard.header, shard.payload), now, lossless);
                     host_seq +%= 1;
                     res.packets += 1;
+                    if (shard.header.shard >= shard.header.data_shards) res.parity += 1;
                 }
             }
             next_frame += 1;
@@ -162,7 +196,7 @@ fn run(gpa: std.mem.Allocator, sc: Scenario) !Result {
         while (back.recv(now)) |m| {
             defer gpa.free(m);
             var it = (try media.nack.parse(try proto.decode(m))).?;
-            while (it.next()) |seq| if (hist.resend(seq, now)) |shard| {
+            if (answer_nacks) while (it.next()) |seq| if (hist.resend(seq, now)) |shard| {
                 try fwd.send(try proto.encodeVideoShard(&pkt, host_seq, shard.header, shard.payload), now, lossless);
                 host_seq +%= 1;
                 res.retransmits += 1;
@@ -186,10 +220,13 @@ fn run(gpa: std.mem.Allocator, sc: Scenario) !Result {
                 gpa.free(want);
                 sent[f.id] = null;
                 res.delivered += 1;
+                run_lost = 0;
             },
             .lost => |l| {
                 try std.testing.expectEqual(res.delivered + res.lost, l.id);
                 res.lost += 1;
+                run_lost += 1;
+                res.worst_gap = @max(res.worst_gap, run_lost);
             },
         };
         if (try rx.nacks(now, rtt_us, client_seq, &msg)) |m| {
@@ -200,6 +237,7 @@ fn run(gpa: std.mem.Allocator, sc: Scenario) !Result {
     }
     // Every frame is accounted for, in order.
     try std.testing.expectEqual(sc.frames, res.delivered + res.lost);
+    res.fec_groups = rx.reasm.stats.fec_groups;
     return res;
 }
 
@@ -208,8 +246,8 @@ const verbose = false;
 
 fn report(name: []const u8, sc: Scenario, r: Result) void {
     if (!verbose) return;
-    std.debug.print("{s} seed={d}: {d}/{d} frames delivered, {d} lost, {d} packets, {d} retransmits, {d} NACK msgs\n", .{
-        name, sc.seed, r.delivered, sc.frames, r.lost, r.packets, r.retransmits, r.nack_msgs,
+    std.debug.print("{s} seed={d}: {d}/{d} frames delivered, {d} lost (worst run {d}), {d} packets ({d} parity), {d} FEC groups, {d} retransmits, {d} NACK msgs, mode {s}\n", .{
+        name, sc.seed, r.delivered, sc.frames, r.lost, r.worst_gap, r.packets, r.parity, r.fec_groups, r.retransmits, r.nack_msgs, @tagName(r.mode),
     });
 }
 
@@ -280,6 +318,98 @@ test "long RTT beyond the frame timeout loses frames but never corrupts them" {
     const r = try run(std.testing.allocator, sc);
     report("longrtt", sc, r);
     try std.testing.expect(r.lost > 0);
+}
+
+test "policy, short RTT: NACK mode, no parity, every frame" {
+    for (1..3) |seed| {
+        const sc: Scenario = .{
+            .seed = seed,
+            .forward = .{ .one_way_us = 1_000, .jitter_us = 500, .loss = .{ .uniform = 0.05 } },
+            .backward = .{ .one_way_us = 1_000, .loss = .{ .uniform = 0.05 } },
+            .policy = true,
+        };
+        const r = try run(std.testing.allocator, sc);
+        report("policy-lan", sc, r);
+        try std.testing.expectEqual(media.policy.Mode.nack, r.mode);
+        try std.testing.expectEqual(@as(u64, 0), r.parity);
+        try std.testing.expectEqual(sc.frames, r.delivered);
+    }
+}
+
+test "policy, 120 ms RTT and 5% loss: FEC alone keeps frames coming" {
+    // NACK cannot help here: a retransmit lands after the 100 ms frame timeout, and the
+    // policy stops answering NACKs past 80 ms RTT. FEC is all there is.
+    for (1..4) |seed| {
+        const sc: Scenario = .{
+            .seed = seed,
+            .frames = 900,
+            .forward = .{ .one_way_us = 60_000, .jitter_us = 3_000, .loss = .{ .uniform = 0.05 } },
+            .backward = .{ .one_way_us = 60_000 },
+            .policy = true,
+        };
+        const r = try run(std.testing.allocator, sc);
+        report("policy-wan5", sc, r);
+        try std.testing.expectEqual(media.policy.Mode.fec, r.mode);
+        try std.testing.expectEqual(@as(u64, 0), r.retransmits);
+        try std.testing.expect(r.fec_groups > 0);
+        // Parity is at most 30% of data (plus the one-shard minimum on small groups).
+        try std.testing.expect(r.parity * 100 <= (r.packets - r.parity) * 35);
+        // ~99% in practice: what is left is groups that lost more than their parity.
+        try std.testing.expect(r.delivered * 100 >= sc.frames * 98);
+        // No freeze over 500 ms (30 frames at 60 fps).
+        try std.testing.expect(r.worst_gap < 30);
+    }
+}
+
+test "policy, 40 ms RTT and 10% loss: FEC plus NACK backup" {
+    for (1..4) |seed| {
+        const sc: Scenario = .{
+            .seed = seed,
+            .forward = .{ .one_way_us = 20_000, .jitter_us = 2_000, .loss = .{ .uniform = 0.10 } },
+            .backward = .{ .one_way_us = 20_000, .loss = .{ .uniform = 0.05 } },
+            .policy = true,
+        };
+        const r = try run(std.testing.allocator, sc);
+        report("policy-wan10", sc, r);
+        try std.testing.expectEqual(media.policy.Mode.fec, r.mode);
+        try std.testing.expect(r.fec_groups > 0);
+        try std.testing.expect(r.delivered * 1000 >= sc.frames * 995);
+        try std.testing.expect(r.worst_gap <= 2);
+    }
+}
+
+test "policy, relayed: no parity, and the TCP relay loses nothing" {
+    const sc: Scenario = .{
+        .seed = 1,
+        .frames = 240,
+        // TCP underneath: in order, no loss.
+        .forward = .{ .one_way_us = 40_000 },
+        .backward = .{ .one_way_us = 40_000 },
+        .policy = true,
+        .relayed = true,
+    };
+    const r = try run(std.testing.allocator, sc);
+    report("policy-relay", sc, r);
+    try std.testing.expectEqual(media.policy.Mode.relay, r.mode);
+    try std.testing.expectEqual(@as(u64, 0), r.parity);
+    try std.testing.expectEqual(sc.frames, r.delivered);
+}
+
+test "policy, bursty loss at 100 ms RTT: FEC frames stay bit-exact" {
+    // Bursts beat independent-loss sizing; this checks reconstruction under stress,
+    // not the delivery rate.
+    for (1..4) |seed| {
+        const sc: Scenario = .{
+            .seed = seed,
+            .forward = .{ .one_way_us = 50_000, .jitter_us = 5_000, .loss = .{ .burst = .{ .p_enter = 0.01, .p_leave = 0.3, .good = 0.02, .bad = 0.5 } } },
+            .backward = .{ .one_way_us = 50_000 },
+            .policy = true,
+        };
+        const r = try run(std.testing.allocator, sc);
+        report("policy-burst", sc, r);
+        try std.testing.expect(r.fec_groups > 0);
+        try std.testing.expect(r.delivered * 100 >= sc.frames * 80);
+    }
 }
 
 test "media_seq and frame_id wrap" {

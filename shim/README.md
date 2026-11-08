@@ -4,7 +4,7 @@ A thin Rust crate over iroh 1.x (`=1.4.1`) exposing the C ABI in
 [`include/iroh_shim.h`](include/iroh_shim.h). Zig sees it through
 `transport/iroh.zig` (header translated by `zig build`).
 
-## ABI (v0.1)
+## ABI (v0.2)
 
 The full draft ABI from the design doc. Every call has a Zig wrapper in `transport/iroh.zig`
 and a test in `transport/iroh_test.zig` (loopback, `zig build test-shim`) or
@@ -15,29 +15,32 @@ and a test in `transport/iroh_test.zig` (loopback, `zig build test-shim`) or
 | `iroh_shim_init(hook, ctx)` | optional, before anything else; hook runs on the shim runtime thread (pin it, raise priority) |
 | `iroh_shim_version`, `iroh_shim_now_us`, `iroh_last_error` | `now_us` is the clock event timestamps use |
 | `iroh_endpoint_bind(opts, &ep)` | key, ALPN, relay mode (n0 / disabled / custom / custom-only), bind address, and the per-connection transport settings below |
-| `iroh_endpoint_online`, `_id`, `_ticket`, `_connect`, `_accept`, `_free` | blocking calls take a timeout |
+| `iroh_endpoint_online`, `_id`, `_ticket`, `_connect`, `_accept`, `_free` | blocking calls take a timeout; `accept`'s bounds the wait for a connection, not its handshake (10 s) |
+| `iroh_endpoint_network_change` | the local network changed: iroh re-runs its net report and tries new paths now |
 | `iroh_conn_send_datagram` | never blocks; a full send buffer evicts the oldest datagrams, counted exactly |
 | `iroh_conn_recv_datagram` | `ms = 0` is non-blocking (`IROH_ERR_AGAIN`) |
 | `iroh_conn_set_target_bitrate(conn, bps)` | AppRate pacing target for the selected path; moves with the path |
 | `iroh_conn_set_burst(conn, us)` | AppRate burst credit (default 20 ms) |
 | `iroh_conn_wakeup_handle`, `_wakeup_clear` | fd (Unix) / SOCKET (Windows), readable on datagram, event or close |
 | `iroh_conn_poll_event` | path opened / selected / closed, lagged, no-ack-progress, ack-resumed, conn closed |
-| `iroh_conn_stats` | exact datagram accounting on both sides, QUIC loss, target, selected path |
+| `iroh_conn_stats` | exact datagram accounting on both sides, QUIC loss, target, selected path, `path_selections` (bumps on every path change) |
 | `iroh_conn_path_stats` | per path: RTT, min RTT, cwnd, loss, direct vs relay, controller pacing rate, ack stall |
 | `iroh_conn_open_bi`, `_accept_bi`, `iroh_stream_write`, `_read`, `_finish`, `_free` | reliable bidirectional streams |
 | `iroh_conn_max_datagram_size`, `_local_drops`, `_remote_id`, `_free` | |
 
 Transport settings (`IrohBindOpts`, 0 = default): datagram send buffer (1 MiB; must hold the
 largest frame, S10), datagram receive buffer (2 MiB), shim receive queue (4096), per-path idle
-timeout (300 ms, S5; S5b's question is still open) and keep-alive (100 ms), connection idle
-timeout, initial target, burst credit, no-ack-progress threshold (150 ms).
+timeout (300 ms, S5; the S5c decision is still open) and keep-alive (100 ms), connection idle
+timeout, initial target, burst credit, no-ack-progress threshold (150 ms), and `relay_ca_pem`,
+extra roots (PEM text) for relay TLS (a self-hosted relay with its own CA, the netns lab).
 
 **Congestion control (`src/apprate.rs`).** S3's `AppRate`, installed through a per-connection
 transport config, so each connection has its own factory and rate knob. It paces at the target,
 sizes the window at 2x BDP plus the burst, never cuts on loss, and counts acks, loss and stalls.
 iroh builds one controller per path; the shim maps path IDs to controllers via
 `Connection::congestion_state`, and on `Selected` moves the target to that controller (other
-paths pace at 1 Mbit/s or the target, if lower). Burst credit
+paths pace at 1 Mbit/s or the target, if lower). If iroh selects a path before the shim can
+map it to its controller, the 5 ms monitor retries the move until it lands. Burst credit
 follows spike S10b: noq's own pacer bucket holds only ~2 ms of the rate, so the controller keeps
 its own token bucket of `burst_us` at the target, refilled at the target. While it holds at least
 one packet, the controller reports a 10 Gbit/s pacing rate, so a frame leaves at line rate;
@@ -56,7 +59,9 @@ queue counts its own overflow. Behind a 20 Mbit/s tbf in netns, `tx_wire - rx_wi
 
 **No ack progress.** Each controller records when ack-eliciting data was first left unacked
 (`on_packet_sent`, so pure ACKs don't count) and clears it on any ack. A 5 ms monitor raises
-`IROH_EV_NO_ACK_PROGRESS` when the selected path stalls past the threshold. In netns, after a
+`IROH_EV_NO_ACK_PROGRESS` when the selected path stalls past the threshold, which is never
+less than 1.5 × the path's RTT (the larger of smoothed and latest) + 25 ms: an idle path's
+keep-alive stays unacked for a whole RTT, so a fixed 150 ms fired constantly at 250 ms RTT. In netns, after a
 direct path is blackholed: the signal at 159 ms, path closed at 305 ms, relay selected at
 305 ms, with the target on the relay's controller (delivered 9.7 Mbit/s at a 10 Mbit/s target).
 
