@@ -158,6 +158,20 @@ cost about 230 bytes.
 A packet not reported as received in one message may be reported in a later one (late
 arrival); the host takes the latest report.
 
+### `control_fast` kind 3: NACK (client → host)
+
+Asks the host to resend video shards by `media_seq`. Defined in `core/media/nack.zig`.
+
+| Offset | Size | Field | Meaning |
+| ---: | ---: | --- | --- |
+| 0 | 6·n | entries | `base u32`, `mask u16` per entry, n ≥ 1. Names `media_seq` `base`, and `base+1+i` for each set bit `i` (LSB first). |
+
+A message whose length is not a positive multiple of 6 is invalid. The host resends each
+named shard it still holds and that is younger than its retransmit age limit, with the
+same shard header plus `flags.retransmit` and a new envelope `seq`; it ignores the rest.
+The client sends the first NACK for a gap after a reorder wait (adaptive, 1–5 ms by
+default) and repeats it every RTT plus slack while the shard's frame is still pending.
+
 ## Changes
 
 - v0 (Nov 2026): first draft.

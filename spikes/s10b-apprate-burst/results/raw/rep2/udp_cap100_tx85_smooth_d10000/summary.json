@@ -1,0 +1,18 @@
+{
+ "dir": "",
+ "sent": 115909,
+ "received": 115909,
+ "unique": 115909,
+ "missing": 0,
+ "missing_steady": 0,
+ "owd_min": 10006.796,
+ "owd_p50": 10015.905,
+ "owd_p99": 10150.764,
+ "owd_p999": 11630.733,
+ "owd_max": 13104.399,
+ "fdl_p50": 10015.994,
+ "fdl_p99": 10645.963,
+ "frame_done_p50": 10015.994,
+ "frame_done_p99": 10645.963,
+ "tbf_dropped": 0
+}
