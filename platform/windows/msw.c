@@ -258,3 +258,21 @@ done:
     MSW_RELEASE(staging);
     return hr;
 }
+
+msw_hr msw_texture_noise(msw_d3d *d, void *texture, uint32_t seed) {
+    ID3D11Texture2D *t = (ID3D11Texture2D *)texture;
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D_GetDesc(t, &td);
+    uint32_t *px = (uint32_t *)malloc((size_t)td.Width * td.Height * 4);
+    if (!px) return E_OUTOFMEMORY;
+    uint32_t x = seed * 2654435761u + 1u;
+    for (size_t i = 0; i < (size_t)td.Width * td.Height; i++) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        px[i] = x | 0xFF000000u;
+    }
+    ID3D11DeviceContext_UpdateSubresource(d->context, (ID3D11Resource *)t, 0, NULL, px, td.Width * 4, 0);
+    free(px);
+    return S_OK;
+}

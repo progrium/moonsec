@@ -228,7 +228,9 @@ pub const Encoder = struct {
         if (out.dropped != 0 or out.len == 0) return null;
         const data = out.data[0..out.len];
         return .{
-            .slices = splitSlices(cfg.codec, data, &self.slices),
+            // At most the configured count: an encoder may cut more slices than asked
+            // (Media Foundation's software encoder cuts one per worker thread).
+            .slices = splitSlices(cfg.codec, data, self.slices[0..@min(@max(cfg.slices, 1), max_slices)]),
             .keyframe = out.keyframe != 0,
             .ltr_token = if (out.has_ltr_token != 0) out.ltr_token else null,
             .ltr_refresh = out.ltr_refresh != 0,
