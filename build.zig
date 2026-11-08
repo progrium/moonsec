@@ -28,6 +28,16 @@ pub fn build(b: *std.Build) void {
     const core_tests = b.addTest(.{ .root_module = core_mod });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
+    // Platform interface (platform/api.zig): what each OS backend implements for the
+    // host and client apps. Pure Zig; backends live under platform/<os>/.
+    const platform_mod = b.addModule("platform", .{
+        .root_source_file = b.path("platform/api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core_mod }},
+    });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = platform_mod })).step);
+
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
     const pipe_mod = b.addModule("pipe", .{ .root_source_file = b.path("transport/pipe.zig"), .target = target, .optimize = optimize });
