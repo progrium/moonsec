@@ -60,7 +60,17 @@ jobs:
         run: |
           ./platform/windows/idd/out/package-x64/install.ps1 -RootDevice
           pnputil /enum-drivers | Select-String -Context 0,6 moonsecidd
-          pnputil /enum-devices /class Display | Select-String -Context 0,6 -Pattern "moonsec"
+          Get-PnpDevice -FriendlyName "moonsec*" | ForEach-Object {
+            $_ | Format-List InstanceId, FriendlyName, Status, Problem, ProblemDescription
+            Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_ProblemCode, DEVPKEY_Device_ProblemStatus, DEVPKEY_Device_DriverVersion | Format-Table KeyName, Data
+          }
+      - name: Driver events
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Get-WinEvent -LogName "Microsoft-Windows-DriverFrameworks-UserMode/Operational" -MaxEvents 30 -ErrorAction SilentlyContinue | Format-Table TimeCreated, Id, Message -Wrap
+          Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=(Get-Date).AddMinutes(-15)} -MaxEvents 40 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'moonsec|WUDF|IddCx|Indirect' } | Format-Table TimeCreated, Id, ProviderName, Message -Wrap
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}

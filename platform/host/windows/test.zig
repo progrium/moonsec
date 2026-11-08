@@ -264,6 +264,11 @@ test "openHost on WARP: the bundle encodes through the platform interface" {
 
 fn openVdisp() !*c.msw_vdisp {
     var v: ?*c.msw_vdisp = null;
+    // An installed device first (install.ps1 -RootDevice), then our own software device;
+    // each result is printed so a refusal says which step it came from.
+    const existing = c.msw_vdisp_open(0, &v);
+    if (existing >= 0) return v.?;
+    std.debug.print("virtual display: no installed device: {f}\n", .{win.fmtHr(existing)});
     const hr = c.msw_vdisp_open(1, &v);
     if (hr < 0) try skip("idd", "virtual display driver not available:", hr);
     return v.?;
