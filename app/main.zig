@@ -16,6 +16,10 @@
 //!   moonsec pattern --out FILE.ppm [--time-us N] [--frame N] [--size WxH]
 //!       Write the measurement test pattern as a PPM.
 //!
+//!   moonsec id | pair host|client | paired | unpair | run pair
+//!       Device identity and pairing; see app/pair_cmd.zig. `peer iroh` with --state-dir
+//!       uses the device key, and the host admits only paired clients.
+//!
 //! Options: --fps N, --bitrate BPS, --size WxH, --slices N; sim and soak also take
 //! --outage-at-ms T --outage-ms D (drop everything host to client for D ms at T).
 const std = @import("std");
@@ -31,10 +35,11 @@ const apps = @import("apps.zig");
 const simrun = @import("simrun.zig");
 const iroh = if (options.iroh) @import("iroh") else struct {};
 const iroh_pipe = if (options.iroh) @import("iroh_pipe") else struct {};
+const pair_cmd = @import("pair_cmd.zig");
 
 const Io = std.Io;
 const Micros = i64;
-const alpn = "moonsec/0";
+const alpn = pair_cmd.alpn;
 
 const Args = struct {
     cmd: []const u8 = "",
@@ -58,6 +63,7 @@ const Args = struct {
     frame: u32 = 0,
     outage_at_ms: i64 = 0,
     outage_ms: i64 = 0,
+    p: pair_cmd.Args = .{},
 };
 
 fn usage() error{Usage} {
@@ -68,6 +74,14 @@ fn usage() error{Usage} {
         \\       moonsec peer sim host|client --hub PORT [opts]
         \\       moonsec peer iroh host|client --ticket-file PATH [--relay] [opts]
         \\       moonsec pattern --out FILE.ppm [--time-us N] [--frame N] [--size WxH]
+        \\       moonsec id [--state-dir D]
+        \\       moonsec pair host [--state-dir D] [--name N] [--seconds 120] [--pairings 1] [--relay]
+        \\                         [--pin-only|--qr-only] [--ticket-file F] [--pin-file F] [--qr-svg F]
+        \\       moonsec pair client (--ticket T | --ticket-file F) [--pin P] [--state-dir D] [--name N] [--relay]
+        \\       moonsec paired [--state-dir D]
+        \\       moonsec unpair ID-PREFIX [--state-dir D]
+        \\       moonsec run pair [--seconds N]
+        \\       (peer iroh also takes --state-dir: device key, and the host admits paired clients only)
         \\opts:  --fps N --bitrate BPS --size WxH --slices N --rate-control
         \\
     , .{});
@@ -89,6 +103,14 @@ fn parseArgs(args: []const [:0]const u8) !Args {
             a.rate_control = true;
             continue;
         }
+        if (std.mem.eql(u8, s, "--pin-only")) {
+            a.p.pin_only = true;
+            continue;
+        }
+        if (std.mem.eql(u8, s, "--qr-only")) {
+            a.p.qr_only = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, s, "--")) {
             if (i + 1 >= args.len) return usage();
             i += 1;
@@ -96,7 +118,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
             const eq = std.mem.eql;
             if (eq(u8, s, "--seed")) a.seed = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--seconds")) a.seconds = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--profile")) {
                 a.profile = std.meta.stringToEnum(simrun.Profile, v) orelse return usage();
-            } else if (eq(u8, s, "--fps")) a.fps = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--bitrate")) a.bitrate = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--slices")) a.slices = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--hub")) a.hub_port = try std.fmt.parseInt(u16, v, 10) else if (eq(u8, s, "--ticket-file")) a.ticket_file = v else if (eq(u8, s, "--out")) a.out = v else if (eq(u8, s, "--time-us")) a.time_us = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--frame")) a.frame = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--outage-at-ms")) a.outage_at_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--outage-ms")) a.outage_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--size")) {
+            } else if (eq(u8, s, "--fps")) a.fps = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--bitrate")) a.bitrate = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--slices")) a.slices = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--hub")) a.hub_port = try std.fmt.parseInt(u16, v, 10) else if (eq(u8, s, "--ticket-file")) a.ticket_file = v else if (eq(u8, s, "--out")) a.out = v else if (eq(u8, s, "--time-us")) a.time_us = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--frame")) a.frame = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--outage-at-ms")) a.outage_at_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--outage-ms")) a.outage_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--state-dir")) a.p.state_dir = v else if (eq(u8, s, "--name")) a.p.name = v else if (eq(u8, s, "--ticket")) a.p.ticket = v else if (eq(u8, s, "--pin")) a.p.pin = v else if (eq(u8, s, "--pin-file")) a.p.pin_file = v else if (eq(u8, s, "--qr-svg")) a.p.qr_svg = v else if (eq(u8, s, "--pairings")) a.p.pairings = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--size")) {
                 const x = std.mem.indexOfScalar(u8, v, 'x') orelse return usage();
                 a.width = try std.fmt.parseInt(u32, v[0..x], 10);
                 a.height = try std.fmt.parseInt(u32, v[x + 1 ..], 10);
@@ -122,6 +144,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     const a = try parseArgs(argv);
+    environ = init.environ_map;
     var out_buf: [4096]u8 = undefined;
     var stdout = Io.File.stdout().writerStreaming(io, &out_buf);
     const w = &stdout.interface;
@@ -136,10 +159,38 @@ pub fn main(init: std.process.Init) !void {
         try cmdPeer(gpa, io, a)
     else if (eq(u8, a.cmd, "pattern"))
         try cmdPattern(gpa, io, a)
+    else if (eq(u8, a.cmd, "id"))
+        try pair_cmd.cmdId(pctx(gpa, io, a), w)
+    else if (eq(u8, a.cmd, "paired"))
+        try pair_cmd.cmdPaired(pctx(gpa, io, a), w)
+    else if (eq(u8, a.cmd, "unpair"))
+        (if (a.npos == 1) try pair_cmd.cmdUnpair(pctx(gpa, io, a), a.pos[0], w) else return usage())
+    else if (eq(u8, a.cmd, "pair"))
+        try cmdPair(gpa, io, a, w)
     else
         return usage();
     try w.flush();
     std.process.exit(if (ok) 0 else 1);
+}
+
+var environ: *std.process.Environ.Map = undefined;
+
+fn pctx(gpa: std.mem.Allocator, io: Io, a: Args) pair_cmd.Ctx {
+    return .{ .gpa = gpa, .io = io, .env = environ, .p = a.p, .ticket_file = a.ticket_file, .relay = a.relay, .seconds = a.seconds };
+}
+
+fn cmdPair(gpa: std.mem.Allocator, io: Io, a: Args, w: *Io.Writer) !bool {
+    if (a.npos != 1) return usage();
+    if (!options.iroh) {
+        std.debug.print("moonsec: built without the iroh shim; use `zig build moonsec`\n", .{});
+        return false;
+    }
+    const role = std.meta.stringToEnum(Role, a.pos[0]) orelse return usage();
+    if (role == .client and a.p.ticket.len == 0 and a.ticket_file.len == 0) return usage();
+    return switch (role) {
+        .host => pair_cmd.cmdPairHost(pctx(gpa, io, a), w),
+        .client => pair_cmd.cmdPairClient(pctx(gpa, io, a), w),
+    };
 }
 
 fn simOptions(a: Args, seconds: u32, progress: u32) simrun.Options {
@@ -226,7 +277,17 @@ fn cmdRun(gpa: std.mem.Allocator, io: Io, a: Args) !bool {
     const which = if (a.npos > 0) a.pos[0] else "all";
     const want_sim = std.mem.eql(u8, which, "all") or std.mem.eql(u8, which, "sim");
     const want_iroh = std.mem.eql(u8, which, "all") or std.mem.eql(u8, which, "iroh");
-    if (!want_sim and !want_iroh) return usage();
+    const want_pair = std.mem.eql(u8, which, "pair");
+    if (!want_sim and !want_iroh and !want_pair) return usage();
+    if (want_pair) {
+        if (!options.iroh) {
+            std.debug.print("moonsec: built without the iroh shim; use `zig build moonsec`\n", .{});
+            return false;
+        }
+        const exe = try std.process.executablePathAlloc(io, gpa);
+        defer gpa.free(exe);
+        return pair_cmd.runPairE2E(pctx(gpa, io, a), exe);
+    }
     const self_exe = try std.process.executablePathAlloc(io, gpa);
     defer gpa.free(self_exe);
     var ok = true;
@@ -420,11 +481,17 @@ fn quitAfter(app: *apps.ClientApp, io: Io, seconds: u32) Io.Cancelable!void {
 
 fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
     if (a.ticket_file.len == 0) return usage();
+    // With --state-dir: the device key, and pairing enforced on both sides.
+    var state: ?@import("pairing.zig").State = if (a.p.state_dir.len > 0) try pair_cmd.openStateFor(pctx(gpa, io, a)) else null;
+    defer if (state) |*st| st.close();
+    var secret: ?[32]u8 = null;
+    if (state) |*st| secret = (try st.identity()).secret;
     iroh.init(null, null) catch |e| {
         std.debug.print("iroh init: {s}\n", .{iroh.lastError()});
         return e;
     };
     const ep = iroh.Endpoint.bind(.{
+        .secret_key = if (secret) |*k| k else null,
         .alpn = if (role == .host) alpn else "",
         .relay_mode = if (a.relay) .default else .disabled,
         .bind_addr = if (a.relay) "0.0.0.0:0" else "127.0.0.1:0",
@@ -433,6 +500,7 @@ fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
         return e;
     };
     defer ep.deinit();
+    const accept_ms: u32 = if (a.relay) 600_000 else 30_000;
     const conn = switch (role) {
         .host => blk: {
             var tbuf: [4096]u8 = undefined;
@@ -441,7 +509,12 @@ fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
             const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{a.ticket_file});
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = t });
             try Io.Dir.rename(.cwd(), tmp, .cwd(), a.ticket_file, io);
-            break :blk ep.accept(if (a.relay) 600_000 else 30_000) catch |e| {
+            if (state) |*st| {
+                var clients = try st.loadList(.clients);
+                defer clients.deinit();
+                break :blk try pair_cmd.acceptAdmitted(pctx(gpa, io, a), ep, &clients, accept_ms);
+            }
+            break :blk ep.accept(accept_ms) catch |e| {
                 std.debug.print("accept: {s}\n", .{iroh.lastError()});
                 return e;
             };
@@ -464,6 +537,11 @@ fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
         },
     };
     defer conn.deinit(0);
+    if (role == .client) if (state) |*st| {
+        var hosts = try st.loadList(.hosts);
+        defer hosts.deinit();
+        if (!try pair_cmd.requestSession(conn, &hosts)) return false;
+    };
     var ip = iroh_pipe.IrohPipe.init(conn);
     const ok = try peer(gpa, io, a, role, ip.packetPipe());
     io.sleep(.fromMilliseconds(200), .awake) catch {};

@@ -86,6 +86,9 @@ pub const BindOptions = struct {
     burst_us: ?u32 = null,
     /// Selected-path stall that raises `.no_ack_progress`, ms (null = default 150, 0 = off).
     no_ack_progress_ms: ?u32 = null,
+    /// Extra trusted roots (PEM text) for relay TLS, on top of the built-in web roots: the
+    /// private CA of a self-hosted relay (relay/lab-cert.sh). null = built-in roots only.
+    relay_ca_pem: ?[*:0]const u8 = null,
 };
 
 pub const Endpoint = struct {
@@ -108,6 +111,7 @@ pub const Endpoint = struct {
             .initial_target_bps = opts.initial_target_bps,
             .burst_us = if (opts.burst_us) |v| (if (v == 0) c.IROH_BURST_OFF else v) else 0,
             .no_ack_progress_ms = if (opts.no_ack_progress_ms) |v| (if (v == 0) c.IROH_NO_ACK_OFF else v) else 0,
+            .relay_ca_pem = opts.relay_ca_pem,
         };
         var out: ?*c.IrohEndpoint = null;
         try check(c.iroh_endpoint_bind(&raw, &out));

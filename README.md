@@ -3,7 +3,7 @@
 Low-latency remote desktop and game streaming core in Zig, with networking from
 Rust [iroh](https://github.com/n0-computer/iroh) through a small in-repo shim.
 
-Design and plan: [docs/design.md](docs/design.md). Wire protocol: [spec/wire-v0.md](spec/wire-v0.md) (audio: [spec/audio-v0.md](spec/audio-v0.md)). Spike write-ups, code and results:
+Design and plan: [docs/design.md](docs/design.md). Wire protocol: [spec/wire-v0.md](spec/wire-v0.md) (audio: [spec/audio-v0.md](spec/audio-v0.md); pairing: [spec/pairing-v0.md](spec/pairing-v0.md)). Spike write-ups, code and results:
 [spikes/](spikes) (status table in the design doc's "Spike status" section).
 
 Zig is pinned to **0.16.0** (`build.zig.zon` `minimum_zig_version`).
@@ -18,6 +18,7 @@ Zig is pinned to **0.16.0** (`build.zig.zon` `minimum_zig_version`).
 /web           browser client glue (TypeScript)
 /spec          versioned wire protocol spec
 /sim           simulation harness and scenarios
+/relay         self-hosted iroh-relay: config, container, systemd unit
 /tools         latency probe, netem scripts, interop harness
 /docs          design doc
 /spikes        time-boxed spikes S1–S9
@@ -37,9 +38,12 @@ zig build gate            # Phase 1 gate over iroh (loopback) and the sim; `-- r
 zig build test-app        # Phase 2 host and client apps over the in-process sim
 zig build soak            # one hour of simulated LAN streaming, fails on any freeze
 zig build moonsec -- run all   # host and client processes over iroh and the sim (builds the shim)
+zig build test-pair       # pairing (QR ticket, PIN) and session admission over iroh (part of test-shim)
 zig build echo            # builds the shim with cargo, links it, runs the loopback datagram echo
 zig build echo -- selftest --relay -n 50   # same, but through n0's public relays
 ```
+
+To run your own relay (container or systemd), see [relay/README.md](relay/README.md).
 
 See [shim/README.md](shim/README.md) for the shim ABI, build modes and the S1 results.
 
