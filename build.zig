@@ -179,6 +179,7 @@ pub fn build(b: *std.Build) void {
             m.addImport("iroh", iroh_mod);
             m.addImport("iroh_pipe", iroh_pipe_mod);
         }
+        if (target.result.os.tag == .windows) m.linkSystemLibrary("winmm", .{});
         const exe = b.addExecutable(.{ .name = if (with_iroh) "gate" else "gate-sim", .root_module = m });
         const run = b.addRunArtifact(exe);
         if (with_iroh) {

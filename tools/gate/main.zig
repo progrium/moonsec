@@ -15,6 +15,7 @@
 //! What each side sends and checks: tools/gate/session.zig. `gate-sim` is this
 //! program built without the iroh shim (sim only), for builds without Rust.
 const std = @import("std");
+const builtin = @import("builtin");
 const options = @import("gate_options");
 const session = @import("session.zig");
 const scenario = @import("scenario.zig");
@@ -86,7 +87,15 @@ fn sessionConfig(a: Args) session.Config {
     return .{ .seed = a.seed, .frames = a.frames };
 }
 
+/// Windows sleeps in 15.6 ms ticks by default, which turns the hub's and the peers'
+/// sub-millisecond waits into 16 ms bursts (frames and deliveries batch up, and the
+/// rate controller reads the batching as queueing). Ask for 1 ms ticks.
+const winmm = if (builtin.os.tag == .windows) struct {
+    extern "winmm" fn timeBeginPeriod(period: u32) callconv(.winapi) u32;
+} else struct {};
+
 pub fn main(init: std.process.Init) !void {
+    if (builtin.os.tag == .windows) _ = winmm.timeBeginPeriod(1);
     const gpa = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());

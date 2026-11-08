@@ -243,7 +243,9 @@ pub const Session = struct {
                 errdefer gpa.destroy(c);
                 c.* = .{
                     .receiver = try media.Receiver.init(gpa, .{
-                        .reassembly = .{ .frame_timeout_us = window },
+                        // Room for a second of frames in flight, so a frame waiting on a
+                        // retransmit is timed out by `window`, not pushed out by newer frames.
+                        .reassembly = .{ .frame_timeout_us = window, .window = 128 },
                         .nack = .{ .max_age_us = window, .max_retries = 30 },
                     }),
                     .sender = input.Sender.init(.{}),
