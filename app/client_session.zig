@@ -47,6 +47,9 @@ pub const Config = struct {
     /// treated as lost: showing it would only replay the past. Recovery then asks for a
     /// refresh, which catches the picture up. 0: never.
     max_frame_age_us: Micros = 200_000,
+    /// Every audio datagram (stream 2), for the audio stage: envelope, payload, arrival.
+    audio_ctx: ?*anyopaque = null,
+    onAudio: ?*const fn (ctx: ?*anyopaque, env: proto.Envelope, payload: []const u8, recv_us: Micros) void = null,
 };
 
 pub const State = enum { connecting, streaming, ended };
@@ -359,7 +362,7 @@ pub const ClientSession = struct {
                     };
                     s.sender.onAck(next);
                 },
-                .audio => {}, // the audio stage's (not in this session yet)
+                .audio => if (s.cfg.onAudio) |f| f(s.cfg.audio_ctx, o.envelope, o.payload, now),
                 else => s.stats.unknown += 1,
             },
             else => s.stats.unknown += 1,

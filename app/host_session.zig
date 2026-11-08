@@ -409,6 +409,13 @@ pub const HostSession = struct {
         s.sendRaw(dg);
     }
 
+    /// Send one audio datagram (stream 2) with the session's transport-wide seq, so the
+    /// rate controller and transport feedback see it. For the audio stage.
+    pub fn sendAudio(s: *HostSession, kind: u8, payload: []const u8, now: Micros) void {
+        if (s.state != .streaming) return;
+        s.sendOther(.audio, kind, payload, now);
+    }
+
     // --- input stage ----------------------------------------------------
 
     /// The next input action to inject, in order, with its client capture time.
