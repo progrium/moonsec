@@ -1,0 +1,37 @@
+name: soak
+
+# The Phase 2 gate's "one hour without a freeze", in simulation: an hour of synthetic
+# streaming over the simulated LAN (0.5% loss, 1% reordering, jitter) in virtual time,
+# through the real host and client sessions. Fails on any freeze (no new picture for
+# 200 ms), lost or reordered input, or a frame that does not check out. Takes about
+# five minutes. The shorter soak runs on every push in sim.yml.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Simulated seconds
+        default: "3600"
+      profile:
+        description: lan, wan or clean
+        default: lan
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Soak
+        run: zig build soak -Doptimize=ReleaseSafe -- soak --seconds ${{ inputs.seconds || '3600' }} --profile ${{ inputs.profile || 'lan' }}

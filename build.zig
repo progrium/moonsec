@@ -37,6 +37,17 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core_mod }},
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = platform_mod })).step);
+    // Synthetic backend (platform/synthetic): test pattern, passthrough codec, scripted input.
+    const synthetic_mod = b.addModule("synthetic", .{
+        .root_source_file = b.path("platform/synthetic/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "core", .module = core_mod }, .{ .name = "platform", .module = platform_mod } },
+    });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = synthetic_mod })).step);
+
+    // Client platform backends (platform/client/build.zig).
+    @import("platform/client/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
 
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
@@ -60,6 +71,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     wasm_step.dependOn(&wasm_tests.step);
+
+    // libopus from source (codec/opus/libopus.zig) and its Zig binding, for every target.
+    const opus = addOpus(b, target, optimize);
+    const opus_tests = b.addTest(.{ .name = "opus-test", .root_module = opus.module });
+    const run_opus_tests = b.addRunArtifact(opus_tests);
+    b.step("test-opus", "Run the libopus binding tests").dependOn(&run_opus_tests.step);
+    test_step.dependOn(&run_opus_tests.step);
+    // Browser client: libopus and the binding must build for wasm32-wasi (design, "Web").
+    const wasm_wasi = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
+    wasm_step.dependOn(&b.addTest(.{ .root_module = addOpus(b, wasm_wasi, optimize).module }).step);
+    // `zig build check-opus`: cross-compile libopus for every shipping target from one host.
+    const check_opus = b.step("check-opus", "Cross-compile libopus and its binding for every target");
+    for (opus_targets) |q| {
+        const t = b.resolveTargetQuery(q);
+        check_opus.dependOn(&b.addTest(.{ .root_module = addOpus(b, t, .ReleaseSafe).module }).step);
+    }
 
     const shim = resolveShim(b, target, shim_source, shim_link, shim_dir_opt);
 
@@ -207,6 +234,76 @@ pub fn build(b: *std.Build) void {
     test_sim.dependOn(&b.addRunArtifact(gate_tests).step);
     test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = simlink_mod })).step);
 
+    // The audio stream with real libopus over the simulated network (sim/audio.zig).
+    // codec/opus/stage.zig: Opus plus core/audio, the host and client ends of the audio stage.
+    const audio_stage_mod = b.addModule("audio_stage", .{ .root_source_file = b.path("codec/opus/stage.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "core", .module = core_mod }, .{ .name = "opus", .module = opus.module } } });
+    const audio_imports: []const std.Build.Module.Import = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod }, .{ .name = "opus", .module = opus.module }, .{ .name = "audio_stage", .module = audio_stage_mod } };
+    const audio_sim = b.addExecutable(.{ .name = "audio-sim", .root_module = b.createModule(.{ .root_source_file = b.path("sim/audio_main.zig"), .target = target, .optimize = optimize, .imports = audio_imports }) });
+    const run_audio_sim = b.addRunArtifact(audio_sim);
+    if (b.args) |a| run_audio_sim.addArgs(a);
+    b.step("audio-sim", "Run the audio scenarios with libopus over the sim and print a table").dependOn(&run_audio_sim.step);
+    const audio_tests = b.addRunArtifact(b.addTest(.{ .name = "audio-sim-test", .root_module = b.createModule(.{ .root_source_file = b.path("sim/audio.zig"), .target = target, .optimize = optimize, .imports = audio_imports }) }));
+    b.step("test-audio", "Run the libopus binding tests and the audio sim scenarios").dependOn(&audio_tests.step);
+    b.top_level_steps.get("test-audio").?.step.dependOn(&run_opus_tests.step);
+    const stage_tests = b.addRunArtifact(b.addTest(.{ .name = "audio-stage-test", .root_module = audio_stage_mod }));
+    b.top_level_steps.get("test-audio").?.step.dependOn(&stage_tests.step);
+    test_sim.dependOn(&stage_tests.step);
+    test_sim.dependOn(&audio_tests.step);
+
+    // Phase 2 session spine (app/): host and client sessions, the apps over any
+    // platform backend, and the `moonsec` tool (sim runs, soak, iroh, test pattern).
+    const app_imports = [_]std.Build.Module.Import{
+        .{ .name = "core", .module = core_mod },
+        .{ .name = "pipe", .module = pipe_mod },
+        .{ .name = "platform", .module = platform_mod },
+        .{ .name = "synthetic", .module = synthetic_mod },
+        .{ .name = "simnet", .module = simnet_mod },
+        .{ .name = "simlink", .module = simlink_mod },
+        .{ .name = "audio_stage", .module = audio_stage_mod },
+    };
+    const app_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("app/test.zig"), .target = target, .optimize = optimize, .imports = &app_imports }) });
+    const test_app = b.step("test-app", "Host and client apps end to end over the in-process sim");
+    test_app.dependOn(&b.addRunArtifact(app_tests).step);
+    test_step.dependOn(test_app);
+    for ([_]bool{ false, true }) |with_iroh| {
+        const opts = b.addOptions();
+        opts.addOption(bool, "iroh", with_iroh);
+        const m = b.createModule(.{ .root_source_file = b.path("app/main.zig"), .target = target, .optimize = optimize, .imports = &app_imports });
+        m.addOptions("app_options", opts);
+        if (with_iroh) {
+            m.addImport("iroh", iroh_mod);
+            m.addImport("iroh_pipe", iroh_pipe_mod);
+        }
+        if (target.result.os.tag == .windows) m.linkSystemLibrary("winmm", .{});
+        const exe = b.addExecutable(.{ .name = if (with_iroh) "moonsec" else "moonsec-sim", .root_module = m });
+        const run = b.addRunArtifact(exe);
+        if (b.args) |a| run.addArgs(a);
+        if (with_iroh) {
+            if (b.args == null) run.addArgs(&.{ "run", "all" });
+            b.step("moonsec", "Run the moonsec tool with the iroh shim (default: `run all`; args: see app/main.zig)").dependOn(&run.step);
+            const install = b.addInstallArtifact(exe, .{});
+            b.step("install-moonsec", "Install zig-out/bin/moonsec (builds the shim)").dependOn(&install.step);
+            const run_all = b.addRunArtifact(exe);
+            run_all.addArgs(&.{ "run", "all", "--seconds", "8" });
+            b.top_level_steps.get("test-shim").?.step.dependOn(&run_all.step);
+            // Pairing (QR ticket, PIN) and session admission, end to end over iroh.
+            const run_pair = b.addRunArtifact(exe);
+            run_pair.addArgs(&.{ "run", "pair", "--seconds", "3" });
+            run_pair.step.dependOn(&run_all.step); // one loopback run at a time
+            b.top_level_steps.get("test-shim").?.step.dependOn(&run_pair.step);
+            const run_pair_only = b.addRunArtifact(exe);
+            run_pair_only.addArgs(&.{ "run", "pair", "--seconds", "3" });
+            b.step("test-pair", "Pairing and admission end to end over iroh on loopback (builds the shim)").dependOn(&run_pair_only.step);
+        } else {
+            if (b.args == null) run.addArgs(&.{ "sim", "--seconds", "10" });
+            b.step("moonsec-sim", "Run the moonsec tool without the shim (sim, soak, run sim, pattern)").dependOn(&run.step);
+            b.installArtifact(exe);
+            const soak = b.addRunArtifact(exe);
+            soak.addArgs(if (b.args) |a| a else &.{ "soak", "--seconds", "3600" });
+            b.step("soak", "One hour of streaming over the simulated LAN in virtual time (args override)").dependOn(&soak.step);
+        }
+    }
+
     // core/rate driving the simulated network with S11's metrics (sim/rate.zig).
     const sim_rate = b.addExecutable(.{ .name = "sim-rate", .root_module = b.createModule(.{ .root_source_file = b.path("sim/rate.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod } } }) });
     b.installArtifact(sim_rate);
@@ -236,6 +333,8 @@ pub fn build(b: *std.Build) void {
     } else {
         test_win.dependOn(&b.addFail("test-win needs a Windows host; use check-win to cross-compile").step);
     }
+    // Windows client backend tests join both steps (platform/client/build.zig).
+    @import("platform/client/build.zig").addWindowsTests(b, target, optimize, check_win, test_win);
 }
 
 /// Compiler flags for every C file under platform/ on Windows.
@@ -477,4 +576,40 @@ fn artifactSuffix(t: std.Target) []const u8 {
         .windows => if (t.cpu.arch == .aarch64) "windows_aarch64" else "windows_x86_64",
         else => @panic("unsupported os for the iroh shim"),
     };
+}
+
+/// Targets `check-opus` cross-compiles libopus for. Windows MSVC needs the Windows SDK, so
+/// CI builds it natively on the Windows runner instead (`-Dtarget=x86_64-windows-msvc`).
+const opus_targets = [_]std.Target.Query{
+    .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu },
+    .{ .cpu_arch = .x86_64, .os_tag = .macos },
+    .{ .cpu_arch = .aarch64, .os_tag = .macos },
+    .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
+    .{ .cpu_arch = .aarch64, .os_tag = .windows, .abi = .gnu },
+    .{ .cpu_arch = .wasm32, .os_tag = .wasi },
+};
+
+const Opus = struct {
+    lib: *std.Build.Step.Compile,
+    /// The Zig binding (codec/opus/opus.zig), linked against `lib`. Import it as "opus".
+    module: *std.Build.Module,
+};
+
+fn addOpus(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Opus {
+    const src = b.dependency("opus", .{});
+    const lib = @import("codec/opus/libopus.zig").library(b, src, target, optimize);
+    const translate = b.addTranslateC(.{ .root_source_file = b.path("codec/opus/ctl.h"), .target = target, .optimize = optimize });
+    translate.addIncludePath(src.path("include"));
+    const m = b.createModule(.{
+        .root_source_file = b.path("codec/opus/opus.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "opus_c", .module = translate.createModule() }},
+    });
+    m.addIncludePath(src.path("include"));
+    m.addCSourceFile(.{ .file = b.path("codec/opus/ctl.c"), .flags = &.{"-fno-sanitize=undefined"} });
+    m.linkLibrary(lib);
+    return .{ .lib = lib, .module = m };
 }

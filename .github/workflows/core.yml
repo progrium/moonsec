@@ -29,7 +29,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - name: zig fmt
         if: runner.os == 'Linux'
-        run: zig fmt --check build.zig core platform
+        run: zig fmt --check build.zig core platform codec sim/audio.zig sim/audio_main.zig
       - name: Core tests (Debug)
         run: zig build test --summary all
       - name: Core tests (ReleaseSafe)
@@ -37,3 +37,12 @@ jobs:
       - name: wasm32 compile check
         if: runner.os == 'Linux'
         run: zig build check-wasm --summary all
+      - name: libopus for every target (cross-compiled)
+        if: runner.os == 'Linux'
+        run: zig build check-opus --summary all
+      # Windows apps link the MSVC-ABI shim, so libopus must build and pass there too.
+      - name: libopus and audio tests (x86_64-windows-msvc)
+        if: runner.os == 'Windows'
+        run: zig build test-audio -Dtarget=x86_64-windows-msvc --summary all
+      - name: Audio scenarios (full length)
+        run: zig build audio-sim -Doptimize=ReleaseSafe

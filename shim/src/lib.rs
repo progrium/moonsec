@@ -35,9 +35,11 @@ use iroh::endpoint::{
     ConnectOptions, Connection, IdleTimeout, PathEvent, PathId, QuicTransportConfig, RecvStream, SendStream,
     presets,
 };
+use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_future::StreamExt;
+use rustls_pki_types::{CertificateDer, pem::PemObject};
 use wakeup::Wakeup;
 
 pub const IROH_OK: i32 = 0;
@@ -226,6 +228,10 @@ pub struct IrohBindOpts {
     /// Stall on the selected path that raises IROH_EV_NO_ACK_PROGRESS, in ms
     /// (default 150; IROH_NO_ACK_OFF disables the event).
     pub no_ack_progress_ms: u32,
+    /// Extra trusted root certificates (PEM, NUL-terminated, one or more CERTIFICATE blocks) for
+    /// the TLS that relays and discovery use, on top of the built-in web roots. For a relay
+    /// with a private CA (relay/lab-cert.sh); NULL = built-in roots only.
+    pub relay_ca_pem: *const c_char,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -344,6 +350,15 @@ pub unsafe extern "C" fn iroh_endpoint_bind(opts: *const IrohBindOpts, out: *mut
             }
             m => return Err(format!("unknown relay_mode {m}")),
         };
+        if let Some(pem) = unsafe { opt_str(opts.relay_ca_pem) }? {
+            let roots = CertificateDer::pem_slice_iter(pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("bad relay_ca_pem: {e}"))?;
+            if roots.is_empty() {
+                return Err("relay_ca_pem holds no CERTIFICATE".into());
+            }
+            b = b.ca_tls_config(CaTlsConfig::embedded().with_extra_roots(roots));
+        }
         if !opts.secret_key.is_null() {
             let mut k = [0u8; 32];
             k.copy_from_slice(unsafe { bytes_arg(opts.secret_key, 32) });

@@ -13,6 +13,9 @@ pub const proto = @import("proto/root.zig");
 /// Packetizer, reassembly, NACK/retransmit (and the FEC codec).
 pub const media = @import("media/root.zig");
 
+/// Audio stream: frame and RS parity messages, sender, jitter buffer.
+pub const audio = @import("audio/root.zig");
+
 /// Loss recovery: LTR acks, freeze on gap, LTR refresh or IDR (docs/design.md, "Loss recovery").
 pub const recovery = @import("recovery/root.zig");
 
@@ -24,6 +27,9 @@ pub const input = @import("input/root.zig");
 
 /// Host/client clock offset and skew from round trips.
 pub const clock = @import("clock/root.zig");
+
+/// Pairing: identity, tickets, PIN/QR, the paired-device list and the pairing exchange.
+pub const pair = @import("pair/root.zig");
 
 /// Per-frame stage timing and rolling stats for the latency overlay.
 pub const telemetry = @import("telemetry/root.zig");

@@ -52,7 +52,7 @@ kind skips the datagram.
 | ---: | --- | --- | --- |
 | 0 | invalid | | Never sent. |
 | 1 | `video` | host → client | |
-| 2 | `audio` | host → client | Kinds defined with the audio module. |
+| 2 | `audio` | host → client | Frames and RS parity: [audio-v0.md](audio-v0.md). |
 | 3 | `input` | client → host | Kinds defined with the input module. |
 | 4 | `control_fast` | both | Small latency-critical control: frame acks, feedback. |
 | 5 | `mic` | client → host | Reserved; not in v1. |
@@ -172,6 +172,24 @@ same shard header plus `flags.retransmit` and a new envelope `seq`; it ignores t
 The client sends the first NACK for a gap after a reorder wait (adaptive, 1–5 ms by
 default) and repeats it every RTT plus slack while the shard's frame is still pending.
 
+### `control_fast` kinds 18 and 32–34: session (both directions)
+
+Session setup on datagrams, until the reliable QUIC control streams land. Defined in
+`app/wire.zig`. Every field is little-endian; reserved bytes are 0.
+
+| kind | name | direction | payload |
+| ---: | --- | --- | --- |
+| 18 | `clock_report` | client → host | `i64 offset_us` (host clock − client clock, from clock sync), `i64 error_bound_us`. 16 bytes. The host uses it to time input injection against capture. |
+| 32 | `hello` | client → host | `u32 nonce`, `u8 codecs` (bit 0 H.264, 1 HEVC, 2 AV1, 3 passthrough), 3 reserved, `u32 max_width`, `u32 max_height` (0 = any). 16 bytes. |
+| 33 | `config` | host → client | `u32 nonce` (echo), `u8 codec` (1 H.264, 2 HEVC, 3 AV1, 250 passthrough), `u8 slices`, `u16 fps`, `u32 width`, `u32 height`, `u64 bitrate_bps`. 24 bytes; `fps`, `slices`, `width`, `height` non-zero. |
+| 34 | `bye` | both | `u8 reason` (0 done, 1 quit, 2 error). |
+
+The client sends `hello` every 100 ms until a `config` with its nonce arrives. The host
+answers every `hello` with `config`; a `hello` with a nonce it has not seen starts a new
+session from a keyframe. Either side leaves by sending `bye` three times, 20 ms apart; a
+side that hears nothing from the other for 5 s ends the session.
+
 ## Changes
 
 - v0 (Nov 2026): first draft.
+- v0 (Nov 2026): session messages (`hello`, `config`, `bye`, `clock_report`) for the Phase 2 apps.
