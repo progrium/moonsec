@@ -47,6 +47,8 @@ To run your own relay (container or systemd), see [relay/README.md](relay/README
 
 See [shim/README.md](shim/README.md) for the shim ABI, build modes and the S1 results.
 
+Installers, signing and third-party notices: [packaging/README.md](packaging/README.md).
+
 The Phase 1 gate ([tools/gate](tools/gate/main.zig)) starts a host and a client process that
 exchange stream-tagged datagrams through the core (video through the packetizer with NACK
 retransmits, audio, input with acks, transport feedback driving the rate controller, whose

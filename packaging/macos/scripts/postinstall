@@ -1,0 +1,8 @@
+#!/bin/sh
+# Load the host agent for the user at the console now, rather than at their next login.
+uid=$(stat -f %u /dev/console 2>/dev/null || echo 0)
+if [ "$uid" != 0 ]; then
+  launchctl bootout "gui/$uid/com.github.progrium.moonsec.host" 2>/dev/null || true
+  launchctl bootstrap "gui/$uid" /Library/LaunchAgents/com.github.progrium.moonsec.host.plist 2>/dev/null || true
+fi
+exit 0

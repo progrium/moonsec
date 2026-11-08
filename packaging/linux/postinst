@@ -1,0 +1,13 @@
+#!/bin/sh
+# Loads uinput now and applies the udev rule, so the host's input works without a reboot.
+# The host unit is per user and isn't enabled here: `systemctl --user enable --now moonsec-host`.
+set -e
+if [ "$1" = configure ]; then
+  modprobe uinput >/dev/null 2>&1 || true
+  if command -v udevadm >/dev/null; then
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=misc --sysname-match=uinput >/dev/null 2>&1 || true
+  fi
+  systemctl --global daemon-reload >/dev/null 2>&1 || true
+fi
+exit 0

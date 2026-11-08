@@ -1,0 +1,21 @@
+#!/bin/sh
+# Starts the moonsec host for the logged-on user; the systemd user unit
+# moonsec-host.service runs this. It accepts paired clients only (pair one first with
+# `moonsec pair host`). Extra arguments, or MOONSEC_HOST_ARGS in
+# ~/.config/moonsec/host.env, go to `moonsec peer iroh host`.
+#
+# State (device key, paired clients) is in $XDG_CONFIG_HOME/moonsec, the same
+# directory `moonsec pair` uses. The portal restore token (7A, PipeWire capture) goes in
+# $XDG_STATE_HOME/moonsec/portal-restore-token, so a restart reuses the screen-share
+# grant instead of asking again.
+set -eu
+config="${XDG_CONFIG_HOME:-$HOME/.config}/moonsec"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/moonsec"
+mkdir -p "$config" "$state"
+chmod 700 "$config"
+export MOONSEC_PORTAL_RESTORE_TOKEN="$state/portal-restore-token"
+# Until the Linux host (7C) has its own command, the host is `peer iroh host`: one
+# session per run, and the unit restarts it for the next one.
+# shellcheck disable=SC2086
+exec "${MOONSEC_BIN:-/usr/bin/moonsec}" peer iroh host --relay \
+  --state-dir "$config" --ticket-file "$state/host-ticket" ${MOONSEC_HOST_ARGS:-} "$@"

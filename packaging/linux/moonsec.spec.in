@@ -1,0 +1,35 @@
+# Filled in by packaging/linux/build.sh; it packs a prebuilt tree (the stage macro), so there is
+# no %build. rpm finds the library Requires from the ELF itself.
+Name:           moonsec
+Version:        @VERSION@
+Release:        1
+Summary:        @SUMMARY@
+License:        @LICENSE@
+URL:            https://github.com/progrium/moonsec
+Recommends:     pipewire
+Recommends:     xdg-desktop-portal
+%global debug_package %{nil}
+%global __strip /bin/true
+
+%description
+%(cat %{_topdir}/SOURCES/description)
+
+%install
+cp -a %{stage}/. %{buildroot}/
+
+%post
+udevadm control --reload-rules >/dev/null 2>&1 || :
+modprobe uinput >/dev/null 2>&1 || :
+udevadm trigger --subsystem-match=misc --sysname-match=uinput >/dev/null 2>&1 || :
+systemctl --global daemon-reload >/dev/null 2>&1 || :
+
+%postun
+udevadm control --reload-rules >/dev/null 2>&1 || :
+
+%files
+%{_bindir}/moonsec
+%{_prefix}/lib/moonsec/
+%{_prefix}/lib/systemd/user/moonsec-host.service
+%{_prefix}/lib/udev/rules.d/60-moonsec-uinput.rules
+%{_prefix}/lib/modules-load.d/moonsec-uinput.conf
+%doc %{_docdir}/moonsec/
