@@ -85,7 +85,7 @@ We use Rust iroh 1.x (pinned at 1.4.1) through a Rust shim that lives in the rep
 
 **What iroh carries**
 
-- Identity and pairing: endpoint ID = Ed25519 key; pairing adds a client key to the host allowlist via PIN or QR ticket.
+- Identity and pairing: endpoint ID = Ed25519 key; pairing adds a client key to the host allowlist via PIN or QR ticket, with an HMAC exchange bound to both endpoint IDs over a reliable stream ([spec/pairing-v0.md](../spec/pairing-v0.md)). Keys sit behind a `KeyStore` interface (file-backed now; DPAPI and Keychain later).
 - Discovery: DNS/pkarr and self-hosted relays; mDNS for LAN.
 - Control: reliable QUIC streams for session setup, clipboard, display config and file transfer.
 - Media: unreliable QUIC datagrams, tagged with stream IDs.
@@ -107,7 +107,7 @@ The core still owns the rate decision. Its controller uses our own one-way delay
 - Streams: open/accept bidirectional, read, write, finish.
 - Rate: `set_target_bitrate(conn, bps)`, applied to the selected path's controller.
 - Path stats: RTT, loss, congestion window, direct vs relayed, per-path controller counters, shim-counted send and receive drops, a "no ack progress" signal; path changes (opened, selected, closed) as events, which S5 saw arrive within 1 ms of the change on loopback and S5b within two RTTs over a real NAT.
-- Config: datagram buffer sizes, path idle timeout and keep-alive.
+- Config: datagram buffer sizes, path idle timeout and keep-alive, extra CA roots for a self-hosted relay's TLS.
 - Runtime: `iroh_shim_init(on_thread_start, ctx)` before anything else.
 - Built with `panic = "abort"`; Zig owns every buffer that crosses the boundary.
 
@@ -241,6 +241,7 @@ The shim's source lives in the repo, but its built libraries are CI release arti
 /web           browser client glue (TypeScript)
 /spec          versioned wire protocol spec
 /sim           simulation harness and scenarios
+/relay         self-hosted iroh-relay package (config, container, systemd unit)
 /tools         latency probe, netem scripts, interop harness
 ```
 
@@ -424,7 +425,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 - Delay-gradient rate controller with the bitrate, resolution, frame-rate ladder.
 - Adaptive Reed-Solomon FEC and path-based choice between NACK and FEC.
 - Capacity estimate driving the shim's pacing rate; relay mode; reconnect and path-change handling.
-- Pairing with tickets and PIN/QR, host allowlist, self-hosted relay deployment.
+- Pairing with tickets and PIN/QR, host allowlist, self-hosted relay deployment. The relay is packaged in [relay/](../relay/README.md) (iroh-relay 1.4.1 config, container, systemd unit; the netns tests run through it in CI); deploying it to a public host is still to do.
 
 **Gate:** sim suite passes (no freeze over 500 ms at 5% random loss; bitrate recovers within 2 s after a bandwidth halving); field tests on cable, LTE and hotel-grade Wi-Fi.
 

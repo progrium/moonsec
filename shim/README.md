@@ -32,7 +32,7 @@ Transport settings (`IrohBindOpts`, 0 = default): datagram send buffer (1 MiB; m
 largest frame, S10), datagram receive buffer (2 MiB), shim receive queue (4096), per-path idle
 timeout (300 ms, S5; the S5c decision is still open) and keep-alive (100 ms), connection idle
 timeout, initial target, burst credit, no-ack-progress threshold (150 ms), and `relay_ca_pem`,
-a PEM file of extra roots for relay TLS (a self-hosted relay with its own CA, the netns lab).
+extra roots (PEM text) for relay TLS (a self-hosted relay with its own CA, the netns lab).
 
 **Congestion control (`src/apprate.rs`).** S3's `AppRate`, installed through a per-connection
 transport config, so each connection has its own factory and rate knob. It paces at the target,
@@ -84,9 +84,13 @@ zig build test-shim                         # echo selftest + loopback ABI tests
 zig build netns-test && sudo IROH_RELAY=$(which iroh-relay) zig-out/bin/iroh-netns-test
 ```
 
-The netns tests need root, iproute2 (tc with tbf), iptables, and `iroh-relay` for the path
-change test (`cargo install iroh-relay@1.4.1 --features server --locked`); without it that test
-skips. CI runs both on linux-x86_64.
+The netns tests need root, iproute2 (tc with tbf), iptables, openssl, curl, and `iroh-relay`
+for the relay tests (`cargo install iroh-relay@1.4.1 --features server --locked`); without it
+those tests skip. They run the relay with the packaged lab config ([relay/lab.toml](../relay/lab.toml):
+HTTPS with a lab CA, QUIC address discovery), and endpoints trust the CA through
+`relay_ca_pem`. With `MOONSEC_RELAY_URL` (and `MOONSEC_RELAY_CA`) they use a running relay
+instead, which is how CI runs them through the container and the systemd unit
+([relay/README.md](../relay/README.md)). The shim workflow runs them on linux-x86_64.
 
 ## Build modes
 

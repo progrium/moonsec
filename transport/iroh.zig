@@ -87,7 +87,8 @@ pub const BindOptions = struct {
     /// Selected-path stall that raises `.no_ack_progress`, ms (null = default 150, 0 = off).
     /// The shim never uses less than 1.5 x the path's RTT + 25 ms.
     no_ack_progress_ms: ?u32 = null,
-    /// PEM file of extra root certificates for relay TLS (a self-hosted or lab relay).
+    /// Extra trusted roots (PEM text) for relay TLS, on top of the built-in web roots: the
+    /// private CA of a self-hosted relay (relay/lab-cert.sh). null = built-in roots only.
     relay_ca_pem: ?[*:0]const u8 = null,
 };
 

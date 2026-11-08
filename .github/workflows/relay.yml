@@ -1,0 +1,113 @@
+name: relay
+
+# The self-hosted relay package in relay/: the systemd unit (under the runner's systemd) and the
+# container image each run relay/lab.toml (HTTPS with a lab CA, QUIC address discovery), and the
+# shim netns tests run through each of them. Then the image's own config (Let's Encrypt) is
+# started to check that it parses and binds 80/443/7842 as non-root; ACME points at a dead URL
+# so CI never talks to Let's Encrypt.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+  CARGO_TERM_COLOR: always
+  LAB: /tmp/moonsec-relay-lab
+  RELAY_URL: https://10.91.3.1:3443
+
+jobs:
+  relay:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Rust toolchain (pinned by shim/rust-toolchain.toml)
+        working-directory: shim
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/zig
+          key: relay-${{ hashFiles('shim/Cargo.lock', 'shim/rust-toolchain.toml', 'build.zig.zon') }}
+      - name: iroh-relay binary cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/iroh-relay
+          key: iroh-relay-1.4.1-ubuntu-24.04-${{ runner.arch }}
+
+      - name: Build iroh-relay, the shim and the netns tests
+        run: |
+          command -v iroh-relay || (cd shim && cargo install iroh-relay@1.4.1 --features server --locked)
+          zig build netns-test -Doptimize=ReleaseSafe
+          relay/lab-cert.sh "$LAB"
+
+      - name: systemd unit (relay/iroh-relay.service)
+        run: |
+          set -euo pipefail
+          sudo install -m 0755 "$(command -v iroh-relay)" /usr/local/bin/iroh-relay
+          sudo install -m 0644 relay/iroh-relay.sysusers /usr/lib/sysusers.d/iroh-relay.conf
+          sudo systemd-sysusers
+          # Lab config and certs in place of the Let's Encrypt config.
+          sudo install -D -m 0644 relay/lab.toml /etc/iroh-relay/iroh-relay.toml
+          sudo install -d -m 0700 -o iroh-relay -g iroh-relay /var/lib/iroh-relay
+          sudo install -m 0600 -o iroh-relay -g iroh-relay "$LAB/default.crt" "$LAB/default.key" /var/lib/iroh-relay/
+          sudo install -m 0644 relay/iroh-relay.service /etc/systemd/system/
+          sudo systemd-analyze verify /etc/systemd/system/iroh-relay.service
+          sudo systemctl daemon-reload
+          sudo systemctl start iroh-relay
+          for i in $(seq 1 50); do curl -sf --cacert "$LAB/ca.crt" https://127.0.0.1:3443/ping >/dev/null && break; sleep 0.2; done
+          systemctl is-active iroh-relay
+          sudo systemd-analyze security iroh-relay | tail -1
+
+      - name: netns tests through the systemd relay
+        run: sudo SHIM_ECHO=zig-out/bin/shim-echo MOONSEC_RELAY_URL="$RELAY_URL" MOONSEC_RELAY_CA="$LAB/ca.crt" zig-out/bin/iroh-netns-test
+
+      - name: Stop the systemd relay
+        if: always()
+        run: |
+          sudo journalctl -u iroh-relay --no-pager -o cat | tail -40 || true
+          sudo systemctl stop iroh-relay || true
+
+      - name: Container image (relay/Dockerfile)
+        run: |
+          set -euo pipefail
+          docker build -t moonsec-relay relay/
+          docker image ls moonsec-relay
+          docker run -d --name relay-lab --network host \
+            -v "$PWD/relay/lab.toml:/etc/iroh-relay/iroh-relay.toml:ro" -v "$LAB:/var/lib/iroh-relay:ro" moonsec-relay
+          for i in $(seq 1 50); do curl -sf --cacert "$LAB/ca.crt" https://127.0.0.1:3443/ping >/dev/null && break; sleep 0.2; done
+          docker exec relay-lab /usr/local/bin/iroh-relay --version
+
+      - name: netns tests through the container relay
+        run: sudo SHIM_ECHO=zig-out/bin/shim-echo MOONSEC_RELAY_URL="$RELAY_URL" MOONSEC_RELAY_CA="$LAB/ca.crt" zig-out/bin/iroh-netns-test
+
+      - name: shim-echo selftest through the container relay
+        run: zig-out/bin/shim-echo selftest --relay-url https://127.0.0.1:3443 --relay-ca "$LAB/ca.crt" -n 100
+
+      - name: Stop the container relay
+        if: always()
+        run: |
+          docker logs relay-lab 2>&1 | tail -40 || true
+          docker rm -f relay-lab || true
+
+      - name: Image's own config (Let's Encrypt) starts as non-root
+        run: |
+          set -euo pipefail
+          docker run -d --name relay-prod -e IROH_RELAY_ACME_URL=https://127.0.0.1:1/directory \
+            -p 18080:80 -p 18443:443 -p 17842:7842/udp moonsec-relay
+          for i in $(seq 1 50); do curl -sf -o /dev/null http://127.0.0.1:18080/generate_204 && break; sleep 0.2; done
+          curl -sf -o /dev/null -w "captive portal: %{http_code}\n" http://127.0.0.1:18080/generate_204
+          docker logs relay-prod 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee prod.log | tail -20
+          grep -q "serving on 0.0.0.0:443" prod.log
+          grep -q "QUIC server listening" prod.log
+          test "$(docker inspect -f '{{.State.Running}} {{.Config.User}}' relay-prod)" = "true nonroot"
+          docker rm -f relay-prod

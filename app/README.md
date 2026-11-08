@@ -13,6 +13,9 @@ a session, and a `PacketPipe`, wired into the pipeline.
 | [pathsim.zig](pathsim.zig) | Scripted path flaps (direct <-> relay) and connection drops over the sim, for the session tests. |
 | [pathlog.zig](pathlog.zig) | The sessions' path log. |
 | [main.zig](main.zig) | The `moonsec` tool. |
+| [pairing.zig](pairing.zig) | Pairing on a device: the state directory, and the pairing exchange and session admission over any reliable stream ([spec/pairing-v0.md](../spec/pairing-v0.md)). |
+| [keystore.zig](keystore.zig) | `KeyStore` interface for the device key; file-backed store (0600) and an in-memory one. |
+| [pair_cmd.zig](pair_cmd.zig) | `moonsec id`, `pair host`, `pair client`, `paired`, `unpair`, `run pair`, and admission for `peer iroh --state-dir`. |
 
 ## The synthetic backend and the test pattern
 
@@ -42,6 +45,22 @@ zig build install-moonsec                # then, on two machines:
 zig-out/bin/moonsec peer iroh host --ticket-file t --relay --seconds 60
 zig-out/bin/moonsec peer iroh client --ticket-file t --relay --seconds 60   # copy t over first
 ```
+
+## Pairing
+
+```sh
+zig build test-pair                      # pair by QR ticket and by PIN, then admission, over iroh
+moonsec pair host --relay                # shows a QR code, the ticket text and a PIN for 120 s
+moonsec pair client --ticket MOONSEC1:...          # QR ticket: pairs with no PIN
+moonsec pair client --ticket MOONSEC1:... --pin 123456   # address ticket plus the PIN
+moonsec paired                           # this device's ID and both paired-device lists
+moonsec unpair a1b2c3d4                  # remove a device by ID prefix
+moonsec peer iroh host --state-dir D ... # device key; admits only paired clients
+```
+
+Each device keeps its key and lists in a state directory (`--state-dir`, else
+`$MOONSEC_STATE_DIR`, else the per-user config directory). `peer iroh` without
+`--state-dir` keeps the old behaviour (fresh key, no admission) for the gate tooling.
 
 The freeze detector ([core/telemetry/freeze.zig](../core/telemetry/freeze.zig)) counts a freeze
 whenever no new picture reaches the screen for 200 ms (nothing presented, or old content

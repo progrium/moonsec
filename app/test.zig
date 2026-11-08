@@ -4,6 +4,8 @@ const simrun = @import("simrun.zig");
 
 test {
     _ = @import("wire.zig");
+    _ = @import("keystore.zig");
+    _ = @import("pairing.zig");
 }
 
 fn expectPass(o: simrun.Options) !simrun.Result {

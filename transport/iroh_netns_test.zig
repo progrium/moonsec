@@ -3,7 +3,11 @@
 //!
 //! Needs root, iproute2 (ip, tc with tbf) and iptables. Build and run from the repo root:
 //!   zig build netns-test && sudo zig-out/bin/iroh-netns-test
-//! Each test skips when not root. The peer is `zig-out/bin/shim-echo sink` (override with
+//! Each test skips when not root. The relay tests run the packaged relay config
+//! (relay/lab.toml: HTTPS with a lab CA from relay/lab-cert.sh, QUIC address discovery), with
+//! `iroh-relay` from PATH or IROH_RELAY; or, with MOONSEC_RELAY_URL (and MOONSEC_RELAY_CA, the
+//! CA's PEM file), an already running relay such as the container or systemd unit in relay/.
+//! The peer is `zig-out/bin/shim-echo sink` (override with
 //! SHIM_ECHO=path) running in namespace msn-srv, reached from the root namespace over two veth
 //! links, so the client sees two direct paths:
 //!
@@ -93,13 +97,14 @@ const Peer = struct {
     ep: iroh.Endpoint,
     conn: iroh.Conn,
 
-    fn start(client_opts: iroh.BindOptions, relay_url: ?[:0]const u8) !Peer {
+    fn start(client_opts: iroh.BindOptions, relay: ?*const Relay) !Peer {
         const echo_path: []const u8 = if (std.c.getenv("SHIM_ECHO")) |p| std.mem.span(p) else "zig-out/bin/shim-echo";
         std.Io.Dir.cwd().deleteFile(io, ticket_path) catch {};
         const base = [_][]const u8{ "ip", "netns", "exec", ns, echo_path, "sink", "0.0.0.0:47200", ticket_path };
-        const with_relay = base ++ [_][]const u8{ "--relay-url", relay_url orelse "" };
+        const with_relay = base ++ [_][]const u8{ "--relay-url", if (relay) |r| r.url else "" };
+        const with_ca = with_relay ++ [_][]const u8{ "--relay-ca", if (relay) |r| r.ca_path orelse "" else "" };
         var child = try std.process.spawn(io, .{
-            .argv = if (relay_url != null) &with_relay else &base,
+            .argv = if (relay) |r| (if (r.ca_path != null) &with_ca else &with_relay) else &base,
             .stdin = .ignore,
             .stdout = .inherit,
             .stderr = .inherit,
@@ -116,12 +121,16 @@ const Peer = struct {
         const tz = try gpa.dupeZ(u8, t);
         defer gpa.free(tz);
         var o = client_opts;
-        o.relay_mode = if (relay_url != null) .custom_only else .disabled;
-        o.relay_urls = if (relay_url) |u| u.ptr else null;
+        o.relay_mode = if (relay != null) .custom_only else .disabled;
+        o.relay_urls = if (relay) |r| r.url.ptr else null;
+        o.relay_ca_pem = if (relay) |r| (if (r.ca_pem) |p| p.ptr else null) else null;
         o.bind_addr = "0.0.0.0:0";
         const ep = try iroh.Endpoint.bind(o);
         errdefer ep.deinit();
-        if (relay_url != null) try ep.online(10_000);
+        if (relay != null) ep.online(10_000) catch |e| {
+            std.debug.print("client online: {s}\n", .{iroh.lastError()});
+            return e;
+        };
         const conn = ep.connect(tz, alpn, 15_000) catch |e| {
             std.debug.print("connect: {s}\n", .{iroh.lastError()});
             return e;
@@ -245,26 +254,64 @@ fn udpSndbufErrors() !u64 {
     return std.fmt.parseInt(u64, std.mem.trim(u8, out, " \n"), 10);
 }
 
-const local_relay = "http://10.91.3.1:3340";
-const relay_config = "/tmp/moonsec-netns-relay.toml";
+/// The relay the tests dial: https://10.91.3.1:3443 (link c's root-namespace address) unless
+/// MOONSEC_RELAY_URL says otherwise.
+const Relay = struct {
+    url: [:0]const u8,
+    ca_path: ?[:0]const u8,
+    ca_pem: ?[:0]u8,
+    child: ?std.process.Child,
 
-fn startRelay() !?std.process.Child {
-    const bin: []const u8 = if (std.c.getenv("IROH_RELAY")) |p| std.mem.span(p) else "iroh-relay";
-    // IPv4-only: the default metrics and QUIC listeners bind [::], which some CI hosts lack.
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = relay_config,
-        .data = "http_bind_addr = \"0.0.0.0:3340\"\nenable_metrics = false\nenable_quic_addr_discovery = false\n",
-    });
-    return std.process.spawn(io, .{
-        .argv = &.{ bin, "--dev", "--config-path", relay_config },
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    }) catch |e| {
-        std.debug.print("cannot start {s} ({t}); install it with `cargo install iroh-relay --features server` or set IROH_RELAY; skipping\n", .{ bin, e });
-        return null;
-    };
-}
+    const lab_dir = "/tmp/moonsec-relay-lab";
+    const lab_url = "https://10.91.3.1:3443";
+
+    /// null when no relay is available (the test skips).
+    fn start() !?Relay {
+        if (std.c.getenv("MOONSEC_RELAY_URL")) |u| {
+            const ca: ?[:0]const u8 = if (std.c.getenv("MOONSEC_RELAY_CA")) |p| std.mem.span(p) else null;
+            return .{ .url = std.mem.span(u), .ca_path = ca, .ca_pem = try readCa(ca), .child = null };
+        }
+        const bin: []const u8 = if (std.c.getenv("IROH_RELAY")) |p| std.mem.span(p) else "iroh-relay";
+        // The repo's lab config and cert script, as a deployment would use them.
+        const root = try std.process.currentPathAlloc(io, gpa);
+        defer gpa.free(root);
+        var buf: [1024]u8 = undefined;
+        try sh(try std.fmt.bufPrint(&buf, "{s}/relay/lab-cert.sh " ++ lab_dir ++ " >/dev/null", .{root}));
+        const config = try std.fmt.bufPrint(&buf, "{s}/relay/lab.toml", .{root});
+        const child = std.process.spawn(io, .{
+            .argv = &.{ bin, "--config-path", config },
+            .cwd = .{ .path = lab_dir },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch |e| {
+            std.debug.print("cannot start {s} ({t}); install it with `cargo install iroh-relay@1.4.1 --features server --locked` or set IROH_RELAY; skipping\n", .{ bin, e });
+            return null;
+        };
+        const ca = lab_dir ++ "/ca.crt";
+        return .{ .url = lab_url, .ca_path = ca, .ca_pem = try readCa(ca), .child = child };
+    }
+
+    fn readCa(path: ?[:0]const u8) !?[:0]u8 {
+        const p = path orelse return null;
+        return try std.Io.Dir.cwd().readFileAllocOptions(io, p, gpa, .limited(1 << 20), .of(u8), 0);
+    }
+
+    /// Waits until the relay answers over HTTPS (the CA must verify it).
+    fn waitReady(self: *const Relay) !void {
+        var buf: [1024]u8 = undefined;
+        const cmd = if (self.ca_path) |ca|
+            try std.fmt.bufPrint(&buf, "for i in $(seq 1 100); do curl -sf --cacert {s} {s}/ping >/dev/null && exit 0; sleep 0.1; done; exit 1", .{ ca, self.url })
+        else
+            try std.fmt.bufPrint(&buf, "for i in $(seq 1 100); do curl -sf {s}/ping >/dev/null && exit 0; sleep 0.1; done; exit 1", .{self.url});
+        try sh(cmd);
+    }
+
+    fn stop(self: *Relay) void {
+        if (self.child) |*c| c.kill(io);
+        if (self.ca_pem) |p| gpa.free(p);
+    }
+};
 
 // Like S5: a direct path (link a) plus a relay path (relay in the root namespace, reached by the
 // sink over link c, whose UDP is blocked so it is no second direct path).
@@ -273,12 +320,12 @@ test "netns: target rate moves from a dead direct path to the relay" {
     try topology("a c");
     defer teardown();
     try sh("ip netns exec " ++ ns ++ " iptables -A INPUT -i ms-c1 -p udp -j DROP && ip netns exec " ++ ns ++ " iptables -A OUTPUT -o ms-c1 -p udp -j DROP");
-    var relay = (try startRelay()) orelse return error.SkipZigTest;
-    defer relay.kill(io);
-    sleepMs(500);
+    var relay = (try Relay.start()) orelse return error.SkipZigTest;
+    defer relay.stop();
+    try relay.waitReady();
 
     const target: u64 = 10_000_000;
-    var peer = try Peer.start(.{ .initial_target_bps = target }, local_relay);
+    var peer = try Peer.start(.{ .initial_target_bps = target }, &relay);
     defer peer.stop();
     var d: Driver = .{ .conn = peer.conn };
     defer d.deinit();
@@ -356,6 +403,28 @@ test "netns: target rate moves from a dead direct path to the relay" {
     const again = try d.measure(target, 1500);
     std.debug.print("direct again: delivered {d} kbit/s at target {d}\n", .{ again / 1000, target / 2000 });
     try std.testing.expect(within(again, target / 2, 20));
+}
+
+// The relay's certificate is checked: with the CA an endpoint registers, without it (built-in
+// web roots only) it never does. Skips for a relay without a private CA (a public certificate).
+test "netns: the relay's TLS certificate is verified against relay_ca_pem" {
+    try skipUnlessRoot();
+    try topology("c");
+    defer teardown();
+    var relay = (try Relay.start()) orelse return error.SkipZigTest;
+    defer relay.stop();
+    try relay.waitReady();
+    const pem = relay.ca_pem orelse return error.SkipZigTest;
+
+    const trusted = try iroh.Endpoint.bind(.{ .relay_mode = .custom_only, .relay_urls = relay.url.ptr, .relay_ca_pem = pem.ptr, .bind_addr = "0.0.0.0:0" });
+    defer trusted.deinit();
+    try trusted.online(10_000);
+
+    const untrusted = try iroh.Endpoint.bind(.{ .relay_mode = .custom_only, .relay_urls = relay.url.ptr, .bind_addr = "0.0.0.0:0" });
+    defer untrusted.deinit();
+    try std.testing.expectError(error.Timeout, untrusted.online(3_000));
+
+    try std.testing.expectError(error.Internal, iroh.Endpoint.bind(.{ .relay_mode = .custom_only, .relay_urls = relay.url.ptr, .relay_ca_pem = "not a certificate" }));
 }
 
 test "netns: every datagram is accounted for behind a bottleneck" {

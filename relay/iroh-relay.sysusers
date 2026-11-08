@@ -1,0 +1,2 @@
+# sysusers.d entry for the iroh-relay service user (install as /usr/lib/sysusers.d/iroh-relay.conf).
+u iroh-relay - "iroh relay" /var/lib/iroh-relay

@@ -35,9 +35,11 @@ use iroh::endpoint::{
     ConnectOptions, Connection, IdleTimeout, PathEvent, PathId, QuicTransportConfig, RecvStream, SendStream,
     presets,
 };
+use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_future::StreamExt;
+use rustls_pki_types::{CertificateDer, pem::PemObject};
 use wakeup::Wakeup;
 
 pub const IROH_OK: i32 = 0;
@@ -229,8 +231,9 @@ pub struct IrohBindOpts {
     /// (default 150; IROH_NO_ACK_OFF disables the event). The shim never uses less than
     /// 1.5 x the path's RTT + 25 ms, so a long path's normal ack delay is not a stall.
     pub no_ack_progress_ms: u32,
-    /// Optional path to a PEM file of extra root certificates trusted for relay TLS
-    /// (a self-hosted or lab relay with its own CA). NULL = the embedded web roots only.
+    /// Extra trusted root certificates (PEM, NUL-terminated, one or more CERTIFICATE blocks) for
+    /// the TLS that relays and discovery use, on top of the built-in web roots. For a relay
+    /// with a private CA (relay/lab-cert.sh); NULL = built-in roots only.
     pub relay_ca_pem: *const c_char,
 }
 
@@ -350,6 +353,15 @@ pub unsafe extern "C" fn iroh_endpoint_bind(opts: *const IrohBindOpts, out: *mut
             }
             m => return Err(format!("unknown relay_mode {m}")),
         };
+        if let Some(pem) = unsafe { opt_str(opts.relay_ca_pem) }? {
+            let roots = CertificateDer::pem_slice_iter(pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("bad relay_ca_pem: {e}"))?;
+            if roots.is_empty() {
+                return Err("relay_ca_pem holds no CERTIFICATE".into());
+            }
+            b = b.ca_tls_config(CaTlsConfig::embedded().with_extra_roots(roots));
+        }
         if !opts.secret_key.is_null() {
             let mut k = [0u8; 32];
             k.copy_from_slice(unsafe { bytes_arg(opts.secret_key, 32) });
@@ -357,17 +369,6 @@ pub unsafe extern "C" fn iroh_endpoint_bind(opts: *const IrohBindOpts, out: *mut
         }
         if !alpn.is_empty() {
             b = b.alpns(vec![alpn.clone()]);
-        }
-        if let Some(path) = unsafe { opt_str(opts.relay_ca_pem) }? {
-            use rustls_pki_types::{CertificateDer, pem::PemObject};
-            let certs = CertificateDer::pem_file_iter(path)
-                .map_err(|e| format!("relay_ca_pem {path}: {e}"))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("relay_ca_pem {path}: {e}"))?;
-            if certs.is_empty() {
-                return Err(format!("relay_ca_pem {path}: no certificates"));
-            }
-            b = b.ca_tls_config(iroh::tls::CaTlsConfig::embedded().with_extra_roots(certs));
         }
         if let Some(addr) = unsafe { opt_str(opts.bind_addr) }? {
             let sa = SocketAddr::from_str(addr).map_err(|e| format!("bad bind_addr {addr}: {e}"))?;

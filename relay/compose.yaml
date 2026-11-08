@@ -1,0 +1,17 @@
+# docker compose -f relay/compose.yaml up -d
+# Edit iroh-relay.toml (hostname, contact) before the first start; Let's Encrypt needs the
+# hostname's DNS pointing here and 443/tcp reachable from the internet.
+services:
+  relay:
+    build: .
+    image: moonsec-relay
+    restart: unless-stopped
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "7842:7842/udp"
+    volumes:
+      - ./iroh-relay.toml:/etc/iroh-relay/iroh-relay.toml:ro
+      - relay-state:/var/lib/iroh-relay
+volumes:
+  relay-state:
