@@ -115,7 +115,7 @@ fn usage() error{Usage} {
         \\       moonsec peer iroh host|client --ticket-file PATH [--relay] [opts]
         \\       moonsec pattern --out FILE.ppm [--time-us N] [--frame N] [--size WxH]
         \\       moonsec id [--state-dir D]
-        \\       moonsec pair host [--state-dir D] [--name N] [--seconds 120] [--pairings 1] [--relay]
+        \\       moonsec pair host [--state-dir D] [--name N] [--seconds 120] [--pairings 1] [--relay | --relay-url URL [--relay-ca PEM]]
         \\                         [--pin-only|--qr-only] [--ticket-file F] [--pin-file F] [--qr-svg F]
         \\       moonsec pair client (--ticket T | --ticket-file F) [--pin P] [--state-dir D] [--name N] [--relay]
         \\       moonsec paired [--state-dir D]
@@ -231,7 +231,7 @@ pub fn main(init: std.process.Init) !void {
 var environ: *std.process.Environ.Map = undefined;
 
 fn pctx(gpa: std.mem.Allocator, io: Io, a: Args) pair_cmd.Ctx {
-    return .{ .gpa = gpa, .io = io, .env = environ, .p = a.p, .ticket_file = a.ticket_file, .relay = a.relay, .seconds = a.seconds };
+    return .{ .gpa = gpa, .io = io, .env = environ, .p = a.p, .ticket_file = a.ticket_file, .relay = a.relay, .relay_url = a.relay_url, .relay_ca = a.relay_ca, .seconds = a.seconds };
 }
 
 fn cmdPair(gpa: std.mem.Allocator, io: Io, a: Args, w: *Io.Writer) !bool {
