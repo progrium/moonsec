@@ -1,7 +1,7 @@
 //! Build steps for the client platform backends, kept out of the root
 //! build.zig so the per-OS threads don't collide there. The root calls `add`
-//! (portable tests, part of `zig build test`) and `addWindowsTests` (part of
-//! `check-win` and `test-win`).
+//! (portable tests, part of `zig build test`), `addWindowsTests` (part of
+//! `check-win` and `test-win`) and `addMacosTests` (`test-mac`).
 
 const std = @import("std");
 const root = @import("../../build.zig");
@@ -31,6 +31,14 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .imports = &.{.{ .name = "platform", .module = m.platform }},
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "client-rawinput-test", .root_module = rawinput_mod })).step);
+
+    const nsinput_mod = b.createModule(.{
+        .root_source_file = b.path("platform/client/macos/nsinput.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "platform", .module = m.platform }},
+    });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "client-nsinput-test", .root_module = nsinput_mod })).step);
 }
 
 /// The Windows client backend ("client_windows", platform/client/windows/backend.zig)
@@ -94,4 +102,65 @@ pub fn addWindowsTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize
         const t = b.addTest(.{ .name = "client-win-test", .root_module = windowsTestModule(b, target, optimize) });
         test_win.dependOn(&b.addRunArtifact(t).step);
     }
+}
+
+/// Flags for the macOS client's Objective-C files (ARC, warnings as errors).
+pub const macos_objc_flags: []const []const u8 = &.{
+    "-fobjc-arc", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+};
+
+/// The macOS client backend ("client_macos", platform/client/macos/backend.zig) for a
+/// macOS target, with its Objective-C files compiled and the frameworks linked. Needs
+/// the macOS SDK, so a macOS host.
+pub fn macosClientModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const core = b.createModule(.{ .root_source_file = b.path("core/root.zig"), .target = target, .optimize = optimize });
+    const platform = b.createModule(.{
+        .root_source_file = b.path("platform/api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+    const tc = b.addTranslateC(.{ .root_source_file = b.path("platform/client/macos/macc.h"), .target = target, .optimize = optimize });
+    const m = b.createModule(.{
+        .root_source_file = b.path("platform/client/macos/backend.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "platform", .module = platform },
+            .{ .name = "core", .module = core },
+            .{ .name = "client_overlay", .module = overlayModule(b, target, optimize, .{ .core = core, .platform = platform }) },
+            .{ .name = "macc_c", .module = tc.createModule() },
+        },
+    });
+    root.addMacosSdkPaths(b, m, target);
+    m.addIncludePath(b.path("platform/client/macos"));
+    m.addCSourceFiles(.{
+        .root = b.path("platform/client/macos"),
+        .files = &.{ "macc_window.m", "macc_decode.m", "macc_present.m", "macc_audio.m" },
+        .flags = macos_objc_flags,
+    });
+    for ([_][]const u8{
+        "Foundation",   "AppKit",       "QuartzCore", "Metal",        "CoreVideo", "CoreMedia",
+        "VideoToolbox", "AudioToolbox", "CoreAudio",  "CoreGraphics", "IOSurface",
+    }) |f| m.linkFramework(f, .{});
+    return m;
+}
+
+/// Adds the macOS client tests to `test-mac` (run, on a macOS host).
+pub fn addMacosTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_mac: *std.Build.Step) void {
+    if (target.result.os.tag != .macos) return;
+    const client = macosClientModule(b, target, optimize);
+    const tm = b.createModule(.{
+        .root_source_file = b.path("platform/client/macos/test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "client_macos", .module = client },
+            .{ .name = "platform", .module = client.import_table.get("platform").? },
+            .{ .name = "core", .module = client.import_table.get("core").? },
+        },
+    });
+    const t = b.addTest(.{ .name = "client-mac-test", .root_module = tm });
+    test_mac.dependOn(&b.addRunArtifact(t).step);
 }

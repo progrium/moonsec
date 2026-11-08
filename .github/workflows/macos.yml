@@ -1,0 +1,30 @@
+name: macos
+
+# macOS platform backends (platform/client/macos). The macos-15 runner is an Apple
+# Silicon VM: Metal runs on its paravirtual GPU, VideoToolbox decodes in software
+# where the VM has no hardware decoder, and tests that need a window server or an
+# audio output device skip (saying so) when there is none.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test:
+    name: test (macos-15)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: macOS platform tests
+        run: zig build test-mac --summary all

@@ -338,6 +338,23 @@ pub fn build(b: *std.Build) void {
     }
     // Windows client backend tests join both steps (platform/client/build.zig).
     @import("platform/client/build.zig").addWindowsTests(b, target, optimize, check_win, test_win);
+
+    // macOS platform tests: Objective-C against the SDK's frameworks, so they build and
+    // run on a macOS host only (platform/client/build.zig).
+    const test_mac = b.step("test-mac", "Run the macOS platform tests (macOS host; Metal and VideoToolbox software paths run in a VM)");
+    if (target.result.os.tag != .macos) {
+        test_mac.dependOn(&b.addFail("test-mac needs a macOS host").step);
+    }
+    @import("platform/client/build.zig").addMacosTests(b, target, optimize, test_mac);
+}
+
+/// Points `m` at the macOS SDK's frameworks, headers and libraries (Zig does not
+/// search the SDK on its own). No-op off macOS hosts.
+pub fn addMacosSdkPaths(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    const sdk = b.sysroot orelse macosSdk(b, target.result) orelse return;
+    m.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+    m.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+    m.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
 }
 
 /// Compiler flags for every C file under platform/ on Windows.
