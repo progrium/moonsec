@@ -125,10 +125,16 @@ pub const CaptureConfig = struct {
     fps: u32 = 60,
     /// Draw the cursor into the frame. Desktop mode leaves it off and the client draws it.
     cursor: bool = false,
-    /// Preferred size, 0 = the display's own. A backend may ignore it.
+    /// Preferred size, 0 = the display's own. A backend may ignore it. With a virtual
+    /// display this is the size it is created at (the client's), 0 = 1920x1080.
     width: u32 = 0,
     height: u32 = 0,
+    /// Create a virtual display to capture (headless host). Backends without one ignore
+    /// it and capture `display`. See virtual_display.zig.
+    virtual_display: virtual_display.Policy = .off,
 };
+
+pub const virtual_display = @import("virtual_display.zig");
 
 pub const CapturedFrame = struct {
     image: Image,
@@ -671,4 +677,5 @@ pub const pattern = @import("pattern.zig");
 
 test {
     _ = pattern;
+    _ = virtual_display;
 }

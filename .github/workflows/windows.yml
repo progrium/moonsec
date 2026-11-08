@@ -34,6 +34,22 @@ jobs:
           MOONSEC_REQUIRE: mf,input
         run: zig build test-win --summary all
 
+  idd:
+    # The virtual display driver (platform/windows/idd), built with the runner's WDK and
+    # test-signed. The package is uploaded for installing on a real machine.
+    name: virtual display driver (windows-2022)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test-sign (x64)
+        shell: pwsh
+        run: ./platform/windows/idd/build.ps1 -Platform x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moonsec-idd-x64
+          path: platform/windows/idd/out/package-x64
+          if-no-files-found: error
+
   cross:
     name: cross-compile (ubuntu-24.04)
     runs-on: ubuntu-24.04
