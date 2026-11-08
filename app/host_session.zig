@@ -13,6 +13,12 @@
 //! Phase 2 runs at a fixed encoder bitrate. The rate controller still runs on the client's
 //! feedback for pacing and the overlay: the pipe paces at its rate, but never below
 //! `pace_floor` × the bitrate, so a frame always leaves faster than the encoder makes it.
+//!
+//! With `rate_control` (Phase 3) the controller drives the encoder through the ladder
+//! (core/rate/ladder.zig): bitrate changes go out in `EncodeParams.bitrate_bps`, and
+//! resolution or frame-rate steps wait in `takeReconfigure` for the app to apply with
+//! `Encoder.configure`. Relay mode and FEC cap it through `setLimits`. Every frame also goes
+//! through `Controller.onFrame`, so probe frames leave at the probe rate.
 const std = @import("std");
 const core = @import("core");
 const api = @import("platform");
@@ -39,6 +45,9 @@ pub const Config = struct {
     ltr: bool = true,
     /// Apply a pacing rate to the pipe.
     pace: bool = true,
+    /// Drive the encoder bitrate from the rate controller through the ladder, starting
+    /// at `bitrate_bps`. Off: `bitrate_bps` is fixed, as in Phase 2.
+    rate_control: bool = false,
     /// The pipe never paces below this × the encoder bitrate: a frame then takes at most
     /// 1/pace_floor of a frame interval to leave. The controller's rate (link capacity
     /// from frame trains) is used when it is higher.
@@ -106,6 +115,12 @@ pub const HostSession = struct {
     packetizer: media.Packetizer = .{},
     history: media.History,
     ctl: *rate.Controller,
+    ladder: rate.Ladder,
+    limits: rate.ladder.Limits = .{},
+    /// The encoder's bitrate now, and a change not yet handed to it.
+    bitrate_bps: u64,
+    pending_bitrate: u64 = 0,
+    pending_reconfigure: ?rate.ladder.Rung = null,
     rec: *recovery.Host,
     input_rx: core.input.Receiver = .{},
     actions: std.Deque(Pending) = .empty,
@@ -116,13 +131,16 @@ pub const HostSession = struct {
         errdefer history.deinit(gpa);
         const ctl = try gpa.create(rate.Controller);
         errdefer gpa.destroy(ctl);
-        ctl.reset(.{});
+        if (cfg.rate_control) {
+            ctl.reset(.{ .gcc = .{ .start_bps = @floatFromInt(cfg.bitrate_bps) }, .fps = @floatFromInt(cfg.fps) });
+        } else ctl.reset(.{});
+        const ladder = rate.Ladder.init(.{ .width = cfg.width, .height = cfg.height, .fps = cfg.fps });
         const rec = try gpa.create(recovery.Host);
         errdefer gpa.destroy(rec);
         rec.* = recovery.Host.init(.{ .ltr = cfg.ltr });
         const tele = try gpa.create(telemetry.Telemetry(512));
         tele.* = .init();
-        return .{ .gpa = gpa, .cfg = cfg, .pipe = p, .history = history, .ctl = ctl, .rec = rec, .tele = tele };
+        return .{ .gpa = gpa, .cfg = cfg, .pipe = p, .history = history, .ctl = ctl, .ladder = ladder, .bitrate_bps = cfg.bitrate_bps, .rec = rec, .tele = tele };
     }
 
     pub fn deinit(s: *HostSession) void {
@@ -232,7 +250,8 @@ pub const HostSession = struct {
             .feedback => |f| {
                 s.ctl.onFeedbackMsg(now, f.feedback);
                 s.stats.feedback += 1;
-                s.applyPacing();
+                if (s.cfg.rate_control) s.updateLadder(now);
+                s.applyPacing(now);
             },
             .frame_ack => |a| {
                 s.stats.frame_acks += 1;
@@ -244,14 +263,38 @@ pub const HostSession = struct {
         }
     }
 
-    fn applyPacing(s: *HostSession) void {
+    fn applyPacing(s: *HostSession, now: Micros) void {
         if (!s.cfg.pace) return;
-        const floor = s.cfg.pace_floor * @as(f64, @floatFromInt(s.cfg.bitrate_bps));
-        const p: u64 = @intFromFloat(@max(s.ctl.pacingBps(), s.ctl.capacityBps() orelse 0, floor));
+        const floor = s.cfg.pace_floor * @as(f64, @floatFromInt(s.bitrate_bps));
+        const p: u64 = @intFromFloat(@max(s.ctl.pacingAt(now), s.ctl.capacityBps() orelse 0, floor));
         if (p != s.last_pacing) {
             s.pipe.setPacingRate(p);
             s.last_pacing = p;
         }
+    }
+
+    fn updateLadder(s: *HostSession, now: Micros) void {
+        const req = s.ladder.update(now, s.ctl.encoderBps(), s.limits);
+        if (req.bitrate_bps != 0) {
+            s.bitrate_bps = req.bitrate_bps;
+            s.pending_bitrate = req.bitrate_bps;
+        }
+        if (req.reconfigure) |r| {
+            s.pending_reconfigure = r;
+            s.ctl.setFrameRate(@floatFromInt(r.fps));
+        }
+    }
+
+    /// Caps from relay mode and FEC (core/media's policy) for the ladder.
+    pub fn setLimits(s: *HostSession, l: rate.ladder.Limits) void {
+        s.limits = l;
+    }
+
+    /// A resolution or frame-rate step the ladder wants, once: the app applies it with
+    /// `Encoder.configure` (expect a keyframe). Only with `rate_control`.
+    pub fn takeReconfigure(s: *HostSession) ?rate.ladder.Rung {
+        defer s.pending_reconfigure = null;
+        return s.pending_reconfigure;
     }
 
     fn onOther(s: *HostSession, m: proto.Message, env: proto.Envelope, payload: []const u8, now: Micros) void {
@@ -341,11 +384,12 @@ pub const HostSession = struct {
         std.debug.assert(!s.in_encoder);
         s.in_encoder = true;
         const d = s.rec.nextEncode();
+        defer s.pending_bitrate = 0;
         return .{ .force = switch (d.force) {
             .none => .none,
             .ltr_refresh => .ltr_refresh,
             .idr => .idr,
-        }, .acked_ltr_tokens = d.acked_tokens };
+        }, .acked_ltr_tokens = d.acked_tokens, .bitrate_bps = s.pending_bitrate };
     }
 
     pub fn onEncodeDropped(s: *HostSession) void {
@@ -371,6 +415,12 @@ pub const HostSession = struct {
         const cap: u64 = @bitCast(cf.captured_us);
         const enc: u64 = @bitCast(@max(ef.encoded_us, cf.captured_us));
         const n: u8 = @intCast(ef.slices.len);
+        if (s.cfg.rate_control) {
+            var total: usize = 0;
+            for (ef.slices) |sl| total += sl.len;
+            s.ctl.onFrame(now, id, total);
+            s.applyPacing(now);
+        }
         for (ef.slices, 0..) |sl, i| {
             if (sl.len == 0) continue;
             var it = s.packetizer.slice(.{

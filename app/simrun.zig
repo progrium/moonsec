@@ -55,6 +55,8 @@ pub const Options = struct {
     outage_us: Micros = 0,
     /// Stream the synthetic tone over the Opus stage alongside the video.
     audio: bool = true,
+    /// Let the rate controller drive the encoder bitrate (Phase 3), from `bitrate_bps`.
+    rate_control: bool = false,
 };
 
 pub const Result = struct {
@@ -182,7 +184,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     const cb = sc.backend();
     defer cb.deinit();
 
-    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices }, net.pipeFor(.a));
+    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices, .session = .{ .rate_control = o.rate_control } }, net.pipeFor(.a));
     defer host.deinit();
     var client = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent }, net.pipeFor(.b));
     defer client.deinit();
