@@ -81,7 +81,7 @@ document (or its own spec, linked here) and claims its block below.
 | `0x0001`–`0x00ff` | channel: `hello`, `close` | this document |
 | `0x0100`–`0x01ff` | clipboard | this document |
 | `0x0200`–`0x02ff` | displays: list, select, mode changes (Phase 5B) | reserved |
-| `0x0300`–`0x03ff` | multi-user sessions: join, leave, input handoff (Phase 5D) | reserved |
+| `0x0300`–`0x03ff` | multi-user sessions: roster, input request and handoff (Phase 5D) | [multi-user-v0.md](multi-user-v0.md) |
 | `0x0400`–`0x04ff` | codec, chroma and colour negotiation (Phase 5F) | reserved |
 | `0x0500`–`0x05ff` | file transfer | reserved |
 | `0x0600`–`0xefff` | unassigned | |
@@ -115,7 +115,7 @@ Feature bits (bit 0 = LSB):
 | 2 | `clipboard_html`: reserved. |
 | 3–7 | clipboard, reserved. |
 | 8–15 | displays (5B), reserved. |
-| 16–23 | multi-user (5D), reserved. |
+| 16–23 | multi-user (5D): bit 16 `multi_user`, [multi-user-v0.md](multi-user-v0.md); 17–23 reserved. |
 | 24–31 | codec negotiation (5F), reserved. |
 | 32–39 | file transfer, reserved. |
 | 40–63 | unassigned. |
