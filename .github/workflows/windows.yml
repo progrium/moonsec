@@ -34,6 +34,33 @@ jobs:
           MOONSEC_REQUIRE: mf,input
         run: zig build test-win --summary all
 
+  vigem:
+    # The virtual gamepad path end to end (docs/virtual-gamepad.md): install the last
+    # signed ViGEmBus release, plug an Xbox 360 controller and read it back with XInput.
+    name: vigem (windows-2022)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install ViGEmBus 1.22.0
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\ViGEmBus_1.22.0_x64_x86_arm64.exe"
+          Invoke-WebRequest -Uri https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe -OutFile $exe
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash
+          if ($hash -ne "89220A7865076B342892F98865F3499FB7C4CFD673159E89D352C360FD014C6A") { throw "unexpected installer hash $hash" }
+          $p = Start-Process -FilePath $exe -ArgumentList "/exenoui","/qn","/norestart" -Wait -PassThru
+          "installer exit code: $($p.ExitCode)"
+          Get-Service ViGEmBus | Format-List Name,Status,StartType
+          Get-PnpDevice -FriendlyName "*Virtual Gamepad*" -ErrorAction SilentlyContinue | Format-Table -AutoSize Status,Class,FriendlyName,InstanceId
+          Get-CimInstance Win32_SystemDriver -Filter "Name='ViGEmBus'" | Format-List Name,State,PathName
+      - name: Virtual gamepad tests
+        env:
+          MOONSEC_REQUIRE: vigem
+        run: zig build test-win --summary all
+
   cross:
     name: cross-compile (ubuntu-24.04)
     runs-on: ubuntu-24.04

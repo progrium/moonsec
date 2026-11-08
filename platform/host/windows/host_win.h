@@ -145,6 +145,30 @@ msw_hr msw_input_move_abs(uint16_t x, uint16_t y, int32_t left, int32_t top, int
 /* The primary display's rectangle in virtual-desktop pixels. */
 void msw_input_primary_rect(int32_t *left, int32_t *top, int32_t *width, int32_t *height);
 
+/* ---- Virtual gamepads through ViGEmBus (pad_vigem.c) ------------------------ */
+
+/* XINPUT_GAMEPAD's layout: XInput button bits, 8-bit triggers, 16-bit sticks. */
+typedef struct msw_xusb_report {
+    uint16_t buttons;
+    uint8_t lt, rt;
+    int16_t lx, ly, rx, ry;
+} msw_xusb_report;
+
+typedef struct msw_vigem msw_vigem;
+/* Opens the ViGEmBus bus device. HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) when the
+ * driver isn't installed. */
+msw_hr msw_vigem_open(msw_vigem **out);
+/* Closing the bus unplugs every controller this handle plugged. */
+void msw_vigem_close(msw_vigem *v);
+/* Plugs a wired Xbox 360 controller and waits (up to 2 s) until it takes reports. */
+msw_hr msw_vigem_plug_x360(msw_vigem *v, uint32_t *serial);
+msw_hr msw_vigem_update_x360(msw_vigem *v, uint32_t serial, const msw_xusb_report *report);
+msw_hr msw_vigem_unplug(msw_vigem *v, uint32_t serial);
+/* The XInput user index (0..3) Windows gave the controller. */
+msw_hr msw_vigem_user_index(msw_vigem *v, uint32_t serial, uint32_t *index);
+/* XInputGetState through xinput1_4.dll (tests read back what a controller reports). */
+msw_hr msw_xinput_state(uint32_t user, msw_xusb_report *out, uint32_t *packet);
+
 #ifdef __cplusplus
 }
 #endif
