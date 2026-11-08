@@ -1,4 +1,4 @@
-/* Flip-model swapchain, NV12 to BGRA through the D3D11 video processor, overlay copy.
+/* Flip-model swapchain, NV12 to BGRA, overlay copy.
  *
  * Low-latency choices (docs/design.md, "Platform backends"):
  *   - DXGI_SWAP_EFFECT_FLIP_DISCARD with 2 buffers: the compositor can scan out our
@@ -9,8 +9,12 @@
  *   - DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING (when IDXGIFactory5 reports it) and
  *     Present(0, DXGI_PRESENT_ALLOW_TEARING) in lowest-latency mode: no vsync wait;
  *     VRR displays get variable refresh. Smooth mode is Present(1, 0).
- *   - No shaders: the video processor does colour conversion and scaling, and the
- *     overlay is a CopySubresourceRegion of a CPU-drawn BGRA image (opaque box).
+ *   - Colour conversion and scaling: the D3D11 video processor when the device has
+ *     one (hardware devices created with video support). Otherwise, as on WARP, which
+ *     refuses D3D11_CREATE_DEVICE_VIDEO_SUPPORT, a two-SRV pixel shader (R8 luma,
+ *     R8G8 chroma views of the NV12 texture) compiled at startup with
+ *     d3dcompiler_47.dll, which ships with Windows 10 and later.
+ *   - The overlay is a CopySubresourceRegion of a CPU-drawn BGRA image (opaque box).
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
@@ -30,6 +34,18 @@ typedef struct view_entry {
     UINT index;
     ID3D11VideoProcessorInputView *view;
 } view_entry;
+
+typedef struct srv_entry {
+    ID3D11Texture2D *tex; /* not owned: identity only */
+    UINT index;
+    ID3D11ShaderResourceView *y, *uv;
+} srv_entry;
+
+typedef struct shader_consts {
+    float uv_scale[4]; /* xy: crop / coded size */
+    float yoff[4];     /* x: luma offset, y: luma scale */
+    float r[4], g[4], b[4]; /* rows applied to (y, u - 0.5, v - 0.5, 0) */
+} shader_consts;
 
 struct mswc_presenter {
     msw_d3d *d3d;
@@ -52,6 +68,15 @@ struct mswc_presenter {
     view_entry views[VIEW_CACHE];
     UINT next_view;
 
+    /* Shader path (no video device). */
+    int use_shader;
+    ID3D11VertexShader *vs;
+    ID3D11PixelShader *ps;
+    ID3D11SamplerState *sampler;
+    ID3D11Buffer *cb;
+    srv_entry srvs[VIEW_CACHE];
+    UINT next_srv;
+
     ID3D11Texture2D *overlay;
     UINT overlay_w, overlay_h;
 
@@ -62,6 +87,14 @@ static void drop_views(mswc_presenter *p) {
     for (int i = 0; i < VIEW_CACHE; i++) {
         MSW_RELEASE(p->views[i].view);
         p->views[i].tex = NULL;
+    }
+}
+
+static void drop_srvs(mswc_presenter *p) {
+    for (int i = 0; i < VIEW_CACHE; i++) {
+        MSW_RELEASE(p->srvs[i].y);
+        MSW_RELEASE(p->srvs[i].uv);
+        p->srvs[i].tex = NULL;
     }
 }
 
@@ -102,7 +135,75 @@ static int check_tearing(IDXGIFactory2 *f2) {
     return allow ? 1 : 0;
 }
 
-msw_hr mswc_presenter_create(msw_d3d *d3d, mswc_window *win, mswc_presenter **out) {
+static const char kShader[] =
+    "Texture2DArray<float> Y : register(t0);\n"
+    "Texture2DArray<float2> UV : register(t1);\n"
+    "SamplerState S : register(s0);\n"
+    "cbuffer C : register(b0) { float4 uv_scale; float4 yoff; float4 r; float4 g; float4 b; };\n"
+    "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "V vs(uint id : SV_VertexID) {\n"
+    "  float2 t = float2((id << 1) & 2, id & 2);\n"
+    "  V o; o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t * uv_scale.xy; return o;\n"
+    "}\n"
+    "float4 ps(V i) : SV_Target {\n"
+    "  float y = (Y.Sample(S, float3(i.uv, 0)) - yoff.x) * yoff.y;\n"
+    "  float2 c = UV.Sample(S, float3(i.uv, 0)) - 0.5;\n"
+    "  float4 v = float4(y, c, 0);\n"
+    "  return float4(saturate(float3(dot(r, v), dot(g, v), dot(b, v))), 1);\n"
+    "}\n";
+
+typedef HRESULT(WINAPI *d3dcompile_fn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *, ID3DInclude *, LPCSTR,
+                                       LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
+
+static HRESULT compile(d3dcompile_fn fn, const char *entry, const char *target, ID3DBlob **out) {
+    ID3DBlob *errs = NULL;
+    HRESULT hr = fn(kShader, sizeof kShader - 1, "mswc_present", NULL, NULL, entry, target,
+                    1u << 15 /* D3DCOMPILE_OPTIMIZATION_LEVEL3 */, 0, out, &errs);
+    if (errs) {
+        if (FAILED(hr)) OutputDebugStringA((const char *)ID3D10Blob_GetBufferPointer(errs));
+        ID3D10Blob_Release(errs);
+    }
+    return hr;
+}
+
+static HRESULT setup_shader(mswc_presenter *p) {
+    HMODULE lib = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (!lib) return HRESULT_FROM_WIN32(GetLastError());
+    d3dcompile_fn fn;
+    FARPROC proc = GetProcAddress(lib, "D3DCompile");
+    memcpy(&fn, &proc, sizeof fn);
+    HRESULT hr = fn ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    ID3DBlob *vsb = NULL, *psb = NULL;
+    if (FAILED(hr)) goto done;
+    MSW_TRY(compile(fn, "vs", "vs_4_0", &vsb), done);
+    MSW_TRY(compile(fn, "ps", "ps_4_0", &psb), done);
+    MSW_TRY(ID3D11Device_CreateVertexShader(p->d3d->device, ID3D10Blob_GetBufferPointer(vsb),
+                                            ID3D10Blob_GetBufferSize(vsb), NULL, &p->vs),
+            done);
+    MSW_TRY(ID3D11Device_CreatePixelShader(p->d3d->device, ID3D10Blob_GetBufferPointer(psb),
+                                           ID3D10Blob_GetBufferSize(psb), NULL, &p->ps),
+            done);
+    D3D11_SAMPLER_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    MSW_TRY(ID3D11Device_CreateSamplerState(p->d3d->device, &sd, &p->sampler), done);
+    D3D11_BUFFER_DESC bd;
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = sizeof(shader_consts);
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    MSW_TRY(ID3D11Device_CreateBuffer(p->d3d->device, &bd, NULL, &p->cb), done);
+done:
+    MSW_RELEASE(vsb);
+    MSW_RELEASE(psb);
+    /* d3dcompiler stays loaded: unloading it while its blobs' code may be cached is
+     * not worth the few hundred KB. */
+    return hr;
+}
+
+msw_hr mswc_presenter_create(msw_d3d *d3d, mswc_window *win, uint32_t flags, mswc_presenter **out) {
     *out = NULL;
     mswc_presenter *p = (mswc_presenter *)calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
@@ -146,8 +247,14 @@ msw_hr mswc_presenter_create(msw_d3d *d3d, mswc_window *win, mswc_presenter **ou
         goto fail;
     }
 
-    MSW_TRY(ID3D11Device_QueryInterface(d3d->device, &IID_ID3D11VideoDevice, (void **)&p->vd), fail);
-    MSW_TRY(ID3D11DeviceContext_QueryInterface(d3d->context, &IID_ID3D11VideoContext, (void **)&p->vc), fail);
+    if ((flags & MSWC_PRESENTER_SHADER) ||
+        FAILED(ID3D11Device_QueryInterface(d3d->device, &IID_ID3D11VideoDevice, (void **)&p->vd)) ||
+        FAILED(ID3D11DeviceContext_QueryInterface(d3d->context, &IID_ID3D11VideoContext, (void **)&p->vc))) {
+        MSW_RELEASE(p->vd);
+        MSW_RELEASE(p->vc);
+        p->use_shader = 1;
+        MSW_TRY(setup_shader(p), fail);
+    }
 
     memset(&td, 0, sizeof td);
     td.Width = OVERLAY_MAX_W;
@@ -173,7 +280,12 @@ fail:
 void mswc_presenter_destroy(mswc_presenter *p) {
     if (!p) return;
     drop_vp(p);
+    drop_srvs(p);
     drop_targets(p);
+    MSW_RELEASE(p->cb);
+    MSW_RELEASE(p->sampler);
+    MSW_RELEASE(p->ps);
+    MSW_RELEASE(p->vs);
     MSW_RELEASE(p->overlay);
     MSW_RELEASE(p->vc);
     MSW_RELEASE(p->vd);
@@ -183,6 +295,8 @@ void mswc_presenter_destroy(mswc_presenter *p) {
 }
 
 int mswc_presenter_tearing(const mswc_presenter *p) { return p->tearing; }
+
+int mswc_presenter_uses_shader(const mswc_presenter *p) { return p->use_shader; }
 
 void mswc_presenter_size(const mswc_presenter *p, uint32_t *w, uint32_t *h) {
     *w = p->w;
@@ -281,6 +395,129 @@ static RECT letterbox(UINT fw, UINT fh, UINT w, UINT h) {
     return r;
 }
 
+static HRESULT draw_vp(mswc_presenter *p, const mswc_frame *frame) {
+    HRESULT hr;
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)frame->texture, &td);
+    MSW_TRY(ensure_vp(p, td.Width, td.Height), done);
+    if (!p->ov) {
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC od;
+        memset(&od, 0, sizeof od);
+        od.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        MSW_TRY(ID3D11VideoDevice_CreateVideoProcessorOutputView(p->vd, (ID3D11Resource *)p->back, p->vpe, &od,
+                                                                 &p->ov),
+                done);
+    }
+    ID3D11VideoProcessorInputView *iv = NULL;
+    MSW_TRY(input_view(p, (ID3D11Texture2D *)frame->texture, frame->index, &iv), done);
+
+    RECT src = {0, 0, (LONG)frame->width, (LONG)frame->height};
+    RECT dst = letterbox(frame->width, frame->height, p->w, p->h);
+    RECT all = {0, 0, (LONG)p->w, (LONG)p->h};
+    ID3D11VideoContext_VideoProcessorSetStreamSourceRect(p->vc, p->vp, 0, TRUE, &src);
+    ID3D11VideoContext_VideoProcessorSetStreamDestRect(p->vc, p->vp, 0, TRUE, &dst);
+    ID3D11VideoContext_VideoProcessorSetOutputTargetRect(p->vc, p->vp, TRUE, &all);
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE in_cs;
+    memset(&in_cs, 0, sizeof in_cs);
+    in_cs.YCbCr_Matrix = frame->height >= 720 ? 1 : 0; /* BT.709 for HD, BT.601 below */
+    in_cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+    ID3D11VideoContext_VideoProcessorSetStreamColorSpace(p->vc, p->vp, 0, &in_cs);
+
+    D3D11_VIDEO_PROCESSOR_STREAM st;
+    memset(&st, 0, sizeof st);
+    st.Enable = TRUE;
+    st.pInputSurface = iv;
+    MSW_TRY(ID3D11VideoContext_VideoProcessorBlt(p->vc, p->vp, p->ov, 0, 1, &st), done);
+done:
+    return hr;
+}
+
+static HRESULT shader_views(mswc_presenter *p, ID3D11Texture2D *tex, UINT index, srv_entry **out) {
+    for (int i = 0; i < VIEW_CACHE; i++) {
+        if (p->srvs[i].y && p->srvs[i].tex == tex && p->srvs[i].index == index) {
+            *out = &p->srvs[i];
+            return S_OK;
+        }
+    }
+    srv_entry *e = &p->srvs[p->next_srv];
+    p->next_srv = (p->next_srv + 1) % VIEW_CACHE;
+    MSW_RELEASE(e->y);
+    MSW_RELEASE(e->uv);
+    e->tex = NULL;
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+    memset(&vd, 0, sizeof vd);
+    vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    vd.Texture2DArray.MipLevels = 1;
+    vd.Texture2DArray.FirstArraySlice = index;
+    vd.Texture2DArray.ArraySize = 1;
+    vd.Format = DXGI_FORMAT_R8_UNORM;
+    HRESULT hr = ID3D11Device_CreateShaderResourceView(p->d3d->device, (ID3D11Resource *)tex, &vd, &e->y);
+    if (FAILED(hr)) return hr;
+    vd.Format = DXGI_FORMAT_R8G8_UNORM;
+    hr = ID3D11Device_CreateShaderResourceView(p->d3d->device, (ID3D11Resource *)tex, &vd, &e->uv);
+    if (FAILED(hr)) {
+        MSW_RELEASE(e->y);
+        return hr;
+    }
+    e->tex = tex;
+    e->index = index;
+    *out = e;
+    return S_OK;
+}
+
+static HRESULT draw_shader(mswc_presenter *p, const mswc_frame *frame) {
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D_GetDesc((ID3D11Texture2D *)frame->texture, &td);
+    srv_entry *e = NULL;
+    HRESULT hr = shader_views(p, (ID3D11Texture2D *)frame->texture, frame->index, &e);
+    if (FAILED(hr)) return hr;
+
+    shader_consts k;
+    memset(&k, 0, sizeof k);
+    k.uv_scale[0] = (float)frame->width / (float)td.Width;
+    k.uv_scale[1] = (float)frame->height / (float)td.Height;
+    /* Limited-range luma; chroma rows for BT.709 (HD) or BT.601. */
+    k.yoff[0] = 16.0f / 255.0f;
+    k.yoff[1] = 255.0f / 219.0f;
+    const float cs = 255.0f / 224.0f;
+    if (frame->height >= 720) {
+        const float r[4] = {1, 0, 1.5748f * cs, 0}, g[4] = {1, -0.1873f * cs, -0.4681f * cs, 0},
+                    b[4] = {1, 1.8556f * cs, 0, 0};
+        memcpy(k.r, r, sizeof r);
+        memcpy(k.g, g, sizeof g);
+        memcpy(k.b, b, sizeof b);
+    } else {
+        const float r[4] = {1, 0, 1.402f * cs, 0}, g[4] = {1, -0.344136f * cs, -0.714136f * cs, 0},
+                    b[4] = {1, 1.772f * cs, 0, 0};
+        memcpy(k.r, r, sizeof r);
+        memcpy(k.g, g, sizeof g);
+        memcpy(k.b, b, sizeof b);
+    }
+    ID3D11DeviceContext *ctx = p->d3d->context;
+    ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)p->cb, 0, NULL, &k, 0, 0);
+
+    RECT dst = letterbox(frame->width, frame->height, p->w, p->h);
+    D3D11_VIEWPORT vp = {(float)dst.left, (float)dst.top, (float)(dst.right - dst.left), (float)(dst.bottom - dst.top),
+                         0, 1};
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &p->rtv, NULL);
+    ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(ctx, p->vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 1, &p->cb);
+    ID3D11DeviceContext_PSSetShader(ctx, p->ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &p->cb);
+    ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &p->sampler);
+    ID3D11ShaderResourceView *srv[2] = {e->y, e->uv};
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 2, srv);
+    ID3D11DeviceContext_Draw(ctx, 3, 0);
+    /* Unbind so the decoder can write the texture again. */
+    ID3D11ShaderResourceView *none[2] = {NULL, NULL};
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 2, none);
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
+    return S_OK;
+}
+
 msw_hr mswc_presenter_draw(mswc_presenter *p, const mswc_frame *frame) {
     HRESULT hr;
     MSW_TRY(get_targets(p), done);
@@ -288,37 +525,10 @@ msw_hr mswc_presenter_draw(mswc_presenter *p, const mswc_frame *frame) {
     ID3D11DeviceContext_ClearRenderTargetView(p->d3d->context, p->rtv, black);
 
     if (frame && frame->texture) {
-        D3D11_TEXTURE2D_DESC td;
-        ID3D11Texture2D_GetDesc((ID3D11Texture2D *)frame->texture, &td);
-        MSW_TRY(ensure_vp(p, td.Width, td.Height), done);
-        if (!p->ov) {
-            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC od;
-            memset(&od, 0, sizeof od);
-            od.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-            MSW_TRY(ID3D11VideoDevice_CreateVideoProcessorOutputView(p->vd, (ID3D11Resource *)p->back, p->vpe, &od,
-                                                                     &p->ov),
-                    done);
-        }
-        ID3D11VideoProcessorInputView *iv = NULL;
-        MSW_TRY(input_view(p, (ID3D11Texture2D *)frame->texture, frame->index, &iv), done);
-
-        RECT src = {0, 0, (LONG)frame->width, (LONG)frame->height};
-        RECT dst = letterbox(frame->width, frame->height, p->w, p->h);
-        RECT all = {0, 0, (LONG)p->w, (LONG)p->h};
-        ID3D11VideoContext_VideoProcessorSetStreamSourceRect(p->vc, p->vp, 0, TRUE, &src);
-        ID3D11VideoContext_VideoProcessorSetStreamDestRect(p->vc, p->vp, 0, TRUE, &dst);
-        ID3D11VideoContext_VideoProcessorSetOutputTargetRect(p->vc, p->vp, TRUE, &all);
-        D3D11_VIDEO_PROCESSOR_COLOR_SPACE in_cs;
-        memset(&in_cs, 0, sizeof in_cs);
-        in_cs.YCbCr_Matrix = frame->height >= 720 ? 1 : 0; /* BT.709 for HD, BT.601 below */
-        in_cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
-        ID3D11VideoContext_VideoProcessorSetStreamColorSpace(p->vc, p->vp, 0, &in_cs);
-
-        D3D11_VIDEO_PROCESSOR_STREAM st;
-        memset(&st, 0, sizeof st);
-        st.Enable = TRUE;
-        st.pInputSurface = iv;
-        MSW_TRY(ID3D11VideoContext_VideoProcessorBlt(p->vc, p->vp, p->ov, 0, 1, &st), done);
+        if (p->use_shader)
+            MSW_TRY(draw_shader(p, frame), done);
+        else
+            MSW_TRY(draw_vp(p, frame), done);
     }
 
     if (p->overlay_w && p->overlay_h) {

@@ -119,13 +119,22 @@ enum {
     MSWC_PRESENT_SMOOTH = 1,         /* Present(1, 0) */
 };
 
+enum {
+    /* Convert with the pixel shader even when the device has a video processor. */
+    MSWC_PRESENTER_SHADER = 1u << 0,
+};
+
 /* Flip-model swapchain (FLIP_DISCARD, 2 buffers, BGRA8) on the window with a frame
  * latency waitable object and a maximum frame latency of 1; ALLOW_TEARING when the
  * factory supports it. NV12 frames are scaled and converted by the D3D11 video
- * processor, letterboxed into the back buffer. */
-msw_hr mswc_presenter_create(msw_d3d *d3d, mswc_window *win, mswc_presenter **out);
+ * processor, or by a pixel shader when the device has none (WARP), letterboxed into
+ * the back buffer. The shader path needs the frame texture to allow shader resource
+ * views. */
+msw_hr mswc_presenter_create(msw_d3d *d3d, mswc_window *win, uint32_t flags, mswc_presenter **out);
 void mswc_presenter_destroy(mswc_presenter *p);
 int mswc_presenter_tearing(const mswc_presenter *p);
+/* 1 when colour conversion runs in the pixel shader, 0 for the video processor. */
+int mswc_presenter_uses_shader(const mswc_presenter *p);
 /* Waits on the frame latency waitable object: returns once DXGI can take another
  * frame without queueing. MSW_DXGI_ERROR_WAIT_TIMEOUT after `timeout_ms`. */
 msw_hr mswc_presenter_wait(mswc_presenter *p, uint32_t timeout_ms);

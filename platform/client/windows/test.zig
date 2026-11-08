@@ -127,7 +127,19 @@ test "decoder rejects garbage without wedging" {
     c.mswc_decoder_release_frame(dec, &f);
 }
 
-test "flip-model swapchain on WARP: waitable, video-processor blit, overlay" {
+test "flip-model swapchain on WARP: waitable, colour conversion, overlay" {
+    try swapchainTest(0);
+    try swapchainTest(c.MSWC_PRESENTER_SHADER);
+}
+
+fn checkHr(what: []const u8, hr: i32) !void {
+    if (hr < 0) {
+        std.debug.print("{s}: {f}\n", .{ what, win.fmtHr(hr) });
+        return error.Win32;
+    }
+}
+
+fn swapchainTest(flags: u32) !void {
     const com = try win.ComThread.init();
     defer com.deinit();
     const d3d = try warp();
@@ -137,9 +149,12 @@ test "flip-model swapchain on WARP: waitable, video-processor blit, overlay" {
     try win.check(c.mswc_window_create(320, 240, "moonsec test", c.MSWC_WINDOW_VISIBLE, &w));
     defer c.mswc_window_destroy(w);
     var pr: ?*c.mswc_presenter = null;
-    try win.check(c.mswc_presenter_create(client.d3dPtr(d3d), w, &pr));
+    try checkHr("mswc_presenter_create", c.mswc_presenter_create(client.d3dPtr(d3d), w, flags, &pr));
     defer c.mswc_presenter_destroy(pr);
-    std.debug.print("swapchain: tearing {s}\n", .{if (c.mswc_presenter_tearing(pr) != 0) "supported" else "not supported"});
+    std.debug.print("swapchain: tearing {s}, {s}\n", .{
+        if (c.mswc_presenter_tearing(pr) != 0) "supported" else "not supported",
+        if (c.mswc_presenter_uses_shader(pr) != 0) "pixel shader" else "video processor",
+    });
 
     var dec: ?*c.mswc_decoder = null;
     try win.check(c.mswc_decoder_create(client.d3dPtr(d3d), c.MSWC_CODEC_H264, 0, &dec));
@@ -164,7 +179,7 @@ test "flip-model swapchain on WARP: waitable, video-processor blit, overlay" {
         defer c.mswc_decoder_release_frame(dec, &f);
 
         if (i == 2) try win.check(c.mswc_presenter_set_overlay(pr, &overlay_px, 8, 4, 8));
-        try win.check(c.mswc_presenter_draw(pr, &f));
+        try checkHr("mswc_presenter_draw", c.mswc_presenter_draw(pr, &f));
 
         var px: u32 = 0;
         // 128x96 letterboxed into 320x240: same 4:3 aspect, fills the buffer.
@@ -182,7 +197,7 @@ test "flip-model swapchain on WARP: waitable, video-processor blit, overlay" {
         } else {
             try testing.expect(px & 0xFFFFFF != 0x00FF00);
         }
-        try win.check(c.mswc_presenter_present(pr, if (i % 2 == 0) c.MSWC_PRESENT_LOWEST_LATENCY else c.MSWC_PRESENT_SMOOTH));
+        try checkHr("mswc_presenter_present", c.mswc_presenter_present(pr, if (i % 2 == 0) c.MSWC_PRESENT_LOWEST_LATENCY else c.MSWC_PRESENT_SMOOTH));
     }
 
     // Hiding the overlay.

@@ -441,7 +441,7 @@ pub fn open(gpa: std.mem.Allocator, opts: Options) !*Client {
     errdefer c.mswc_window_destroy(w);
 
     var pr: ?*c.mswc_presenter = null;
-    try win.check(c.mswc_presenter_create(d3dPtr(d3d), w, &pr));
+    try win.check(c.mswc_presenter_create(d3dPtr(d3d), w, 0, &pr));
     errdefer c.mswc_presenter_destroy(pr);
 
     // The canvas is as large as the overlay the presenter can show.
