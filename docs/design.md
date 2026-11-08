@@ -437,6 +437,8 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 - Clients: macOS (VideoToolbox, Metal) and Linux (VAAPI, Wayland/EGL).
 - Gamepads on all clients; virtual gamepad on Windows host (driver path decided in Phase 3).
 
+- Cross-pair latency measurement. (Built: [tools/latency](../tools/latency/README.md) reads photodiode logs, camera footage or screenshots of the test pattern by barcode or digits, and writes the host×client matrix against the Phase 2 bar, moonsec within 5 ms of a reference run on the same pair and method; CI runs it end to end on the synthetic pair. Still needed on the bench: a full-screen pattern program for real hosts.)
+
 **Gate:** every host/client pair in the target table streams with the Phase 2 latency bar.
 
 ### Phase 5: Quality and recovery (about 5 weeks)
