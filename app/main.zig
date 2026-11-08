@@ -52,6 +52,7 @@ const Args = struct {
     hub_port: u16 = 0,
     ticket_file: []const u8 = "",
     relay: bool = false,
+    loss_policy: bool = false,
     out: []const u8 = "",
     time_us: u64 = 0,
     frame: u32 = 0,
@@ -61,13 +62,14 @@ const Args = struct {
 
 fn usage() error{Usage} {
     std.debug.print(
-        \\usage: moonsec sim [--profile lan|wan|clean] [--seconds N] [--seed N] [opts]
+        \\usage: moonsec sim [--profile lan|wan|longhaul|clean] [--seconds N] [--seed N] [opts]
         \\       moonsec soak [--seconds 3600] [--profile lan] [--seed N] [opts]
         \\       moonsec run [sim|iroh|all] [--seconds N] [--seed N] [opts]
         \\       moonsec peer sim host|client --hub PORT [opts]
         \\       moonsec peer iroh host|client --ticket-file PATH [--relay] [opts]
         \\       moonsec pattern --out FILE.ppm [--time-us N] [--frame N] [--size WxH]
         \\opts:  --fps N --bitrate BPS --size WxH --slices N
+        \\       --loss-policy (sim, soak: NACK/FEC/relay chosen per path)
         \\
     , .{});
     return error.Usage;
@@ -82,6 +84,10 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         const s = args[i];
         if (std.mem.eql(u8, s, "--relay")) {
             a.relay = true;
+            continue;
+        }
+        if (std.mem.eql(u8, s, "--loss-policy")) {
+            a.loss_policy = true;
             continue;
         }
         if (std.mem.startsWith(u8, s, "--")) {
@@ -150,6 +156,7 @@ fn simOptions(a: Args, seconds: u32, progress: u32) simrun.Options {
         .progress_every_s = progress,
         .outage_at_us = a.outage_at_ms * 1000,
         .outage_us = a.outage_ms * 1000,
+        .loss_policy = a.loss_policy,
     };
 }
 

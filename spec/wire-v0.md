@@ -104,6 +104,15 @@ least 1; a header where this is ≤ 0 is invalid). Parity shards carry `S` bytes
 over the data shards zero-padded to `S`. The payload length must equal this exactly;
 receivers drop the datagram otherwise.
 
+**FEC.** Parity is a systematic Reed-Solomon code over GF(2^8) (`core/media/fec.zig`:
+Cauchy rows, scaled so the first parity shard is the XOR of the data shards). The host
+sends a group's data shards, then its parity shards, each with its own `media_seq`, so a
+group's shards hold `media_seq` from `first` to `first + data_shards + parity_shards − 1`
+and `first = media_seq − shard`. Every shard of a group carries the same `data_shards`,
+`parity_shards` and `group_len`; receivers drop shards that disagree with the first one
+they saw. Any `data_shards` of the group's shards rebuild it. `parity_shards` can change
+from group to group (the host sizes it from measured loss, `core/media/policy.zig`).
+
 **Validity.** Receivers drop a shard unless `slice < slice_count`, `group < group_count`,
 `shard < data_shards + parity_shards`, `data_shards ≥ 1`, `group_len ≥ 1` and, when `ltr`
 is clear, `ltr_token = 0`.

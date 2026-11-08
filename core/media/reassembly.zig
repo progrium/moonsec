@@ -8,9 +8,13 @@
 //! window. Frames are never delivered out of order, and nothing after a lost frame is
 //! held back for it: freezing on a gap is the recovery module's job (item H).
 //!
-//! Parity shards (FEC, item G) are counted and ignored for now.
+//! FEC: a group with parity shards is complete once any `data_shards` of its shards are
+//! in; missing data shards are then rebuilt with the Reed-Solomon codec (fec.zig).
+//! When a group completes, `completed` names its media_seq range so the NACK tracker
+//! stops waiting for the shards it no longer needs.
 const std = @import("std");
 const proto = @import("../proto/root.zig");
+const fec = @import("fec.zig");
 const Header = proto.ShardHeader;
 
 fn seqAfter(a: u32, b: u32) bool {
@@ -42,8 +46,10 @@ pub const PushResult = enum {
     late,
     /// Too far ahead, inconsistent with earlier shards, or over a size limit.
     rejected,
-    /// FEC parity, not used without FEC.
+    /// A new FEC parity shard was stored.
     parity,
+    /// Its group was already complete (rebuilt by FEC, or all data in): not needed.
+    unneeded,
     /// Allocation failed.
     out_of_memory,
 };
@@ -54,7 +60,11 @@ pub const Stats = struct {
     late: u64 = 0,
     rejected: u64 = 0,
     parity: u64 = 0,
+    unneeded: u64 = 0,
     out_of_memory: u64 = 0,
+    /// Groups completed with FEC, and the data shards it rebuilt.
+    fec_groups: u64 = 0,
+    fec_shards: u64 = 0,
     frames_delivered: u64 = 0,
     frames_lost: u64 = 0,
 };
@@ -62,9 +72,15 @@ pub const Stats = struct {
 const Group = struct {
     len: u32 = 0,
     data_shards: u8 = 0,
+    parity_shards: u8 = 0,
+    /// Data shards in (received or rebuilt), and parity shards in.
     have: u16 = 0,
+    have_parity: u16 = 0,
     bits: std.StaticBitSet(256) = .initEmpty(),
+    /// `data_shards` × shard size: the data, zero-padded after `len`.
     data: []u8 = &.{},
+    /// `parity_shards` × shard size, allocated with the first parity shard.
+    parity: []u8 = &.{},
 
     fn started(g: Group) bool {
         return g.data_shards != 0;
@@ -73,6 +89,9 @@ const Group = struct {
         return g.started() and g.have == g.data_shards;
     }
 };
+
+/// Media seqs of a group that just completed: `count` seqs from `first`.
+pub const SeqRange = struct { first: u32, count: u16 };
 
 const Slice = struct {
     groups: []Group = &.{},
@@ -116,7 +135,7 @@ pub const FrameView = struct {
     pub fn copySlice(v: FrameView, i: usize, out: []u8) []u8 {
         var n: usize = 0;
         for (v.frame.slices[i].groups) |g| {
-            @memcpy(out[n..][0..g.len], g.data);
+            @memcpy(out[n..][0..g.len], g.data[0..g.len]);
             n += g.len;
         }
         return out[0..n];
@@ -148,6 +167,8 @@ pub const Reassembler = struct {
     /// Frame handed out by the last poll, freed on the next one.
     delivered: ?*Frame = null,
     stats: Stats = .{},
+    /// Set by the `push` that completed a group, cleared by the next `push`.
+    completed: ?SeqRange = null,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) !Reassembler {
         std.debug.assert(cfg.window > 0);
@@ -172,7 +193,10 @@ pub const Reassembler = struct {
 
     fn release(r: *Reassembler, f: *Frame) void {
         for (f.slices) |s| {
-            for (s.groups) |g| r.gpa.free(g.data);
+            for (s.groups) |g| {
+                r.gpa.free(g.data);
+                r.gpa.free(g.parity);
+            }
             r.gpa.free(s.groups);
         }
         r.gpa.free(f.slices);
@@ -188,9 +212,10 @@ pub const Reassembler = struct {
 
     /// Store one video shard (as `proto.decode` returns it).
     pub fn push(r: *Reassembler, h: Header, payload: []const u8, now_us: u64) PushResult {
+        r.completed = null;
         h.validate() catch return r.count(.rejected);
-        if (h.shard >= h.data_shards) return r.count(.parity);
-        if (payload.len != h.payloadLen()) return r.count(.rejected);
+        const is_parity = h.shard >= h.data_shards;
+        if (payload.len != (if (is_parity) h.shardSize() else h.payloadLen())) return r.count(.rejected);
 
         if (!r.started) {
             r.started = true;
@@ -239,24 +264,61 @@ pub const Reassembler = struct {
         } else if (s.groups.len != h.group_count) return r.count(.rejected);
 
         const g = &s.groups[h.group];
+        const sz: usize = h.shardSize();
         if (!g.started()) {
             if (f.bytes + h.group_len > r.cfg.max_frame_bytes) return r.count(.rejected);
-            g.data = r.gpa.alloc(u8, h.group_len) catch return r.count(.out_of_memory);
+            g.data = r.gpa.alloc(u8, sz * h.data_shards) catch return r.count(.out_of_memory);
+            @memset(g.data[h.group_len..], 0);
             g.len = h.group_len;
             g.data_shards = h.data_shards;
+            g.parity_shards = h.parity_shards;
             f.bytes += h.group_len;
-        } else if (g.len != h.group_len or g.data_shards != h.data_shards) return r.count(.rejected);
+        } else if (g.len != h.group_len or g.data_shards != h.data_shards or g.parity_shards != h.parity_shards) return r.count(.rejected);
 
         if (seqAfter(h.media_seq, f.max_seq)) f.max_seq = h.media_seq;
         if (g.bits.isSet(h.shard)) return r.count(.duplicate);
+        if (g.complete()) return r.count(.unneeded);
         g.bits.set(h.shard);
-        g.have += 1;
-        @memcpy(g.data[@as(usize, h.shard) * h.shardSize() ..][0..payload.len], payload);
+        if (is_parity) {
+            if (g.parity.len == 0) {
+                g.parity = r.gpa.alloc(u8, sz * h.parity_shards) catch {
+                    g.bits.unset(h.shard);
+                    return r.count(.out_of_memory);
+                };
+            }
+            @memcpy(g.parity[(h.shard - h.data_shards) * sz ..][0..sz], payload);
+            g.have_parity += 1;
+        } else {
+            @memcpy(g.data[@as(usize, h.shard) * sz ..][0..payload.len], payload);
+            g.have += 1;
+        }
+        if (!g.complete() and g.have + g.have_parity >= g.data_shards) r.rebuild(g, sz);
         if (g.complete()) {
+            r.completed = .{ .first = h.media_seq -% h.shard, .count = h.shardCount() };
             s.complete_groups += 1;
             if (s.complete_groups == s.groups.len) f.complete_slices += 1;
         }
-        return r.count(.stored);
+        return r.count(if (is_parity) .parity else .stored);
+    }
+
+    /// Rebuild a group's missing data shards from the shards in.
+    fn rebuild(r: *Reassembler, g: *Group, sz: usize) void {
+        const k = g.data_shards;
+        const n = @as(usize, k) + g.parity_shards;
+        var all: [256][]u8 = undefined;
+        var present: [256]bool = undefined;
+        for (0..n) |i| {
+            all[i] = if (i < k) g.data[i * sz ..][0..sz] else g.parity[(i - k) * sz ..][0..sz];
+            present[i] = g.bits.isSet(i);
+        }
+        const codec = fec.Codec.init(k, g.parity_shards) catch unreachable;
+        codec.reconstruct(all[0..n], present[0..n]) catch unreachable;
+        // The codec rebuilds the zero padding too; keep it zero even if a sender lied.
+        @memset(g.data[g.len..], 0);
+        r.stats.fec_groups += 1;
+        r.stats.fec_shards += k - g.have;
+        for (0..k) |i| g.bits.set(i);
+        g.have = k;
     }
 
     /// Next frame or loss, in frame order, or null if the next frame is still worth waiting for.
@@ -418,8 +480,113 @@ test "inconsistent, invalid and oversized shards are rejected" {
     s.header.slice = 2;
     try std.testing.expectEqual(PushResult.rejected, push(&r, s, 0)); // slice count changed
     s = pk.items[4];
-    s.header.data_shards = 2;
     s.header.parity_shards = 1;
-    s.header.shard = 2;
-    try std.testing.expectEqual(PushResult.parity, push(&r, s, 0));
+    try std.testing.expectEqual(PushResult.rejected, push(&r, s, 0)); // parity count changed
+}
+
+fn fecShards(gpa: std.mem.Allocator, p: *Packetizer, frame_id: u32, data: []const u8) !std.ArrayList(OwnedShard) {
+    var list: std.ArrayList(OwnedShard) = .empty;
+    var it = try p.slice(.{ .frame_id = frame_id, .slice = 0, .slice_count = 1 }, data);
+    while (it.next()) |x| {
+        var o: OwnedShard = .{ .header = x.header, .len = x.payload.len };
+        @memcpy(o.buf[0..x.payload.len], x.payload);
+        try list.append(gpa, o);
+    }
+    return list;
+}
+
+const OwnedShard = struct {
+    header: Header,
+    buf: [proto.video_payload]u8 = undefined,
+    len: usize,
+    fn payload(o: *const OwnedShard) []const u8 {
+        return o.buf[0..o.len];
+    }
+};
+
+test "fec: any k of n shards rebuild the frame bit-exact" {
+    const gpa = std.testing.allocator;
+    var pb: packetizer.ParityBuffer = .{};
+    var p: Packetizer = .{ .max_payload = 16, .group_shards = 6, .parity_buf = &pb };
+    p.parity[6] = 3;
+    p.parity[2] = 1;
+    var data: [6 * 16 * 2 + 20]u8 = undefined; // two full groups and a 2-shard group
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 31 +% 5);
+    var pk = try fecShards(gpa, &p, 0, &data);
+    defer pk.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 9 + 9 + 3), pk.items.len);
+    var prng = std.Random.DefaultPrng.init(42);
+    const rnd = prng.random();
+    for (0..50) |round| {
+        var r = try Reassembler.init(gpa, .{});
+        defer r.deinit();
+        // Drop up to m shards of each group, chosen at random (data or parity).
+        var drop: [21]bool = @splat(false);
+        for ([_][3]usize{ .{ 0, 9, 3 }, .{ 9, 9, 3 }, .{ 18, 3, 1 } }) |grp| {
+            const lose = rnd.uintAtMost(usize, grp[2]);
+            var n: usize = 0;
+            while (n < lose) {
+                const i = grp[0] + rnd.uintLessThan(usize, grp[1]);
+                if (!drop[i]) {
+                    drop[i] = true;
+                    n += 1;
+                }
+            }
+        }
+        var completed: usize = 0;
+        for (pk.items, 0..) |*s, i| {
+            if (drop[i]) continue;
+            const res = r.push(s.header, s.payload(), 0);
+            try std.testing.expect(res == .stored or res == .parity or res == .unneeded);
+            if (r.completed) |c| {
+                completed += 1;
+                try std.testing.expectEqual(s.header.media_seq -% s.header.shard, c.first);
+                try std.testing.expectEqual(s.header.shardCount(), c.count);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 3), completed);
+        const ev = r.poll(0) orelse return error.TestUnexpectedResult;
+        var out: [data.len]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, &data, ev.frame.copyTo(&out));
+        _ = round;
+    }
+}
+
+test "fec: one shard too many lost and the frame times out" {
+    const gpa = std.testing.allocator;
+    var pb: packetizer.ParityBuffer = .{};
+    var p: Packetizer = .{ .max_payload = 16, .group_shards = 4, .parity_buf = &pb };
+    p.parity[4] = 1;
+    var data: [64]u8 = undefined;
+    @memset(&data, 7);
+    var pk = try fecShards(gpa, &p, 0, &data);
+    defer pk.deinit(gpa);
+    var r = try Reassembler.init(gpa, .{ .frame_timeout_us = 10 });
+    defer r.deinit();
+    for (pk.items[2..]) |*s| _ = r.push(s.header, s.payload(), 0);
+    try std.testing.expect(r.poll(0) == null);
+    try std.testing.expectEqual(@as(u32, 0), r.poll(10).?.lost.id);
+    try std.testing.expectEqual(@as(u64, 0), r.stats.fec_groups);
+}
+
+test "fec: parity after all data is unneeded, and rebuilt padding stays zero" {
+    const gpa = std.testing.allocator;
+    var pb: packetizer.ParityBuffer = .{};
+    var p: Packetizer = .{ .max_payload = 10, .group_shards = 3, .parity_buf = &pb };
+    p.parity[3] = 2;
+    const data = "abcdefghijklmnopqrstu"; // 3 shards of 7
+    var pk = try fecShards(gpa, &p, 0, data);
+    defer pk.deinit(gpa);
+    var r = try Reassembler.init(gpa, .{});
+    defer r.deinit();
+    for (pk.items[0..3]) |*s| try std.testing.expectEqual(PushResult.stored, r.push(s.header, s.payload(), 0));
+    try std.testing.expectEqual(PushResult.unneeded, r.push(pk.items[3].header, pk.items[3].payload(), 0));
+    var out: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(data, r.poll(0).?.frame.copyTo(&out));
+    // Now lose the (short) last data shard and rebuild it from parity.
+    var r2 = try Reassembler.init(gpa, .{});
+    defer r2.deinit();
+    for ([_]usize{ 0, 1, 4 }) |i| _ = r2.push(pk.items[i].header, pk.items[i].payload(), 0);
+    try std.testing.expectEqual(@as(u64, 1), r2.stats.fec_shards);
+    try std.testing.expectEqualStrings(data, r2.poll(0).?.frame.copyTo(&out));
 }
