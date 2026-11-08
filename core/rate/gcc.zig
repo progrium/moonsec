@@ -97,8 +97,9 @@ pub const Config = struct {
     /// Leave competing mode this long after entering and let the drain test
     /// the queue again, so a false entry (a lone flow on a bufferbloated
     /// link) can't fill the buffer for good. If the queue is still foreign,
-    /// the drain's early give-up re-enters within about 0.6 s.
-    competing_recheck_us: i64 = 10_000_000,
+    /// the drain's early give-up re-enters within about 0.6 s and the
+    /// rate from before the recheck is regained.
+    competing_recheck_us: i64 = 20_000_000,
     /// Loss rule below the 10% cap: over `loss_window_us` (and at least 20
     /// packets), loss above `loss_high` with mean queueing above
     /// `loss_queue_us` cuts to (1 - loss/2) x the acked rate. 0 turns it off.
@@ -188,6 +189,8 @@ pub const Gcc = struct {
     competing_low_windows: u32 = 0,
     competing_wmax: f64 = 0,
     competing_since_us: i64 = -1,
+    recheck_bps: f64 = 0,
+    recheck_us: i64 = -1,
     ou_streak: u32 = 0,
     ou_first_us: i64 = -1,
     ou_max_q: f64 = 0,
@@ -287,6 +290,9 @@ pub const Gcc = struct {
         }
         if (self.competing and self.cfg.competing_recheck_us > 0 and now_us - self.competing_since_us >= self.cfg.competing_recheck_us) {
             // Recheck: hand the queue back to the drain (the baseline stays frozen).
+            // If the drain gives up again soon, re-entry restores this rate.
+            self.recheck_bps = self.bitrate;
+            self.recheck_us = now_us;
             self.competing = false;
             self.drain_off_until_us = now_us;
             self.over_since_us = -1;
@@ -397,7 +403,10 @@ pub const Gcc = struct {
         self.competing_since_us = now_us;
         self.competing_level_us = level_us;
         self.competing_low_windows = 0;
-        self.competing_wmax = 0;
+        // Back from a recheck that found the foreign queue still there: regain the
+        // rate the drain's cuts took, as after a loss cut.
+        self.competing_wmax = if (self.recheck_us >= 0 and now_us - self.recheck_us < 3_000_000) self.recheck_bps else 0;
+        self.recheck_us = -1;
         self.competing_entries += 1;
     }
 
