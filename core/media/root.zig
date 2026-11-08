@@ -9,6 +9,7 @@ pub const reassembly = @import("reassembly.zig");
 pub const nack = @import("nack.zig");
 pub const retransmit = @import("retransmit.zig");
 pub const receiver = @import("receiver.zig");
+pub const fec = @import("fec.zig");
 
 pub const Packetizer = packetizer.Packetizer;
 pub const Reassembler = reassembly.Reassembler;

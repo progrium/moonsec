@@ -5,3 +5,5 @@ dist/
 target/
 shim/target/
 spikes/s4-ffi-jitter/harness/out/
+shim/THIRD_PARTY_NOTICES.md
+zig-pkg/

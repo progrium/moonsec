@@ -11,7 +11,10 @@ pub const FrameAck = struct {
         /// The client hit a gap at `gap_frame` and is dropping frames until a keyframe or
         /// an `ltr_refresh` frame arrives.
         recovery_needed: bool = false,
-        _reserved: u7 = 0,
+        /// Answer with an IDR, not an LTR refresh: the client has no keyframe yet or an
+        /// `ltr_refresh` frame failed to decode. Only with `recovery_needed`.
+        want_idr: bool = false,
+        _reserved: u6 = 0,
     };
 
     pub const Entry = struct {
@@ -34,7 +37,7 @@ pub const FrameAck = struct {
 
     pub fn encode(self: FrameAck, e: *wire.Encoder) EncodeError!void {
         if (self.entries.len > max_entries) return error.InvalidMessage;
-        if (!self.flags.recovery_needed and self.gap_frame != 0) return error.InvalidMessage;
+        if (!self.flags.recovery_needed and (self.gap_frame != 0 or self.flags.want_idr)) return error.InvalidMessage;
         try e.int(u8, @bitCast(self.flags));
         try e.int(u32, self.gap_frame);
         try e.int(u8, @intCast(self.entries.len));
@@ -72,12 +75,12 @@ pub const FrameAck = struct {
     /// Consumes the rest of the decoder; trailing bytes are an error.
     pub fn decode(d: *wire.Decoder) DecodeError!View {
         const raw_flags = try d.int(u8);
-        const flags: Flags = @bitCast(raw_flags & 0x01);
+        const flags: Flags = @bitCast(raw_flags & 0x03);
         const gap_frame = try d.int(u32);
         const count = try d.int(u8);
         const raw = try d.take(@as(usize, count) * entry_size);
         if (d.rest().len != 0) return error.InvalidMessage;
-        if (!flags.recovery_needed and gap_frame != 0) return error.InvalidMessage;
+        if (!flags.recovery_needed and (gap_frame != 0 or flags.want_idr)) return error.InvalidMessage;
         return .{ .flags = flags, .gap_frame = gap_frame, .count = count, .raw_entries = raw };
     }
 };
@@ -246,6 +249,13 @@ test "frame ack with no entries, and malformed acks" {
     // gap_frame without recovery_needed
     d = wire.Decoder.init(&.{ 0, 1, 0, 0, 0, 0 });
     try testing.expectError(error.InvalidMessage, FrameAck.decode(&d));
+    // want_idr without recovery_needed
+    d = wire.Decoder.init(&.{ 2, 0, 0, 0, 0, 0 });
+    try testing.expectError(error.InvalidMessage, FrameAck.decode(&d));
+    // want_idr with recovery_needed
+    d = wire.Decoder.init(&.{ 3, 0, 0, 0, 7, 0 });
+    const w = try FrameAck.decode(&d);
+    try testing.expect(w.flags.want_idr and w.flags.recovery_needed);
     // count says 1 entry, none present
     d = wire.Decoder.init(&.{ 0, 0, 0, 0, 0, 1 });
     try testing.expectError(error.Truncated, FrameAck.decode(&d));
