@@ -95,6 +95,14 @@ fn stampTime(t: Micros) u64 {
     return @bitCast(t);
 }
 
+/// A BGRA picture on one side's screen, for the latency probe (tools/latency).
+pub const Screen = struct {
+    data: []const u8,
+    width: u32,
+    height: u32,
+    stride: u32,
+};
+
 // ---------------------------------------------------------------------------
 // Capture
 
@@ -169,6 +177,13 @@ pub const Capture = struct {
 
     pub fn release(c: *Capture, _: *const api.CapturedFrame) void {
         c.out = false;
+    }
+
+    /// What the host's screen shows: the last captured picture (the synthetic screen is
+    /// the pattern, redrawn at each capture). Null before the first capture.
+    pub fn screen(c: *const Capture) ?Screen {
+        if (c.seq == 0 or c.buf.len == 0) return null;
+        return .{ .data = c.buf, .width = c.width, .height = c.height, .stride = c.width * 4 };
     }
 
     pub fn stop(c: *Capture) void {
@@ -438,6 +453,10 @@ pub const Presenter = struct {
     /// Stamp read back from the last presented picture.
     last_stamp: ?pattern.Stamp = null,
     stats: struct { presents: u64 = 0, unreadable: u64 = 0, overlays: u64 = 0 } = .{},
+    /// Set to keep a copy of what is on screen (`screen()`), for the latency probe.
+    keep_gpa: ?std.mem.Allocator = null,
+    shown: []u8 = &.{},
+    shown_size: api.Size = .{ .width = 0, .height = 0 },
 
     pub fn configure(p: *Presenter, cfg: api.PresenterConfig) api.Error!void {
         p.cfg = cfg;
@@ -454,10 +473,31 @@ pub const Presenter = struct {
         }
         if (o != null) p.stats.overlays += 1;
         p.stats.presents += 1;
+        if (p.keep_gpa) |gpa| {
+            const w = f.image.width;
+            const h = f.image.height;
+            if (p.shown.len != w * h * 4) {
+                if (p.shown.len > 0) gpa.free(p.shown);
+                p.shown = &.{};
+                p.shown = gpa.alloc(u8, w * h * 4) catch return error.OutOfMemory;
+            }
+            for (0..h) |y| @memcpy(p.shown[y * w * 4 ..][0 .. w * 4], img.data[y * img.stride ..][0 .. w * 4]);
+            p.shown_size = .{ .width = w, .height = h };
+        }
         return .{ .presented_us = p.clock.now() };
     }
 
-    pub fn deinit(_: *Presenter) void {}
+    /// What the client's screen shows: the last presented picture. Null before the first
+    /// present, or when `keep_screen` was off.
+    pub fn screen(p: *const Presenter) ?Screen {
+        if (p.shown.len == 0) return null;
+        return .{ .data = p.shown, .width = p.shown_size.width, .height = p.shown_size.height, .stride = p.shown_size.width * 4 };
+    }
+
+    pub fn deinit(p: *Presenter) void {
+        if (p.keep_gpa) |gpa| if (p.shown.len > 0) gpa.free(p.shown);
+        p.shown = &.{};
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -664,6 +704,8 @@ pub const Options = struct {
     input_limit: u64 = 0,
     /// Offer the audio source (host) and sink (client).
     audio: bool = true,
+    /// Client: keep a copy of the presented picture (`presenter.screen()`).
+    keep_screen: bool = false,
 };
 
 pub const Host = struct {
@@ -720,6 +762,7 @@ pub const Client = struct {
     fn deinitClient(p: ?*anyopaque) void {
         const c: *Client = @ptrCast(@alignCast(p.?));
         c.decoder.deinit();
+        c.presenter.deinit();
         c.gpa.destroy(c);
     }
 };
@@ -744,7 +787,7 @@ pub fn openClient(gpa: std.mem.Allocator, o: Options) !*Client {
         .gpa = gpa,
         .clock = o.clock,
         .decoder = .{ .gpa = gpa, .clock = o.clock },
-        .presenter = .{ .clock = o.clock },
+        .presenter = .{ .clock = o.clock, .keep_gpa = if (o.keep_screen) gpa else null },
         .input = .{ .clock = o.clock, .interval_us = @max(o.input_interval_us, 1), .limit = o.input_limit },
         .with_input = o.input_interval_us > 0,
         .audio = .{ .clock = o.clock },

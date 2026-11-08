@@ -31,7 +31,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - name: zig fmt
         if: runner.os == 'Linux'
-        run: zig fmt --check transport/pipe.zig transport/sim.zig transport/simlink.zig transport/iroh_pipe.zig tools/gate sim app platform
+        run: zig fmt --check transport/pipe.zig transport/sim.zig transport/simlink.zig transport/iroh_pipe.zig tools/gate tools/latency sim app platform
       - name: Scenarios against sim/golden.txt
         run: zig build sim-check -Doptimize=ReleaseSafe
       - name: core/rate against S11's numbers
@@ -42,6 +42,12 @@ jobs:
       - name: Phase 2 apps over the sim (two processes, wall clock, pipeline threads)
         timeout-minutes: 5
         run: zig build moonsec-sim -Doptimize=ReleaseSafe -- run sim --seconds 8
+      - name: Phase 4 latency gate on the synthetic pair (simulated photodiode and camera)
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          zig build latency-e2e -Doptimize=ReleaseSafe
+          cat zig-out/latency/report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Soak, 10 minutes of simulated LAN (virtual time)
         timeout-minutes: 10
         run: zig build soak -Doptimize=ReleaseSafe -- soak --seconds 600

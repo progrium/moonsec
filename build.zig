@@ -307,6 +307,38 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // Phase 4 gate (tools/latency): glass-to-glass from photodiode logs, camera footage
+    // or screenshots of the test pattern, as a host x client matrix against the Phase 2
+    // bar. `latency-e2e` records the synthetic pair under a simulated photodiode and
+    // camera and runs the gate on it.
+    const simrun_mod = b.createModule(.{ .root_source_file = b.path("app/simrun.zig"), .target = target, .optimize = optimize, .imports = &app_imports });
+    const latency_imports = [_]std.Build.Module.Import{
+        .{ .name = "platform", .module = platform_mod },
+        .{ .name = "synthetic", .module = synthetic_mod },
+        .{ .name = "simrun", .module = simrun_mod },
+    };
+    const latency_mod = b.createModule(.{ .root_source_file = b.path("tools/latency/main.zig"), .target = target, .optimize = optimize, .imports = &latency_imports });
+    const latency = b.addExecutable(.{ .name = "latency", .root_module = latency_mod });
+    b.installArtifact(latency);
+    const run_latency = b.addRunArtifact(latency);
+    if (b.args) |a| run_latency.addArgs(a) else run_latency.addArgs(&.{ "synthetic", "--out-dir", "zig-out/latency" });
+    b.step("latency", "Run the latency tool (args: see tools/latency/main.zig)").dependOn(&run_latency.step);
+    const latency_tests = b.addTest(.{ .root_module = latency_mod });
+    test_app.dependOn(&b.addRunArtifact(latency_tests).step);
+    {
+        const rec = b.addRunArtifact(latency);
+        rec.addArgs(&.{ "synthetic", "--seconds", "12", "--out-dir" });
+        const dir = rec.addOutputDirectoryArg("latency");
+        const gate = b.addRunArtifact(latency);
+        gate.addArg("matrix");
+        gate.addFileArg(dir.path(b, "manifest.txt"));
+        gate.addArg("--out");
+        const report = gate.addOutputFileArg("report.md");
+        gate.has_side_effects = true; // print the matrix every time
+        const e2e = b.step("latency-e2e", "Phase 4 gate on the synthetic pair: record, measure, write zig-out/latency/report.md");
+        e2e.dependOn(&b.addInstallFileWithDir(report, .prefix, "latency/report.md").step);
+    }
+
     // core/rate driving the simulated network with S11's metrics (sim/rate.zig).
     const sim_rate = b.addExecutable(.{ .name = "sim-rate", .root_module = b.createModule(.{ .root_source_file = b.path("sim/rate.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod } } }) });
     b.installArtifact(sim_rate);

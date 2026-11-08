@@ -31,7 +31,9 @@ The pattern is also the measurement tool for real backends: a barcode and seven-
 with the capture time in ms, and a flash square that is white for the first 100 ms of every
 second of the capture clock. Put a photodiode (or a camera) on the host's screen and the
 client's; the delay between the two flashes is glass-to-glass. `moonsec pattern --out p.ppm`
-writes one; `pattern.read` decodes a screenshot or camera crop.
+writes one; `pattern.read` decodes a screenshot or camera crop and `pattern.readDigits` reads the
+digits when the barcode does not survive. [tools/latency](../tools/latency/README.md) turns photodiode
+logs and camera or screenshot frames into the host×client latency matrix for the Phase 4 gate.
 
 ## Commands
 

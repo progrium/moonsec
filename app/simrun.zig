@@ -68,6 +68,15 @@ pub const Options = struct {
     path: ?pathsim.Config = null,
     /// Host and client session settings that differ from the defaults.
     pause_on_stall: bool = true,
+    /// Called after every step with both screens, for the latency probe (tools/latency).
+    observer: ?Observer = null,
+};
+
+/// Watches both screens as a photodiode or camera would. `t_us` is the simulation's
+/// global time (no clock offset); the host screen's stamps are on the host clock.
+pub const Observer = struct {
+    ctx: *anyopaque,
+    stepFn: *const fn (ctx: *anyopaque, t_us: Micros, host: ?synthetic.Screen, client: ?synthetic.Screen) anyerror!void,
 };
 
 pub const Result = struct {
@@ -209,7 +218,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     const sh = try synthetic.openHost(gpa, .{ .clock = hc.clock(), .width = o.width, .height = o.height, .audio = o.audio });
     const hb = sh.backend();
     defer hb.deinit();
-    const sc = try synthetic.openClient(gpa, .{ .clock = cc.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio });
+    const sc = try synthetic.openClient(gpa, .{ .clock = cc.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio, .keep_screen = o.observer != null });
     const cb = sc.backend();
     defer cb.deinit();
 
@@ -248,6 +257,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         try net.runUntil(t);
         host.tick();
         client.tick();
+        if (o.observer) |ob| try ob.stepFn(ob.ctx, t, sh.capture.screen(), sc.presenter.screen());
         if (log) |w| if (o.progress_every_s > 0 and t >= next_progress) {
             const fz = client.s.freeze.stats;
             try w.print("  t={d} s: presented {d}, freezes {d}, longest gap {d:.1} ms\n", .{ @divTrunc(t, simnet.SEC), client.s.stats.frames_presented, fz.freezes, @as(f64, @floatFromInt(fz.longest_gap_us)) / 1000 });

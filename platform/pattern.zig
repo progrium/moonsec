@@ -14,7 +14,8 @@
 //!
 //! `render` draws the pattern; `read` gets the stamp back from a picture (the synthetic
 //! client checks every presented frame with it, and it reads screenshots or camera frames
-//! after cropping). Pure Zig, no allocation.
+//! after cropping); `readDigits` reads the digits when the barcode does not survive.
+//! tools/latency turns these into glass-to-glass numbers. Pure Zig, no allocation.
 const std = @import("std");
 
 pub const Stamp = struct {
@@ -125,23 +126,29 @@ pub fn flashOn(time_us: u64) bool {
 // f (top left), g (middle).
 const seg_masks = [10]u7{ 0b0111111, 0b0000110, 0b1011011, 0b1001111, 0b1100110, 0b1101101, 0b1111101, 0b0000111, 0b1111111, 0b1101111 };
 
-fn drawNumber(px: []u8, stride: u32, l: Layout, value: u64) void {
+const DigitGeom = struct {
     const n_digits = 8;
-    const dh = l.digits_h;
-    const dw = @min(dh / 2, (l.w - l.flash) * 4 / (5 * n_digits + 6));
-    if (dw < 3 or dh < 5) return;
-    const t = @max(dw / 5, 1);
-    var v = value;
-    var i: u32 = n_digits;
-    while (i > 0) {
-        i -= 1;
-        const d: usize = @intCast(v % 10);
-        v /= 10;
-        const x = dw / 2 + i * (dw + dw / 4);
-        const y = l.digits_y;
-        const m = seg_masks[d];
+    dw: u32,
+    dh: u32,
+    t: u32,
+    y: u32,
+
+    fn of(l: Layout) ?DigitGeom {
+        const dh = l.digits_h;
+        const dw = @min(dh / 2, (l.w - l.flash) * 4 / (5 * n_digits + 6));
+        if (dw < 3 or dh < 5) return null;
+        return .{ .dw = dw, .dh = dh, .t = @max(dw / 5, 1), .y = l.digits_y };
+    }
+
+    /// Rectangles (x0, y0, x1, y1) of digit `i`'s segments a..g, most significant first.
+    fn segments(g: DigitGeom, i: u32) [7][4]u32 {
+        const x = g.dw / 2 + i * (g.dw + g.dw / 4);
+        const y = g.y;
+        const dw = g.dw;
+        const dh = g.dh;
+        const t = g.t;
         const half = dh / 2;
-        const segs = [7][4]u32{
+        return .{
             .{ x, y, x + dw, y + t }, // a
             .{ x + dw - t, y, x + dw, y + half }, // b
             .{ x + dw - t, y + half, x + dw, y + dh }, // c
@@ -150,7 +157,19 @@ fn drawNumber(px: []u8, stride: u32, l: Layout, value: u64) void {
             .{ x, y, x + t, y + half }, // f
             .{ x, y + half - t / 2, x + dw, y + half - t / 2 + t }, // g
         };
-        for (segs, 0..) |r, si| {
+    }
+};
+
+fn drawNumber(px: []u8, stride: u32, l: Layout, value: u64) void {
+    const g = DigitGeom.of(l) orelse return;
+    var v = value;
+    var i: u32 = DigitGeom.n_digits;
+    while (i > 0) {
+        i -= 1;
+        const d: usize = @intCast(v % 10);
+        v /= 10;
+        const m = seg_masks[d];
+        for (g.segments(i), 0..) |r, si| {
             if ((m >> @intCast(si)) & 1 == 1) fill(px, stride, r[0], r[1], r[2], r[3], white);
         }
     }
@@ -182,6 +201,27 @@ pub fn read(px: []const u8, w: u32, h: u32, stride: u32) ?Stamp {
     for (0..crc_bits) |i| crc = (crc << 1) | @intFromBool(d[time_bits + frame_bits + i]);
     if (crc != crc16(time_us, frame)) return null;
     return .{ .time_us = time_us, .frame = frame };
+}
+
+/// Read the seven-segment digits back: the capture time in milliseconds, mod 10^8. For
+/// camera frames whose barcode does not survive (blur, glare, a frame caught mid-refresh);
+/// null unless all eight digits are clean. Same geometry rules as `read`.
+pub fn readDigits(px: []const u8, w: u32, h: u32, stride: u32) ?u64 {
+    if (w < min_width or h < min_height) return null;
+    const l = Layout.of(w, h);
+    const g = DigitGeom.of(l) orelse return null;
+    var v: u64 = 0;
+    for (0..DigitGeom.n_digits) |i| {
+        const segs = g.segments(@intCast(i));
+        var m: u7 = 0;
+        for (segs, 0..) |r, si| {
+            const on = luma(px, stride, (r[0] + r[2]) / 2, (r[1] + r[3]) / 2) >= 128;
+            if (on) m |= @as(u7, 1) << @intCast(si);
+        }
+        const d = std.mem.indexOfScalar(u7, &seg_masks, m) orelse return null;
+        v = v * 10 + d;
+    }
+    return v;
 }
 
 /// Write the picture as a binary PPM (for looking at the pattern, or feeding a camera test).
@@ -243,4 +283,25 @@ test "flash square follows the clock" {
     render(&px, w, h, w * 4, .{ .time_us = 5_150_000, .frame = 2 });
     try testing.expect(luma(&px, w * 4, w - 2, h - 2) < 50);
     try testing.expect(flashOn(7_000_000) and !flashOn(7_100_000));
+}
+
+test "digits read back, and a smudged digit is rejected" {
+    const w = 320;
+    const h = 180;
+    var px: [w * h * 4]u8 = undefined;
+    for ([_]u64{ 0, 1_234_567_890, 99_999_999_999, 31_415_926_535 }) |t_ms| {
+        render(&px, w, h, w * 4, .{ .time_us = t_ms * 1000 + 999, .frame = 3 });
+        try testing.expectEqual(@as(?u64, t_ms % 100_000_000), readDigits(&px, w, h, w * 4));
+    }
+    // Wipe the barcode: the digits still read, the barcode does not.
+    const l = Layout.of(w, h);
+    fill(&px, w * 4, 0, 0, w, l.bar_h, black);
+    try testing.expectEqual(@as(?Stamp, null), read(&px, w, h, w * 4));
+    try testing.expect(readDigits(&px, w, h, w * 4) != null);
+    // Light every segment of the first digit: 8 is valid, so light only b and e instead.
+    const g = DigitGeom.of(l).?;
+    const segs = g.segments(0);
+    fill(&px, w * 4, segs[0][0], segs[0][1], segs[3][2], segs[3][3], [4]u8{ 48, 48, 48, 255 });
+    for ([_]usize{ 1, 4 }) |si| fill(&px, w * 4, segs[si][0], segs[si][1], segs[si][2], segs[si][3], white);
+    try testing.expectEqual(@as(?u64, null), readDigits(&px, w, h, w * 4));
 }
