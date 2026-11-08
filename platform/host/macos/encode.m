@@ -393,6 +393,17 @@ int mh_enc_encode(mh_enc *e, void *pixel_buffer, int64_t pts_us, const mh_enc_pa
 
 void mh_enc_get_info(mh_enc *e, mh_enc_info *out) { *out = e->info; }
 
+uint64_t mh_enc_bitrate(mh_enc *e) {
+    if (!e->session) return 0;
+    CFNumberRef n = NULL;
+    int64_t v = 0;
+    if (VTSessionCopyProperty(e->session, kVTCompressionPropertyKey_AverageBitRate, NULL, &n) == noErr && n) {
+        CFNumberGetValue(n, kCFNumberSInt64Type, &v);
+        CFRelease(n);
+    }
+    return v > 0 ? (uint64_t)v : 0;
+}
+
 void mh_enc_destroy(mh_enc *e) {
     if (!e) return;
     drop_session(e);

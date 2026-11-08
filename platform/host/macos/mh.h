@@ -182,6 +182,8 @@ int mh_enc_configure(mh_enc *e, const mh_enc_config *cfg);
  * to the configured one. pts_us must increase. */
 int mh_enc_encode(mh_enc *e, void *pixel_buffer, int64_t pts_us, const mh_enc_params *p, mh_enc_output *out);
 void mh_enc_get_info(mh_enc *e, mh_enc_info *out);
+/* The session's AverageBitRate as VideoToolbox reads it back (0 when unavailable). */
+uint64_t mh_enc_bitrate(mh_enc *e);
 void mh_enc_destroy(mh_enc *e);
 /* Writes VTCopyVideoEncoderList (name, id, hardware flag), one per line. Returns the length. */
 size_t mh_enc_list(char *buf, size_t cap);
