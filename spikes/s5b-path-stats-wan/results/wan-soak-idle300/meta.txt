@@ -1,0 +1,4 @@
+plan=soak:600
+cfg=300:100
+pps=2000
+hold_scale=1

@@ -1,0 +1,3 @@
+t,side,kind,id,relay,addr,extra
+1794096531.222653,host,opened,PathId(1),false,"Ip(71.116.60.17:50950)",""
+1794096531.222660,host,selected,PathId(1),false,"Ip(71.116.60.17:50950)",""

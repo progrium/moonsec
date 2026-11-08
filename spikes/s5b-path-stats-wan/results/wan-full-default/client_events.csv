@@ -1,0 +1,11 @@
+t,side,kind,id,relay,addr,extra
+1794096352.123978,client,opened,PathId(1),false,"Ip(54.149.165.58:47003)",""
+1794096352.124092,client,selected,PathId(1),false,"Ip(54.149.165.58:47003)",""
+1794096372.204600,client,closed,PathId(1),false,"Ip(54.149.165.58:47003)","rtt=72.045593ms sent=1344 lost=16"
+1794096372.204729,client,selected,PathId(0),true,"Relay(https://usw1-1.relay.n0.iroh.link./)",""
+1794096395.397121,client,opened,PathId(2),false,"Ip(54.149.165.58:47003)",""
+1794096395.397519,client,selected,PathId(2),false,"Ip(54.149.165.58:47003)",""
+1794096514.802207,client,closed,PathId(2),false,"Ip(54.149.165.58:47003)","rtt=72.033605ms sent=23017 lost=325"
+1794096514.802261,client,selected,PathId(0),true,"Relay(https://usw1-1.relay.n0.iroh.link./)",""
+1794096519.591418,client,opened,PathId(3),false,"Ip(54.149.165.58:47003)",""
+1794096519.591545,client,selected,PathId(3),false,"Ip(54.149.165.58:47003)",""

@@ -1,0 +1,4 @@
+plan=full
+cfg=300:100
+pps=200
+hold_scale=1

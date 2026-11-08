@@ -95,7 +95,7 @@ We use Rust iroh 1.x (pinned at 1.4.1) through a Rust shim that lives in the rep
 - **Congestion control.** iroh's default controller (Cubic) let a 1 MiB datagram send buffer hide 100–140 ms of queueing while QUIC's RTT stayed flat (S2). The shim installs our own controller (S3's `AppRate`) through iroh's public transport-config builder. It paces at a target rate the core sets, sizes the window at 2× BDP and counts loss without cutting the rate.
 - **Pacing.** The target rate is the core's estimate of link capacity, not the encoder bitrate; pacing at the encoder bitrate stretches every frame across the whole frame interval. The core keeps the encoder below that rate. iroh builds one controller per network path, so the shim applies the target to whichever path is selected and moves it when the path changes.
 - **Drop accounting.** iroh counts neither send-buffer evictions nor receive-buffer drops. The shim counts its own (datagrams sent minus datagrams on the wire, datagrams received minus datagrams read) and reports them with path stats; media sequence numbers catch the rest.
-- **Buffers and timeouts.** The datagram send buffer holds at least the largest frame at the top bitrate (S10: a 64 KiB buffer evicted 62% of an 85 Mbit/s 60 fps stream). The core's own queue bounds delay by age, so an encoder that outruns the target cannot build a ~90 ms queue, and the shim counts every eviction. Per-path idle timeout 300 ms (iroh's default is 15 s, during which a dead direct path looks healthy) and keep-alive 100 ms.
+- **Buffers and timeouts.** The datagram send buffer holds at least the largest frame at the top bitrate (S10: a 64 KiB buffer evicted 62% of an 85 Mbit/s 60 fps stream). The core's own queue bounds delay by age, so an encoder that outruns the target cannot build a ~90 ms queue, and the shim counts every eviction. Per-path idle timeout 300 ms (iroh's default is 15 s, during which a dead direct path looks healthy) and keep-alive 100 ms. Under review after S5b: over a real NAT, 300 ms also closes the direct path on 200–300 ms outages, and iroh then takes 9–60 s to punch a new one.
 - **Runtime threading.** One dedicated current-thread runtime per process, started through `iroh_shim_init` with the host's thread-start hook (see Threading).
 
 The core still owns the rate decision. Its controller uses our own one-way delay from capture and send timestamps, not QUIC's RTT, which stays flat while the send buffer fills.
@@ -106,14 +106,14 @@ The core still owns the rate decision. Its controller uses our own one-way delay
 - Datagrams: `send_datagram(conn, buf, len)`, `recv_datagram(conn, buf, cap)` (non-blocking, with a wakeup fd/handle).
 - Streams: open/accept bidirectional, read, write, finish.
 - Rate: `set_target_bitrate(conn, bps)`, applied to the selected path's controller.
-- Path stats: RTT, loss, congestion window, direct vs relayed, per-path controller counters, shim-counted send and receive drops, a "no ack progress" signal; path changes (opened, selected, closed) as events, which S5 saw arrive within 1 ms.
+- Path stats: RTT, loss, congestion window, direct vs relayed, per-path controller counters, shim-counted send and receive drops, a "no ack progress" signal; path changes (opened, selected, closed) as events, which S5 saw arrive within 1 ms of the change on loopback and S5b within two RTTs over a real NAT.
 - Config: datagram buffer sizes, path idle timeout and keep-alive.
 - Runtime: `iroh_shim_init(on_thread_start, ctx)` before anything else.
 - Built with `panic = "abort"`; Zig owns every buffer that crosses the boundary.
 
 **Relay mode**
 
-Relayed paths run over HTTPS/WebSocket on TCP, so there is head-of-line blocking but no packet loss. When the path is relayed the core turns FEC off, caps bitrate, prefers lower resolution, and shows a relay badge in the overlay. Browser clients are always in this mode.
+Relayed paths run over HTTPS/WebSocket on TCP, so there is head-of-line blocking but no packet loss. A public n0 relay carried about 8 Mbit/s in S5b, with 2–3 s of queue when offered 18 Mbit/s. When the path is relayed the core turns FEC off, caps bitrate, prefers lower resolution, and shows a relay badge in the overlay. Browser clients are always in this mode.
 
 **Fallback**
 
@@ -264,7 +264,7 @@ Static linking is the default and works on all five targets (S1); a dynamic libr
 
 Nine time-boxed spikes, roughly three to four weeks in total, settle the decisions that are expensive to reverse; the transport spikes (S2 to S5) decide whether Rust iroh stays. Pass thresholds are proposed starting points to confirm in review.
 
-As of Nov 7, 2026, S1 to S5, S7 and its follow-up S7b, and S10 have run and iroh stays (for media too: S10), with the shim changes described under Transport. S8 has run on VideoToolbox only. S11 (capacity estimation, added after the original plan) has run in simulation; its real Wi-Fi run is pending. S6, S9 and S8's Windows rows need a Windows GPU host. The table below is the original plan; results are under Spike status.
+As of Nov 7, 2026, S1 to S5, S5's real-network rerun S5b, S7 and its follow-up S7b, and S10 have run and iroh stays (for media too: S10), with the shim changes described under Transport. S8 has run on VideoToolbox only. S11 (capacity estimation, added after the original plan) has run in simulation; its real Wi-Fi run is pending. S6, S9 and S8's Windows rows need a Windows GPU host. The table below is the original plan; results are under Spike status.
 
 | # | Question | Method | Pass | If it fails | Box |
 | --- | --- | --- | --- | --- | --- |
@@ -291,6 +291,7 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 | S3 | Pass | A custom congestion controller installs through iroh's public builder and holds a target rate on a live connection; under 2% loss it keeps 12 ms p99 where Cubic collapses to ~4 Mbit/s and 500+ ms |
 | S4 | Pass with the fallback | FFI call is free (p99 ≤ 0.4 µs); handoff to a shared multi-thread runtime fails under load (1–4 ms p99), a dedicated pinned current-thread runtime passes (≤ 0.4 ms p99) |
 | S5 | Pass, with one config change | Path events arrive within 1 ms and per-path RTT/loss and direct vs relayed are all public API; a dead direct path takes 15 s to detect on defaults, 300 ms with a lower idle timeout |
+| S5b | Pass on punching and stats; idle timeout open | Real NAT pair (MacBook at home ↔ AWS VM, 75 ms RTT): 16/16 connections hole-punched, direct 0.53–0.55 s after dialing; path RTT and loss match app probes; 300 ms detects a dead path in 295–377 ms and had 0 false switches in a 10-minute 18 Mbit/s soak, but closes on 200–300 ms blackouts, and iroh takes 9–60 s to re-punch after any close |
 | S6 | Pending | Needs a Windows GPU host |
 | S7 | Pass, with non-obvious settings | M3 Max, real SCK capture at 1080p60: encode p99 6.75 ms (H.264) and 4.99 ms (HEVC), but only with `RealTime=false` and low-latency rate control off; with them on, 15.5 ms |
 | S7b | Close, not quite | Low-latency encoder with LTR on (S7/S8 follow-up): 8.6 ms p99 HEVC, 8.1–10.9 ms H.264 with `RealTime=true` and `ExpectedFrameRate=1000`; 101/101 simulated losses recovered bit-exact |
@@ -323,7 +324,13 @@ Updated Nov 7, 2026. Each spike's write-up, code and raw results are under [`spi
 **S5: path visibility** ([`spikes/s5-path-stats`](../spikes/s5-path-stats/README.md))
 
 - Findings: `path_events()` (Opened/Selected/Closed/Lagged), `is_relay()` and per-path `PathStats` are all public; events land within 1 ms of the change on the wire. A blackholed direct path is invisible until the per-path idle timeout (15 s default) while `send_datagram` keeps returning Ok. A 150–300 ms idle timeout did not flap under 5% loss on loopback. Relay paths report zero loss, so relay trouble shows up only as RTT.
-- Implications: the "patch shim for noq path stats" fallback is not needed. The shim sets `default_path_max_idle_timeout` to 300 ms and keepalive to 100 ms, forwards path events to Zig, samples `stats()` on the network thread, and exposes a "no ack progress" signal so the core can react before iroh switches paths. Re-check the idle timeout at real internet RTTs and through real NATs.
+- Implications: the "patch shim for noq path stats" fallback is not needed. The shim sets `default_path_max_idle_timeout` to 300 ms and keepalive to 100 ms, forwards path events to Zig, samples `stats()` on the network thread, and exposes a "no ack progress" signal so the core can react before iroh switches paths. Re-check the idle timeout at real internet RTTs and through real NATs (done in S5b, below).
+
+**S5b: S5 across a real network** ([`spikes/s5b-path-stats-wan`](../spikes/s5b-path-stats-wan/README.md))
+
+- Setup: MacBook Pro behind a home NAT ↔ Linux VM in AWS us-west-2 behind a security group that drops unsolicited inbound UDP, n0 production relay, 71–77 ms RTT. The host applies iptables blocks, loss and blackouts to its own direct UDP port. The VM kernel has no netem, so added delay and jitter are untested.
+- Findings: dialed by key + relay URL only, 16 of 16 connections hole-punched and went direct 0.53–0.55 s after dialing. Selected(direct) follows the first direct packet by ~150 ms (two RTTs of path validation). Path RTT matches probe RTT within ~0.5 ms and `lost_packets` tracks injected 2/5/20% loss. A blocked direct path closes after 295–377 ms at idle 300 (1.0 s at 1000, 15 s on defaults), and a 10-minute 18 Mbit/s soak had no false switch. But at idle 300, blackouts of 200–300 ms and above closed the direct path, and 20% loss closed it once in two runs; at idle 1000 nothing up to 600 ms did. After any close, iroh took 9–60 s to go direct again: it does not re-punch when a path is abandoned, only on its 60 s upgrade check, on address changes or on a major network change, and `Endpoint::network_change()` did not trigger it. Path RTT is network RTT only: when loss collapsed the congestion window, probe RTT reached 1–4 s while `stats().rtt` read 72 ms. The n0 relay carried ~8 Mbit/s.
+- Implications: punching and stats pass. The 300 ms idle timeout is right for detection, but each false close costs up to a minute on the relay, so either the shim gets a way to re-punch right after a direct path closes (iroh exposes none; needs an upstream change or a patch), or the idle timeout moves to about 1 s and the core's "no ack progress" signal covers the first second. Undecided; the 300 ms setting stands until then. Latency signals must include the shim's send buffer, not just `stats().rtt`. Relay mode should cap well under 8 Mbit/s on public relays.
 
 **S7: macOS host encode baseline** ([`spikes/s7-macos-encode`](../spikes/s7-macos-encode/README.md))
 
@@ -436,7 +443,7 @@ The original top risk, QUIC congestion control fighting our rate controller, is 
 | Delay-based control loses to loss-based flows (S11: ~55% of fair share against Reno) | Lower bitrate on links shared with downloads | Drain give-up already avoids starvation; consider a loss-based floor while a foreign queue persists; test Cubic/BBR and fq_codel |
 | Shim pacer stalls (5–23 ms, seen in S2 on a shared runtime) | Occasional frame delay on smooth traffic | Rerun on the dedicated runtime; else more burst credit or pace slightly above capacity |
 | iroh/noq internals we depend on (drop counting, per-path controllers) change on upgrade | Silent drops or a lost pacing rate | Pin iroh; shim tests for drop counts and path-change rate handoff; upstream the uncounted-drop and `datagram_send_buffer_space()` issues |
-| 300 ms path idle timeout flaps at real internet RTTs | Spurious path closes | Re-check through real NATs and long-RTT paths in Phase 3 field tests |
+| 300 ms path idle timeout closes on short outages (S5b: 200–300 ms blackouts at 75 ms RTT) and iroh re-punches only after 9–60 s | Up to a minute on the relay after a Wi-Fi stall | Re-punch on path close (upstream or patch), or a ~1 s timeout with the core reacting to "no ack progress"; test long-RTT paths with netem |
 | Windows virtual gamepad and IddCx display drivers need signing | No gamepads or headless host on Windows | Decide driver route by Phase 3; ship without until signed |
 | macOS private API (CGVirtualDisplay) changes | Headless macOS host breaks on an OS update | Feature-flag it; test on every macOS beta |
 | Relay quality for browsers | Stutter on lossy networks | Self-hosted regional relays; set expectations in UI |
