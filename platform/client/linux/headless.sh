@@ -22,7 +22,8 @@ trap cleanup EXIT
 
 weston --backend=headless --renderer=gl --socket="$WAYLAND_DISPLAY" --idle-time=0 --width=1280 --height=720 >"$work/weston.log" 2>&1 &
 pids+=($!)
-for _ in $(seq 1 100); do [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break; sleep 0.05; done
+# The GL renderer can take a while to come up on llvmpipe (CI runners: over 5 s).
+for _ in $(seq 1 600); do [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break; sleep 0.1; done
 if [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
     echo "headless.sh: weston did not start" >&2
     cat "$work/weston.log" >&2
