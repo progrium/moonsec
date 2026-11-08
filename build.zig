@@ -48,6 +48,8 @@ pub fn build(b: *std.Build) void {
 
     // Client platform backends (platform/client/build.zig).
     @import("platform/client/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
+    // macOS host backend (platform/host/macos/build.zig): test-mac, check-mac.
+    @import("platform/host/macos/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
 
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
