@@ -1,27 +1,44 @@
-//! moonsec iroh shim: a minimal C ABI over iroh 1.x.
+//! moonsec iroh shim: the C ABI the Zig core uses for networking (v0.1).
 //!
-//! Spike S1 surface: bind, connect (by ticket), accept, unreliable datagrams.
+//! Beyond wrapping iroh, the shim owns what spikes S2-S5 and S10 showed it must:
+//! - congestion control and pacing (`AppRate`, one factory per connection, rate set by the core
+//!   and moved to whichever path iroh selects; burst credit for frames),
+//! - exact datagram drop accounting on both sides,
+//! - path events, per-path stats and a "no ack progress" signal,
+//! - datagram buffer sizes, path idle timeout and keep-alive,
+//! - one dedicated current-thread runtime that the host can pin (S4).
+//!
 //! Conventions:
 //! - Every function returns an `int32_t` status (0 = ok, negative = error) unless noted.
 //! - On error, `iroh_last_error()` returns a thread-local, NUL-terminated message that
 //!   stays valid until the next shim call on the same thread.
 //! - The caller (Zig) owns every buffer that crosses the boundary; the shim never
 //!   returns heap memory except opaque handles, which are freed with their `_free` call.
-//! - Blocking calls run on a shared tokio runtime owned by the shim.
 #![allow(clippy::missing_safety_doc)]
 
+mod apprate;
+mod wakeup;
+
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, presets};
-use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey};
+use apprate::{AppRate, AppRateFactory, NO_SELECTION, PathCounters, RateKnob};
+use bytes::Bytes;
+use iroh::endpoint::{
+    ConnectOptions, Connection, IdleTimeout, PathEvent, PathId, QuicTransportConfig, RecvStream, SendStream,
+    presets,
+};
+use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
+use n0_future::StreamExt;
+use wakeup::Wakeup;
 
 pub const IROH_OK: i32 = 0;
 pub const IROH_ERR_AGAIN: i32 = -1;
@@ -34,9 +51,37 @@ pub const IROH_ERR_INTERNAL: i32 = -6;
 pub const IROH_RELAY_DEFAULT: u32 = 0;
 pub const IROH_RELAY_DISABLED: u32 = 1;
 pub const IROH_RELAY_CUSTOM: u32 = 2;
+pub const IROH_RELAY_CUSTOM_ONLY: u32 = 3;
 
-/// Inbound datagrams buffered per connection before the shim starts dropping (and counting).
-const RECV_QUEUE: usize = 4096;
+pub const IROH_PATH_NONE: u32 = u32::MAX;
+pub const IROH_BURST_OFF: u32 = u32::MAX;
+pub const IROH_NO_ACK_OFF: u32 = u32::MAX;
+
+pub const IROH_EV_PATH_OPENED: u32 = 1;
+pub const IROH_EV_PATH_SELECTED: u32 = 2;
+pub const IROH_EV_PATH_CLOSED: u32 = 3;
+pub const IROH_EV_LAGGED: u32 = 4;
+pub const IROH_EV_NO_ACK_PROGRESS: u32 = 5;
+pub const IROH_EV_ACK_RESUMED: u32 = 6;
+pub const IROH_EV_CONN_CLOSED: u32 = 7;
+
+// Defaults (see docs/design.md, Transport: "What the shim owns").
+/// S10: 64 KiB evicted 62% of an 85 Mbit/s 60 fps stream; hold the largest frame.
+const DEFAULT_SEND_BUFFER: usize = 1 << 20;
+const DEFAULT_RECV_BUFFER: usize = 2 << 20;
+const DEFAULT_RECV_QUEUE: u32 = 4096;
+/// S5: dead direct path detected in 300 ms instead of 15 s. S5b's question is still open.
+const DEFAULT_PATH_IDLE_MS: u32 = 300;
+const DEFAULT_PATH_KEEPALIVE_MS: u32 = 100;
+/// S10: about one frame of credit (20 ms) took frame bursts from 1.3 to 0.6 ms added p99.
+const DEFAULT_BURST_US: u32 = 20_000;
+const DEFAULT_NO_ACK_MS: u32 = 150;
+const EVENT_QUEUE: usize = 256;
+const MONITOR_TICK: Duration = Duration::from_millis(5);
+/// Bytes of bookkeeping noq charges per queued datagram (`size_of::<frame::Datagram>()`).
+const DGRAM_OVERHEAD: usize = std::mem::size_of::<Bytes>();
+/// Resolve the send FIFO at least this often, to bound its memory.
+const TX_FIFO_RESOLVE: usize = 1024;
 
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::default());
@@ -52,6 +97,10 @@ fn fail(code: i32, msg: impl std::fmt::Display) -> i32 {
     code
 }
 
+// ---------------------------------------------------------------------------------------------
+// Runtime
+// ---------------------------------------------------------------------------------------------
+
 /// Called on the shim's runtime thread before it starts driving iroh, so the host can pin
 /// it to a core and raise its priority (MMCSS, QoS class, SCHED_FIFO...).
 pub type IrohThreadStartFn = Option<unsafe extern "C" fn(ctx: *mut std::ffi::c_void)>;
@@ -66,6 +115,7 @@ static RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 /// one pinned, high-priority shim thread stayed at 100-400 us.
 fn runtime() -> &'static tokio::runtime::Handle {
     RUNTIME.get_or_init(|| {
+        apprate::epoch();
         let hook = THREAD_HOOK.lock().unwrap().take();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -99,7 +149,7 @@ where
     rx.recv().expect("iroh-shim runtime stopped")
 }
 
-/// Runs `fut` on the shim thread with a timeout.
+/// Runs `fut` on the shim thread with a timeout. A zero timeout polls `fut` once.
 fn block_on_timeout<F>(timeout_ms: u32, fut: F) -> Result<F::Output, tokio::time::error::Elapsed>
 where
     F: std::future::Future + Send + 'static,
@@ -121,17 +171,29 @@ pub extern "C" fn iroh_shim_init(on_thread_start: IrohThreadStartFn, ctx: *mut s
     IROH_OK
 }
 
-pub struct IrohEndpoint {
-    ep: Endpoint,
+/// Returns the shim ABI version as (major << 16) | (minor << 8) | patch.
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_shim_version() -> u32 {
+    0x00_01_00
 }
 
-pub struct IrohConn {
-    conn: Connection,
-    rx: Mutex<Receiver<bytes::Bytes>>,
-    dropped: Arc<AtomicU64>,
+/// Microseconds on the shim's monotonic clock (the clock event timestamps use).
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_shim_now_us() -> u64 {
+    apprate::now_us()
 }
 
-/// Options for `iroh_endpoint_bind`. All pointers may be NULL unless noted.
+/// Returns the last error message for the calling thread (never NULL).
+#[unsafe(no_mangle)]
+pub extern "C" fn iroh_last_error() -> *const c_char {
+    LAST_ERROR.with(|e| e.borrow().as_ptr())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Endpoint
+// ---------------------------------------------------------------------------------------------
+
+/// Options for `iroh_endpoint_bind`. All pointers may be NULL and all numbers 0 (= default).
 #[repr(C)]
 pub struct IrohBindOpts {
     /// 32-byte Ed25519 secret key; NULL generates a fresh key.
@@ -141,10 +203,99 @@ pub struct IrohBindOpts {
     pub alpn_len: usize,
     /// One of IROH_RELAY_*.
     pub relay_mode: u32,
-    /// Newline-separated relay URLs, used when relay_mode == IROH_RELAY_CUSTOM.
+    /// Newline-separated relay URLs, used with IROH_RELAY_CUSTOM and IROH_RELAY_CUSTOM_ONLY.
     pub relay_urls: *const c_char,
     /// Optional IPv4 bind address such as "127.0.0.1:0" or "0.0.0.0:4433".
     pub bind_addr: *const c_char,
+    /// QUIC datagram send buffer in bytes (default 1 MiB). Must hold the largest frame.
+    pub datagram_send_buffer: usize,
+    /// QUIC datagram receive buffer in bytes (default 2 MiB).
+    pub datagram_recv_buffer: usize,
+    /// Datagrams the shim buffers for the caller before dropping (default 4096).
+    pub recv_queue_len: u32,
+    /// Per-path idle timeout in ms (default 300).
+    pub path_idle_timeout_ms: u32,
+    /// Per-path keep-alive interval in ms (default 100).
+    pub path_keepalive_ms: u32,
+    /// Connection idle timeout in ms (default: iroh's).
+    pub conn_idle_timeout_ms: u32,
+    /// Target send rate for new connections in bits/s (default 0 = unpaced until set).
+    pub initial_target_bps: u64,
+    /// AppRate burst credit in us of the target rate (default 20000; IROH_BURST_OFF = none).
+    pub burst_us: u32,
+    /// Stall on the selected path that raises IROH_EV_NO_ACK_PROGRESS, in ms
+    /// (default 150; IROH_NO_ACK_OFF disables the event).
+    pub no_ack_progress_ms: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnConfig {
+    send_buffer: usize,
+    recv_buffer: usize,
+    recv_queue: usize,
+    path_idle: Duration,
+    path_keepalive: Duration,
+    conn_idle: Option<Duration>,
+    target_bps: u64,
+    burst_us: u64,
+    no_ack_us: Option<u64>,
+}
+
+fn or<T: PartialEq + Default>(v: T, d: T) -> T {
+    if v == T::default() { d } else { v }
+}
+
+impl ConnConfig {
+    fn from_opts(o: &IrohBindOpts) -> Result<Self, String> {
+        let path_idle = or(o.path_idle_timeout_ms, DEFAULT_PATH_IDLE_MS);
+        let path_keepalive = or(o.path_keepalive_ms, DEFAULT_PATH_KEEPALIVE_MS);
+        if path_keepalive >= path_idle {
+            return Err(format!("path keep-alive ({path_keepalive} ms) must be below the idle timeout ({path_idle} ms)"));
+        }
+        let send_buffer = or(o.datagram_send_buffer, DEFAULT_SEND_BUFFER);
+        if send_buffer < 4096 {
+            return Err("datagram_send_buffer must be at least 4096".into());
+        }
+        Ok(Self {
+            send_buffer,
+            recv_buffer: or(o.datagram_recv_buffer, DEFAULT_RECV_BUFFER),
+            recv_queue: or(o.recv_queue_len, DEFAULT_RECV_QUEUE) as usize,
+            path_idle: Duration::from_millis(path_idle as u64),
+            path_keepalive: Duration::from_millis(path_keepalive as u64),
+            conn_idle: (o.conn_idle_timeout_ms != 0).then(|| Duration::from_millis(o.conn_idle_timeout_ms as u64)),
+            target_bps: o.initial_target_bps,
+            burst_us: match o.burst_us {
+                IROH_BURST_OFF => 0,
+                0 => DEFAULT_BURST_US as u64,
+                v => v as u64,
+            },
+            no_ack_us: match o.no_ack_progress_ms {
+                IROH_NO_ACK_OFF => None,
+                0 => Some(DEFAULT_NO_ACK_MS as u64 * 1000),
+                v => Some(v as u64 * 1000),
+            },
+        })
+    }
+
+    /// One transport config (and so one AppRate factory) per connection.
+    fn transport(&self, factory: Arc<AppRateFactory>) -> Result<QuicTransportConfig, String> {
+        let mut b = QuicTransportConfig::builder()
+            .congestion_controller_factory(factory)
+            .datagram_send_buffer_size(self.send_buffer)
+            .datagram_receive_buffer_size(Some(self.recv_buffer))
+            .default_path_max_idle_timeout(self.path_idle)
+            .default_path_keep_alive_interval(self.path_keepalive);
+        if let Some(d) = self.conn_idle {
+            b = b.max_idle_timeout(Some(IdleTimeout::try_from(d).map_err(|e| format!("conn idle timeout: {e}"))?));
+        }
+        Ok(b.build())
+    }
+}
+
+pub struct IrohEndpoint {
+    ep: Endpoint,
+    alpn: Vec<u8>,
+    cfg: ConnConfig,
 }
 
 unsafe fn opt_str<'a>(p: *const c_char) -> Result<Option<&'a str>, String> {
@@ -161,32 +312,22 @@ unsafe fn bytes_arg<'a>(p: *const u8, len: usize) -> &'a [u8] {
     if p.is_null() || len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(p, len) } }
 }
 
-/// Returns the shim ABI version as (major << 16) | (minor << 8) | patch.
 #[unsafe(no_mangle)]
-pub extern "C" fn iroh_shim_version() -> u32 {
-    0x00_01_00
-}
-
-/// Returns the last error message for the calling thread (never NULL).
-#[unsafe(no_mangle)]
-pub extern "C" fn iroh_last_error() -> *const c_char {
-    LAST_ERROR.with(|e| e.borrow().as_ptr())
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn iroh_endpoint_bind(
-    opts: *const IrohBindOpts,
-    out: *mut *mut IrohEndpoint,
-) -> i32 {
+pub unsafe extern "C" fn iroh_endpoint_bind(opts: *const IrohBindOpts, out: *mut *mut IrohEndpoint) -> i32 {
     if opts.is_null() || out.is_null() {
         return fail(IROH_ERR_INVALID, "null argument");
     }
     let opts = unsafe { &*opts };
+    let cfg = match ConnConfig::from_opts(opts) {
+        Ok(c) => c,
+        Err(e) => return fail(IROH_ERR_INVALID, e),
+    };
+    let alpn = unsafe { bytes_arg(opts.alpn, opts.alpn_len) }.to_vec();
     let built = (|| -> Result<Endpoint, String> {
         let mut b = match opts.relay_mode {
             IROH_RELAY_DEFAULT => Endpoint::builder(presets::N0),
             IROH_RELAY_DISABLED => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
-            IROH_RELAY_CUSTOM => {
+            IROH_RELAY_CUSTOM | IROH_RELAY_CUSTOM_ONLY => {
                 let urls = unsafe { opt_str(opts.relay_urls) }?.ok_or("relay_urls required")?;
                 let urls = urls
                     .lines()
@@ -194,7 +335,12 @@ pub unsafe extern "C" fn iroh_endpoint_bind(
                     .filter(|l| !l.is_empty())
                     .map(|u| RelayUrl::from_str(u).map_err(|e| format!("bad relay url {u}: {e}")))
                     .collect::<Result<Vec<_>, _>>()?;
-                Endpoint::builder(presets::N0).relay_mode(RelayMode::custom(urls))
+                let preset = opts.relay_mode == IROH_RELAY_CUSTOM;
+                if preset {
+                    Endpoint::builder(presets::N0).relay_mode(RelayMode::custom(urls))
+                } else {
+                    Endpoint::builder(presets::Minimal).relay_mode(RelayMode::custom(urls))
+                }
             }
             m => return Err(format!("unknown relay_mode {m}")),
         };
@@ -203,9 +349,8 @@ pub unsafe extern "C" fn iroh_endpoint_bind(
             k.copy_from_slice(unsafe { bytes_arg(opts.secret_key, 32) });
             b = b.secret_key(SecretKey::from_bytes(&k));
         }
-        let alpn = unsafe { bytes_arg(opts.alpn, opts.alpn_len) };
         if !alpn.is_empty() {
-            b = b.alpns(vec![alpn.to_vec()]);
+            b = b.alpns(vec![alpn.clone()]);
         }
         if let Some(addr) = unsafe { opt_str(opts.bind_addr) }? {
             let sa = SocketAddr::from_str(addr).map_err(|e| format!("bad bind_addr {addr}: {e}"))?;
@@ -215,7 +360,7 @@ pub unsafe extern "C" fn iroh_endpoint_bind(
     })();
     match built {
         Ok(ep) => {
-            unsafe { *out = Box::into_raw(Box::new(IrohEndpoint { ep })) };
+            unsafe { *out = Box::into_raw(Box::new(IrohEndpoint { ep, alpn, cfg })) };
             IROH_OK
         }
         Err(e) => fail(IROH_ERR_INTERNAL, e),
@@ -227,8 +372,7 @@ pub unsafe extern "C" fn iroh_endpoint_bind(
 pub unsafe extern "C" fn iroh_endpoint_online(ep: *const IrohEndpoint, timeout_ms: u32) -> i32 {
     let Some(ep) = (unsafe { ep.as_ref() }) else { return fail(IROH_ERR_INVALID, "null endpoint") };
     let endpoint = ep.ep.clone();
-    let r = block_on_timeout(timeout_ms, async move { endpoint.online().await });
-    match r {
+    match block_on_timeout(timeout_ms, async move { endpoint.online().await }) {
         Ok(()) => IROH_OK,
         Err(_) => fail(IROH_ERR_TIMEOUT, "timed out waiting for relay"),
     }
@@ -269,25 +413,6 @@ unsafe fn write_cstr(s: &str, buf: *mut c_char, cap: usize, out_len: *mut usize)
     IROH_OK
 }
 
-fn wrap_conn(conn: Connection) -> *mut IrohConn {
-    let (tx, rx): (SyncSender<bytes::Bytes>, _) = std::sync::mpsc::sync_channel(RECV_QUEUE);
-    let dropped = Arc::new(AtomicU64::new(0));
-    let reader = conn.clone();
-    let drops = dropped.clone();
-    runtime().spawn(async move {
-        while let Ok(d) = reader.read_datagram().await {
-            match tx.try_send(d) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    drops.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(TrySendError::Disconnected(_)) => break,
-            }
-        }
-    });
-    Box::into_raw(Box::new(IrohConn { conn, rx: Mutex::new(rx), dropped }))
-}
-
 /// Dials the endpoint described by `ticket` using `alpn`. Blocks up to timeout_ms.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn iroh_endpoint_connect(
@@ -312,12 +437,22 @@ pub unsafe extern "C" fn iroh_endpoint_connect(
         Err(e) => return fail(IROH_ERR_INVALID, format!("bad ticket: {e}")),
     };
     let alpn = unsafe { bytes_arg(alpn, alpn_len) }.to_vec();
+    let cfg = ep.cfg;
+    let knob = Arc::new(RateKnob::new(cfg.target_bps, cfg.burst_us));
+    let factory = AppRateFactory::new(knob.clone());
+    let tc = match cfg.transport(factory.clone()) {
+        Ok(tc) => tc,
+        Err(e) => return fail(IROH_ERR_INVALID, e),
+    };
     let endpoint = ep.ep.clone();
     let addr = ticket.endpoint_addr().clone();
-    let fut = async move { endpoint.connect(addr, &alpn).await };
+    let fut = async move {
+        let opts = ConnectOptions::new().with_transport_config(tc);
+        endpoint.connect_with_opts(addr, &alpn, opts).await.map_err(|e| e.to_string())?.await.map_err(|e| e.to_string())
+    };
     match block_on_timeout(timeout_ms, fut) {
         Ok(Ok(conn)) => {
-            unsafe { *out = wrap_conn(conn) };
+            unsafe { *out = wrap_conn(conn, cfg, knob, factory) };
             IROH_OK
         }
         Ok(Err(e)) => fail(IROH_ERR_INTERNAL, format!("connect: {e}")),
@@ -327,23 +462,32 @@ pub unsafe extern "C" fn iroh_endpoint_connect(
 
 /// Waits up to timeout_ms for an incoming connection and completes its handshake.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn iroh_endpoint_accept(
-    ep: *const IrohEndpoint,
-    timeout_ms: u32,
-    out: *mut *mut IrohConn,
-) -> i32 {
+pub unsafe extern "C" fn iroh_endpoint_accept(ep: *const IrohEndpoint, timeout_ms: u32, out: *mut *mut IrohConn) -> i32 {
     let Some(ep) = (unsafe { ep.as_ref() }) else { return fail(IROH_ERR_INVALID, "null endpoint") };
     if out.is_null() {
         return fail(IROH_ERR_INVALID, "null out");
     }
+    if ep.alpn.is_empty() {
+        return fail(IROH_ERR_INVALID, "endpoint was bound without an ALPN (dial-only)");
+    }
+    let cfg = ep.cfg;
+    let knob = Arc::new(RateKnob::new(cfg.target_bps, cfg.burst_us));
+    let factory = AppRateFactory::new(knob.clone());
+    let tc = match cfg.transport(factory.clone()) {
+        Ok(tc) => tc,
+        Err(e) => return fail(IROH_ERR_INVALID, e),
+    };
     let endpoint = ep.ep.clone();
+    let alpn = ep.alpn.clone();
     let fut = async move {
         let incoming = endpoint.accept().await.ok_or((IROH_ERR_CLOSED, "endpoint closed".to_string()))?;
-        incoming.await.map_err(|e| (IROH_ERR_INTERNAL, format!("accept: {e}")))
+        let sc = endpoint.create_server_config_builder(vec![alpn]).set_transport_config(tc).build();
+        let accepting = incoming.accept_with(Arc::new(sc)).map_err(|e| (IROH_ERR_INTERNAL, format!("accept: {e}")))?;
+        accepting.await.map_err(|e| (IROH_ERR_INTERNAL, format!("accept: {e}")))
     };
     match block_on_timeout(timeout_ms, fut) {
         Ok(Ok(conn)) => {
-            unsafe { *out = wrap_conn(conn) };
+            unsafe { *out = wrap_conn(conn, cfg, knob, factory) };
             IROH_OK
         }
         Ok(Err((code, msg))) => fail(code, msg),
@@ -361,15 +505,340 @@ pub unsafe extern "C" fn iroh_endpoint_free(ep: *mut IrohEndpoint) {
     run(async move { ep.ep.close().await });
 }
 
-/// Queues one unreliable datagram. Never blocks; the shim copies the bytes.
+// ---------------------------------------------------------------------------------------------
+// Connection state
+// ---------------------------------------------------------------------------------------------
+
+/// One path change or signal, polled with `iroh_conn_poll_event`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IrohEvent {
+    /// IROH_EV_*.
+    pub kind: u32,
+    /// Path the event is about, or IROH_PATH_NONE.
+    pub path_id: u32,
+    /// Shim clock (`iroh_shim_now_us`) when the shim saw the event.
+    pub t_us: u64,
+    /// LAGGED: events missed. NO_ACK_PROGRESS: stall in us. PATH_CLOSED: lost packets on the path.
+    pub value: u64,
+    /// 1 if the path goes through a relay.
+    pub is_relay: u8,
+    pub _pad: [u8; 7],
+    /// Remote address of the path ("ip:port" or the relay URL), NUL-terminated, truncated.
+    pub remote_addr: [c_char; 96],
+}
+
+impl IrohEvent {
+    fn new(kind: u32, path_id: u32, value: u64) -> Self {
+        Self { kind, path_id, t_us: apprate::now_us(), value, is_relay: 0, _pad: [0; 7], remote_addr: [0; 96] }
+    }
+
+    fn with_addr(mut self, a: &TransportAddr) -> Self {
+        self.is_relay = a.is_relay() as u8;
+        let s = match a {
+            TransportAddr::Ip(sa) => sa.to_string(),
+            TransportAddr::Relay(url) => url.to_string(),
+            other => format!("{other:?}"),
+        };
+        let n = s.len().min(self.remote_addr.len() - 1);
+        for (d, b) in self.remote_addr.iter_mut().zip(&s.as_bytes()[..n]) {
+            *d = *b as c_char;
+        }
+        self
+    }
+}
+
+#[derive(Default)]
+struct TxState {
+    /// Lengths of datagrams accepted but not yet known to be sent or evicted, oldest first.
+    fifo: VecDeque<usize>,
+    /// `frame_tx.datagram` at the last resolve.
+    wire_base: u64,
+}
+
+struct Shared {
+    knob: Arc<RateKnob>,
+    factory: Arc<AppRateFactory>,
+    cfg: ConnConfig,
+    wake: Wakeup,
+    /// Path ID -> its controller's counters.
+    paths: Mutex<HashMap<u32, Arc<PathCounters>>>,
+    selected_path: AtomicU32,
+    events: Mutex<VecDeque<IrohEvent>>,
+    events_dropped: AtomicU64,
+    closed: AtomicBool,
+    tx: Mutex<TxState>,
+    tx_sent: AtomicU64,
+    tx_wire: AtomicU64,
+    tx_drops: AtomicU64,
+    tx_queued: AtomicU64,
+    rx_wire: AtomicU64,
+    rx_from_quic: AtomicU64,
+    rx_drops_quic: AtomicU64,
+    rx_drops_shim: AtomicU64,
+    rx_read: AtomicU64,
+}
+
+pub struct IrohConn {
+    conn: Connection,
+    sh: Arc<Shared>,
+    rx: Mutex<Receiver<Bytes>>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+fn path_u32(id: PathId) -> u32 {
+    id.to_string().parse().unwrap_or(IROH_PATH_NONE)
+}
+
+impl Shared {
+    fn push_event(&self, ev: IrohEvent) {
+        {
+            let mut q = self.events.lock().unwrap();
+            if q.len() >= EVENT_QUEUE {
+                q.pop_front();
+                self.events_dropped.fetch_add(1, Relaxed);
+            }
+            q.push_back(ev);
+        }
+        self.wake.signal();
+    }
+
+    fn mark_closed(&self) {
+        if !self.closed.swap(true, Relaxed) {
+            self.push_event(IrohEvent::new(IROH_EV_CONN_CLOSED, IROH_PATH_NONE, 0));
+        }
+    }
+
+    /// Maps a path to its AppRate controller's counters (cached).
+    fn counters(&self, conn: &Connection, id: PathId) -> Option<Arc<PathCounters>> {
+        let key = path_u32(id);
+        if let Some(c) = self.paths.lock().unwrap().get(&key) {
+            return Some(c.clone());
+        }
+        let ctl = conn.congestion_state(id)?.into_any().downcast::<AppRate>().ok()?;
+        self.paths.lock().unwrap().insert(key, ctl.counters.clone());
+        Some(ctl.counters.clone())
+    }
+
+    /// Moves the target rate to `id`'s controller.
+    fn select(&self, conn: &Connection, id: PathId) {
+        self.selected_path.store(path_u32(id), Relaxed);
+        if let Some(c) = self.counters(conn, id) {
+            self.knob.selected.store(c.ctl_index, Relaxed);
+        }
+    }
+
+    /// Resolves which accepted datagrams have left the send buffer and how many were evicted.
+    ///
+    /// noq's send buffer is a FIFO: transmission and eviction both pop the front, so its
+    /// contents are always the newest suffix of what we accepted. Its payload size (from
+    /// `datagram_send_buffer_space`) tells us where that suffix starts; everything before it
+    /// either went on the wire (`frame_tx.datagram`) or was evicted. Caller holds `tx`.
+    fn resolve_tx(&self, conn: &Connection, st: &mut TxState) {
+        // A consistent (space, stats) pair: no pop happened in between if space didn't move.
+        let (mut space, mut stats);
+        let mut tries = 0;
+        loop {
+            space = conn.datagram_send_buffer_space();
+            stats = conn.stats();
+            tries += 1;
+            if conn.datagram_send_buffer_space() == space || tries >= 8 {
+                break;
+            }
+        }
+        let payload = self.cfg.send_buffer.saturating_sub(DGRAM_OVERHEAD).saturating_sub(space);
+        let mut sum = 0usize;
+        let mut k = st.fifo.len();
+        while k > 0 && sum < payload {
+            k -= 1;
+            sum += st.fifo[k];
+        }
+        let wire = stats.frame_tx.datagram;
+        let wire_delta = wire.saturating_sub(st.wire_base);
+        let resolved = k as u64;
+        if resolved > wire_delta {
+            self.tx_drops.fetch_add(resolved - wire_delta, Relaxed);
+        }
+        st.fifo.drain(..k);
+        st.wire_base = wire;
+        self.tx_wire.store(wire, Relaxed);
+        self.tx_queued.store(st.fifo.len() as u64, Relaxed);
+    }
+}
+
+fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Arc<AppRateFactory>) -> *mut IrohConn {
+    let (tx, rx): (SyncSender<Bytes>, _) = std::sync::mpsc::sync_channel(cfg.recv_queue);
+    let sh = Arc::new(Shared {
+        knob,
+        factory,
+        cfg,
+        wake: Wakeup::new().expect("wakeup socket"),
+        paths: Mutex::new(HashMap::new()),
+        selected_path: AtomicU32::new(IROH_PATH_NONE),
+        events: Mutex::new(VecDeque::new()),
+        events_dropped: AtomicU64::new(0),
+        closed: AtomicBool::new(false),
+        tx: Mutex::new(TxState { fifo: VecDeque::new(), wire_base: conn.stats().frame_tx.datagram }),
+        tx_sent: AtomicU64::new(0),
+        tx_wire: AtomicU64::new(0),
+        tx_drops: AtomicU64::new(0),
+        tx_queued: AtomicU64::new(0),
+        rx_wire: AtomicU64::new(0),
+        rx_from_quic: AtomicU64::new(0),
+        rx_drops_quic: AtomicU64::new(0),
+        rx_drops_shim: AtomicU64::new(0),
+        rx_read: AtomicU64::new(0),
+    });
+    // Subscribe before reading the current selection so no change falls in between.
+    let mut events = conn.path_events();
+    for p in conn.paths().iter() {
+        if p.is_selected() {
+            sh.select(&conn, p.id());
+        }
+    }
+    let mut tasks = Vec::new();
+
+    // Datagram reader: drains QUIC's receive buffer into the shim queue. On the
+    // current-thread runtime nothing else runs between a drain and the stats read, so
+    // `frame_rx.datagram - read` is exactly what QUIC's buffer dropped.
+    {
+        let (conn, sh) = (conn.clone(), sh.clone());
+        tasks.push(
+            runtime()
+                .spawn(async move {
+                    const BATCH: usize = 64;
+                    let mut batch: Vec<Bytes> = vec![Bytes::new(); BATCH];
+                    while let Ok(n) = conn.read_many_datagrams(&mut batch).await {
+                        for d in batch.iter_mut().take(n) {
+                            match tx.try_send(std::mem::take(d)) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    sh.rx_drops_shim.fetch_add(1, Relaxed);
+                                }
+                                Err(TrySendError::Disconnected(_)) => return,
+                            }
+                        }
+                        let total = sh.rx_from_quic.fetch_add(n as u64, Relaxed) + n as u64;
+                        if n < BATCH {
+                            let wire = conn.stats().frame_rx.datagram;
+                            sh.rx_wire.store(wire, Relaxed);
+                            sh.rx_drops_quic.store(wire.saturating_sub(total), Relaxed);
+                        }
+                        sh.wake.signal();
+                    }
+                    sh.mark_closed();
+                })
+                .abort_handle(),
+        );
+    }
+
+    // Path events: forward to the caller and move the target rate on selection.
+    {
+        let (conn, sh) = (conn.clone(), sh.clone());
+        tasks.push(
+            runtime()
+                .spawn(async move {
+                    while let Some(ev) = events.next().await {
+                        let ev = match ev {
+                            PathEvent::Opened { id, remote_addr, .. } => {
+                                let _ = sh.counters(&conn, id);
+                                IrohEvent::new(IROH_EV_PATH_OPENED, path_u32(id), 0).with_addr(&remote_addr)
+                            }
+                            PathEvent::Selected { id, remote_addr, .. } => {
+                                sh.select(&conn, id);
+                                IrohEvent::new(IROH_EV_PATH_SELECTED, path_u32(id), 0).with_addr(&remote_addr)
+                            }
+                            PathEvent::Closed { id, remote_addr, last_stats, .. } => {
+                                sh.paths.lock().unwrap().remove(&path_u32(id));
+                                IrohEvent::new(IROH_EV_PATH_CLOSED, path_u32(id), last_stats.lost_packets)
+                                    .with_addr(&remote_addr)
+                            }
+                            PathEvent::Lagged { missed, .. } => IrohEvent::new(IROH_EV_LAGGED, IROH_PATH_NONE, missed),
+                            _ => continue,
+                        };
+                        sh.push_event(ev);
+                    }
+                })
+                .abort_handle(),
+        );
+    }
+
+    // No-ack-progress monitor on the selected path.
+    if let Some(threshold) = cfg.no_ack_us {
+        let (conn, sh) = (conn.clone(), sh.clone());
+        tasks.push(
+            runtime()
+                .spawn(async move {
+                    let mut tick = tokio::time::interval(MONITOR_TICK);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut stalled = false;
+                    loop {
+                        tick.tick().await;
+                        if conn.close_reason().is_some() {
+                            sh.mark_closed();
+                            return;
+                        }
+                        let sel = sh.knob.selected.load(Relaxed);
+                        let ctl = {
+                            let built = sh.factory.built.lock().unwrap();
+                            if sel == NO_SELECTION { built.first().cloned() } else { built.get(sel as usize).cloned() }
+                        };
+                        let Some(ctl) = ctl else { continue };
+                        let stall = ctl.ack_stall_us(apprate::now_us());
+                        let path = sh.selected_path.load(Relaxed);
+                        if !stalled && stall >= threshold {
+                            stalled = true;
+                            sh.push_event(IrohEvent::new(IROH_EV_NO_ACK_PROGRESS, path, stall));
+                        } else if stalled && stall < threshold {
+                            stalled = false;
+                            sh.push_event(IrohEvent::new(IROH_EV_ACK_RESUMED, path, 0));
+                        }
+                    }
+                })
+                .abort_handle(),
+        );
+    }
+
+    Box::into_raw(Box::new(IrohConn { conn, sh, rx: Mutex::new(rx), tasks }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Datagrams
+// ---------------------------------------------------------------------------------------------
+
+/// Queues one unreliable datagram. Never blocks; the shim copies the bytes. If the send buffer
+/// is full, the oldest queued datagrams are evicted (and counted in `send_drops`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn iroh_conn_send_datagram(c: *const IrohConn, buf: *const u8, len: usize) -> i32 {
     let Some(c) = (unsafe { c.as_ref() }) else { return fail(IROH_ERR_INVALID, "null conn") };
-    let data = bytes::Bytes::copy_from_slice(unsafe { bytes_arg(buf, len) });
-    match c.conn.send_datagram(data) {
-        Ok(()) => IROH_OK,
-        Err(e) => fail(IROH_ERR_INTERNAL, format!("send_datagram: {e}")),
+    if len == 0 {
+        return fail(IROH_ERR_INVALID, "empty datagram");
     }
+    let data = Bytes::copy_from_slice(unsafe { bytes_arg(buf, len) });
+    let sh = &c.sh;
+    let mut st = sh.tx.lock().unwrap();
+    // Space only grows behind our back (the runtime pops); pushes happen under `tx`. So if
+    // even counting every unresolved entry as queued the new datagram fits, nothing is evicted.
+    let space = c.conn.datagram_send_buffer_space();
+    let worst = sh.cfg.send_buffer.saturating_sub(DGRAM_OVERHEAD).saturating_sub(space)
+        + st.fifo.len() * DGRAM_OVERHEAD;
+    let may_evict = worst + len > sh.cfg.send_buffer;
+    match c.conn.send_datagram(data) {
+        Ok(()) => {}
+        Err(iroh::endpoint::SendDatagramError::ConnectionLost(e)) => {
+            return fail(IROH_ERR_CLOSED, format!("send_datagram: {e}"));
+        }
+        Err(iroh::endpoint::SendDatagramError::TooLarge) => {
+            return fail(IROH_ERR_TOO_SMALL, "datagram larger than iroh_conn_max_datagram_size");
+        }
+        Err(e) => return fail(IROH_ERR_INTERNAL, format!("send_datagram: {e}")),
+    }
+    st.fifo.push_back(len);
+    sh.tx_sent.fetch_add(1, Relaxed);
+    if may_evict || st.fifo.len() >= TX_FIFO_RESOLVE {
+        sh.resolve_tx(&c.conn, &mut st);
+    }
+    IROH_OK
 }
 
 /// Receives one datagram into buf. timeout_ms == 0 is non-blocking (IROH_ERR_AGAIN if empty).
@@ -398,6 +867,7 @@ pub unsafe extern "C" fn iroh_conn_recv_datagram(
             Err(RecvTimeoutError::Disconnected) => return fail(IROH_ERR_CLOSED, "connection closed"),
         }
     };
+    c.sh.rx_read.fetch_add(1, Relaxed);
     if !out_len.is_null() {
         unsafe { *out_len = d.len() };
     }
@@ -414,10 +884,10 @@ pub unsafe extern "C" fn iroh_conn_max_datagram_size(c: *const IrohConn) -> usiz
     unsafe { c.as_ref() }.and_then(|c| c.conn.max_datagram_size()).unwrap_or(0)
 }
 
-/// Datagrams dropped inside the shim because Zig did not drain the queue fast enough.
+/// Datagrams dropped inside the shim because the caller did not drain the queue fast enough.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn iroh_conn_local_drops(c: *const IrohConn) -> u64 {
-    unsafe { c.as_ref() }.map(|c| c.dropped.load(Ordering::Relaxed)).unwrap_or(0)
+    unsafe { c.as_ref() }.map(|c| c.sh.rx_drops_shim.load(Relaxed)).unwrap_or(0)
 }
 
 /// Writes the remote endpoint ID into buf, NUL-terminated.
@@ -435,4 +905,340 @@ pub unsafe extern "C" fn iroh_conn_free(c: *mut IrohConn, error_code: u32) {
     }
     let c = unsafe { Box::from_raw(c) };
     c.conn.close(error_code.into(), b"");
+    for t in &c.tasks {
+        t.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rate, wakeup, events, stats
+// ---------------------------------------------------------------------------------------------
+
+/// Sets the pacing target (bits/s) for the connection's selected path; 0 removes pacing.
+/// This is the core's capacity estimate, not the encoder bitrate. It moves with the path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_conn_set_target_bitrate(c: *const IrohConn, bps: u64) -> i32 {
+    let Some(c) = (unsafe { c.as_ref() }) else { return fail(IROH_ERR_INVALID, "null conn") };
+    c.sh.knob.target_bps.store(bps, Relaxed);
+    IROH_OK
+}
+
+/// Sets AppRate's burst credit in microseconds of the target rate (0 = none).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_conn_set_burst(c: *const IrohConn, burst_us: u32) -> i32 {
+    let Some(c) = (unsafe { c.as_ref() }) else { return fail(IROH_ERR_INVALID, "null conn") };
+    c.sh.knob.burst_us.store(burst_us as u64, Relaxed);
+    IROH_OK
+}
+
+/// The connection's pollable wakeup handle: an fd on Unix, a SOCKET on Windows. It becomes
+/// readable when a datagram or event arrives or the connection closes. Valid until
+/// `iroh_conn_free`. Call `iroh_conn_wakeup_clear` before draining.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_conn_wakeup_handle(c: *const IrohConn) -> i64 {
+    unsafe { c.as_ref() }.map(|c| c.sh.wake.handle()).unwrap_or(-1)
+}
+
+/// Drains the wakeup handle and re-arms it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_conn_wakeup_clear(c: *const IrohConn) {
+    if let Some(c) = unsafe { c.as_ref() } {
+        c.sh.wake.clear();
+    }
+}
+
+/// Pops the oldest pending event into `*out`. IROH_ERR_AGAIN if there is none.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_conn_poll_event(c: *const IrohConn, out: *mut IrohEvent) -> i32 {
+    let Some(c) = (unsafe { c.as_ref() }) else { return fail(IROH_ERR_INVALID, "null conn") };
+    if out.is_null() {
+        return fail(IROH_ERR_INVALID, "null out");
+    }
+    match c.sh.events.lock().unwrap().pop_front() {
+        Some(ev) => {
+            unsafe { *out = ev };
+            IROH_OK
+        }
+        None => IROH_ERR_AGAIN,
+    }
+}
+
+/// Connection-wide counters. Datagram accounting is exact:
+/// `dgram_sent == dgram_tx_wire + dgram_send_drops + dgram_send_queued` and
+/// `dgram_rx_wire == dgram_read + dgram_recv_drops_quic + dgram_recv_drops_shim + dgram_recv_queued`
+/// (the receive side once the shim's reader has drained QUIC's buffer).
+#[repr(C)]
+#[derive(Default)]
+pub struct IrohConnStats {
+    pub dgram_sent: u64,
+    pub dgram_tx_wire: u64,
+    pub dgram_send_drops: u64,
+    pub dgram_send_queued: u64,
+    pub dgram_rx_wire: u64,
+    pub dgram_read: u64,
+    pub dgram_recv_drops_quic: u64,
+    pub dgram_recv_drops_shim: u64,
+    pub dgram_recv_queued: u64,
+    pub sent_packets: u64,
+    pub lost_packets: u64,
+    pub lost_bytes: u64,
+    pub udp_tx_bytes: u64,
+    pub udp_rx_bytes: u64,
+    pub target_bps: u64,
+    pub events_dropped: u64,
+    pub selected_path: u32,
+    pub path_count: u32,
+    pub closed: u32,
+    pub _pad: u32,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_conn_stats(c: *const IrohConn, out: *mut IrohConnStats) -> i32 {
+    let Some(c) = (unsafe { c.as_ref() }) else { return fail(IROH_ERR_INVALID, "null conn") };
+    if out.is_null() {
+        return fail(IROH_ERR_INVALID, "null out");
+    }
+    let sh = &c.sh;
+    {
+        let mut st = sh.tx.lock().unwrap();
+        sh.resolve_tx(&c.conn, &mut st);
+    }
+    let s = c.conn.stats();
+    let rx_from_quic = sh.rx_from_quic.load(Relaxed);
+    let read = sh.rx_read.load(Relaxed);
+    let drops_shim = sh.rx_drops_shim.load(Relaxed);
+    let o = IrohConnStats {
+        dgram_sent: sh.tx_sent.load(Relaxed),
+        dgram_tx_wire: sh.tx_wire.load(Relaxed),
+        dgram_send_drops: sh.tx_drops.load(Relaxed),
+        dgram_send_queued: sh.tx_queued.load(Relaxed),
+        dgram_rx_wire: sh.rx_wire.load(Relaxed).max(rx_from_quic),
+        dgram_read: read,
+        dgram_recv_drops_quic: sh.rx_drops_quic.load(Relaxed),
+        dgram_recv_drops_shim: drops_shim,
+        dgram_recv_queued: rx_from_quic.saturating_sub(read + drops_shim),
+        sent_packets: s.sent_packets,
+        lost_packets: s.lost_packets,
+        lost_bytes: s.lost_bytes,
+        udp_tx_bytes: s.udp_tx.bytes,
+        udp_rx_bytes: s.udp_rx.bytes,
+        target_bps: sh.knob.target_bps.load(Relaxed),
+        events_dropped: sh.events_dropped.load(Relaxed),
+        selected_path: sh.selected_path.load(Relaxed),
+        path_count: c.conn.paths().len() as u32,
+        closed: (sh.closed.load(Relaxed) || c.conn.close_reason().is_some()) as u32,
+        _pad: 0,
+    };
+    unsafe { *out = o };
+    IROH_OK
+}
+
+/// Per-path stats, from iroh and from the path's AppRate controller.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IrohPathStats {
+    pub path_id: u32,
+    pub is_relay: u8,
+    pub is_selected: u8,
+    /// 1 if the stall below exceeds the connection's no-ack-progress threshold.
+    pub no_ack_progress: u8,
+    pub _pad: u8,
+    pub rtt_us: u64,
+    pub min_rtt_us: u64,
+    pub cwnd: u64,
+    pub mtu: u64,
+    pub sent_packets: u64,
+    pub sent_bytes: u64,
+    pub lost_packets: u64,
+    pub lost_bytes: u64,
+    pub congestion_events: u64,
+    pub udp_tx_datagrams: u64,
+    pub udp_rx_datagrams: u64,
+    /// Base pacing rate this path's controller last reported (bits/s, 0 = unpaced).
+    pub pacing_bps: u64,
+    /// How long sent data has gone unacknowledged on this path, us (0 = all acked).
+    pub ack_stall_us: u64,
+    /// Shim clock time of the last ack on this path (0 = none yet).
+    pub last_ack_us: u64,
+    /// Remote address ("ip:port" or relay URL), NUL-terminated, truncated.
+    pub remote_addr: [c_char; 96],
+}
+
+/// Writes up to `cap` path stats into `out`; `*out_n` receives the number of paths (which may
+/// exceed `cap`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_conn_path_stats(
+    c: *const IrohConn,
+    out: *mut IrohPathStats,
+    cap: usize,
+    out_n: *mut usize,
+) -> i32 {
+    let Some(c) = (unsafe { c.as_ref() }) else { return fail(IROH_ERR_INVALID, "null conn") };
+    let now = apprate::now_us();
+    let paths = c.conn.paths();
+    let mut n = 0usize;
+    for p in paths.iter() {
+        if n < cap && !out.is_null() {
+            let s = p.stats();
+            let ctl = c.sh.counters(&c.conn, p.id());
+            let ld = |f: fn(&PathCounters) -> &AtomicU64| ctl.as_ref().map(|k| f(k).load(Relaxed)).unwrap_or(0);
+            let stall = ctl.as_ref().map(|k| k.ack_stall_us(now)).unwrap_or(0);
+            let row = IrohPathStats {
+                path_id: path_u32(p.id()),
+                is_relay: p.is_relay() as u8,
+                is_selected: p.is_selected() as u8,
+                no_ack_progress: c.sh.cfg.no_ack_us.is_some_and(|t| stall >= t) as u8,
+                _pad: 0,
+                rtt_us: s.rtt.as_micros() as u64,
+                min_rtt_us: ld(|k| &k.min_rtt_us),
+                cwnd: s.cwnd,
+                mtu: s.current_mtu as u64,
+                sent_packets: s.sent_packets,
+                sent_bytes: s.sent_bytes,
+                lost_packets: s.lost_packets,
+                lost_bytes: s.lost_bytes,
+                congestion_events: s.congestion_events,
+                udp_tx_datagrams: s.udp_tx.datagrams,
+                udp_rx_datagrams: s.udp_rx.datagrams,
+                pacing_bps: ld(|k| &k.pacing_bps),
+                ack_stall_us: stall,
+                last_ack_us: ld(|k| &k.last_ack_us),
+                remote_addr: IrohEvent::new(0, 0, 0).with_addr(p.remote_addr()).remote_addr,
+            };
+            unsafe { *out.add(n) = row };
+        }
+        n += 1;
+    }
+    if !out_n.is_null() {
+        unsafe { *out_n = n };
+    }
+    IROH_OK
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bidirectional streams
+// ---------------------------------------------------------------------------------------------
+
+pub struct IrohStream {
+    send: Arc<tokio::sync::Mutex<SendStream>>,
+    recv: Arc<tokio::sync::Mutex<RecvStream>>,
+}
+
+fn wrap_stream((send, recv): (SendStream, RecvStream)) -> *mut IrohStream {
+    Box::into_raw(Box::new(IrohStream {
+        send: Arc::new(tokio::sync::Mutex::new(send)),
+        recv: Arc::new(tokio::sync::Mutex::new(recv)),
+    }))
+}
+
+/// Opens a bidirectional stream. QUIC opens streams lazily: the peer's accept returns once
+/// the first bytes are written.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_conn_open_bi(c: *const IrohConn, timeout_ms: u32, out: *mut *mut IrohStream) -> i32 {
+    let Some(c) = (unsafe { c.as_ref() }) else { return fail(IROH_ERR_INVALID, "null conn") };
+    if out.is_null() {
+        return fail(IROH_ERR_INVALID, "null out");
+    }
+    let conn = c.conn.clone();
+    match block_on_timeout(timeout_ms, async move { conn.open_bi().await }) {
+        Ok(Ok(s)) => {
+            unsafe { *out = wrap_stream(s) };
+            IROH_OK
+        }
+        Ok(Err(e)) => fail(IROH_ERR_CLOSED, format!("open_bi: {e}")),
+        Err(_) => fail(IROH_ERR_TIMEOUT, "open_bi timed out"),
+    }
+}
+
+/// Accepts a bidirectional stream opened by the peer (timeout_ms == 0 polls once).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_conn_accept_bi(c: *const IrohConn, timeout_ms: u32, out: *mut *mut IrohStream) -> i32 {
+    let Some(c) = (unsafe { c.as_ref() }) else { return fail(IROH_ERR_INVALID, "null conn") };
+    if out.is_null() {
+        return fail(IROH_ERR_INVALID, "null out");
+    }
+    let conn = c.conn.clone();
+    match block_on_timeout(timeout_ms, async move { conn.accept_bi().await }) {
+        Ok(Ok(s)) => {
+            unsafe { *out = wrap_stream(s) };
+            IROH_OK
+        }
+        Ok(Err(e)) => fail(IROH_ERR_CLOSED, format!("accept_bi: {e}")),
+        Err(_) if timeout_ms == 0 => IROH_ERR_AGAIN,
+        Err(_) => fail(IROH_ERR_TIMEOUT, "accept_bi timed out"),
+    }
+}
+
+/// Writes all of `buf` (blocking up to timeout_ms for flow control).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_stream_write(s: *const IrohStream, buf: *const u8, len: usize, timeout_ms: u32) -> i32 {
+    let Some(s) = (unsafe { s.as_ref() }) else { return fail(IROH_ERR_INVALID, "null stream") };
+    let data = unsafe { bytes_arg(buf, len) }.to_vec();
+    let send = s.send.clone();
+    match block_on_timeout(timeout_ms, async move { send.lock().await.write_all(&data).await }) {
+        Ok(Ok(())) => IROH_OK,
+        Ok(Err(e)) => fail(IROH_ERR_CLOSED, format!("write: {e}")),
+        Err(_) => fail(IROH_ERR_TIMEOUT, "write timed out"),
+    }
+}
+
+/// Reads up to `cap` bytes. `*out_len == 0` with IROH_OK means the peer finished the stream.
+/// timeout_ms == 0 polls once (IROH_ERR_AGAIN if nothing is buffered).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_stream_read(
+    s: *const IrohStream,
+    buf: *mut u8,
+    cap: usize,
+    timeout_ms: u32,
+    out_len: *mut usize,
+) -> i32 {
+    let Some(s) = (unsafe { s.as_ref() }) else { return fail(IROH_ERR_INVALID, "null stream") };
+    if buf.is_null() || cap == 0 || out_len.is_null() {
+        return fail(IROH_ERR_INVALID, "null or empty buffer");
+    }
+    let recv = s.recv.clone();
+    match block_on_timeout(timeout_ms, async move { recv.lock().await.read_chunk(cap).await }) {
+        Ok(Ok(Some(chunk))) => {
+            unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), buf, chunk.len());
+                *out_len = chunk.len();
+            }
+            IROH_OK
+        }
+        Ok(Ok(None)) => {
+            unsafe { *out_len = 0 };
+            IROH_OK
+        }
+        Ok(Err(e)) => fail(IROH_ERR_CLOSED, format!("read: {e}")),
+        Err(_) if timeout_ms == 0 => IROH_ERR_AGAIN,
+        Err(_) => fail(IROH_ERR_TIMEOUT, "read timed out"),
+    }
+}
+
+/// Finishes the send side (the peer reads end-of-stream after the data).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_stream_finish(s: *const IrohStream) -> i32 {
+    let Some(s) = (unsafe { s.as_ref() }) else { return fail(IROH_ERR_INVALID, "null stream") };
+    let send = s.send.clone();
+    match run(async move { send.lock().await.finish() }) {
+        Ok(()) => IROH_OK,
+        Err(e) => fail(IROH_ERR_CLOSED, format!("finish: {e}")),
+    }
+}
+
+/// Frees the stream. A nonzero error_code resets the send side and stops the receive side;
+/// 0 leaves an unfinished send side to be finished gracefully.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_stream_free(s: *mut IrohStream, error_code: u32) {
+    if s.is_null() {
+        return;
+    }
+    let s = unsafe { Box::from_raw(s) };
+    run(async move {
+        if error_code != 0 {
+            let _ = s.send.lock().await.reset(error_code.into());
+            let _ = s.recv.lock().await.stop(error_code.into());
+        }
+        drop(s);
+    });
 }

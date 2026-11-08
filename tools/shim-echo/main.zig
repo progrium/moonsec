@@ -3,6 +3,10 @@
 //!   shim-echo selftest [--relay] [-n COUNT]   two endpoints in one process, datagram echo
 //!   shim-echo listen                          print a ticket, echo datagrams until killed
 //!   shim-echo dial TICKET [-n COUNT]          send COUNT datagrams to a listener, check echoes
+//!   shim-echo sink BIND_ADDR TICKET_FILE [--relay-url URL]
+//!                                             relays off (or only URL); write the ticket to TICKET_FILE, then
+//!                                             count datagrams and report counts every 20 ms
+//!                                             (peer for transport/iroh_netns_test.zig)
 //!
 //! Exit status 0 means every datagram came back intact.
 const std = @import("std");
@@ -19,16 +23,23 @@ pub fn main(init: std.process.Init) !void {
     var count: u32 = 100;
     var relay = false;
     var ticket: ?[:0]const u8 = null;
+    var extra: ?[:0]const u8 = null;
+    var relay_url: ?[:0]const u8 = null;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "-n") and i + 1 < args.len) {
             i += 1;
             count = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, a, "--relay-url") and i + 1 < args.len) {
+            i += 1;
+            relay_url = args[i];
         } else if (std.mem.eql(u8, a, "--relay")) {
             relay = true;
-        } else {
+        } else if (ticket == null) {
             ticket = a;
+        } else {
+            extra = a;
         }
     }
 
@@ -46,7 +57,56 @@ pub fn main(init: std.process.Init) !void {
         const conn = ep.connect(t, alpn, 30_000) catch |e| return die("connect", e);
         defer conn.deinit(0);
         try pingLoop(init.io, conn, count);
+    } else if (std.mem.eql(u8, cmd, "sink")) {
+        try sink(init.io, ticket orelse return usage(), extra orelse return usage(), relay_url);
     } else return usage();
+}
+
+/// Report datagram the sink sends back: magic, then little-endian u64 counters.
+pub const sink_magic = "RPT1";
+
+fn sink(io: std.Io, bind_addr: [:0]const u8, ticket_file: []const u8, relay_url: ?[:0]const u8) !void {
+    const ep = try bindOrDie(.{
+        .alpn = alpn,
+        .relay_mode = if (relay_url != null) .custom_only else .disabled,
+        .relay_urls = if (relay_url) |u| u.ptr else null,
+        .bind_addr = bind_addr,
+    });
+    if (relay_url != null) ep.online(10_000) catch |e| return die("online", e);
+    defer ep.deinit();
+    var tbuf: [4096]u8 = undefined;
+    const t = try ep.ticket(&tbuf);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ticket_file, .data = t });
+    std.debug.print("sink ticket: {s}\n", .{t});
+    while (true) {
+        const conn = ep.accept(600_000) catch |e| return die("accept", e);
+        defer conn.deinit(0);
+        var buf: [65536]u8 = undefined;
+        var bytes: u64 = 0;
+        var last = iroh.nowUs();
+        while (true) {
+            if (conn.recvDatagram(&buf, 5)) |d| {
+                bytes += d.len;
+            } else |e| switch (e) {
+                error.Timeout => {},
+                error.Closed => break,
+                else => return die("sink recv", e),
+            }
+            const now = iroh.nowUs();
+            if (now - last >= 20_000) {
+                last = now;
+                const s = conn.stats() catch break;
+                var rpt: [4 + 5 * 8]u8 = undefined;
+                @memcpy(rpt[0..4], sink_magic);
+                std.mem.writeInt(u64, rpt[4..12], s.dgram_read, .little);
+                std.mem.writeInt(u64, rpt[12..20], s.dgram_rx_wire, .little);
+                std.mem.writeInt(u64, rpt[20..28], bytes, .little);
+                std.mem.writeInt(u64, rpt[28..36], s.dgram_recv_drops_quic + s.dgram_recv_drops_shim, .little);
+                std.mem.writeInt(u64, rpt[36..44], now, .little);
+                conn.sendDatagram(&rpt) catch break;
+            }
+        }
+    }
 }
 
 fn onShimThread(_: ?*anyopaque) callconv(.c) void {
@@ -55,7 +115,7 @@ fn onShimThread(_: ?*anyopaque) callconv(.c) void {
 }
 
 fn usage() error{Usage} {
-    std.debug.print("usage: shim-echo selftest [--relay] [-n COUNT] | listen | dial TICKET [-n COUNT]\n", .{});
+    std.debug.print("usage: shim-echo selftest [--relay] [-n COUNT] | listen | dial TICKET [-n COUNT] | sink BIND_ADDR TICKET_FILE [--relay-url URL]\n", .{});
     return error.Usage;
 }
 

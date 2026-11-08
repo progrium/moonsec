@@ -87,6 +87,34 @@ pub fn build(b: *std.Build) void {
     const run_test = b.addRunArtifact(echo);
     run_test.addArg("selftest");
     b.step("test-shim", "Run the shim echo selftest (builds the shim)").dependOn(&run_test.step);
+
+    // Shim ABI tests over loopback (transport/iroh_test.zig); part of test-shim.
+    const iroh_tests = b.addTest(.{
+        .name = "iroh-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("transport/iroh_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "iroh", .module = iroh_mod }},
+        }),
+    });
+    const run_iroh_tests = b.addRunArtifact(iroh_tests);
+    b.top_level_steps.get("test-shim").?.step.dependOn(&run_iroh_tests.step);
+
+    // Linux netns tests (root): `zig build netns-test` installs zig-out/bin/iroh-netns-test,
+    // run it with sudo. It drives zig-out/bin/shim-echo as the peer in another namespace.
+    const netns_tests = b.addTest(.{
+        .name = "iroh-netns-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("transport/iroh_netns_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "iroh", .module = iroh_mod }},
+        }),
+    });
+    const netns_step = b.step("netns-test", "Install the Linux netns shim tests (run zig-out/bin/iroh-netns-test as root)");
+    netns_step.dependOn(&b.addInstallArtifact(netns_tests, .{}).step);
+    netns_step.dependOn(b.getInstallStep());
 }
 
 const Shim = struct {

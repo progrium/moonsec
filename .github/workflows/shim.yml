@@ -131,6 +131,25 @@ jobs:
           zig build -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -p out-static
           out-static/bin/shim-echo selftest -n 500
 
+      - name: Shim ABI tests (loopback)
+        shell: bash
+        run: zig build test-shim -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe --summary all
+
+      - name: iroh-relay for the netns tests
+        if: matrix.name == 'linux-x86_64'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/iroh-relay
+          key: iroh-relay-1.4.1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Shim netns tests (path change, bottleneck)
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        run: |
+          command -v iroh-relay || (cd shim && cargo install iroh-relay@1.4.1 --features server --locked)
+          zig build netns-test -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+          sudo SHIM_ECHO=zig-out/bin/shim-echo IROH_RELAY="$(command -v iroh-relay)" zig-out/bin/iroh-netns-test
+
       - name: Link into Zig (dynamic) and run echo
         shell: bash
         run: |
