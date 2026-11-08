@@ -170,7 +170,9 @@ The pipeline never buffers: every frame is encoded, sent, decoded and presented 
 
 **Audio**
 
-- Opus at 5 to 10 ms frames, Opus in-band FEC plus light Reed-Solomon, about 20 ms jitter buffer. Audio is not the clock master.
+- Opus at 10 ms frames, Opus in-band FEC plus light Reed-Solomon, about 20 ms jitter buffer. Audio is not the clock master. Wire format in [spec/audio-v0.md](../spec/audio-v0.md).
+- In-band FEC exists only in SILK and hybrid modes, so 5 ms frames (CELT only) never carry it, and music in CELT doesn't either. In the audio sim (libopus 1.5.2, 128 kbit/s stereo, 5% loss) it covered 47% of lost speech frames but 3.5% of lost music frames, and libopus' FEC mode 1 moves music to hybrid mode for it at 12 dB lower waveform SNR. We use mode 2 (music stays CELT) and RS parity over pairs of frames (k = 2, m = 1, +80 kbit/s), which rebuilt 88% of lost frames bit-exact; bursts of losses beat both and fall back to concealment.
+- The jitter buffer holds the fastest frames for 20 ms and trims or adds a frame when that drifts more than half a frame for two seconds, which absorbs clock drift between host and device (tested to 0.25%).
 
 **Input**
 
