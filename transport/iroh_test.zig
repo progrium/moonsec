@@ -140,9 +140,16 @@ test "runtime: init hook runs on the shim thread, second init fails, version and
     if (builtin.os.tag == .linux) try std.testing.expect(hook_pinned.load(.acquire));
     try std.testing.expectError(error.Invalid, iroh.init(null, null));
     try std.testing.expectEqual(@as(u32, 0x000100), iroh.version());
+    // The shim clock ticks in microseconds at the same rate as Zig's monotonic clock.
+    const z0 = std.Io.Clock.awake.now(std.testing.io);
     const a = iroh.nowUs();
-    sleepMs(5);
-    try std.testing.expect(iroh.nowUs() - a >= 4000);
+    sleepMs(20);
+    const shim_us = iroh.nowUs() - a;
+    const zig_us: u64 = @intCast(@divTrunc(z0.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds(), 1000));
+    if (shim_us == 0 or @max(shim_us, zig_us) - @min(shim_us, zig_us) > 3000) {
+        std.debug.print("shim clock advanced {d} us, Zig's {d} us\n", .{ shim_us, zig_us });
+        return error.ClockMismatch;
+    }
 }
 
 test "endpoint: bind options are validated, id and ticket" {
@@ -232,10 +239,14 @@ test "rate: target paces the selected path and shows in path stats" {
     var out: [dgram_len]u8 = undefined;
     const t0 = iroh.nowUs();
     var seq: u32 = 0;
-    while (iroh.nowUs() - t0 < 1_000_000) : (seq += 1) {
-        fill(&out, seq);
-        try p.client.sendDatagram(&out);
-        if (seq % 4 == 0) sleepMs(1); // ~4.4 MB/s offered
+    // Offer 4x the target by elapsed time (sleep granularity is ~15 ms on Windows).
+    while (iroh.nowUs() - t0 < 1_000_000) {
+        const due = 4 * target * (iroh.nowUs() - t0) / 1_000_000 / (dgram_len * 8);
+        while (seq < due) : (seq += 1) {
+            fill(&out, seq);
+            try p.client.sendDatagram(&out);
+        }
+        sleepMs(1);
     }
     sleepMs(300);
     const sel = (try selectedPath(p.client, &pbuf)).?;
