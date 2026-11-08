@@ -41,6 +41,16 @@ const char *mlc_last_error(void);
 #define MLC_FRAME_BGRA 3
 /* A VASurfaceID on `va_display`; imported as dma-buf. */
 #define MLC_FRAME_VAAPI 4
+/* Three full-size planes, 4:4:4 (libavcodec's yuv444p). */
+#define MLC_FRAME_I444 5
+/* Y plane then interleaved UV, 16-bit words with the value in the top bits (P010). */
+#define MLC_FRAME_P010 6
+
+/* Transfer functions (mlc_frame.transfer). */
+#define MLC_TRANSFER_SDR 0
+/* SMPTE ST 2084: HDR10. The presenter tone-maps it to SDR. */
+#define MLC_TRANSFER_PQ 1
+#define MLC_TRANSFER_HLG 2
 
 typedef struct mlc_frame {
     uint32_t kind;
@@ -54,6 +64,20 @@ typedef struct mlc_frame {
     /* YUV matrix and range: BT.709 (else BT.601), full range (else limited). */
     uint8_t bt709;
     uint8_t full_range;
+    /* BT.2020 non-constant-luminance matrix and primaries (overrides bt709). */
+    uint8_t bt2020;
+    /* Bits per sample: 8, or 10 for I420/I444 planes of 16-bit words (yuv4xxp10le, value
+     * in the low bits) and P010 (value in the high bits). */
+    uint8_t bit_depth;
+    /* MLC_TRANSFER_*. */
+    uint8_t transfer;
+    /* HDR static metadata the stream carried (SEI / metadata OBU), 0 when it had none:
+     * mastering display max and min in 0.0001 cd/m², MaxCLL and MaxFALL in cd/m². */
+    uint8_t has_mastering;
+    uint32_t max_luminance;
+    uint32_t min_luminance;
+    uint16_t max_cll;
+    uint16_t max_fall;
     /* Decoder-private (the AVFrame). */
     void *priv;
 } mlc_frame;
@@ -121,6 +145,15 @@ typedef struct mlc_decoder mlc_decoder;
 
 /* 1 when libavcodec has a decoder for the codec. */
 int mlc_decoder_supported(uint32_t codec);
+
+/* Coded formats the software decoder handles for `codec`, and the presenter draws, as
+ * platform/format.zig's Formats bits: */
+#define MLC_FMT_420_8 0x01
+#define MLC_FMT_420_10 0x02
+#define MLC_FMT_444_8 0x04
+#define MLC_FMT_444_10 0x08
+#define MLC_FMT_HDR10 0x10
+uint32_t mlc_decoder_formats(uint32_t codec);
 
 /* `hardware`: try VAAPI on `device` (a DRM render node; NULL picks the first). Falls back
  * to software when VAAPI cannot open or cannot decode the codec. */

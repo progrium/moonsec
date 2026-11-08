@@ -152,9 +152,9 @@ test "decoder rejects garbage without wedging" {
     c.mlc_decoder_release_frame(dec, &f);
 }
 
-test "libavcodec has H.264 and HEVC" {
+test "libavcodec has H.264, HEVC and AV1" {
     const set = client.probeCodecs();
-    try testing.expect(set.h264 and set.hevc and set.passthrough);
+    try testing.expect(set.h264 and set.hevc and set.av1 and set.passthrough);
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +302,211 @@ test "openClient: H.264 through the platform interface" {
     try testing.expectEqual(@as(u64, n), snap.counters.frames);
     std.debug.print("llvmpipe + software decode: decode p50 {d} us, present p50 {d} us\n", .{ snap.stage(.decode).p50, snap.stage(.present).p50 });
     try testing.expectError(error.Unsupported, be.decoder.configure(.{ .codec = @enumFromInt(77), .width = 1, .height = 1 }));
+}
+
+// ---------------------------------------------------------------------------
+// AV1, 4:4:4, 10-bit and HDR10 (testdata/gen-formats.sh)
+
+const solid_av1 = @embedFile("testdata/solid_128x96.av1");
+const stripes_444_h265 = @embedFile("testdata/stripes_128x96_444.h265");
+const stripes_444_av1 = @embedFile("testdata/stripes_128x96_444.av1");
+const hdr10_main10_h265 = @embedFile("testdata/hdr10_128x96_main10.h265");
+const hdr10_10bit_av1 = @embedFile("testdata/hdr10_128x96_10bit.av1");
+const hdr10_444_10_h265 = @embedFile("testdata/hdr10_128x96_444_10.h265");
+
+/// Splits an AV1 low-overhead OBU stream (Annex-less, "Section 5") into temporal units:
+/// each starts at a temporal delimiter OBU.
+fn splitTemporalUnits(stream: []const u8, out: [][]const u8) !usize {
+    var n: usize = 0;
+    var start: ?usize = null;
+    var i: usize = 0;
+    while (i < stream.len) {
+        const hdr = stream[i];
+        const obu_type = (hdr >> 3) & 0xF;
+        if (hdr & 0x02 == 0) return error.NoObuSize; // ffmpeg's obu muxer always sets it
+        var p = i + 1 + @as(usize, @intFromBool(hdr & 0x04 != 0));
+        var size: usize = 0;
+        var shift: u6 = 0;
+        while (true) : (shift += 7) {
+            const b = stream[p];
+            p += 1;
+            size |= @as(usize, b & 0x7F) << shift;
+            if (b & 0x80 == 0) break;
+        }
+        if (obu_type == 2) { // OBU_TEMPORAL_DELIMITER
+            if (start) |s0| {
+                out[n] = stream[s0..i];
+                n += 1;
+            }
+            start = i;
+        }
+        i = p + size;
+    }
+    if (start) |s0| {
+        out[n] = stream[s0..];
+        n += 1;
+    }
+    return n;
+}
+
+const Fixture = struct {
+    codec: u32,
+    data: []const u8,
+    kind: c_uint,
+    bits: u8,
+    hdr: bool,
+};
+
+/// Decodes all 6 frames, checks the frame description and hands each to `check`.
+fn decodeFixture(fx: Fixture, check: *const fn (f: *const c.mlc_frame) anyerror!void) !void {
+    var dec: ?*c.mlc_decoder = null;
+    try testing.expectEqual(@as(c_int, 0), c.mlc_decoder_create(fx.codec, 0, null, &dec));
+    defer c.mlc_decoder_destroy(dec);
+    var aus: [16][]const u8 = undefined;
+    const n = if (fx.codec == c.MLC_CODEC_AV1) try splitTemporalUnits(fx.data, &aus) else splitAccessUnits(fx.data, true, &aus);
+    try testing.expectEqual(@as(usize, 6), n);
+    for (aus[0..n], 0..) |au, i| {
+        var f: c.mlc_frame = undefined;
+        var got: c_int = 0;
+        try testing.expectEqual(@as(c_int, 0), c.mlc_decoder_decode(dec, au.ptr, au.len, @intCast(i), &f, &got));
+        try testing.expect(got != 0); // low delay holds for these too
+        defer c.mlc_decoder_release_frame(dec, &f);
+        try testing.expectEqual(@as(u32, 128), f.width);
+        try testing.expectEqual(fx.kind, f.kind);
+        try testing.expectEqual(fx.bits, f.bit_depth);
+        if (fx.hdr) {
+            try testing.expectEqual(@as(u8, c.MLC_TRANSFER_PQ), f.transfer);
+            try testing.expectEqual(@as(u8, 1), f.bt2020);
+            // HdrMetadata.default_hdr10, from the SEI or metadata OBUs. (Only the first
+            // frame is sure to carry them: x265 and SVT-AV1 repeat them on keyframes.)
+            if (i == 0) {
+                try testing.expectEqual(@as(u8, 1), f.has_mastering);
+                try testing.expectEqual(@as(u32, 1000 * 10_000), f.max_luminance);
+                try testing.expectEqual(@as(u32, 50), f.min_luminance);
+                try testing.expectEqual(@as(u16, 1000), f.max_cll);
+                try testing.expectEqual(@as(u16, 400), f.max_fall);
+            }
+        } else {
+            try testing.expectEqual(@as(u8, c.MLC_TRANSFER_SDR), f.transfer);
+        }
+        try check(&f);
+    }
+}
+
+fn sample16(f: *const c.mlc_frame, plane: usize, x: u32, y: u32) u16 {
+    const row: [*]const u16 = @ptrCast(@alignCast(f.planes[plane] + y * f.strides[plane]));
+    return row[x];
+}
+
+fn near16(a: u16, b: u16, tol: u16) bool {
+    return @max(a, b) - @min(a, b) <= tol;
+}
+
+fn checkSolid(f: *const c.mlc_frame) !void {
+    const yuv = samplePlanes(f, 64, 48);
+    for (yuv, solid_yuv) |g, want| try testing.expect(near(g, want, 2));
+}
+
+/// Y 128, V 128, U 80 on even columns and 176 on odd ones: only 4:4:4 keeps that.
+fn checkStripes(f: *const c.mlc_frame) !void {
+    for ([_]u32{ 10, 64, 65, 101 }) |x| {
+        try testing.expect(near(f.planes[0][48 * f.strides[0] + x], 128, 3));
+        try testing.expect(near(f.planes[1][48 * f.strides[1] + x], if (x % 2 == 0) 80 else 176, 6));
+        try testing.expect(near(f.planes[2][48 * f.strides[2] + x], 128, 3));
+    }
+}
+
+/// 10-bit Y 509, U/V 512: a 100 cd/m² grey in PQ.
+fn checkGrey10(f: *const c.mlc_frame) !void {
+    try testing.expect(near16(sample16(f, 0, 64, 48), 509, 4));
+    try testing.expect(near16(sample16(f, 1, 32, 24), 512, 4));
+    try testing.expect(near16(sample16(f, 2, 32, 24), 512, 4));
+}
+
+/// 10-bit Y 509, V 512, U 320/704 by column, 4:4:4.
+fn checkStripes10(f: *const c.mlc_frame) !void {
+    for ([_]u32{ 10, 64, 65, 101 }) |x| {
+        try testing.expect(near16(sample16(f, 0, x, 48), 509, 6));
+        try testing.expect(near16(sample16(f, 1, x, 48), if (x % 2 == 0) 320 else 704, 12));
+        try testing.expect(near16(sample16(f, 2, x, 48), 512, 6));
+    }
+}
+
+test "software AV1 decode (dav1d): one picture per temporal unit, right pixels" {
+    try decodeFixture(.{ .codec = c.MLC_CODEC_AV1, .data = solid_av1, .kind = c.MLC_FRAME_I420, .bits = 8, .hdr = false }, checkSolid);
+}
+
+test "4:4:4: HEVC Main 4:4:4 and AV1 High keep full-resolution chroma" {
+    try decodeFixture(.{ .codec = c.MLC_CODEC_HEVC, .data = stripes_444_h265, .kind = c.MLC_FRAME_I444, .bits = 8, .hdr = false }, checkStripes);
+    try decodeFixture(.{ .codec = c.MLC_CODEC_AV1, .data = stripes_444_av1, .kind = c.MLC_FRAME_I444, .bits = 8, .hdr = false }, checkStripes);
+}
+
+test "HDR10: HEVC Main10, AV1 10-bit and HEVC Main 4:4:4 10 carry PQ, BT.2020 and the metadata" {
+    try decodeFixture(.{ .codec = c.MLC_CODEC_HEVC, .data = hdr10_main10_h265, .kind = c.MLC_FRAME_I420, .bits = 10, .hdr = true }, checkGrey10);
+    try decodeFixture(.{ .codec = c.MLC_CODEC_AV1, .data = hdr10_10bit_av1, .kind = c.MLC_FRAME_I420, .bits = 10, .hdr = true }, checkGrey10);
+    try decodeFixture(.{ .codec = c.MLC_CODEC_HEVC, .data = hdr10_444_10_h265, .kind = c.MLC_FRAME_I444, .bits = 10, .hdr = true }, checkStripes10);
+}
+
+test "the decoder reports the formats it plays, and configure holds to them" {
+    const f = client.probeFormats(.{ .h264 = true, .hevc = true, .av1 = true, .passthrough = true }, api.Formats.all);
+    try testing.expectEqual(api.Formats.all, f.hevc);
+    try testing.expectEqual(api.Formats{ .yuv420_8 = true, .yuv444_8 = true }, f.h264);
+    try testing.expectEqual(api.Formats.all, f.av1); // dav1d (Ubuntu's libavcodec has it)
+    try testing.expectEqual(api.Formats.all, f.passthrough);
+}
+
+fn presentFixture(win: *c.mlc_window, codec: u32, data: []const u8) !void {
+    var dec: ?*c.mlc_decoder = null;
+    try testing.expectEqual(@as(c_int, 0), c.mlc_decoder_create(codec, 0, null, &dec));
+    defer c.mlc_decoder_destroy(dec);
+    var aus: [16][]const u8 = undefined;
+    const n = if (codec == c.MLC_CODEC_AV1) try splitTemporalUnits(data, &aus) else splitAccessUnits(data, true, &aus);
+    var f: c.mlc_frame = undefined;
+    var got: c_int = 0;
+    try testing.expectEqual(@as(c_int, 0), c.mlc_decoder_decode(dec, aus[0].ptr, aus[0].len, 0, &f, &got));
+    try testing.expect(got != 0 and n == 6);
+    defer c.mlc_decoder_release_frame(dec, &f);
+    try testing.expectEqual(@as(c_int, 0), c.mlc_window_dispatch(win));
+    try testing.expectEqual(@as(c_int, 0), c.mlc_window_draw(win, &f));
+}
+
+test "presenter: 4:4:4 chroma survives to the screen, column by column" {
+    const win = try window(128, 96);
+    defer c.mlc_window_destroy(win);
+    var ww: u32 = 0;
+    var wh: u32 = 0;
+    for ([_]struct { u32, []const u8 }{ .{ c.MLC_CODEC_HEVC, stripes_444_h265 }, .{ c.MLC_CODEC_AV1, stripes_444_av1 } }) |fx| {
+        try presentFixture(win, fx[0], fx[1]);
+        c.mlc_window_size(win, &ww, &wh);
+        if (ww != 128 or wh != 96) return error.SkipZigTest; // the compositor picked another size
+        // U only moves blue (and a little green): 80 vs 176 is about -95/+95 of blue.
+        const a = try readPixel(win, 64, 48);
+        const b = try readPixel(win, 65, 48);
+        try testing.expect(@as(i32, b[2]) - @as(i32, a[2]) > 150);
+        try testing.expect(near(a[0], b[0], 4)); // red: no U term
+        try testing.expectEqual(@as(c_int, 0), c.mlc_window_present(win));
+    }
+}
+
+test "presenter: HDR10 is tone-mapped to SDR (a 100 cd/m² grey lands near 184)" {
+    const win = try window(128, 96);
+    defer c.mlc_window_destroy(win);
+    for ([_]struct { u32, []const u8 }{ .{ c.MLC_CODEC_HEVC, hdr10_main10_h265 }, .{ c.MLC_CODEC_AV1, hdr10_10bit_av1 }, .{ c.MLC_CODEC_HEVC, hdr10_444_10_h265 } }, 0..) |fx, i| {
+        try presentFixture(win, fx[0], fx[1]);
+        const px = try readPixel(win, 64, 48);
+        if (i < 2) {
+            // 100 cd/m² over a 203 cd/m² reference white, through a 2.2 gamma: 0.72.
+            for (px) |v| if (!near(v, 184, 10)) {
+                std.debug.print("HDR10 grey drew as {any}, want ~184\n", .{px});
+                return error.TestUnexpectedResult;
+            };
+        } else {
+            // The 4:4:4 10-bit stripes: blue alternates by column around the same grey.
+            const q = try readPixel(win, 65, 48);
+            try testing.expect(@as(i32, q[2]) - @as(i32, px[2]) > 60);
+        }
+        try testing.expectEqual(@as(c_int, 0), c.mlc_window_present(win));
+    }
 }
 
 // ---------------------------------------------------------------------------
