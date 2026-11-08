@@ -37,6 +37,7 @@ jobs:
         if: always()
         shell: bash
         run: |
+          touch test-mac.log
           {
             echo '### VideoToolbox on the macos-15 runner'
             echo '```'

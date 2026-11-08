@@ -76,7 +76,7 @@ static OSStatus append_parameter_sets(struct mh_enc *e, CMFormatDescriptionRef f
         st = hevc ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, i, &ps, &n, NULL, NULL)
                   : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, i, &ps, &n, NULL, NULL);
         if (st != noErr) return st;
-        if (!append_nal(e, ps, n)) return kCMBlockBufferMemoryAllocationErr;
+        if (!append_nal(e, ps, n)) return kCMBlockBufferBlockAllocationFailedErr;
     }
     return noErr;
 }
@@ -100,7 +100,7 @@ static OSStatus to_annex_b(struct mh_enc *e, CMSampleBufferRef sb) {
     st = CMBlockBufferGetDataPointer(bb, 0, &contiguous, NULL, &data);
     if (st != noErr || contiguous < total) {
         copy = malloc(total);
-        if (!copy) return kCMBlockBufferMemoryAllocationErr;
+        if (!copy) return kCMBlockBufferBlockAllocationFailedErr;
         st = CMBlockBufferCopyDataBytes(bb, 0, total, copy);
         if (st != noErr) {
             free(copy);
@@ -116,7 +116,7 @@ static OSStatus to_annex_b(struct mh_enc *e, CMSampleBufferRef sb) {
         off += header_len;
         if (n > total - off) break;
         if (!append_nal(e, p + off, n)) {
-            st = kCMBlockBufferMemoryAllocationErr;
+            st = kCMBlockBufferBlockAllocationFailedErr;
             break;
         }
         off += n;
