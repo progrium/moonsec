@@ -50,16 +50,17 @@ jobs:
           path: platform/windows/idd/out/package-x64
           if-no-files-found: error
       # Experimental: install the test-signed package on the runner (trusting its
-      # certificate; test-signing mode is off and needs a reboot, so Windows may refuse)
-      # and run the virtual display tests. Neither step fails the job; the summary says
+      # certificate; test-signing mode stays off) with a root device, since creating the
+      # software device is refused there (E_ACCESSDENIED), and run the virtual display tests. Neither step fails the job; the summary says
       # how far it got. The real check is on a GPU machine (platform/windows/idd/README.md).
       - name: Try installing the driver on the runner
         id: install
         continue-on-error: true
         shell: pwsh
         run: |
-          ./platform/windows/idd/out/package-x64/install.ps1
+          ./platform/windows/idd/out/package-x64/install.ps1 -RootDevice
           pnputil /enum-drivers | Select-String -Context 0,6 moonsecidd
+          pnputil /enum-devices /class Display | Select-String -Context 0,6 -Pattern "moonsec"
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
