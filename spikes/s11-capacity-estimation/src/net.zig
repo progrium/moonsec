@@ -103,7 +103,8 @@ fn runRecv(port: u16, hello_to: ?Addr) !void {
             if (n <= 0) break;
             const t = nowUs();
             if (buf[0] != 1 or n < 22) continue;
-            if (!have_peer or !got_media) {
+            // a new sender (new source port) takes over at once, not after the 3 s idle timeout
+            if (!have_peer or !got_media or (hello_to == null and (from.port != peer.port or from.addr != peer.addr))) {
                 peer = from;
                 have_peer = true;
                 if (!got_media) std.debug.print("recv: stream started\n", .{});
@@ -211,7 +212,10 @@ fn runSend(init: std.process.Init, to_opt: ?Addr, listen: u16, o: SendOpts) !voi
     defer results.deinit(gpa);
     var csv: std.ArrayList(u8) = .empty;
     defer csv.deinit(gpa);
-    try csv.print(gpa, "t,target,pace,train,acked,sent_mbps,recv_mbps,lost,enobufs,standing_ms\n", .{});
+    try csv.print(gpa, "t,target,pace,train,acked,sent_mbps,recv_mbps,lost,enobufs,standing_ms,q50_ms,q95_ms\n", .{});
+    var win_owd: std.ArrayList(i64) = .empty; // OWDs received in this 100 ms window
+    defer win_owd.deinit(gpa);
+    var min_owd: i64 = std.math.maxInt(i64);
 
     var prng = std.Random.DefaultPrng.init(@intCast(nowUs()));
     const rnd = prng.random();
@@ -316,6 +320,8 @@ fn runSend(init: std.process.Init, to_opt: ?Addr, listen: u16, o: SendOpts) !voi
                 const res = est.Result{ .seq = s, .send_us = r.send_us, .recv_us = rt, .size = r.size, .frame = r.frame, .frame_last = r.last };
                 try results.append(gpa, res);
                 try owds.append(gpa, .{ rt, rt - r.send_us });
+                try win_owd.append(gpa, rt - r.send_us);
+                min_owd = @min(min_owd, rt - r.send_us);
                 owd_track.add(res);
                 const f = &frames.items[r.frame];
                 f.arrived += 1;
@@ -339,9 +345,14 @@ fn runSend(init: std.process.Init, to_opt: ?Addr, listen: u16, o: SendOpts) !voi
             const acked: f64 = switch (ctl) {
                 inline else => |*x| x.acked.rate(x.last_recv) orelse 0,
             };
-            try csv.print(gpa, "{d:.1},{d:.2},{d:.2},{d:.2},{d:.2},{d:.2},{d:.2},{d},{d},{d:.2}\n", .{
+            std.mem.sort(i64, win_owd.items, {}, std.sort.asc(i64));
+            const wq = win_owd.items;
+            const q50: f64 = if (wq.len > 0) @as(f64, @floatFromInt(wq[wq.len / 2] - min_owd)) / 1000 else -1;
+            const q95: f64 = if (wq.len > 0) @as(f64, @floatFromInt(wq[@min(wq.len - 1, wq.len * 95 / 100)] - min_owd)) / 1000 else -1;
+            win_owd.clearRetainingCapacity();
+            try csv.print(gpa, "{d:.1},{d:.2},{d:.2},{d:.2},{d:.2},{d:.2},{d:.2},{d},{d},{d:.2},{d:.2},{d:.2}\n", .{
                 @as(f64, @floatFromInt(now - t0)) / 1e6,     target / 1e6,                                pace / 1e6, tc / 1e6, acked / 1e6,
-                @as(f64, @floatFromInt(win_sent)) * 8 / 1e5, @as(f64, @floatFromInt(win_recv)) * 8 / 1e5, win_lost,   enobufs,  (owd_track.standing() orelse 0) / 1000,
+                @as(f64, @floatFromInt(win_sent)) * 8 / 1e5, @as(f64, @floatFromInt(win_recv)) * 8 / 1e5, win_lost,   enobufs,  (owd_track.standing() orelse 0) / 1000, q50, q95,
             });
             win_sent = 0;
             win_recv = 0;

@@ -166,8 +166,7 @@ Timeseries plots (SVG): [wired steps](results/wired-steps.svg), [Wi-Fi steps](re
 ## Caveats
 
 - **Simulation only so far.** The Wi-Fi model is a guess, and its stalls set the Wi-Fi p99 numbers. The real run will check whether real Wi-Fi has stalls like that.
-- **The bottleneck is one droptail queue.** There are no AQM/fq_codel cases. Under fq_codel, cross traffic wouldn't share our queue, and the competition results would look better.
-- **The TCP flow is a minimal Reno.** Cubic and BBR would differ. Coexistence is a real gap: about 55% of fair share.
+- **The bottleneck is one droptail queue, and the TCP flow is a minimal Reno.** [S11b](../s11b-kernel-bottlenecks/README.md) reran the controllers on real Linux fq_codel and droptail qdiscs against Cubic and BBR. Under fq_codel, `gcc-hybrid` gets 0.86–0.88× its fair share. In a 500 KB droptail buffer it gets only ~0.3×, worse than the 55% simulated here. Alone, the step results match this simulation.
 - **The capacity estimate has a minimum frame size.** Below about 3 Mbit/s at 60 fps (fewer than 4 packets per frame), there is no train estimate, and pacing falls back to 2.5× target.
 - Parameters (30 ms drain threshold, 150 ms hold, 1.5 s give-up, 0.85 jump factor, 2 s jump gate) were tuned by hand on these scenarios. They are a starting point, not a result.
 

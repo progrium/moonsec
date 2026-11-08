@@ -1,0 +1,10 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev
+for m in netfs 9pnet 9p 9pnet_virtio; do insmod /mods/$m.ko; done
+mount -t 9p -o trans=virtio,version=9p2000.L,msize=262144,cache=loose hostroot /mnt || sh
+mount -t proc proc /mnt/proc; mount -t sysfs sys /mnt/sys; mount -t devtmpfs dev /mnt/dev; mount -t tmpfs tmp /mnt/run
+CMD=$(sed -n 's/.*guestcmd=\([^ ]*\).*/\1/p' /proc/cmdline)
+chroot /mnt /bin/bash $CMD
+echo GUEST-DONE
+poweroff -f

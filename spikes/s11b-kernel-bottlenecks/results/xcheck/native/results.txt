@@ -1,0 +1,2 @@
+RESULT steps-bfifo250000-gcc-hybrid-r1 qdelay_ms p50/95/99=1.71/7.14/13.17 frames_lost=0/3600 ctl=gcc-hybrid recv_mbps=18.98 sent_pkts=120472 lost=0 late=0 enobufs=0 frame_ms p50/95/99=11.67/40.42/110.03
+RESULT steps-bfifo250000-qdelay-probe-r1 qdelay_ms p50/95/99=3.74/17.77/24.08 frames_lost=0/3600 ctl=qdelay-probe recv_mbps=21.84 sent_pkts=138293 lost=0 late=0 enobufs=0 frame_ms p50/95/99=18.77/60.92/104.22
