@@ -1,6 +1,6 @@
 //! Windows host backend: Desktop Duplication capture, NVENC (loaded at run time) or the
-//! Media Foundation software H.264 encoder, WASAPI loopback audio and SendInput, behind
-//! the platform interface (platform/api.zig).
+//! Media Foundation software H.264 encoder, WASAPI loopback audio, SendInput and ViGEmBus
+//! virtual gamepads, behind the platform interface (platform/api.zig).
 //!
 //! On a GPU-less machine (the windows-2022 CI runner) open with `.driver = .warp` and
 //! `.encoder = .mf_software`: capture then has no outputs to duplicate, and the encoder
@@ -11,6 +11,8 @@ const core = @import("core");
 const win = @import("win");
 pub const c = @import("host_win_c");
 
+pub const pads = @import("pads.zig");
+
 const log = std.log.scoped(.win_host);
 
 pub const EncoderKind = enum {
@@ -18,6 +20,14 @@ pub const EncoderKind = enum {
     auto,
     nvenc,
     mf_software,
+};
+
+pub const GamepadKind = enum {
+    /// Drop `pad` actions.
+    none,
+    /// Xbox 360 controllers through ViGEmBus, opened on the first connect. Without the
+    /// driver, pads are dropped with one warning and the bus is looked for again every 5 s.
+    vigem,
 };
 
 pub const Options = struct {
@@ -28,6 +38,8 @@ pub const Options = struct {
     /// Open WASAPI loopback; the bundle's `audio` is null when there is no render device.
     audio: bool = true,
     input: bool = true,
+    /// Virtual gamepad driver for `pad` actions (docs/virtual-gamepad.md).
+    gamepad: GamepadKind = .vigem,
     /// D3D11 debug layer (needs the Graphics Tools optional feature).
     debug: bool = false,
 };
@@ -40,13 +52,15 @@ pub const clock = api.clockFn(nowUs);
 
 fn hrError(what: []const u8, hr: i32) api.Error {
     const code: u32 = @bitCast(hr);
-    log.err("{s}: {f}", .{ what, win.fmtHr(hr) });
-    return switch (code) {
+    const e: api.Error = switch (code) {
         0x8007000E => error.OutOfMemory,
         0x887A0005, 0x887A0007, 0x887A0026 => error.DeviceLost, // device removed / reset / access lost
         0x887A0002, 0x887A0004, 0x80070490, 0x80004001 => error.Unsupported, // unsupported / not found / not implemented
         else => error.BackendFailed,
     };
+    // Missing hardware (no output to duplicate on WARP, no NVENC) is an answer, not an error.
+    if (e == error.Unsupported) log.warn("{s}: {f}", .{ what, win.fmtHr(hr) }) else log.err("{s}: {f}", .{ what, win.fmtHr(hr) });
+    return e;
 }
 
 /// The device as host_win.h's msw_d3d (a separate translation of the same C type).
@@ -341,10 +355,74 @@ pub const Audio = struct {
 // ---------------------------------------------------------------------------
 // Input
 
+/// Virtual Xbox 360 controllers through ViGEmBus (pad_vigem.c), a `pads.Backend`.
+pub const Vigem = struct {
+    bus: ?*c.msw_vigem = null,
+    serial: [pads.max_pads]u32 = .{0} ** pads.max_pads,
+
+    pub fn plug(self: *Vigem, slot: u8) pads.Error!void {
+        if (self.bus == null) {
+            const hr = c.msw_vigem_open(&self.bus);
+            if (!ok(hr)) {
+                log.debug("ViGEmBus: {f}", .{win.fmtHr(hr)});
+                return error.Unavailable;
+            }
+        }
+        if (self.serial[slot] != 0) self.unplug(slot);
+        const hr = c.msw_vigem_plug_x360(self.bus, &self.serial[slot]);
+        if (!ok(hr)) {
+            log.warn("ViGEmBus plug: {f}", .{win.fmtHr(hr)});
+            return self.failed(hr);
+        }
+    }
+
+    pub fn update(self: *Vigem, slot: u8, state: pads.Gamepad) pads.Error!void {
+        if (self.bus == null or self.serial[slot] == 0) return error.Failed;
+        const x = pads.toXusb(state);
+        const r: c.msw_xusb_report = .{ .buttons = x.buttons, .lt = x.lt, .rt = x.rt, .lx = x.lx, .ly = x.ly, .rx = x.rx, .ry = x.ry };
+        const hr = c.msw_vigem_update_x360(self.bus, self.serial[slot], &r);
+        if (!ok(hr)) {
+            log.warn("ViGEmBus report: {f}", .{win.fmtHr(hr)});
+            return self.failed(hr);
+        }
+    }
+
+    pub fn unplug(self: *Vigem, slot: u8) void {
+        if (self.bus == null or self.serial[slot] == 0) return;
+        _ = c.msw_vigem_unplug(self.bus, self.serial[slot]);
+        self.serial[slot] = 0;
+    }
+
+    /// The XInput user index Windows gave `slot`'s controller.
+    pub fn userIndex(self: *Vigem, slot: u8) ?u32 {
+        if (self.bus == null or self.serial[slot] == 0) return null;
+        var i: u32 = 0;
+        return if (ok(c.msw_vigem_user_index(self.bus, self.serial[slot], &i))) i else null;
+    }
+
+    pub fn close(self: *Vigem) void {
+        if (self.bus) |b| c.msw_vigem_close(b);
+        self.* = .{};
+    }
+
+    /// A broken bus handle (driver restarted or removed) is reopened on the next plug.
+    fn failed(self: *Vigem, hr: i32) pads.Error {
+        const code: u32 = @bitCast(hr);
+        // ERROR_INVALID_HANDLE, ERROR_DEVICE_NOT_CONNECTED, ERROR_DEVICE_REMOVED, ERROR_FILE_NOT_FOUND
+        if (code == 0x80070006 or code == 0x8007048F or code == 0x80070651 or code == 0x80070002) {
+            self.close();
+            return error.Unavailable;
+        }
+        return error.Failed;
+    }
+};
+
 pub const Injector = struct {
     /// Display rectangle for absolute moves (left, top, width, height); the captured
     /// output's when capture runs, else the primary display.
     capture: ?*const Capture = null,
+    pads: pads.Pads = .{},
+    vigem: Vigem = .{},
 
     pub fn inject(self: *Injector, action: core.input.Action) api.Error!void {
         const hr: i32 = switch (action) {
@@ -360,13 +438,26 @@ pub const Injector = struct {
                 if (r[2] <= 0) c.msw_input_primary_rect(&r[0], &r[1], &r[2], &r[3]);
                 break :blk c.msw_input_move_abs(a.x, a.y, r[0], r[1], r[2], r[3]);
             },
-            // A virtual gamepad needs a signed driver (docs/design.md); until then pads are dropped.
-            .pad => 0,
+            .pad => |p| {
+                // Driver errors drop the snapshot; the next one (sent at least every
+                // 100 ms while a pad is connected) retries.
+                self.pads.apply(p.index, p.connected, p.state, nowUs()) catch {};
+                if (self.pads.warn_unavailable) {
+                    self.pads.warn_unavailable = false;
+                    log.warn("no virtual gamepad driver (ViGEmBus not installed?); gamepads are dropped", .{});
+                }
+                return;
+            },
         };
         if (!ok(hr)) {
             // Unmapped keys and UIPI refusals (elevated window focused) are not fatal.
             log.warn("SendInput: {f}", .{win.fmtHr(hr)});
         }
+    }
+
+    pub fn deinit(self: *Injector) void {
+        self.pads.unplugAll();
+        self.vigem.close();
     }
 };
 
@@ -386,6 +477,7 @@ pub const Host = struct {
         const self: *Host = @ptrCast(@alignCast(p.?));
         self.capture.stop();
         self.audio.stop();
+        self.injector.deinit();
         self.encoder.deinit();
         self.d3d.destroy();
         self.com.deinit();
@@ -416,6 +508,10 @@ pub fn openHost(allocator: std.mem.Allocator, opts: Options) (api.Error || win.E
         .encoder = try Encoder.create(d3d, opts.encoder),
     };
     self.injector.capture = &self.capture;
+    switch (opts.gamepad) {
+        .none => {},
+        .vigem => self.injector.pads.backend = pads.bind(Vigem, &self.injector.vigem),
+    }
     var audio: ?api.AudioSource = null;
     if (opts.audio) {
         // Probe for a render device now so a machine without one gets a null `audio`.

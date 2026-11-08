@@ -433,7 +433,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 - Host: ScreenCaptureKit, VideoToolbox, CGEvent input.
 - Clients: macOS (VideoToolbox, Metal) and Linux (VAAPI, Wayland/EGL).
-- Gamepads on all clients; virtual gamepad on Windows host (driver path decided in Phase 3).
+- Gamepads on all clients; virtual gamepad on Windows host. Phase 3 didn't settle the driver; [virtual-gamepad.md](virtual-gamepad.md) compares the routes and recommends ViGEmBus 1.22.0 now with a signed fork as the fallback (decision pending). The ViGEmBus backend is built behind an interface.
 
 **Gate:** every host/client pair in the target table streams with the Phase 2 latency bar.
 
@@ -474,7 +474,7 @@ The original top risk, QUIC congestion control fighting our rate controller, is 
 | Shim pacer stalls (5–23 ms, seen in S2 and S10; host scheduling, not tokio) | Occasional frame delay on smooth traffic | Recheck on bare metal; burst credit (S10b) lets a backlog after a stall drain at line rate |
 | iroh/noq internals we depend on (drop counting, per-path controllers, `metrics()` read before each pacing decision for burst credit) change on upgrade | Silent drops or a lost pacing rate | Pin iroh; shim tests for drop counts and path-change rate handoff; upstream the uncounted-drop and `datagram_send_buffer_space()` issues |
 | 300 ms path idle timeout closes on short outages (S5b: 200–300 ms blackouts at 75 ms RTT) and iroh re-punches only after 9–60 s | Up to a minute on the relay after a Wi-Fi stall | Re-punch on path close (upstream or patch), or a ~1 s timeout with the core reacting to "no ack progress". S5c measured both at 75–250 ms RTT: a ~1 s timeout still closes on outages of 0.8–1 s and longer, with the same 21–57 s re-punch on stock iroh; a prototype re-punch patch cuts it to 0.13–1.07 s at either setting. Decision open |
-| Windows virtual gamepad and IddCx display drivers need signing | No gamepads or headless host on Windows | Decide driver route by Phase 3; ship without until signed |
+| Windows virtual gamepad and IddCx display drivers need signing | No gamepads or headless host on Windows | Gamepads: use the already-signed ViGEmBus 1.22.0 (retired, so no fixes) and keep a signed fork as the fallback ([virtual-gamepad.md](virtual-gamepad.md)). IddCx: ship without until signed; the EV certificate and Partner Center setup serve both |
 | macOS private API (CGVirtualDisplay) changes | Headless macOS host breaks on an OS update | Feature-flag it; test on every macOS beta |
 | Relay quality for browsers | Stutter on lossy networks | Self-hosted regional relays; set expectations in UI |
 | Zig stdlib churn | Rework on upgrade | Pin one Zig version per release; sans-I/O core limits exposure |

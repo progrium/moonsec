@@ -1,7 +1,7 @@
 //! Windows host backend tests (zig build test-win). They run on the GPU-less windows-2022
 //! runner: WARP for the device, Media Foundation's software encoder, and skips for
 //! hardware that is not there. Set MOONSEC_REQUIRE to a comma list (dup, mf, nvenc, audio,
-//! input) to turn those skips into failures; CI requires what its runner has.
+//! input, vigem, xinput) to turn those skips into failures; CI requires what its runner has.
 const std = @import("std");
 const api = @import("platform");
 const win = @import("win");
@@ -53,6 +53,7 @@ fn h264Nals(data: []const u8) NalTypes {
 
 test {
     _ = host;
+    _ = host.pads;
 }
 
 test "HID usages map to scan codes" {
@@ -256,4 +257,72 @@ test "openHost on WARP: the bundle encodes through the platform interface" {
     // No LTR on the software encoder: a refresh is an IDR.
     try testing.expect(out2.keyframe and !out2.ltr_refresh);
     if (b.input) |inj| try inj.inject(.{ .pad = .{ .index = 0, .connected = true, .state = .{} } });
+}
+
+fn xinputUntil(user: u32, want: ?c.msw_xusb_report, timeout_us: i64) !?c.msw_xusb_report {
+    const deadline = host.nowUs() + timeout_us;
+    while (true) {
+        var r: c.msw_xusb_report = undefined;
+        var packet: u32 = 0;
+        const hr = c.msw_xinput_state(user, &r, &packet);
+        const got: ?c.msw_xusb_report = if (hr >= 0) r else null;
+        if (want == null and got == null) return null;
+        if (want != null and got != null and std.meta.eql(want.?, got.?)) return got;
+        if (host.nowUs() > deadline) {
+            std.debug.print("XInput user {d}: {f}\n", .{ user, win.fmtHr(hr) });
+            return got;
+        }
+    }
+}
+
+test "ViGEmBus: the bus opens and speaks our protocol version" {
+    var bus: ?*c.msw_vigem = null;
+    const hr = c.msw_vigem_open(&bus);
+    if (hr < 0) return skip("vigem", "ViGEmBus not installed:", hr);
+    c.msw_vigem_close(bus);
+}
+
+test "ViGEmBus: a pad's snapshots reach XInput, disconnect unplugs" {
+    var probe: ?*c.msw_vigem = null;
+    const hr = c.msw_vigem_open(&probe);
+    if (hr < 0) return skip("vigem", "ViGEmBus not installed:", hr);
+    c.msw_vigem_close(probe);
+    // The bus plugs an Xbox 360 USB device; Windows' xusb22.sys has to drive it.
+    if (c.msw_xusb_driver_present() == 0) return skip("xinput", "no xusb22.sys (Windows Server has no Xbox 360 driver)", 0);
+
+    var inj: host.Injector = .{};
+    inj.pads.backend = host.pads.bind(host.Vigem, &inj.vigem);
+    defer inj.deinit();
+    const t0 = host.nowUs();
+    try inj.inject(.{ .pad = .{ .index = 2, .connected = true, .state = .{} } });
+    std.debug.print("ViGEmBus plug took {d} us\n", .{host.nowUs() - t0});
+    try testing.expectEqual(@as(u32, 1), inj.pads.stats.plugs);
+    const user = inj.vigem.userIndex(2) orelse return error.NoUserIndex;
+    std.debug.print("XInput user index {d}\n", .{user});
+
+    const state: host.pads.Gamepad = .{ .buttons = 0x1000 | 0x0001 | 0x0200, .lx = -12345, .ly = 32767, .rx = 77, .ry = -32768, .lt = 0x8000, .rt = 0xFFFF };
+    const t1 = host.nowUs();
+    try inj.inject(.{ .pad = .{ .index = 2, .connected = true, .state = state } });
+    const want: c.msw_xusb_report = .{ .buttons = 0x1201, .lt = 0x80, .rt = 0xFF, .lx = -12345, .ly = 32767, .rx = 77, .ry = -32768 };
+    const got = try xinputUntil(user, want, 1_000_000);
+    std.debug.print("report to XInput in {d} us\n", .{host.nowUs() - t1});
+    try testing.expect(got != null and std.meta.eql(want, got.?));
+
+    try inj.inject(.{ .pad = .{ .index = 2, .connected = false, .state = .{} } });
+    try testing.expectEqual(@as(?c.msw_xusb_report, null), try xinputUntil(user, null, 2_000_000));
+}
+
+test "pads without ViGEmBus are dropped, not errors" {
+    var probe: ?*c.msw_vigem = null;
+    if (c.msw_vigem_open(&probe) >= 0) {
+        c.msw_vigem_close(probe);
+        return error.SkipZigTest; // the driver is there; the test above covers it
+    }
+    var inj: host.Injector = .{};
+    inj.pads.backend = host.pads.bind(host.Vigem, &inj.vigem);
+    defer inj.deinit();
+    try inj.inject(.{ .pad = .{ .index = 0, .connected = true, .state = .{ .buttons = 1 } } });
+    try inj.inject(.{ .pad = .{ .index = 0, .connected = true, .state = .{ .buttons = 2 } } });
+    try testing.expectEqual(@as(u64, 2), inj.pads.stats.dropped);
+    try testing.expectEqual(@as(u32, 1), inj.pads.stats.failures); // the second waits out the backoff
 }
