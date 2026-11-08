@@ -74,6 +74,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(echo);
+
+    // Reed-Solomon FEC (core/media/fec.zig): pure Zig, no shim needed.
+    const fec_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("core/media/fec.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.step("fec-test", "Run the Reed-Solomon FEC tests").dependOn(&b.addRunArtifact(fec_tests).step);
+    const fec_bench = b.addExecutable(.{ .name = "fec-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("core/media/fec_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }) });
+    b.step("fec-bench", "Benchmark the Reed-Solomon FEC codec (ReleaseFast)").dependOn(&b.addRunArtifact(fec_bench).step);
     if (shim_link == .dynamic) {
         // Ship the shared shim next to the executable.
         const ext = sharedName(target.result);
