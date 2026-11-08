@@ -134,11 +134,16 @@ pub const Capture = struct {
                 s(c.sleep_ctx, timeout_us);
                 return null;
             }
-            s(c.sleep_ctx, due - now);
-            now = c.clock.now();
+            // Short sleeps: some hosts (macOS CI) overshoot long ones by many ms.
+            while (now < due) {
+                s(c.sleep_ctx, @min(due - now, 1000));
+                now = c.clock.now();
+            }
         }
-        // Keep the cadence; if we fell more than a frame behind, restart it from now.
-        c.next_due = if (now - due > c.interval_us) now + c.interval_us else due + c.interval_us;
+        // Stay on the frame grid; skip slots we missed entirely.
+        var next = due + c.interval_us;
+        if (next <= now) next += (@divTrunc(now - next, c.interval_us) + 1) * c.interval_us;
+        c.next_due = next;
         const start_us = now;
         pattern.render(c.buf, c.width, c.height, c.width * 4, .{ .time_us = stampTime(start_us), .frame = @truncate(c.seq) });
         const f: api.CapturedFrame = .{
