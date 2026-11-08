@@ -257,6 +257,7 @@ fn runSim(gpa: std.mem.Allocator, io: Io, self_exe: []const u8, a: Args) !bool {
     hub.on_warm = if (loss > 0) switch (a.profile) {
         .lan => &warmLan,
         .wan => &warmWan,
+        .longhaul => &warmLonghaul,
         .clean => null,
     } else null;
     var stop: std.atomic.Value(bool) = .init(false);
@@ -297,6 +298,10 @@ fn warmLan(net: *simnet.Net) void {
 }
 fn warmWan(net: *simnet.Net) void {
     for (&net.links) |*l| l.cfg.loss = simrun.Profile.wan.link().loss;
+}
+
+fn warmLonghaul(net: *simnet.Net) void {
+    for (&net.links) |*l| l.cfg.loss = simrun.Profile.longhaul.link().loss;
 }
 
 fn runIroh(io: Io, self_exe: []const u8, a: Args) !bool {
