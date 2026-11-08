@@ -58,6 +58,14 @@ pub fn build(b: *std.Build) void {
     const run_test = b.addRunArtifact(echo);
     run_test.addArg("selftest");
     b.step("test", "Run the shim echo selftest").dependOn(&run_test.step);
+
+    // core/media: packetizer, reassembly, NACK/retransmit, with the loss/reorder sim tests.
+    const media_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("core/media/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    b.step("test-media", "Run the core/media tests").dependOn(&b.addRunArtifact(media_tests).step);
 }
 
 const Shim = struct {

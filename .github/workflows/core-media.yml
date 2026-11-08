@@ -1,0 +1,28 @@
+name: core-media
+
+# core/media (packetizer, reassembly, NACK/retransmit): unit and loss/reorder sim tests,
+# plus a wasm32 compile check (the browser client reuses reassembly).
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["core/media/**", "build.zig", ".github/workflows/core-media.yml"]
+  pull_request:
+    paths: ["core/media/**", "build.zig", ".github/workflows/core-media.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test-media --summary all
+      - run: zig build test-media -Doptimize=ReleaseSafe --summary all
+      - name: wasm32 compile check
+        run: zig test core/media/root.zig -target wasm32-wasi --test-no-exec
