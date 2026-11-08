@@ -536,6 +536,19 @@ fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
     const ok = try peer(gpa, io, a, role, p);
     const ls = link.linkStats();
     std.debug.print("  {s} link: {d} dials ({d} failed), {d} accepts, {d} reconnects, {d} discarded, {d} datagrams dropped offline\n", .{ @tagName(role), ls.dials, ls.dial_failures, ls.accepts, ls.switches, ls.discarded, ls.offline_drops });
+    if (link.conn()) |conn| printQuic(conn, role);
     io.sleep(.fromMilliseconds(200), .awake) catch {};
     return ok;
+}
+
+/// The current connection's shim counters and paths, so a lab run shows where datagrams went.
+fn printQuic(conn: iroh.Conn, role: anytype) void {
+    if (conn.stats()) |c| {
+        std.debug.print("  {s} quic: datagrams sent {d}, on the wire {d}, evicted {d}, queued {d}; received {d}, read {d}, dropped {d}+{d}; packets {d} (lost {d}); target {d} kbit/s\n", .{ @tagName(role), c.dgram_sent, c.dgram_tx_wire, c.dgram_send_drops, c.dgram_send_queued, c.dgram_rx_wire, c.dgram_read, c.dgram_recv_drops_quic, c.dgram_recv_drops_shim, c.sent_packets, c.lost_packets, c.target_bps / 1000 });
+    } else |_| {}
+    var pbuf: [8]iroh.PathStats = undefined;
+    const paths = conn.pathStats(&pbuf) catch return;
+    for (paths) |*p| {
+        std.debug.print("    path {d} {s} relay={d} selected={d} pacing={d} kbit/s cwnd={d} mtu={d} rtt={d} us sent {d} pkts {d} B, lost {d}\n", .{ p.path_id, iroh.pathRemoteAddr(p), p.is_relay, p.is_selected, p.pacing_bps / 1000, p.cwnd, p.mtu, p.rtt_us, p.sent_packets, p.sent_bytes, p.lost_packets });
+    }
 }
