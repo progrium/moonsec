@@ -60,6 +60,8 @@ pub const Options = struct {
     outage_us: Micros = 0,
     /// Stream the synthetic tone over the Opus stage alongside the video.
     audio: bool = true,
+    /// Let the rate controller drive the encoder bitrate (Phase 3), from `bitrate_bps`.
+    rate_control: bool = false,
     /// Host picks NACK, FEC or relay mode per path (`core.media.policy`).
     loss_policy: bool = false,
     /// Scripted path flaps (direct <-> relay) and connection drops (app/pathsim.zig).
@@ -214,7 +216,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     var model: pathsim.Model = undefined;
     if (o.path) |pc| model.init(pc, net);
     const pipes = if (o.path != null) [2]@TypeOf(net.pipeFor(.a)){ model.pipeFor(.a), model.pipeFor(.b) } else .{ net.pipeFor(.a), net.pipeFor(.b) };
-    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices, .pause_on_stall = o.pause_on_stall, .session = .{ .loss_policy = o.loss_policy } }, pipes[0]);
+    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices, .pause_on_stall = o.pause_on_stall, .session = .{ .rate_control = o.rate_control, .loss_policy = o.loss_policy } }, pipes[0]);
     defer host.deinit();
     var client = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent }, pipes[1]);
     defer client.deinit();

@@ -64,6 +64,7 @@ const Args = struct {
     hub_port: u16 = 0,
     ticket_file: []const u8 = "",
     relay: bool = false,
+    rate_control: bool = false,
     loss_policy: bool = false,
     out: []const u8 = "",
     time_us: u64 = 0,
@@ -117,7 +118,7 @@ fn usage() error{Usage} {
         \\       moonsec unpair ID-PREFIX [--state-dir D]
         \\       moonsec run pair [--seconds N]
         \\       (peer iroh also takes --state-dir: device key, and the host admits paired clients only)
-        \\opts:  --fps N --bitrate BPS --size WxH --slices N
+        \\opts:  --fps N --bitrate BPS --size WxH --slices N --rate-control
         \\       --loss-policy (sim, soak: NACK/FEC/relay chosen per path)
         \\sim:   --flaps T:D,.. --drops T:D,.. --idle-ms N --repunch-ms N --relay-delay-ms N --no-stall-pause
         \\iroh:  --relay-url URL --relay-ca PEM --bind IP:PORT --path-idle-ms N --conn-idle-ms N --min-presented PCT
@@ -135,6 +136,10 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         const s = args[i];
         if (std.mem.eql(u8, s, "--relay")) {
             a.relay = true;
+            continue;
+        }
+        if (std.mem.eql(u8, s, "--rate-control")) {
+            a.rate_control = true;
             continue;
         }
         if (std.mem.eql(u8, s, "--loss-policy")) {
@@ -259,6 +264,7 @@ fn simOptions(a: *const Args, seconds: u32, progress: u32) simrun.Options {
         .progress_every_s = progress,
         .outage_at_us = a.outage_at_ms * 1000,
         .outage_us = a.outage_ms * 1000,
+        .rate_control = a.rate_control,
         .loss_policy = a.loss_policy,
     };
 }
@@ -492,7 +498,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             const sh = try synthetic.openHost(gpa, .{ .clock = clock, .sleeper = wallSleep, .width = a.width, .height = a.height });
             const hb = sh.backend();
             defer hb.deinit();
-            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause }, p);
+            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .session = .{ .rate_control = a.rate_control } }, p);
             defer app.deinit();
             try app.runThreaded(io);
             try app.s.report(&w);

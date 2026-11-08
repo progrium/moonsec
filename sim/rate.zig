@@ -234,7 +234,7 @@ pub fn runOne(gpa: std.mem.Allocator, sc: scenarios.Scenario, v: Variant, seed: 
             ctl.onFeedbackMsg(net.localTime(.a), view);
             fb_in = true;
         }
-        if (fb_in) a.setPacingRate(@intFromFloat(ctl.pacingBps()));
+        if (fb_in) a.setPacingRate(@intFromFloat(ctl.pacingAt(t)));
 
         // Host: one frame.
         if (t == next_frame) {
@@ -244,6 +244,8 @@ pub fn runOne(gpa: std.mem.Allocator, sc: scenarios.Scenario, v: Variant, seed: 
             const n: u32 = @max(1, @as(u32, @intFromFloat(@ceil(bytes / PKT))));
             var left: u32 = @intFromFloat(@max(bytes, 100));
             try frames.append(arena, .{ .capture_us = t, .npkts = n });
+            ctl.onFrame(t, fid, @intFromFloat(@max(bytes, 100)));
+            a.setPacingRate(@intFromFloat(ctl.pacingAt(t)));
             for (0..n) |k| {
                 const sz: u32 = if (k + 1 == n) @max(left, 100) else PKT;
                 left -|= sz;
@@ -426,7 +428,10 @@ fn findRef(scen: []const u8, variant: []const u8) ?S11Ref {
 /// than S11 is allowed more slack than doing worse.
 fn checkRow(m: Summary, r: S11Ref, wired: bool, failures: *u32) void {
     const full = std.mem.eql(u8, r.variant, "gcc-hybrid");
-    expect(failures, r, "est", m.est_p50 >= r.est - 0.08 and m.est_p50 <= r.est + 0.20, m.est_p50, r.est);
+    // Next to Reno, est is a fraction of our fair share: competing-flow mode (S11b) is
+    // meant to raise it, so anything up to a fair share passes.
+    const est_hi = if (std.mem.eql(u8, r.scen, "wifi-tcp")) @max(r.est + 0.20, 1.05) else r.est + 0.20;
+    expect(failures, r, "est", m.est_p50 >= r.est - 0.08 and m.est_p50 <= est_hi, m.est_p50, r.est);
     expect(failures, r, "util", m.util_p50 >= r.util - 0.08, m.util_p50, r.util);
     expect(failures, r, "q p50", m.q_p50 <= r.q_p50 + 1.0, m.q_p50, r.q_p50);
     expect(failures, r, "q p99", m.q_p99 <= @max(1.3 * r.q_p99, r.q_p99 + 5), m.q_p99, r.q_p99);

@@ -11,6 +11,14 @@
 //!    Below 1 it trades bitrate for frame delay: frame transport time is
 //!    about (encoder rate / capacity) × the frame interval.
 //!
+//! Two things keep the train estimate alive (S11b):
+//!  - A target floor where an encoder frame still has `floor_pkts` packets.
+//!    Below it no frame gives a sample, nothing jumps the target, and
+//!    recovery falls back to GCC's 8%/s ramp (16.6 s in one S11b run).
+//!  - Probe frames: `framePacingBps` returns `probe_mult` x the pacing rate
+//!    for one frame every `probe_interval_us`, so the train can see spare
+//!    capacity even when pacing has locked onto our share of a fair queue.
+//!
 //! Sans-I/O: the caller passes the host clock in and reads the rates out.
 const std = @import("std");
 const types = @import("types.zig");
@@ -34,6 +42,21 @@ pub const Config = struct {
     pace_fallback: f64 = 2.5,
     /// Share of the target the encoder sends, in (0, 1].
     app_share: f64 = 1.0,
+    /// Pacing in competing-flow mode, x the target.
+    competing_pace: f64 = 1.5,
+    /// Target floor: an encoder frame keeps `floor_pkts` packets of
+    /// `pkt_bytes` at `fps` (with 25% margin for frame-size spread). Used only
+    /// while the link last measured at least twice the floor, so a slow link
+    /// can still go below it. 0 = off.
+    floor_pkts: u32 = 4,
+    pkt_bytes: u32 = 1200,
+    fps: f64 = 60,
+    /// Pace one frame at `probe_mult` x the pacing rate every
+    /// `probe_interval_us`; 0 = off. Probe samples count for
+    /// `probe_window_us` (see `TrainCap.estimateWithProbes`).
+    probe_interval_us: i64 = 500_000,
+    probe_mult: f64 = 2.0,
+    probe_window_us: i64 = 2_000_000,
 };
 
 /// Estimator state for logging and the telemetry overlay.
@@ -54,6 +77,12 @@ pub const Telemetry = struct {
     drains: u32,
     jumps: u32,
     drain_giveups: u32,
+    competing: bool,
+    competing_entries: u32,
+    competing_cuts: u32,
+    loss_cuts: u32,
+    floor_bps: f64,
+    probes: u32,
 };
 
 /// The 64-bit sequence number nearest `ref` whose low 32 bits are `seq`.
@@ -78,6 +107,14 @@ pub const Controller = struct {
     /// Newest arrival seen (client clock): the "now" of receiver-side windows.
     last_recv_us: i64 = std.math.minInt(i64),
     capacity: ?f64 = null,
+    /// Newest non-null capacity, for the floor's "is the link fast enough".
+    last_capacity: ?f64 = null,
+    last_probe_us: i64 = std.math.minInt(i64),
+    /// The probe frame's pacing rate holds until this host time.
+    probe_until_us: i64 = std.math.minInt(i64),
+    probe_bps: f64 = 0,
+    pacer_busy_until_us: i64 = std.math.minInt(i64),
+    probes: u32 = 0,
     results_buf: [1024]PacketResult = undefined,
 
     pub fn init(cfg: Config) Controller {
@@ -97,6 +134,65 @@ pub const Controller = struct {
         self.history = .{};
         self.last_recv_us = std.math.minInt(i64);
         self.capacity = null;
+        self.last_capacity = null;
+        self.last_probe_us = std.math.minInt(i64);
+        self.probe_until_us = std.math.minInt(i64);
+        self.probe_bps = 0;
+        self.pacer_busy_until_us = std.math.minInt(i64);
+        self.probes = 0;
+    }
+
+    /// Call as a frame of `bytes` enters the pacer, then pace at
+    /// `pacingAt(now)` from here on. Every `probe_interval_us` this marks the
+    /// frame a probe, and `pacingAt` returns `probe_mult` x the pacing rate
+    /// until the frame has left at that rate.
+    pub fn onFrame(self: *Controller, now_us: i64, frame: u32, bytes: usize) void {
+        // When the pacer should be done with what it has: a probe must not
+        // speed up a backlog (a scene-change frame, or the old rate's queue
+        // after a capacity drop), only a frame of its own.
+        const idle = now_us >= self.pacer_busy_until_us;
+        const start = @max(now_us, self.pacer_busy_until_us);
+        self.pacer_busy_until_us = start + @as(i64, @intFromFloat(@as(f64, @floatFromInt(bytes)) * 8e6 / @max(self.pacingAt(now_us), 1)));
+        if (self.cfg.probe_interval_us <= 0 or !idle) return;
+        // Nor a frame much bigger than usual, which would leave a long queue.
+        if (@as(f64, @floatFromInt(bytes)) > 1.5 * self.encoderBps() / 8 / self.cfg.fps) return;
+        if (self.last_probe_us != std.math.minInt(i64) and now_us - self.last_probe_us < self.cfg.probe_interval_us) return;
+        // A frame too small for a sample (or with no packets to spare) can't probe.
+        if (bytes < @as(usize, self.cfg.pkt_bytes) * self.train.min_pkts) return;
+        self.last_probe_us = now_us;
+        self.train.markProbe(frame);
+        self.gcc.probe_frames = self.train.probe_ids;
+        self.probes += 1;
+        self.probe_bps = self.cfg.probe_mult * self.pacingBps();
+        const dur: i64 = @intFromFloat(@as(f64, @floatFromInt(bytes)) * 8e6 / self.probe_bps);
+        self.probe_until_us = now_us + dur + 1_000;
+        self.pacer_busy_until_us = now_us + dur;
+    }
+
+    /// The pacing rate to apply at host time `now_us`: `pacingBps`, or the
+    /// probe rate while a probe frame is leaving.
+    pub fn pacingAt(self: *const Controller, now_us: i64) f64 {
+        return if (now_us < self.probe_until_us) @max(self.probe_bps, self.pacingBps()) else self.pacingBps();
+    }
+
+    /// Tell the controller the encoder's frame rate (the ladder changes it);
+    /// the train floor depends on it.
+    pub fn setFrameRate(self: *Controller, fps: f64) void {
+        self.cfg.fps = fps;
+        self.updateFloor();
+    }
+
+    /// The floor on the target currently in force, bits per second (0 = none).
+    pub fn floorBps(self: *const Controller) f64 {
+        return self.gcc.floor_bps;
+    }
+
+    fn updateFloor(self: *Controller) void {
+        if (self.cfg.floor_pkts == 0) return self.gcc.setFloor(0);
+        const enc = @as(f64, @floatFromInt(self.cfg.floor_pkts * self.cfg.pkt_bytes)) * 8 * self.cfg.fps * 1.25;
+        const f = enc / self.cfg.app_share;
+        const ok = if (self.last_capacity) |c| c >= 2 * f else false;
+        self.gcc.setFloor(if (ok) f else 0);
     }
 
     /// Record a media packet as it leaves the pacer, for joining with
@@ -149,8 +245,12 @@ pub const Controller = struct {
             self.train.onResult(r);
             if (r.received()) self.last_recv_us = @max(self.last_recv_us, r.recv_us);
         }
+        const cut_before = self.gcc.last_decrease_us;
         self.gcc.onFeedback(now_us, rs);
-        self.capacity = if (self.last_recv_us == std.math.minInt(i64)) null else self.train.estimate(self.last_recv_us, self.cfg.train_window_us);
+        if (self.gcc.last_decrease_us != cut_before) self.train.clearProbes();
+        self.capacity = if (self.last_recv_us == std.math.minInt(i64)) null else self.train.estimateWithProbes(self.last_recv_us, self.cfg.train_window_us, self.cfg.probe_window_us);
+        if (self.capacity) |c| self.last_capacity = c;
+        self.updateFloor();
         if (self.cfg.probe) {
             if (self.capacity) |c| self.gcc.onCapacity(now_us, c);
         }
@@ -178,6 +278,9 @@ pub const Controller = struct {
     /// The transport's pacing rate, bits per second.
     pub fn pacingBps(self: *const Controller) f64 {
         const t = self.gcc.target();
+        // Next to a loss-based flow in a shared FIFO, frames paced at link rate
+        // are the bursts that overflow it: pace near the target instead.
+        if (self.gcc.competing) return self.cfg.competing_pace * t;
         return if (self.capacity) |c|
             std.math.clamp(c, self.cfg.pace_floor * t, self.cfg.pace_ceil * t)
         else
@@ -209,6 +312,12 @@ pub const Controller = struct {
             .drains = g.drains,
             .jumps = g.jumps,
             .drain_giveups = g.drain_giveups,
+            .competing = g.competing,
+            .competing_entries = g.competing_entries,
+            .competing_cuts = g.competing_cuts,
+            .loss_cuts = g.loss_cuts,
+            .floor_bps = g.floor_bps,
+            .probes = self.probes,
         };
     }
 };
