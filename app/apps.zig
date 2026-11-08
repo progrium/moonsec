@@ -7,6 +7,11 @@
 //!   - `runThreaded` gives the media stage (capture+encode, or decode+present) its own
 //!     thread next to the network thread. One mutex guards the session; the slow backend
 //!     calls run outside it.
+//!
+//! Audio rides the network stage: when the backend has an audio source (host) or sink
+//! (client), the Opus stage (codec/opus/stage.zig) encodes 10 ms frames from the source
+//! and sends them on the audio stream, and the client renders from its jitter buffer
+//! into the sink, keeping about one frame queued. Both calls are non-blocking.
 const std = @import("std");
 const core = @import("core");
 const api = @import("platform");
@@ -15,6 +20,9 @@ const HostSession = @import("host_session.zig").HostSession;
 const ClientSession = @import("client_session.zig").ClientSession;
 const host_session = @import("host_session.zig");
 const client_session = @import("client_session.zig");
+const audio_stage = @import("audio_stage");
+
+const proto = core.proto;
 
 const Io = std.Io;
 const Micros = i64;
@@ -30,6 +38,8 @@ pub const HostOptions = struct {
     /// Re-send the last picture when the screen has not changed for this long, so a
     /// static desktop keeps streaming (and a lost frame on it still gets repaired).
     repeat_after_us: Micros = 100_000,
+    /// Stream the backend's audio source, if it has one.
+    audio: bool = true,
     session: struct { peer_timeout_us: Micros = 5_000_000, pace: bool = true } = .{},
 };
 
@@ -39,6 +49,7 @@ pub const HostApp = struct {
     opts: HostOptions,
     size: api.Size,
     last_frame_us: ?Micros = null,
+    audio: ?*HostAudio = null,
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: HostOptions, p: pipe_mod.PacketPipe) !HostApp {
@@ -59,17 +70,24 @@ pub const HostApp = struct {
             .pace = o.session.pace,
             .peer_timeout_us = o.session.peer_timeout_us,
         }, p);
-        return .{ .be = be, .s = s, .opts = o, .size = size };
+        var app: HostApp = .{ .be = be, .s = s, .opts = o, .size = size };
+        errdefer app.s.deinit();
+        if (o.audio) if (be.audio) |src| {
+            app.audio = try HostAudio.init(gpa, src);
+        };
+        return app;
     }
 
     pub fn deinit(a: *HostApp) void {
         a.be.capture.stop();
+        if (a.audio) |au| au.deinit();
         a.s.deinit();
     }
 
     /// Network stage: pipe, timers, input injection. Call with the session lock held.
     fn network(a: *HostApp, now: Micros) void {
         a.s.step(now);
+        if (a.audio) |au| au.pump(&a.s, now);
         while (a.s.popAction()) |p| {
             if (a.be.input) |inj| inj.inject(p.action) catch {
                 a.stats.inject_errors += 1;
@@ -165,6 +183,8 @@ pub const ClientOptions = struct {
     content_ctx: ?*anyopaque = null,
     contentFn: ?*const fn (ctx: ?*anyopaque, f: *const api.DecodedFrame) u64 = null,
     overlay_interval_us: Micros = 100_000,
+    /// Play the audio stream into the backend's sink, if it has one.
+    audio: bool = true,
 };
 
 pub const ClientApp = struct {
@@ -175,16 +195,25 @@ pub const ClientApp = struct {
     quit: bool = false,
     overlay: api.Overlay = .{ .telemetry = .{} },
     next_overlay: Micros = 0,
+    audio: ?*ClientAudio = null,
     stats: struct { decode_errors: u64 = 0, present_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.ClientBackend, o: ClientOptions, p: pipe_mod.PacketPipe) !ClientApp {
         var cfg = o.session;
         cfg.codecs = be.decoder.caps().codecs;
-        return .{ .be = be, .s = try ClientSession.init(gpa, cfg, p), .opts = o };
+        var au: ?*ClientAudio = null;
+        if (o.audio) if (be.audio) |sink| {
+            au = try ClientAudio.init(gpa, sink);
+            cfg.audio_ctx = au;
+            cfg.onAudio = ClientAudio.onAudio;
+        };
+        errdefer if (au) |x| x.deinit();
+        return .{ .be = be, .s = try ClientSession.init(gpa, cfg, p), .opts = o, .audio = au };
     }
 
     pub fn deinit(a: *ClientApp) void {
         a.s.deinit();
+        if (a.audio) |au| au.deinit();
     }
 
     fn network(a: *ClientApp, now: Micros) void {
@@ -199,6 +228,7 @@ pub const ClientApp = struct {
         };
         if (a.quit) a.s.close(now);
         a.s.step(now);
+        if (a.audio) |au| if (a.s.state == .streaming) au.render(a.be.clock.now());
     }
 
     /// Configure the decoder and presenter once the host's config is in.
@@ -280,6 +310,137 @@ pub const ClientApp = struct {
         while (!stop.load(.acquire)) {
             if (!a.mediaOne(lock)) lock.io.sleep(.fromMicroseconds(500), .awake) catch {};
         }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Audio stage glue
+
+/// The host's audio: 10 ms of PCM from the source at a time, through Opus and the audio
+/// sender, onto the session's audio stream.
+pub const HostAudio = struct {
+    gpa: std.mem.Allocator,
+    src: api.AudioSource,
+    stage: audio_stage.HostAudio,
+    channels: u8,
+    out: audio_stage.HostAudio.Out = .{},
+    pcm: [frame_samples * 2]f32 = undefined,
+    fill: usize = 0,
+    first_us: Micros = 0,
+    stats: struct { frames: u64 = 0, datagrams: u64 = 0, errors: u64 = 0 } = .{},
+
+    pub const frame_samples = 480;
+
+    fn init(gpa: std.mem.Allocator, src: api.AudioSource) !*HostAudio {
+        const fmt = try src.start(.{});
+        errdefer src.stop();
+        if (fmt.rate != api.audio_rate or fmt.channels == 0 or fmt.channels > 2) return error.Unsupported;
+        const h = try gpa.create(HostAudio);
+        errdefer gpa.destroy(h);
+        h.* = .{ .gpa = gpa, .src = src, .channels = fmt.channels, .stage = try audio_stage.HostAudio.init(gpa, .{ .encoder = .{ .channels = fmt.channels }, .frame_samples = frame_samples }) };
+        return h;
+    }
+
+    fn deinit(h: *HostAudio) void {
+        h.src.stop();
+        h.stage.deinit(h.gpa);
+        h.gpa.destroy(h);
+    }
+
+    /// The session stamps the envelope seq when it sends, so the stage's is a placeholder.
+    fn noSeq(_: void) u32 {
+        return 0;
+    }
+
+    /// Read what the source has, encode every complete frame, send it while streaming.
+    fn pump(h: *HostAudio, s: *HostSession, now: Micros) void {
+        const want = @as(usize, frame_samples) * h.channels;
+        while (true) {
+            const c = h.src.read(h.pcm[h.fill..want], 0) catch {
+                h.stats.errors += 1;
+                return;
+            };
+            if (c.frames == 0) return;
+            if (h.fill == 0) h.first_us = c.time_us;
+            h.fill += c.frames * h.channels;
+            if (h.fill < want) continue;
+            h.fill = 0;
+            if (!s.streaming()) continue;
+            h.stage.encode(h.pcm[0..want], @intCast(@max(0, h.first_us)), {}, noSeq, &h.out) catch {
+                h.stats.errors += 1;
+                continue;
+            };
+            h.stats.frames += 1;
+            for (0..h.out.n) |i| {
+                const dg = h.out.datagram(i);
+                var d = proto.wire.Decoder.init(dg);
+                const env = proto.Envelope.decode(&d) catch unreachable;
+                s.sendAudio(env.kind, dg[proto.Envelope.size..], now);
+                h.stats.datagrams += 1;
+            }
+        }
+    }
+};
+
+/// The client's audio: datagrams into the jitter buffer, and frames out of it into the
+/// sink whenever the sink holds less than `low_water` frames.
+pub const ClientAudio = struct {
+    gpa: std.mem.Allocator,
+    sink: api.AudioSink,
+    stage: audio_stage.ClientAudio,
+    channels: u8,
+    /// One rendered frame (up to 60 ms stereo), and how much of it the sink has taken.
+    buf: [2880 * 2]f32 = undefined,
+    pending: []const f32 = &.{},
+    stats: struct { rendered: u64 = 0, errors: u64 = 0 } = .{},
+
+    pub const low_water = 480;
+
+    fn init(gpa: std.mem.Allocator, sink: api.AudioSink) !*ClientAudio {
+        const fmt = try sink.start(.{});
+        errdefer sink.stop();
+        if (fmt.rate != api.audio_rate or fmt.channels == 0 or fmt.channels > 2) return error.Unsupported;
+        const c = try gpa.create(ClientAudio);
+        errdefer gpa.destroy(c);
+        c.* = .{ .gpa = gpa, .sink = sink, .channels = fmt.channels, .stage = try audio_stage.ClientAudio.init(gpa, fmt.channels, .{}) };
+        return c;
+    }
+
+    fn deinit(c: *ClientAudio) void {
+        c.sink.stop();
+        c.stage.deinit(c.gpa);
+        c.gpa.destroy(c);
+    }
+
+    fn onAudio(ctx: ?*anyopaque, env: proto.Envelope, payload: []const u8, recv_us: Micros) void {
+        const c: *ClientAudio = @ptrCast(@alignCast(ctx.?));
+        c.stage.onMessage(env, payload, recv_us);
+    }
+
+    fn render(c: *ClientAudio, now: Micros) void {
+        while (true) {
+            if (c.pending.len > 0) {
+                const n = c.sink.write(c.pending) catch {
+                    c.stats.errors += 1;
+                    c.pending = &.{};
+                    return;
+                };
+                c.pending = c.pending[n * c.channels ..];
+                if (c.pending.len > 0) return;
+            }
+            if (c.sink.queued() >= low_water) return;
+            const r = c.stage.render(now, &c.buf) catch {
+                c.stats.errors += 1;
+                return;
+            };
+            if (r.samples == 0) return;
+            c.stats.rendered += 1;
+            c.pending = c.buf[0 .. r.samples * c.channels];
+        }
+    }
+
+    pub fn bufferStats(c: *const ClientAudio) @TypeOf(c.stage.rx.stats) {
+        return c.stage.rx.stats;
     }
 };
 

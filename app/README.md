@@ -46,10 +46,15 @@ whenever no new picture reaches the screen for 200 ms (nothing presented, or old
 repeated), and counts 50 ms and 100 ms stalls separately. Every run prints per-stage telemetry
 (capture, encode, network, decode, present, glass-to-glass, input).
 
+Audio rides along on stream 2 whenever the backend has an audio source (host) or sink
+(client): the apps feed 10 ms frames through the Opus stage ([codec/opus/stage.zig](../codec/opus/stage.zig))
+from the network stage, and the client renders from the jitter buffer into the sink, keeping
+about one frame queued. The synthetic backend plays a 440/660 Hz stereo tone; runs report what
+the buffer did (decoded, FEC, RS rebuilt, concealed, late) and sink underruns, and the sim runs
+fail if under 95% of the audio frames play, the sink runs dry, or it plays mostly silence.
+
 ## Not yet
 
-- Audio: the Opus stage (codec/opus) plugs in on stream 2; the sessions pass audio
-  datagrams through untouched today.
 - Rate adaptation: Phase 2 is fixed bitrate; the controller only sets pacing (at least
   4× the bitrate, or the measured capacity when higher).
 - The pipes have no wakeup handle, so the network thread polls at 1 ms.

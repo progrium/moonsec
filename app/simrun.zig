@@ -53,6 +53,8 @@ pub const Options = struct {
     /// (0: none), long enough that frames are lost and recovery has to step in.
     outage_at_us: Micros = 0,
     outage_us: Micros = 0,
+    /// Stream the synthetic tone over the Opus stage alongside the video.
+    audio: bool = true,
 };
 
 pub const Result = struct {
@@ -64,6 +66,7 @@ pub const Result = struct {
         retransmits: u64,
         keys: u64,
         keys_wrong: u64,
+        audio_frames: u64,
         end: []const u8,
     },
     client: struct {
@@ -78,9 +81,24 @@ pub const Result = struct {
         input_sent: u64,
         total_p50_us: Micros,
         total_p99_us: Micros,
+        audio: Audio,
         end: []const u8,
     },
     sim_losses: u64,
+
+    pub const Audio = struct {
+        /// Frames played from a packet (RS-rebuilt ones included), from FEC, concealed.
+        decoded: u64 = 0,
+        fec: u64 = 0,
+        concealed: u64 = 0,
+        rs_recovered: u64 = 0,
+        late: u64 = 0,
+        /// Sink: times it ran dry once playing, and frames of the tone it played.
+        underruns: u64 = 0,
+        loud: u64 = 0,
+        written: u64 = 0,
+        delay_us: i64 = 0,
+    };
 
     pub fn expectedFrames(r: Result, fps: u32) u64 {
         return @as(u64, r.seconds) * fps;
@@ -96,6 +114,13 @@ pub const Result = struct {
         if (r.host.keys_wrong > 0) return "input arrived out of order";
         if (o.input_interval_us > 0 and r.host.keys * 100 < r.client.input_sent * 95) return "input events went missing";
         if (r.client.total_p50_us <= 0) return "no glass-to-glass samples";
+        if (o.audio) {
+            const au = r.client.audio;
+            // 100 frames a second; the first few hundred ms go to session setup.
+            if ((au.decoded + au.fec) * 100 < (@as(u64, r.seconds) * 100 -| 50) * 95) return "audio played under 95% of its frames";
+            if (au.underruns > 0) return "the audio sink ran dry";
+            if (au.loud * 100 < au.written * 50) return "the audio sink played mostly silence";
+        }
         return null;
     }
 
@@ -112,6 +137,8 @@ pub const Result = struct {
             r.host.keys_wrong,
             r.sim_losses,
         });
+        const au = r.client.audio;
+        try w.print("  audio: host sent {d} frames; client played {d} (FEC {d}, RS rebuilt {d}), concealed {d}, late {d}; sink underruns {d}, buffer delay {d:.1} ms\n", .{ r.host.audio_frames, au.decoded + au.fec, au.fec, au.rs_recovered, au.concealed, au.late, au.underruns, @as(f64, @floatFromInt(au.delay_us)) / 1000 });
         try w.print("  host: {s}; client: {s}\n", .{ r.host.end, r.client.end });
     }
 };
@@ -148,10 +175,10 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
 
     var hc: SideClock = .{ .net = net, .side = .a };
     var cc: SideClock = .{ .net = net, .side = .b };
-    const sh = try synthetic.openHost(gpa, .{ .clock = hc.clock(), .width = o.width, .height = o.height });
+    const sh = try synthetic.openHost(gpa, .{ .clock = hc.clock(), .width = o.width, .height = o.height, .audio = o.audio });
     const hb = sh.backend();
     defer hb.deinit();
-    const sc = try synthetic.openClient(gpa, .{ .clock = cc.clock(), .input_interval_us = o.input_interval_us });
+    const sc = try synthetic.openClient(gpa, .{ .clock = cc.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio });
     const cb = sc.backend();
     defer cb.deinit();
 
@@ -196,6 +223,11 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         try client.s.report(w);
     }
     const snap = client.s.tele.snapshot();
+    var au: Result.Audio = .{};
+    if (client.audio) |ca| {
+        const bs = ca.bufferStats();
+        au = .{ .decoded = bs.decoded, .fec = bs.fec, .concealed = bs.concealed, .rs_recovered = bs.rs_recovered, .late = bs.late, .delay_us = bs.delay_us, .underruns = sc.audio.stats.underruns, .loud = sc.audio.stats.loud, .written = sc.audio.stats.written };
+    }
     const fz = client.s.freeze.stats;
     return .{
         .seconds = o.seconds,
@@ -206,6 +238,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .retransmits = host.s.stats.retransmits,
             .keys = sh.injector.keys,
             .keys_wrong = sh.injector.wrong,
+            .audio_frames = if (host.audio) |ha| ha.stats.frames else 0,
             .end = @tagName(host.s.end),
         },
         .client = .{
@@ -220,6 +253,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .input_sent = sc.input.sent,
             .total_p50_us = snap.stage(.total).p50,
             .total_p99_us = snap.stage(.total).p99,
+            .audio = au,
             .end = @tagName(client.s.end),
         },
         .sim_losses = net.linkStats(.a).random_losses + net.linkStats(.b).random_losses,

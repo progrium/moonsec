@@ -371,6 +371,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             try app.runThreaded(io);
             try app.s.report(&w);
             try w.print("  injected keys {d} (out of order {d}), capture timeouts {d}, encode errors {d}\n", .{ sh.injector.keys, sh.injector.wrong, app.stats.capture_timeouts, app.stats.encode_errors });
+            if (app.audio) |au| try w.print("  audio: {d} frames encoded, {d} datagrams, {d} errors; source skipped {d} frames\n", .{ au.stats.frames, au.stats.datagrams, au.stats.errors, sh.audio.stats.skipped });
             ok = app.s.end == .client_bye and sh.injector.wrong == 0 and sh.injector.keys > 0 and app.s.stats.frames > 0;
         },
         .client => {
@@ -386,11 +387,18 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             app.s.freeze.finish(app.s.freeze.last_new_us orelse 0);
             try app.s.report(&w);
             try w.print("  presenter: {d} presents, {d} unreadable patterns; decoder corrupt {d}\n", .{ sc.presenter.stats.presents, sc.presenter.stats.unreadable, sc.decoder.stats.corrupt });
+            var audio_ok = true;
+            if (app.audio) |au| {
+                const bs = au.bufferStats();
+                const ss = sc.audio.stats;
+                try w.print("  audio: played {d} (FEC {d}, RS rebuilt {d}), concealed {d}, late {d}, silence {d}; sink underruns {d} ({d} frames), buffer delay {d:.1} ms\n", .{ bs.decoded + bs.fec, bs.fec, bs.rs_recovered, bs.concealed, bs.late, bs.silence, ss.underruns, ss.underrun_frames, @as(f64, @floatFromInt(bs.delay_us)) / 1000 });
+                audio_ok = (bs.decoded + bs.fec) * 100 >= @as(u64, seconds) * 100 * 80 and ss.loud * 2 >= ss.written;
+            }
             const want = @as(u64, seconds) * a.fps;
             // Wall-clock runs on shared CI machines get scheduling stalls the sim never
             // has; hold them to most frames and no corruption, and report freezes.
             ok = app.s.end == .closed and app.s.stats.frames_presented * 100 >= want * 80 and
-                sc.presenter.stats.unreadable == 0 and sc.decoder.stats.corrupt == 0;
+                sc.presenter.stats.unreadable == 0 and sc.decoder.stats.corrupt == 0 and audio_ok;
         },
     }
     std.debug.print("{s}", .{w.buffered()});

@@ -24,6 +24,11 @@ test "stream over a clean sim path" {
     try std.testing.expectEqual(@as(u64, 0), r.client.lost);
     // 1 ms each way plus encode/decode in zero virtual time: under 5 ms.
     try std.testing.expect(r.client.total_p99_us < 5_000);
+    // Audio: every frame decoded and the sink never ran dry; at most the slot after the
+    // host's last frame, as the client closes, is concealed.
+    try std.testing.expect(r.client.audio.concealed <= 1);
+    try std.testing.expectEqual(@as(u64, 0), r.client.audio.underruns);
+    try std.testing.expect(r.client.audio.decoded >= 290);
 }
 
 test "stream over the LAN profile recovers every loss with NACKs" {
@@ -58,4 +63,8 @@ test "an outage loses frames and recovery brings the picture back" {
     try std.testing.expect(r.client.presented > 3 * 60);
     try std.testing.expectEqual(@as(u64, 0), r.client.corrupt);
     try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+    // Audio conceals through the outage and plays on: the sink never runs dry.
+    try std.testing.expect(r.client.audio.concealed > 0);
+    try std.testing.expectEqual(@as(u64, 0), r.client.audio.underruns);
+    try std.testing.expect(r.client.audio.decoded > 300);
 }

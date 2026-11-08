@@ -13,8 +13,9 @@
 //!                  verified end to end; counts presents and unreadable frames.
 //!   InputSource    a scripted key press/release every `input_interval_us` and some motion.
 //!   InputInjector  checks the keys arrive in the script's order.
-//!
-//! No audio (the Opus stage brings its own test source).
+//!   AudioSource    a stereo tone (440 Hz left, 660 Hz right) at 48 kHz, paced by the clock.
+//!   AudioSink      a device that plays 48 kHz by the clock; counts underruns and how
+//!                  much of what it played was the tone rather than silence.
 const std = @import("std");
 const api = @import("platform");
 const pattern = api.pattern;
@@ -517,6 +518,138 @@ pub const InputInjector = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Audio
+
+pub const AudioSource = struct {
+    clock: api.Clock,
+    sleeper: Sleeper,
+    sleep_ctx: ?*anyopaque,
+    channels: u8 = 2,
+    start_us: ?Micros = null,
+    /// Frames handed out so far.
+    produced: u64 = 0,
+    stats: struct { frames: u64 = 0, skipped: u64 = 0 } = .{},
+
+    pub const amplitude: f32 = 0.25;
+    /// Never hand out more than this backlog; a reader that falls behind skips ahead.
+    pub const max_backlog: u64 = api.audio_rate / 5;
+
+    pub fn start(a: *AudioSource, fmt: api.AudioFormat) api.Error!api.AudioFormat {
+        if (fmt.rate != api.audio_rate or fmt.channels == 0 or fmt.channels > 2) return error.Unsupported;
+        a.channels = fmt.channels;
+        a.start_us = a.clock.now();
+        a.produced = 0;
+        return fmt;
+    }
+
+    fn due(a: *const AudioSource, now: Micros) u64 {
+        const el: u64 = @intCast(@max(0, now - a.start_us.?));
+        return el * api.audio_rate / 1_000_000;
+    }
+
+    pub fn read(a: *AudioSource, out: []f32, timeout_us: Micros) api.Error!api.AudioChunk {
+        if (a.start_us == null) return error.Closed;
+        var now = a.clock.now();
+        if (a.due(now) <= a.produced and timeout_us > 0) if (a.sleeper) |s| {
+            s(a.sleep_ctx, @min(timeout_us, 1000));
+            now = a.clock.now();
+        };
+        const d = a.due(now);
+        if (d > a.produced + max_backlog) {
+            a.stats.skipped += d - max_backlog - a.produced;
+            a.produced = d - max_backlog;
+        }
+        const n: usize = @intCast(@min(d -| a.produced, out.len / a.channels));
+        const t0 = a.start_us.? + @as(Micros, @intCast(a.produced * 1_000_000 / api.audio_rate));
+        for (0..n) |i| {
+            const k = a.produced + i;
+            for (0..a.channels) |ch| out[i * a.channels + ch] = tone(k, @intCast(ch));
+        }
+        a.produced += n;
+        a.stats.frames += n;
+        return .{ .frames = n, .time_us = t0 };
+    }
+
+    pub fn stop(a: *AudioSource) void {
+        a.start_us = null;
+    }
+
+    pub fn tone(k: u64, ch: u8) f32 {
+        const hz: f64 = if (ch == 0) 440 else 660;
+        const ph = @as(f64, @floatFromInt(k % api.audio_rate)) * hz / api.audio_rate;
+        return amplitude * @as(f32, @floatCast(@sin(2 * std.math.pi * ph)));
+    }
+};
+
+pub const AudioSink = struct {
+    clock: api.Clock,
+    channels: u8 = 2,
+    started: bool = false,
+    /// The device starts playing at the first write.
+    play_start_us: ?Micros = null,
+    played: u64 = 0,
+    queue: u64 = 0,
+    dry: bool = false,
+    stats: struct {
+        written: u64 = 0,
+        /// Times the device ran dry after it started, and frames it had to play as silence.
+        underruns: u64 = 0,
+        underrun_frames: u64 = 0,
+        /// Written frames louder than a tenth of the tone: the tone got through.
+        loud: u64 = 0,
+        max_queued: u64 = 0,
+    } = .{},
+
+    pub const capacity: u64 = api.audio_rate / 5;
+
+    pub fn start(a: *AudioSink, fmt: api.AudioFormat) api.Error!api.AudioFormat {
+        if (fmt.rate != api.audio_rate or fmt.channels == 0 or fmt.channels > 2) return error.Unsupported;
+        a.channels = fmt.channels;
+        a.started = true;
+        return fmt;
+    }
+
+    fn advance(a: *AudioSink) void {
+        const t0 = a.play_start_us orelse return;
+        const el: u64 = @intCast(@max(0, a.clock.now() - t0));
+        const target = el * api.audio_rate / 1_000_000;
+        const want = target -| a.played;
+        if (want > a.queue) {
+            if (!a.dry) a.stats.underruns += 1;
+            a.dry = true;
+            a.stats.underrun_frames += want - a.queue;
+            a.queue = 0;
+        } else a.queue -= want;
+        a.played = target;
+    }
+
+    pub fn write(a: *AudioSink, pcm: []const f32) api.Error!usize {
+        if (!a.started) return error.Closed;
+        a.advance();
+        const n = @min(pcm.len / a.channels, capacity - a.queue);
+        if (n == 0) return 0;
+        if (a.play_start_us == null) a.play_start_us = a.clock.now();
+        for (0..n) |i| {
+            if (@abs(pcm[i * a.channels]) > AudioSource.amplitude / 10) a.stats.loud += 1;
+        }
+        a.queue += n;
+        a.dry = false;
+        a.stats.written += n;
+        a.stats.max_queued = @max(a.stats.max_queued, a.queue);
+        return n;
+    }
+
+    pub fn queued(a: *AudioSink) usize {
+        a.advance();
+        return @intCast(a.queue);
+    }
+
+    pub fn stop(a: *AudioSink) void {
+        a.started = false;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Bundles
 
 pub const Options = struct {
@@ -529,6 +662,8 @@ pub const Options = struct {
     /// Client: a scripted key event this often (0: none).
     input_interval_us: Micros = 25_000,
     input_limit: u64 = 0,
+    /// Offer the audio source (host) and sink (client).
+    audio: bool = true,
 };
 
 pub const Host = struct {
@@ -536,6 +671,8 @@ pub const Host = struct {
     capture: Capture,
     encoder: Encoder,
     injector: InputInjector = .{},
+    audio: AudioSource,
+    with_audio: bool,
     clock: api.Clock,
 
     pub fn backend(h: *Host) api.HostBackend {
@@ -544,6 +681,7 @@ pub const Host = struct {
             .capture = api.bind(api.Capture, Capture, &h.capture),
             .encoder = api.bind(api.Encoder, Encoder, &h.encoder),
             .input = api.bind(api.InputInjector, InputInjector, &h.injector),
+            .audio = if (h.with_audio) api.bind(api.AudioSource, AudioSource, &h.audio) else null,
             .deinit_ptr = h,
             .deinitFn = deinitHost,
         };
@@ -562,8 +700,10 @@ pub const Client = struct {
     decoder: Decoder,
     presenter: Presenter,
     input: InputSource,
+    audio: AudioSink,
     clock: api.Clock,
     with_input: bool,
+    with_audio: bool,
 
     pub fn backend(c: *Client) api.ClientBackend {
         return .{
@@ -571,6 +711,7 @@ pub const Client = struct {
             .decoder = api.bind(api.Decoder, Decoder, &c.decoder),
             .presenter = api.bind(api.Presenter, Presenter, &c.presenter),
             .input = if (c.with_input) api.bind(api.InputSource, InputSource, &c.input) else null,
+            .audio = if (c.with_audio) api.bind(api.AudioSink, AudioSink, &c.audio) else null,
             .deinit_ptr = c,
             .deinitFn = deinitClient,
         };
@@ -591,6 +732,8 @@ pub fn openHost(gpa: std.mem.Allocator, o: Options) !*Host {
         .clock = o.clock,
         .capture = .{ .gpa = gpa, .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx, .default_size = .{ .width = o.width, .height = o.height } },
         .encoder = .{ .gpa = gpa, .clock = o.clock },
+        .audio = .{ .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx },
+        .with_audio = o.audio,
     };
     return h;
 }
@@ -604,6 +747,8 @@ pub fn openClient(gpa: std.mem.Allocator, o: Options) !*Client {
         .presenter = .{ .clock = o.clock },
         .input = .{ .clock = o.clock, .interval_us = @max(o.input_interval_us, 1), .limit = o.input_limit },
         .with_input = o.input_interval_us > 0,
+        .audio = .{ .clock = o.clock },
+        .with_audio = o.audio,
     };
     return c;
 }
@@ -717,4 +862,31 @@ test "scripted input reaches the injector in order" {
     }
     try testing.expectEqual(@as(u64, 6), inj.keys);
     try testing.expectEqual(@as(u64, 0), inj.wrong);
+}
+
+test "audio source paces by the clock and the sink plays by it" {
+    const clock = api.clockFn(testClock);
+    test_now = 1_000_000;
+    var src: AudioSource = .{ .clock = clock, .sleeper = null, .sleep_ctx = null };
+    _ = try src.start(.{});
+    var buf: [960]f32 = undefined;
+    try testing.expectEqual(@as(usize, 0), (try src.read(&buf, 0)).frames);
+    test_now += 10_000;
+    const c = try src.read(&buf, 0);
+    try testing.expectEqual(@as(usize, 480), c.frames);
+    try testing.expectEqual(@as(Micros, 1_000_000), c.time_us);
+    test_now += 5_000_000;
+    _ = try src.read(&buf, 0);
+    try testing.expect(src.stats.skipped > 0);
+
+    var sink: AudioSink = .{ .clock = clock };
+    _ = try sink.start(.{});
+    try testing.expectEqual(@as(usize, 480), try sink.write(&buf));
+    try testing.expectEqual(@as(usize, 480), sink.queued());
+    test_now += 5_000;
+    try testing.expectEqual(@as(usize, 240), sink.queued());
+    test_now += 20_000;
+    try testing.expectEqual(@as(usize, 0), sink.queued());
+    try testing.expectEqual(@as(u64, 1), sink.stats.underruns);
+    try testing.expectEqual(@as(u64, 720), sink.stats.underrun_frames);
 }
