@@ -46,6 +46,10 @@ start() {
   HOST_PID=$!
   ip netns exec x3c "$MOONSEC" peer iroh client "${common[@]}" > "$OUT/client.log" 2>&1 &
   CLIENT_PID=$!
+  # Two seconds of the host's failed sends, for diag (strace is optional).
+  if command -v strace >/dev/null; then
+    (sleep 1.5; timeout 2 strace -f -qq -e trace=sendmsg,sendmmsg,sendto -e status=failed -p $HOST_PID 2> "$OUT/strace.log" >/dev/null) &
+  fi
   # Let it connect, hole-punch (S5c: direct ~0.3 s after dialing) and settle.
   sleep 5
 }
@@ -73,7 +77,11 @@ diag() { # where the packets went, when a peer fails
   for l in "x3c vc0" "x3cn vci" "x3cn vcn" "x3d dc" "x3d di" "x3hn vhi" "x3h vh0"; do set -- $l
     echo "  $1 $2: $(ip -n $1 -s -o link show $2 | sed 's/.*RX: *//; s/\\ */ /g' | cut -c1-200)"
   done
-  echo "  rmem_max $(sysctl -n net.core.rmem_max) wmem_max $(sysctl -n net.core.wmem_max) cpus $(nproc)"
+  echo "  rmem_max $(sysctl -n net.core.rmem_max) wmem_max $(sysctl -n net.core.wmem_max) default_qdisc $(sysctl -n net.core.default_qdisc) cpus $(nproc) kernel $(uname -r)"
+  [ -s "$OUT/strace.log" ] && { echo "  host failed sends ($(grep -c '= -1' "$OUT/strace.log") in 2 s):"; grep '= -1' "$OUT/strace.log" | sed 's/.*= -1/    = -1/' | sort | uniq -c | head -5; }
+  for l in "x3h vh0" "x3hn vhn"; do set -- $l
+    echo "  $1 $2 qdisc: $(tc -n $1 -s qdisc show dev $2 | tr '\n' ' ' | tr -s ' ' | cut -c1-300)"
+  done
 }
 
 summary() {

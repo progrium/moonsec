@@ -186,7 +186,7 @@ jobs:
         if: matrix.name == 'linux-x86_64'
         shell: bash
         run: |
-          command -v ethtool || (sudo apt-get update -q && sudo apt-get install -yq ethtool)
+          command -v ethtool && command -v strace || (sudo apt-get update -q && sudo apt-get install -yq ethtool strace)
           zig build install-moonsec delayline -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
           sudo IROH_RELAY="$(command -v iroh-relay)" tools/netlab/run.sh all
 
