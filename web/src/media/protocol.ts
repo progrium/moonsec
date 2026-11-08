@@ -2,6 +2,7 @@
 // worklet (audio-worklet.ts).
 
 import type { Overlay, Stats, StreamConfig } from "../core";
+import type { PadState } from "../input/gamepad";
 
 export interface StartMsg {
   type: "start";
@@ -17,7 +18,18 @@ export interface StartMsg {
   seconds: number;
 }
 
-export type ToWorker = StartMsg | { type: "close" };
+/**
+ * One input call from the page's InputCapture (src/input), forwarded to the core's
+ * session. `t` is absolute (performance.timeOrigin + now, in µs) because the page's and
+ * the worker's performance.now() have different origins.
+ */
+export type InputOp =
+  | { op: "key" | "button"; code: number; down: boolean; t: number }
+  | { op: "scroll"; dx: number; dy: number; t: number }
+  | { op: "rel" | "abs"; x: number; y: number; t: number }
+  | { op: "pad"; index: number; state: PadState | null; t: number };
+
+export type ToWorker = StartMsg | { type: "close" } | { type: "input"; ops: InputOp[] };
 
 export interface VideoReport {
   codec: string | null;

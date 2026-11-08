@@ -38,8 +38,12 @@ macos-15, and uploads those files.
 ## Input
 
 Input goes through the same `core.input.Sender` the native clients use (sequenced keys and
-buttons repeated until acked, motion as running totals, full gamepad snapshots), built for
-wasm32 and called from `src/input/core.ts`. The browser side only maps events:
+buttons repeated until acked, motion as running totals, full gamepad snapshots). In the web
+client, `WebClient` attaches `InputCapture` to the canvas and forwards every call to the
+media worker (`WorkerInputSink`, `{type: "input"}` messages), where the core's client
+session (`ms_input_*` in app/web.zig) sends it with the session's envelope sequence and
+handles the host's acks. The stand-alone sender in `src/input/core.ts`
+(core/input/wasm.zig) is for the harness's stub host. The browser side only maps events:
 
 | Feature | Chromium | Firefox | Safari | Fallback |
 | --- | --- | --- | --- | --- |

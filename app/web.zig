@@ -388,7 +388,7 @@ export fn ms_stats(w: *Web) *const StatsOut {
     return &w.stats;
 }
 
-// --- input (keyboard and mouse; gamepads and the browser capture side are 6C's) -----
+// --- input (web/src/input captures it on the page; client.ts forwards it here) --------
 
 fn input(w: *Web, t: f64, what: api.InputEvent.What) void {
     w.s.onInput(.{ .time_us = us(t), .what = what });
@@ -416,6 +416,27 @@ export fn ms_input_move_rel(w: *Web, dx: i32, dy: i32, t_us: f64) void {
 /// 0..65535 across the streamed display.
 export fn ms_input_move_abs(w: *Web, x: u32, y: u32, t_us: f64) void {
     input(w, t_us, .{ .move_abs = .{ .x = @truncate(x), .y = @truncate(y) } });
+}
+
+/// A pad's full state (`core.input.Gamepad`: XInput button bits, sticks up/right
+/// positive, triggers 0..65535), or a disconnect when `connected` is 0.
+export fn ms_input_pad(w: *Web, index: u32, connected: u32, buttons: u32, lx: i32, ly: i32, rx: i32, ry: i32, lt: i32, rt: i32, t_us: f64) void {
+    if (index >= core.input.max_pads) return;
+    const c = struct {
+        fn f(v: i32, comptime T: type) T {
+            return @intCast(std.math.clamp(v, std.math.minInt(T), std.math.maxInt(T)));
+        }
+    }.f;
+    const state: ?core.input.Gamepad = if (connected == 0) null else .{
+        .buttons = buttons,
+        .lx = c(lx, i16),
+        .ly = c(ly, i16),
+        .rx = c(rx, i16),
+        .ry = c(ry, i16),
+        .lt = c(lt, u16),
+        .rt = c(rt, u16),
+    };
+    input(w, t_us, .{ .pad = .{ .index = @intCast(index), .state = state } });
 }
 
 comptime {

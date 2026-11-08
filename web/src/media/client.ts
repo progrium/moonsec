@@ -2,7 +2,9 @@
 // worklet, and the overlay. Everything else (core, transport, decode, draw) runs in the
 // worker; see worker.ts.
 
-import type { FromWorker, StatsMsg, ToWorker } from "./protocol";
+import type { FromWorker, InputOp, StatsMsg, ToWorker } from "./protocol";
+import { InputCapture, type InputSink, type MouseMode } from "../input/index";
+import type { PadState } from "../input/gamepad";
 import { renderOverlay } from "./overlay";
 
 export interface ClientOptions {
@@ -15,12 +17,60 @@ export interface ClientOptions {
   relayed?: boolean;
   seconds?: number;
   onStats?: (s: StatsMsg) => void;
+  /** Capture input on this element (default: the canvas); false for view-only. */
+  input?: HTMLElement | false;
+  mouseMode?: MouseMode;
   onError?: (message: string) => void;
+}
+
+/**
+ * InputCapture's sink on the page: batches calls and posts them to the worker, whose
+ * core session sequences them with every other datagram it sends (one envelope counter,
+ * acks handled by the session).
+ */
+export class WorkerInputSink implements InputSink {
+  private ops: InputOp[] = [];
+  constructor(private worker: Worker) {}
+
+  private static abs(t: number): number {
+    return performance.timeOrigin * 1000 + t;
+  }
+  private static now(): number {
+    return WorkerInputSink.abs(performance.now() * 1000);
+  }
+
+  key(code: number, down: boolean, t: number) {
+    this.ops.push({ op: "key", code, down, t: WorkerInputSink.abs(t) });
+  }
+  button(code: number, down: boolean, t: number) {
+    this.ops.push({ op: "button", code, down, t: WorkerInputSink.abs(t) });
+  }
+  scroll(dx: number, dy: number, t: number) {
+    this.ops.push({ op: "scroll", dx, dy, t: WorkerInputSink.abs(t) });
+  }
+  moveRel(x: number, y: number) {
+    this.ops.push({ op: "rel", x, y, t: WorkerInputSink.now() });
+  }
+  moveAbs(x: number, y: number) {
+    // Latest wins: replace a queued absolute move instead of piling them up.
+    const last = this.ops[this.ops.length - 1];
+    if (last?.op === "abs") this.ops.pop();
+    this.ops.push({ op: "abs", x, y, t: WorkerInputSink.now() });
+  }
+  pad(index: number, state: PadState | null) {
+    this.ops.push({ op: "pad", index, state, t: WorkerInputSink.now() });
+  }
+  poke() {
+    if (this.ops.length === 0) return;
+    this.worker.postMessage({ type: "input", ops: this.ops } satisfies ToWorker);
+    this.ops = [];
+  }
 }
 
 export class WebClient {
   readonly worker: Worker;
   audioContext: AudioContext | null = null;
+  input: InputCapture | null = null;
   last: StatsMsg | null = null;
 
   private constructor(worker: Worker) {
@@ -63,10 +113,17 @@ export class WebClient {
       seconds: o.seconds ?? 0,
     };
     worker.postMessage(start, audioPort ? [canvas, audioPort] : [canvas]);
+    if (o.input !== false) {
+      const el = o.input ?? o.canvas;
+      c.input = new InputCapture(el, new WorkerInputSink(worker), { mode: o.mouseMode ?? "auto", contentRect: () => o.canvas.getBoundingClientRect() });
+      c.input.attach();
+    }
     return c;
   }
 
   close(): void {
+    this.input?.detach();
+    this.input = null;
     this.worker.postMessage({ type: "close" } satisfies ToWorker);
   }
 }

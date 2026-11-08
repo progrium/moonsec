@@ -124,3 +124,29 @@ test("recovers from loss and an outage without decoder errors", async ({ page },
   expect(st.stats.frames_presented).toBeGreaterThan(seconds * 60 * 0.5);
   expect(st.audio.played).toBeGreaterThan(seconds * 48000 * 0.6);
 });
+
+test("input from the page reaches the host through the session", async ({ page }, info) => {
+  const seconds = 4;
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.goto(`${base}/client.html?autostart&seconds=${seconds}`);
+  await expect.poll(() => page.evaluate(() => window.moonsec.stats?.state ?? "none"), { timeout: 15_000 }).toBe("streaming");
+
+  const box = (await page.locator("#video").boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  for (const k of ["KeyA", "KeyB", "KeyC", "Enter"]) await page.keyboard.press(k);
+  await page.mouse.wheel(0, 100);
+
+  await expect.poll(() => page.evaluate(() => window.moonsec.stats?.state ?? "none"), { timeout: (seconds + 15) * 1000 }).toBe("ended");
+  const st = await page.evaluate(() => window.moonsec.stats!);
+  const host = await hostReport(page);
+  await save(info.project.name, "input", { stats: st, overlay: "" }, host);
+  expect(errors).toEqual([]);
+  // 4 keys down and up, a click (down, up), a scroll, plus the moves.
+  expect(st.stats.input_events).toBeGreaterThanOrEqual(11);
+  expect(st.stats.input_packets).toBeGreaterThan(0);
+  // The host applied them: its report counts injected input actions.
+  const applied = Number(/inputs (\d+)/.exec(host.report)?.[1] ?? 0);
+  expect(applied).toBeGreaterThanOrEqual(11);
+});

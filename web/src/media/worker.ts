@@ -13,7 +13,7 @@
 import { CoreSession, State } from "../core";
 import { WebSocketTransport, type Transport } from "../transport";
 import { codecString, probeDecoders, type DecoderSupport } from "./codec";
-import type { AudioReport, FromWorker, NeedMsg, PcmMsg, StartMsg, ToWorker, VideoReport } from "./protocol";
+import type { AudioReport, FromWorker, InputOp, NeedMsg, PcmMsg, StartMsg, ToWorker, VideoReport } from "./protocol";
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -217,6 +217,36 @@ class Media {
     self.postMessage(msg);
   }
 
+  /** Input from the page: into the core's sender, then a step so it goes out now. */
+  input(ops: InputOp[]) {
+    if (this.ended) return;
+    const origin = performance.timeOrigin * 1000;
+    for (const o of ops) {
+      const t = o.t - origin; // page clock to this worker's
+      switch (o.op) {
+        case "key":
+          this.core.key(o.code, o.down, t);
+          break;
+        case "button":
+          this.core.button(o.code, o.down, t);
+          break;
+        case "scroll":
+          this.core.scroll(o.dx, o.dy, t);
+          break;
+        case "rel":
+          this.core.moveRel(o.x, o.y, t);
+          break;
+        case "abs":
+          this.core.moveAbs(o.x, o.y, t);
+          break;
+        case "pad":
+          this.core.pad(o.index, o.state, t);
+          break;
+      }
+    }
+    this.schedule();
+  }
+
   close() {
     if (this.ended) return;
     this.core.close(nowUs());
@@ -242,6 +272,8 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
       transport = await WebSocketTransport.connect(m.wsUrl);
       for (const dg of pending) transport.send(dg);
       media = new Media(core, transport, m, support);
+    } else if (m.type === "input") {
+      media?.input(m.ops);
     } else if (m.type === "close") {
       media?.close();
     }

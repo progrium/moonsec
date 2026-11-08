@@ -2,6 +2,8 @@
 // stage behind a C ABI. This file loads the module and wraps the ABI; the struct
 // layouts below must match the extern structs in app/web.zig (ABI version 1).
 
+import type { PadState } from "./input/gamepad.js";
+
 export const ABI_VERSION = 1;
 
 /// api.Codec values.
@@ -118,6 +120,7 @@ interface Exports {
   ms_input_scroll(w: number, dx: number, dy: number, t: number): void;
   ms_input_move_rel(w: number, dx: number, dy: number, t: number): void;
   ms_input_move_abs(w: number, x: number, y: number, t: number): void;
+  ms_input_pad(w: number, index: number, connected: number, buttons: number, lx: number, ly: number, rx: number, ry: number, lt: number, rt: number, t: number): void;
 }
 
 /// The module's WASI imports. The core does no I/O: everything but stderr (panic
@@ -337,6 +340,11 @@ export class CoreSession {
   }
   moveAbs(x: number, y: number, t: number): void {
     this.x.ms_input_move_abs(this.w, x, y, t);
+  }
+  /** null: disconnected. */
+  pad(index: number, s: PadState | null, t: number): void {
+    if (s === null) this.x.ms_input_pad(this.w, index, 0, 0, 0, 0, 0, 0, 0, 0, t);
+    else this.x.ms_input_pad(this.w, index, 1, s.buttons, s.lx, s.ly, s.rx, s.ry, s.lt, s.rt, t);
   }
 
   free(): void {

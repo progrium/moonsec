@@ -77,7 +77,10 @@ function startHost(ws, query) {
   let closed = false;
   let out = "";
 
+  let udpClosed = false;
   const toHost = (tag, body) => {
+    // A browser datagram (late input, a repeated bye) can arrive after the host exited.
+    if (udpClosed) return;
     const b = Buffer.alloc(1 + (body ? body.length : 0));
     b[0] = tag.charCodeAt(0);
     if (body) b.set(body, 1);
@@ -119,6 +122,7 @@ function startHost(ws, query) {
     });
     child.on("exit", (code) => {
       clearInterval(stats);
+      udpClosed = true;
       udp.close();
       reports.push({ session: id, code, dropped, report: out });
       while (reports.length > 20) reports.shift();
