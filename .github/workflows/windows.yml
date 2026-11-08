@@ -51,9 +51,12 @@ jobs:
           Invoke-WebRequest -Uri https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe -OutFile $exe
           $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash
           if ($hash -ne "89220A7865076B342892F98865F3499FB7C4CFD673159E89D352C360FD014C6A") { throw "unexpected installer hash $hash" }
-          $p = Start-Process -FilePath $exe -ArgumentList "/exenoui","/qn","/norestart" -Wait -PassThru
+          $log = "$env:RUNNER_TEMP\vigem-install.log"
+          $p = Start-Process -FilePath $exe -ArgumentList "/exenoui","/qn","/norestart","/l*v","`"$log`"" -Wait -PassThru
           "installer exit code: $($p.ExitCode)"
-          Get-Service ViGEmBus | Format-List Name,Status,StartType
+          if (Test-Path $log) { Select-String -Path $log -Pattern "Return value 3","LaunchCondition","error","Error 1","SetupAPI","DIFx","pnputil","devcon" -Context 3,3 | Select-Object -First 40 | Out-String -Width 300 }
+          Get-ChildItem "$env:WINDIR\INF\setupapi.dev.log" | ForEach-Object { Get-Content $_ -Tail 60 }
+          Get-Service ViGEmBus -ErrorAction Continue | Format-List Name,Status,StartType
           Get-PnpDevice -FriendlyName "*Virtual Gamepad*" -ErrorAction SilentlyContinue | Format-Table -AutoSize Status,Class,FriendlyName,InstanceId
           Get-CimInstance Win32_SystemDriver -Filter "Name='ViGEmBus'" | Format-List Name,State,PathName
       - name: Virtual gamepad tests
