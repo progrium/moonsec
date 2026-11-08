@@ -37,7 +37,8 @@ Copy-Item $dll.FullName $pkg
 $inf = Join-Path $pkg "MoonsecIdd.inf"
 Copy-Item (Join-Path $here "driver\MoonsecIdd.inf") $inf
 
-$kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+# Signing and catalog tools are under bin\<version>\<arch>, InfVerif under Tools\<version>\<arch>.
+$kits = @("${env:ProgramFiles(x86)}\Windows Kits\10\bin", "${env:ProgramFiles(x86)}\Windows Kits\10\Tools")
 function Find-KitTool($name) {
     $t = Get-ChildItem -Path $kits -Recurse -Filter $name -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -match '\\(x64|x86)\\' } | Sort-Object FullName -Descending | Select-Object -First 1
