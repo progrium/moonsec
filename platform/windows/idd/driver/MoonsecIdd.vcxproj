@@ -55,13 +55,11 @@
       <TreatWarningAsError>true</TreatWarningAsError>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <ExceptionHandling>false</ExceptionHandling>
+      <PreprocessorDefinitions>IDDCX_VERSION_MAJOR=1;IDDCX_VERSION_MINOR=4;IDDCX_MINIMUM_VERSION_REQUIRED=4;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <AdditionalDependencies>%(AdditionalDependencies);OneCoreUAP.lib;avrt.lib</AdditionalDependencies>
     </Link>
-    <Inf>
-      <TimeStamp>0.1.0.0</TimeStamp>
-    </Inf>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Driver.cpp" />
@@ -69,11 +67,10 @@
   <ItemGroup>
     <ClInclude Include="..\moonsec_idd.h" />
   </ItemGroup>
+  <!-- The INF is stamped, verified and catalogued by ../build.ps1, not here: the WDK's
+       in-build InfVerif step fails to load on the windows-2022 runner. -->
   <ItemGroup>
-    <Inf Include="MoonsecIdd.inf" />
-  </ItemGroup>
-  <ItemGroup>
-    <FilesToPackage Include="$(TargetPath)" />
+    <None Include="MoonsecIdd.inf" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

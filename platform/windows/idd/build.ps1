@@ -28,14 +28,14 @@ if ($LASTEXITCODE -ne 0) { throw "msbuild failed ($LASTEXITCODE)" }
 
 $bin = Join-Path $out "$Platform\$Configuration"
 $dll = Get-ChildItem -Path $bin -Recurse -Filter MoonsecIdd.dll | Select-Object -First 1
-# The stamped INF (DriverVer filled in by stampinf), not the source one.
-$inf = Get-ChildItem -Path $bin -Recurse -Filter MoonsecIdd.inf | Select-Object -First 1
-if (-not $dll -or -not $inf) { throw "build output missing under $bin" }
+if (-not $dll) { throw "MoonsecIdd.dll missing under $bin" }
 
 $pkg = Join-Path $out "package-$Platform"
 Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $pkg | Out-Null
-Copy-Item $dll.FullName, $inf.FullName $pkg
+Copy-Item $dll.FullName $pkg
+$inf = Join-Path $pkg "MoonsecIdd.inf"
+Copy-Item (Join-Path $here "driver\MoonsecIdd.inf") $inf
 
 $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
 function Find-KitTool($name) {
@@ -44,8 +44,17 @@ function Find-KitTool($name) {
     if (-not $t) { throw "$name not found under $kits" }
     return $t.FullName
 }
+$stampinf = Find-KitTool "stampinf.exe"
+$infverif = Find-KitTool "InfVerif.exe"
 $inf2cat = Find-KitTool "Inf2Cat.exe"
 $signtool = Find-KitTool "signtool.exe"
+
+# DriverVer, $ARCH$ and $UMDFVERSION$ (UMDF 2.25, as in the .vcxproj).
+$arch = if ($Platform -eq "ARM64") { "arm64" } else { "amd64" }
+& $stampinf -f $inf -d * -v 0.1.0.0 -a $arch -u 2.25.0
+if ($LASTEXITCODE -ne 0) { throw "stampinf failed ($LASTEXITCODE)" }
+& $infverif /w /v $inf
+if ($LASTEXITCODE -ne 0) { throw "InfVerif failed ($LASTEXITCODE)" }
 
 $os = if ($Platform -eq "ARM64") { "10_RS4_ARM64" } else { "10_RS4_X64" }
 & $inf2cat "/driver:$pkg" "/os:$os" /uselocaltime
