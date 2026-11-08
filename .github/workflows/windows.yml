@@ -36,7 +36,9 @@ jobs:
       - name: Recovery gate on Media Foundation (IDR fallback, WARP)
         # Media Foundation's software encoder has no long-term references, so every loss
         # must recover through an IDR. NVENC, AMF and oneVPL runs need their GPUs
-        # (tools/recovery/README.md).
+        # (tools/recovery/README.md). Runs even when test-win fails, so the gate's result
+        # is reported on its own.
+        if: ${{ !cancelled() }}
         run: zig build recovery -Doptimize=ReleaseSafe -- --backend win-mf --size 640x360 --bitrate 2000000 --frames 600 --expect idr --json recovery-win-mf.json
       - uses: actions/upload-artifact@v4
         if: always()
