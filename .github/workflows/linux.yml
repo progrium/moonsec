@@ -43,13 +43,15 @@ jobs:
           sudo udevadm settle
           ls -l /dev/uinput
       - name: zig fmt
-        run: zig fmt --check platform/client app build.zig
+        run: zig fmt --check platform/client platform/host/linux app build.zig
       - name: Build (VAAPI path included; compile-only without a GPU)
         run: zig build moonsec-linux -Doptimize=ReleaseSafe --summary all
       - name: Client backend tests (Wayland, PipeWire and uinput required)
         env:
           MOONSEC_REQUIRE: wayland,pipewire,uinput
         run: platform/client/linux/headless.sh zig build test-linux --summary all
+      - name: Host encoder tests (software end to end; VAAPI and NVENC not-available paths)
+        run: zig build test-linux-enc --summary all
       - name: End to end against the synthetic host (sim LAN)
         run: platform/client/linux/headless.sh zig-out/bin/moonsec-linux run sim --client linux --uinput-script --seconds 10
       - name: End to end against the synthetic host (sim WAN)
