@@ -22,7 +22,9 @@ bundled mingw-w64 headers, and Zig sees only [host_win.h](host_win.h).
   with two slots: a frame is marked every 15 frames (and on every IDR and refresh), never
   over the newest acked slot, and `ltr_refresh` references the newest acked one. Its token
   is the frame number. The header is vendored in [third_party/nvenc](../../../third_party/nvenc)
-  (SDK 12.0, driver 522.25 or newer). **Not yet run on an NVIDIA GPU**; S8's NVENC rows
+  (SDK 12.0, driver 522.25 or newer). The session, settings and long-term references are
+  [platform/nvenc](../../nvenc/README.md), shared with the Linux host; enc_nvenc.c adds the
+  DLL, the D3D11 device and textures. **Not yet run on an NVIDIA GPU**; S8's NVENC rows
   will check it.
 - **Media Foundation software H.264** (`.mf_software`): the sync MFT that `MFTEnumEx`
   finds first, normally the Microsoft H.264 Video Encoder. Low-latency mode, CBR,
