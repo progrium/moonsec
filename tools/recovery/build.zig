@@ -119,7 +119,8 @@ fn exe(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, optimi
 
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: Modules) void {
     const e = exe(b, "recovery-gate", target, optimize, m);
-    b.installArtifact(e);
+    // Not part of `zig build install`: the release builds target windows-msvc, which the
+    // Windows host backend (mingw C shims) does not build for.
     const r = b.addRunArtifact(e);
     r.has_side_effects = true;
     if (b.args) |a| r.addArgs(a);
