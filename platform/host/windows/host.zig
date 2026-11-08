@@ -418,9 +418,9 @@ pub fn openHost(allocator: std.mem.Allocator, opts: Options) (api.Error || win.E
     const want_video = opts.driver == .hardware and (opts.encoder == .auto or opts.encoder == .vpl);
     const d3d = win.D3d.create(.{ .driver = opts.driver, .adapter_index = opts.adapter, .debug = opts.debug, .video = want_video }) catch
         win.D3d.create(.{ .driver = opts.driver, .adapter_index = opts.adapter, .debug = opts.debug }) catch |e| {
-            log.err("D3D11 device: {f}", .{win.fmtHr(win.last_hr)});
-            return e;
-        };
+        log.err("D3D11 device: {f}", .{win.fmtHr(win.last_hr)});
+        return e;
+    };
     errdefer d3d.destroy();
     const info = d3d.info();
     log.info("D3D11 on {s} (feature level 0x{X})", .{ win.adapterName(&info), info.feature_level });
