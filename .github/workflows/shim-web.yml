@@ -1,0 +1,81 @@
+name: shim-web
+
+# The browser iroh transport (shim-web/): build the wasm crate, its bindings and the pairing
+# module, then run headless browsers through a local iroh-relay (relay/lab.toml) against
+# native moonsec: datagram and stream echo, datagram throughput both ways, pairing (QR and
+# PIN) and session admission (shim-web/test/run.mjs). Chromium gates; Firefox and WebKit run
+# too but don't fail the workflow until they have been seen green.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  browser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Rust toolchain (pinned by shim-web/rust-toolchain.toml) and wasm32
+        working-directory: shim-web
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            shim/target
+            shim-web/target
+          key: shim-web-${{ hashFiles('shim/Cargo.lock', 'shim-web/Cargo.lock', 'shim/rust-toolchain.toml', 'shim-web/rust-toolchain.toml') }}
+      - name: Tool binaries cache (iroh-relay, wasm-bindgen)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/iroh-relay
+            ~/.cargo/bin/wasm-bindgen
+          key: shim-web-tools-iroh-relay-1.4.1-${{ hashFiles('shim-web/Cargo.lock') }}
+      - name: iroh-relay and wasm-bindgen-cli
+        working-directory: shim-web
+        run: |
+          command -v iroh-relay || cargo install iroh-relay@1.4.1 --features server --locked
+          want=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/[^0-9.]/,""); print}' Cargo.lock)
+          [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" = "$want" ] || cargo install "wasm-bindgen-cli@$want" --locked --force
+
+      - name: Build shim-web (wasm, bindings, pairing module)
+        run: shim-web/build.sh | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Build the native peers (shim-echo, moonsec)
+        run: zig build install-moonsec -Doptimize=ReleaseSafe
+      - name: Playwright and browsers
+        working-directory: shim-web/test
+        run: |
+          npm install --no-audit --no-fund
+          npx playwright install --with-deps chromium firefox webkit
+
+      - name: Chromium
+        run: node shim-web/test/run.mjs --browsers chromium --json shim-web-chromium.json
+      - name: Firefox
+        continue-on-error: true
+        run: node shim-web/test/run.mjs --browsers firefox --json shim-web-firefox.json
+      - name: WebKit
+        continue-on-error: true
+        run: node shim-web/test/run.mjs --browsers webkit --json shim-web-webkit.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shim-web-results
+          path: shim-web-*.json

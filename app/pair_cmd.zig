@@ -4,6 +4,8 @@
 //!   moonsec pair host [--state-dir D] [--name N] [--seconds 120] [--pairings 1] [--relay]
 //!                     [--pin-only | --qr-only] [--ticket-file F] [--pin-file F] [--qr-svg F]
 //!   moonsec pair client (--ticket T | --ticket-file F) [--pin P] [--state-dir D] [--name N] [--relay]
+//!   Both pair commands also take --relay-url URL [--relay-ca PEM] in place of --relay: that
+//!   relay only, no n0 relays or discovery (a self-hosted relay; browsers pair through one).
 //!   moonsec paired [--state-dir D]
 //!   moonsec unpair ID-PREFIX [--state-dir D]
 //!   moonsec run pair [--seconds N]      pairing and admission end to end over iroh on loopback
@@ -46,6 +48,9 @@ pub const Ctx = struct {
     /// Shared with the session commands.
     ticket_file: []const u8 = "",
     relay: bool = false,
+    /// A self-hosted relay (custom-only mode) and its CA's PEM file, as `peer iroh` takes them.
+    relay_url: ?[:0]const u8 = null,
+    relay_ca: ?[:0]const u8 = null,
     seconds: ?u32 = null,
 };
 
@@ -167,16 +172,28 @@ fn initIroh() !void {
 
 pub fn bind(c: Ctx, secret: *const [32]u8, accept: bool) !iroh.Endpoint {
     try initIroh();
+    const ca_pem: ?[:0]u8 = if (c.relay_ca) |path| blk: {
+        const text = Io.Dir.cwd().readFileAlloc(c.io, path, c.gpa, .limited(1 << 20)) catch |e| {
+            std.debug.print("moonsec: cannot read --relay-ca {s}: {t}\n", .{ path, e });
+            return e;
+        };
+        defer c.gpa.free(text);
+        break :blk try c.gpa.dupeZ(u8, text);
+    } else null;
+    defer if (ca_pem) |t| c.gpa.free(t);
+    const any_relay = c.relay or c.relay_url != null;
     const ep = iroh.Endpoint.bind(.{
         .secret_key = secret,
         .alpn = if (accept) alpn else "",
-        .relay_mode = if (c.relay) .default else .disabled,
-        .bind_addr = if (c.relay) "0.0.0.0:0" else "127.0.0.1:0",
+        .relay_mode = if (c.relay_url != null) .custom_only else if (c.relay) .default else .disabled,
+        .relay_urls = if (c.relay_url) |u| u.ptr else null,
+        .relay_ca_pem = if (ca_pem) |t| t.ptr else null,
+        .bind_addr = if (any_relay) "0.0.0.0:0" else "127.0.0.1:0",
     }) catch |e| {
         std.debug.print("bind: {s}\n", .{iroh.lastError()});
         return e;
     };
-    if (c.relay) ep.online(15_000) catch std.debug.print("moonsec: no home relay yet; the ticket may only work on this network\n", .{});
+    if (any_relay) ep.online(15_000) catch std.debug.print("moonsec: no home relay yet; the ticket may only work on this network\n", .{});
     return ep;
 }
 
