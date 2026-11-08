@@ -29,7 +29,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - name: zig fmt
         if: runner.os == 'Linux'
-        run: zig fmt --check build.zig core
+        run: zig fmt --check build.zig core platform
       - name: Core tests (Debug)
         run: zig build test --summary all
       - name: Core tests (ReleaseSafe)
