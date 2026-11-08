@@ -125,7 +125,14 @@ fn resolveShim(
             return .{ .lib_dir = root.path(b, "lib"), .include_dir = root.path(b, "include") };
         },
         .prebuilt => {
-            const dep_name = b.fmt("iroh_shim_{s}", .{artifactSuffix(target.result)});
+            const t = target.result;
+            // Releases ship MSVC archives for Windows; Zig's *-windows-gnu needs -Dshim=source.
+            if (t.os.tag == .windows and t.abi != .msvc)
+                @panic("-Dshim=prebuilt has Windows archives for *-windows-msvc only; use -Dtarget=<arch>-windows-msvc or -Dshim=source");
+            const dep_name = b.fmt("iroh_shim_{s}", .{artifactSuffix(t)});
+            if (!hasDependency(b, dep_name)) {
+                std.debug.panic("-Dshim=prebuilt: build.zig.zon has no '{s}'; pin a shim-v* release (see shim/README.md) or use -Dshim=source", .{dep_name});
+            }
             const dep = b.lazyDependency(dep_name, .{}) orelse {
                 // Lazy fetch pending: zig re-runs build() once it is downloaded.
                 return .{ .lib_dir = b.path("shim"), .include_dir = b.path("shim/include") };
@@ -133,6 +140,13 @@ fn resolveShim(
             return .{ .lib_dir = dep.path("lib"), .include_dir = dep.path("include") };
         },
     }
+}
+
+fn hasDependency(b: *std.Build, name: []const u8) bool {
+    for (b.available_deps) |d| {
+        if (std.mem.eql(u8, d[0], name)) return true;
+    }
+    return false;
 }
 
 fn linkShim(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget, shim: Shim, link: ShimLink) void {
