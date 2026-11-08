@@ -4,6 +4,11 @@
 const core = @import("root.zig");
 const proto = core.proto;
 
+comptime {
+    // Input sender ABI for the web client (web/src/input).
+    _ = @import("input/wasm.zig");
+}
+
 /// Parses one datagram; returns its stream ID, or 0 if it does not parse.
 export fn moonsec_proto_stream(ptr: [*]const u8, len: usize) u8 {
     const m = proto.decode(ptr[0..len]) catch return 0;
