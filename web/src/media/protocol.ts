@@ -50,6 +50,8 @@ export interface VideoReport {
 export interface AudioReport {
   /** Frames the worker rendered from the jitter buffer and sent to the worklet. */
   rendered: number;
+  /** Requests answered empty because rendering had run ahead of the clock. */
+  paced: number;
   /** From the worklet. */
   played: number;
   loud: number;

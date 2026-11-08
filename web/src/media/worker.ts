@@ -21,6 +21,8 @@ const nowUs = () => performance.now() * 1000;
 
 /** At most this many frames inside the decoder: one decoding, one arriving. */
 const maxInDecoder = 2;
+/** How far audio rendering may run ahead of the worker's clock. */
+const audioLeadUs = 40_000;
 
 class Media {
   core: CoreSession;
@@ -39,8 +41,11 @@ class Media {
   streamingSince = 0;
   seconds: number;
   video: VideoReport = { codec: null, hardware: "", configured: 0, submitted: 0, decoded: 0, drawn: 0, failed: 0, errors: [], decodeMs: [], drawMs: [], nonBlank: false };
-  audio: AudioReport = { rendered: 0, played: 0, loud: 0, underruns: 0, queued: 0, sampleRate: 0 };
+  audio: AudioReport = { rendered: 0, paced: 0, played: 0, loud: 0, underruns: 0, queued: 0, sampleRate: 0 };
   audioPort: MessagePort | null;
+  /** When the first audio frame was rendered, and how much audio has been since (µs). */
+  audioStartUs = 0;
+  audioPlayedUs = 0;
 
   constructor(core: CoreSession, transport: Transport, m: StartMsg, support: DecoderSupport) {
     this.core = core;
@@ -191,8 +196,18 @@ class Media {
     this.audio.underruns = m.underruns;
     this.audio.queued = m.queued;
     this.audio.sampleRate = m.sampleRate;
-    const pcm = this.ended ? null : this.core.renderAudio(nowUs());
-    if (pcm) this.audio.rendered++;
+    const now = nowUs();
+    // Never pull ahead of real time by more than `audioLead`: a browser that delivers the
+    // worklet's requests in bursts (WebKit) would otherwise drain the jitter buffer ahead
+    // of the network and turn every frame into concealment. The worklet asks again.
+    let pcm: Float32Array | null = null;
+    const due = this.audioStartUs === 0 || this.audioPlayedUs <= now - this.audioStartUs + audioLeadUs;
+    if (!this.ended && due) pcm = this.core.renderAudio(now);
+    if (pcm) {
+      if (this.audioStartUs === 0) this.audioStartUs = now;
+      this.audioPlayedUs += ((pcm.length / this.core.audioChannels) * 1e6) / 48000;
+      this.audio.rendered++;
+    } else if (!due) this.audio.paced++;
     const msg: PcmMsg = { pcm, channels: this.core.audioChannels };
     this.audioPort!.postMessage(msg, pcm ? [pcm.buffer] : []);
   }
