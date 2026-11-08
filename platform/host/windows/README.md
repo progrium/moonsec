@@ -8,7 +8,7 @@ returns a `platform.HostBackend` (see [../../api.zig](../../api.zig)).
 | `Capture` | Desktop Duplication (`IDXGIOutputDuplication`), copied into our own BGRA texture and released at once | capture.c |
 | `Encoder` | NVENC through `nvEncodeAPI64.dll` loaded at run time; Media Foundation's software H.264 MFT as the fallback | enc_nvenc.c, enc_mf.c, enc.c |
 | `AudioSource` | WASAPI loopback of the default render endpoint, 48 kHz float, event driven | audio.c |
-| `InputInjector` | `SendInput`: keys by scan code from HID usages, buttons, wheel, relative and absolute motion | input.c |
+| `InputInjector` | `SendInput`: keys by scan code from HID usages, buttons, wheel, relative and absolute motion. Gamepads: Xbox 360 controllers through ViGEmBus, behind `pads.Backend` ([docs/virtual-gamepad.md](../../../docs/virtual-gamepad.md)) | input.c, pads.zig, pad_vigem.c |
 | `Clock` | `QueryPerformanceCounter` | ../../windows/msw.c |
 
 C code follows [../../windows/README.md](../../windows/README.md): COM in C against Zig's
@@ -41,7 +41,7 @@ the encoder runs on textures the caller fills (`msw_texture_create` / `msw_textu
 
 `zig build test-win` runs [test.zig](test.zig). Tests for missing hardware print `skip`;
 `MOONSEC_REQUIRE=mf,input` (set in CI) turns the named skips into failures. The names are
-`dup`, `mf`, `nvenc`, `audio` and `input`.
+`dup`, `mf`, `nvenc`, `audio`, `input` and `vigem`.
 
 ## Not done yet
 
@@ -49,5 +49,5 @@ the encoder runs on textures the caller fills (`msw_texture_create` / `msw_textu
 - Cursor: the pointer position and shape are kept (`msw_dup_pointer_shape`), but the
   platform interface has no cursor channel yet.
 - Hardware Media Foundation encoders (async MFTs on D3D11 textures), AMF and oneVPL.
-- Virtual gamepads (they need a signed driver); `pad` actions are dropped.
+- Gamepads without ViGEmBus installed are dropped (one warning). Rumble back to the client and DualShock 4 targets aren't wired up.
 - Real timing: capture, encode and SendInput latency need a Windows GPU host (S6).
