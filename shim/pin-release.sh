@@ -24,6 +24,11 @@ else
   label="$tag"
 fi
 
+if ! grep -q '// shim-release-begin' "$zon" || ! grep -q '// shim-release-end' "$zon"; then
+  echo "build.zig.zon lacks the shim-release-begin/end markers inside .dependencies" >&2
+  exit 1
+fi
+
 block="$(mktemp)"
 trap 'rm -f "$block"' EXIT
 {
