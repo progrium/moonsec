@@ -324,7 +324,11 @@ pub const ClientOptions = struct {
     /// The system clipboard to sync over the control channel (platform/clipboard).
     clipboard: ?clipboard.Clipboard = null,
     clipboard_poll_us: Micros = 250_000,
+    /// Scripted display selects, by time since streaming started (tests and `moonsec peer`).
+    switches: []const Switch = &.{},
 };
+
+pub const Switch = struct { after_us: Micros, display: u32 };
 
 pub const ClientApp = struct {
     be: api.ClientBackend,
@@ -336,6 +340,8 @@ pub const ClientApp = struct {
     next_overlay: Micros = 0,
     audio: ?*ClientAudio = null,
     clip: ?clipsync.Sync = null,
+    streaming_since: ?Micros = null,
+    next_switch: usize = 0,
     stats: struct { decode_errors: u64 = 0, present_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.ClientBackend, o: ClientOptions, p: pipe_mod.PacketPipe) !ClientApp {
@@ -371,6 +377,15 @@ pub const ClientApp = struct {
             }
         };
         if (a.quit) a.s.close(now);
+        if (a.s.state == .streaming) {
+            const t0 = a.streaming_since orelse blk: {
+                a.streaming_since = now;
+                break :blk now;
+            };
+            const sw = a.opts.switches;
+            while (a.next_switch < sw.len and now - t0 >= sw[a.next_switch].after_us) : (a.next_switch += 1)
+                a.s.selectDisplay(sw[a.next_switch].display, 0, 0, 0, now);
+        }
         a.s.step(now);
         if (a.clip) |*y| y.pump(a.s.gpa, &a.s.control, now);
         if (a.audio) |au| if (a.s.state == .streaming) au.render(a.be.clock.now());

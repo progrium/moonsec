@@ -25,9 +25,10 @@
 //! scripted path (app/pathsim.zig): --flaps T:D,T:D,... (direct-path outages at T ms for
 //! D ms), --drops T:D,... (connection drops), --idle-ms N (path idle timeout, default 300),
 //! --repunch-ms N (direct again N ms after an outage, default 500), --relay-delay-ms N,
-//! --no-stall-pause (keep sending video while the path is stalled), --displays WxH,WxH,...
-//! (the synthetic host's displays) and --switch T:ID,T:ID,... (the client selects display
-//! ID at T ms; the stream reconfigures mid-session).
+//! --no-stall-pause (keep sending video while the path is stalled). sim, soak, run and the
+//! peers take --displays WxH,WxH,... (the synthetic host's displays) and --switch
+//! T:ID,T:ID,... (the client selects display ID T ms into the stream; it reconfigures
+//! mid-session).
 //! The iroh peers take --path-idle-ms N, --conn-idle-ms N, --bind IP:PORT, --relay-url URL
 //! [--relay-ca PEM] and --min-presented PCT (client pass bar, default 80), and redial
 //! (client) or accept again (host) when the connection drops.
@@ -95,6 +96,9 @@ const Args = struct {
     n_displays: usize = 0,
     switches: [16]simrun.DisplayEvent = undefined,
     n_switches: usize = 0,
+    /// The raw --displays and --switch values, passed on to `run`'s peers.
+    displays_arg: ?[]const u8 = null,
+    switch_arg: ?[]const u8 = null,
     p: pair_cmd.Args = .{},
 };
 
@@ -182,6 +186,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
             } else if (eq(u8, s, "--fps")) a.fps = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--bitrate")) a.bitrate = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--slices")) a.slices = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--hub")) a.hub_port = try std.fmt.parseInt(u16, v, 10) else if (eq(u8, s, "--ticket-file")) a.ticket_file = v else if (eq(u8, s, "--out")) a.out = v else if (eq(u8, s, "--time-us")) a.time_us = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--frame")) a.frame = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--outage-at-ms")) a.outage_at_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--outage-ms")) a.outage_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--flaps")) {
                 a.n_flaps = try parseOutages(v, &a.flaps);
             } else if (eq(u8, s, "--displays")) {
+                a.displays_arg = v;
                 var it = std.mem.splitScalar(u8, v, ',');
                 while (it.next()) |d| {
                     if (a.n_displays == a.displays.len) return usage();
@@ -190,6 +195,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
                     a.n_displays += 1;
                 }
             } else if (eq(u8, s, "--switch")) {
+                a.switch_arg = v;
                 var it = std.mem.splitScalar(u8, v, ',');
                 while (it.next()) |d| {
                     if (a.n_switches == a.switches.len) return usage();
@@ -343,7 +349,7 @@ fn exitedOk(t: std.process.Child.Term) bool {
 /// The argv tail every peer gets.
 const PeerArgs = struct {
     buf: [6][24]u8 = undefined,
-    list: [12][]const u8 = undefined,
+    list: [16][]const u8 = undefined,
     n: usize = 0,
 
     fn add(p: *PeerArgs, k: []const u8, comptime fmt: []const u8, v: anytype) void {
@@ -362,6 +368,11 @@ const PeerArgs = struct {
         p.list[p.n] = "--size";
         p.list[p.n + 1] = std.fmt.bufPrint(&p.buf[5], "{d}x{d}", .{ a.width, a.height }) catch unreachable;
         p.n += 2;
+        inline for (.{ .{ "--displays", "displays_arg" }, .{ "--switch", "switch_arg" } }) |f| if (@field(a, f[1])) |v| {
+            p.list[p.n] = f[0];
+            p.list[p.n + 1] = v;
+            p.n += 2;
+        };
     }
 };
 
@@ -423,7 +434,7 @@ fn runSim(gpa: std.mem.Allocator, io: Io, self_exe: []const u8, a: Args) !bool {
     const port = try std.fmt.bufPrint(&port_buf, "{d}", .{hub.port()});
     var pa: PeerArgs = .{};
     pa.fill(a);
-    var argv: [20][]const u8 = undefined;
+    var argv: [28][]const u8 = undefined;
     const base = [_][]const u8{ self_exe, "peer", "sim", "host", "--hub", port };
     @memcpy(argv[0..base.len], &base);
     @memcpy(argv[base.len..][0..pa.n], pa.list[0..pa.n]);
@@ -464,7 +475,7 @@ fn runIroh(io: Io, self_exe: []const u8, a: Args) !bool {
     defer Io.Dir.cwd().deleteFile(io, ticket_file) catch {};
     var pa: PeerArgs = .{};
     pa.fill(a);
-    var argv: [20][]const u8 = undefined;
+    var argv: [28][]const u8 = undefined;
     const base = [_][]const u8{ self_exe, "peer", "iroh", "host", "--ticket-file", ticket_file };
     @memcpy(argv[0..base.len], &base);
     @memcpy(argv[base.len..][0..pa.n], pa.list[0..pa.n]);
@@ -591,7 +602,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
     var ok = false;
     switch (role) {
         .host => {
-            const sh = try synthetic.openHost(gpa, .{ .clock = clock, .sleeper = wallSleep, .width = a.width, .height = a.height });
+            const sh = try synthetic.openHost(gpa, .{ .clock = clock, .sleeper = wallSleep, .width = a.width, .height = a.height, .displays = a.displays[0..a.n_displays] });
             const hb = sh.backend();
             defer hb.deinit();
             var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
@@ -615,7 +626,9 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             const sc = try synthetic.openClient(gpa, .{ .clock = clock, .input_interval_us = 25_000 });
             const cb = sc.backend();
             defer cb.deinit();
-            var app = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
+            var switches: [16]apps.Switch = undefined;
+            for (a.switches[0..a.n_switches], switches[0..a.n_switches]) |e, *sw| sw.* = .{ .after_us = e.at_us, .display = e.what.select.display };
+            var app = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent, .control_stream = ctl_stream, .clipboard = clip_opt, .switches = switches[0..a.n_switches] }, p);
             defer app.deinit();
             // Stop after `seconds` of streaming: the input source asks to quit.
             var timer = try io.concurrent(quitAfter, .{ &app, io, seconds });
