@@ -204,8 +204,7 @@ macc_status macc_presenter_create(macc_window *win, uint32_t w, uint32_t h, uint
 
 void macc_presenter_destroy(macc_presenter *pr) {
     if (!pr) return;
-    MaccPresenterObj *p = (__bridge_transfer MaccPresenterObj *)(void *)pr;
-    p = nil;
+    CFBridgingRelease(pr); // drops the reference create handed out
 }
 
 const char *macc_presenter_device_name(macc_presenter *p) {

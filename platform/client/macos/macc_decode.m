@@ -90,8 +90,7 @@ macc_status macc_decoder_create(uint32_t codec, int hardware, macc_decoder **out
 
 void macc_decoder_destroy(macc_decoder *dec) {
     if (!dec) return;
-    MaccDecoderObj *d = (__bridge_transfer MaccDecoderObj *)(void *)dec;
-    d = nil;
+    CFBridgingRelease(dec); // drops the reference create handed out
 }
 
 int macc_decoder_is_hardware(macc_decoder *dec) {
