@@ -9,16 +9,19 @@ $ErrorActionPreference = 'Stop'
 $work = Join-Path $env:RUNNER_TEMP 'vigem'
 New-Item -ItemType Directory -Force "$work\x", "$work\a" | Out-Null
 Start-Process -FilePath $Exe -ArgumentList '/extract', "`"$work\x`"" -Wait
-$msi = Get-ChildItem "$work\x" -Recurse -Filter *.msi | Select-Object -First 1
-if (-not $msi) { Get-ChildItem -Recurse $work | Format-Table FullName; throw 'no MSI in the installer' }
-$p = Start-Process msiexec -ArgumentList '/a', "`"$($msi.FullName)`"", '/qn', "TARGETDIR=`"$work\a`"" -Wait -PassThru
-"administrative install of $($msi.Name): exit $($p.ExitCode)"
+Get-ChildItem "$work\x" -Recurse -File | Format-Table -AutoSize Length, FullName | Out-String -Width 300
+# The bundle carries one MSI per architecture; unpack them all and pick the amd64 package.
+foreach ($m in Get-ChildItem "$work\x" -Recurse -Filter *.msi) {
+    $dest = Join-Path "$work\a" $m.BaseName
+    $p = Start-Process msiexec -ArgumentList '/a', "`"$($m.FullName)`"", '/qn', "TARGETDIR=`"$dest`"" -Wait -PassThru
+    "administrative install of $($m.Name): exit $($p.ExitCode)"
+}
 Get-ChildItem "$work\a" -Recurse -Include *.inf, *.sys, *.cat | Format-Table -AutoSize Length, FullName | Out-String -Width 300
 
 $inf = Get-ChildItem "$work\a" -Recurse -Filter ViGEmBus.inf |
-    Where-Object { (Test-Path (Join-Path $_.DirectoryName 'ViGEmBus.sys')) -and ($_.FullName -match 'x64|amd64') } |
+    Where-Object { ($_.DirectoryName -notmatch '32-bit|x86|ARM64') -and (Test-Path (Join-Path $_.DirectoryName 'ViGEmBus.sys')) } |
     Select-Object -First 1
-if (-not $inf) { $inf = Get-ChildItem "$work\a" -Recurse -Filter ViGEmBus.inf | Select-Object -First 1 }
+if (-not $inf) { throw 'no amd64 ViGEmBus.inf in the installer' }
 "driver package: $($inf.FullName)"
 
 # Who signed it: attestation-signed packages carry the "Windows Hardware Driver Attested
@@ -75,7 +78,9 @@ try {
 
 Get-PnpDevice -Class System | Where-Object { $_.HardwareID -contains 'Nefarius\ViGEmBus\Gen1' } | ForEach-Object {
     $code = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_ProblemCode).Data
-    "$($_.InstanceId): $($_.Status) (problem code $code)"
+    "$($_.InstanceId): $($_.Status) (problem code $code; 48 = blocked by policy, 52 = signature not accepted)"
 }
 Get-Service ViGEmBus -ErrorAction SilentlyContinue | Format-List Name, Status
+Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 10 -ErrorAction SilentlyContinue |
+    Where-Object { $_.Message -match 'ViGEm' } | Format-List TimeCreated, Id, Message
 Get-ChildItem "$env:WINDIR\System32\drivers\xusb22.sys" -ErrorAction SilentlyContinue | Format-Table Name, Length
