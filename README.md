@@ -30,6 +30,9 @@ zig build check-wasm      # compile the core for wasm32
 zig build test-shim       # build the shim with cargo, run its loopback tests and the Phase 1 gate
 zig build gate-sim        # Phase 1 gate over the simulated network only (two processes, no Rust)
 zig build gate            # Phase 1 gate over iroh (loopback) and the sim; `-- run iroh --seed 3` etc.
+zig build test-app        # Phase 2 host and client apps over the in-process sim
+zig build soak            # one hour of simulated LAN streaming, fails on any freeze
+zig build moonsec -- run all   # host and client processes over iroh and the sim (builds the shim)
 zig build echo            # builds the shim with cargo, links it, runs the loopback datagram echo
 zig build echo -- selftest --relay -n 50   # same, but through n0's public relays
 ```
@@ -42,3 +45,7 @@ retransmits, audio, input with acks, transport feedback driving the rate control
 pacing rate goes back to the transport) over `PacketPipe`: once over iroh, once over the
 simulated network, where the parent process is the hub that owns the network. Each side
 checks every byte it received and the other side's counts; CI runs it on every target.
+
+The Phase 2 session spine ([app/](app/README.md)) runs a host and a client over any platform
+backend ([platform/api.zig](platform/api.zig)); the synthetic backend streams a self-checking
+test pattern, so it runs end to end on any machine.

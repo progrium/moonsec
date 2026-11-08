@@ -37,6 +37,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core_mod }},
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = platform_mod })).step);
+    // Synthetic backend (platform/synthetic): test pattern, passthrough codec, scripted input.
+    const synthetic_mod = b.addModule("synthetic", .{
+        .root_source_file = b.path("platform/synthetic/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "core", .module = core_mod }, .{ .name = "platform", .module = platform_mod } },
+    });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = synthetic_mod })).step);
 
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
@@ -206,6 +214,51 @@ pub fn build(b: *std.Build) void {
     const gate_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tools/gate/test.zig"), .target = target, .optimize = optimize, .imports = &gate_imports }) });
     test_sim.dependOn(&b.addRunArtifact(gate_tests).step);
     test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = simlink_mod })).step);
+
+    // Phase 2 session spine (app/): host and client sessions, the apps over any
+    // platform backend, and the `moonsec` tool (sim runs, soak, iroh, test pattern).
+    const app_imports = [_]std.Build.Module.Import{
+        .{ .name = "core", .module = core_mod },
+        .{ .name = "pipe", .module = pipe_mod },
+        .{ .name = "platform", .module = platform_mod },
+        .{ .name = "synthetic", .module = synthetic_mod },
+        .{ .name = "simnet", .module = simnet_mod },
+        .{ .name = "simlink", .module = simlink_mod },
+    };
+    const app_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("app/test.zig"), .target = target, .optimize = optimize, .imports = &app_imports }) });
+    const test_app = b.step("test-app", "Host and client apps end to end over the in-process sim");
+    test_app.dependOn(&b.addRunArtifact(app_tests).step);
+    test_step.dependOn(test_app);
+    for ([_]bool{ false, true }) |with_iroh| {
+        const opts = b.addOptions();
+        opts.addOption(bool, "iroh", with_iroh);
+        const m = b.createModule(.{ .root_source_file = b.path("app/main.zig"), .target = target, .optimize = optimize, .imports = &app_imports });
+        m.addOptions("app_options", opts);
+        if (with_iroh) {
+            m.addImport("iroh", iroh_mod);
+            m.addImport("iroh_pipe", iroh_pipe_mod);
+        }
+        if (target.result.os.tag == .windows) m.linkSystemLibrary("winmm", .{});
+        const exe = b.addExecutable(.{ .name = if (with_iroh) "moonsec" else "moonsec-sim", .root_module = m });
+        const run = b.addRunArtifact(exe);
+        if (b.args) |a| run.addArgs(a);
+        if (with_iroh) {
+            if (b.args == null) run.addArgs(&.{ "run", "all" });
+            b.step("moonsec", "Run the moonsec tool with the iroh shim (default: `run all`; args: see app/main.zig)").dependOn(&run.step);
+            const install = b.addInstallArtifact(exe, .{});
+            b.step("install-moonsec", "Install zig-out/bin/moonsec (builds the shim)").dependOn(&install.step);
+            const run_all = b.addRunArtifact(exe);
+            run_all.addArgs(&.{ "run", "all", "--seconds", "8" });
+            b.top_level_steps.get("test-shim").?.step.dependOn(&run_all.step);
+        } else {
+            if (b.args == null) run.addArgs(&.{ "sim", "--seconds", "10" });
+            b.step("moonsec-sim", "Run the moonsec tool without the shim (sim, soak, run sim, pattern)").dependOn(&run.step);
+            b.installArtifact(exe);
+            const soak = b.addRunArtifact(exe);
+            soak.addArgs(if (b.args) |a| a else &.{ "soak", "--seconds", "3600" });
+            b.step("soak", "One hour of streaming over the simulated LAN in virtual time (args override)").dependOn(&soak.step);
+        }
+    }
 
     // core/rate driving the simulated network with S11's metrics (sim/rate.zig).
     const sim_rate = b.addExecutable(.{ .name = "sim-rate", .root_module = b.createModule(.{ .root_source_file = b.path("sim/rate.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod } } }) });

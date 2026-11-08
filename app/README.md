@@ -1,0 +1,55 @@
+# app: the Phase 2 session spine
+
+The host and client apps: a platform backend bundle ([platform/api.zig](../platform/api.zig)),
+a session, and a `PacketPipe`, wired into the pipeline.
+
+| File | What |
+| --- | --- |
+| [host_session.zig](host_session.zig) | Host network stage: config, packetizer + retransmit history, NACKs, transport feedback into the rate controller (pacing), frame acks into `core/recovery`, clock pongs, input actions, host-side telemetry (capture, encode, input). Fixed encoder bitrate. |
+| [client_session.zig](client_session.zig) | Client network stage: hello, reassembly + NACKs, transport feedback, recovery (freeze on gap, LTR refresh requests), clock ping/estimate, input sender, per-frame stage times into telemetry, the freeze detector, the overlay. |
+| [apps.zig](apps.zig) | `HostApp`/`ClientApp`: `tick()` runs every stage on one thread without blocking (virtual time); `runThreaded()` gives capture+encode or decode+present its own thread next to the network thread. |
+| [wire.zig](wire.zig) | Session messages (spec/wire-v0.md, "session"). |
+| [simrun.zig](simrun.zig) | Both apps with the synthetic backend over the in-process sim, in virtual time. |
+| [main.zig](main.zig) | The `moonsec` tool. |
+
+## The synthetic backend and the test pattern
+
+[platform/synthetic](../platform/synthetic/root.zig) implements the platform interface with
+no OS behind it. Capture renders the test pattern ([platform/pattern.zig](../platform/pattern.zig)),
+stamped with the capture clock and frame number. The passthrough codec carries the stamp, a
+CRC-32 of the pixels, reference bookkeeping (IDR, P, LTR, LTR refresh) and filler sized to the
+bitrate; its decoder fails a P frame after a gap like a real one, re-renders the picture and
+checks the CRC. The presenter reads the stamp back from the pixels, so every presented frame is
+checked end to end.
+
+The pattern is also the measurement tool for real backends: a barcode and seven-segment digits
+with the capture time in ms, and a flash square that is white for the first 100 ms of every
+second of the capture clock. Put a photodiode (or a camera) on the host's screen and the
+client's; the delay between the two flashes is glass-to-glass. `moonsec pattern --out p.ppm`
+writes one; `pattern.read` decodes a screenshot or camera crop.
+
+## Commands
+
+```sh
+zig build test-app                       # both apps over the in-process sim (part of `zig build test`)
+zig build moonsec-sim -- sim --profile wan --seconds 60
+zig build soak                           # one hour of simulated LAN in virtual time (~5 min)
+zig build moonsec-sim -- run sim         # two processes over the sim hub, wall clock, threads
+zig build moonsec -- run all             # ...and over iroh on loopback (builds the shim)
+zig build install-moonsec                # then, on two machines:
+zig-out/bin/moonsec peer iroh host --ticket-file t --relay --seconds 60
+zig-out/bin/moonsec peer iroh client --ticket-file t --relay --seconds 60   # copy t over first
+```
+
+The freeze detector ([core/telemetry/freeze.zig](../core/telemetry/freeze.zig)) counts a freeze
+whenever no new picture reaches the screen for 200 ms (nothing presented, or old content
+repeated), and counts 50 ms and 100 ms stalls separately. Every run prints per-stage telemetry
+(capture, encode, network, decode, present, glass-to-glass, input).
+
+## Not yet
+
+- Audio: the Opus stage (codec/opus) plugs in on stream 2; the sessions pass audio
+  datagrams through untouched today.
+- Rate adaptation: Phase 2 is fixed bitrate; the controller only sets pacing (at least
+  4× the bitrate, or the measured capacity when higher).
+- The pipes have no wakeup handle, so the network thread polls at 1 ms.

@@ -665,3 +665,10 @@ test "codec sets" {
     try testing.expect(s.has(.h264) and s.has(.passthrough) and !s.has(.hevc));
     try testing.expect(!s.has(@enumFromInt(99)));
 }
+
+/// The measurement test pattern (barcode timestamp, digits, flash square).
+pub const pattern = @import("pattern.zig");
+
+test {
+    _ = pattern;
+}
