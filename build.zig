@@ -18,6 +18,35 @@ pub fn build(b: *std.Build) void {
     const shim_link = b.option(ShimLink, "shim-link", "Link the shim statically or as a shared library (default: static)") orelse .static;
     const shim_dir_opt = b.option([]const u8, "shim-dir", "Prebuilt shim directory for -Dshim=dir");
 
+    // Core: pure Zig, no shim, no libc. Other modules import it as "core".
+    const core_mod = b.addModule("core", .{
+        .root_source_file = b.path("core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const test_step = b.step("test", "Run the core unit tests (no Rust needed)");
+    const core_tests = b.addTest(.{ .root_module = core_mod });
+    test_step.dependOn(&b.addRunArtifact(core_tests).step);
+
+    // The core must build for the browser unchanged: compile it (and its tests) for wasm32.
+    const wasm_step = b.step("check-wasm", "Compile the core for wasm32-freestanding and its tests for wasm32-wasi");
+    const wasm_lib = b.addLibrary(.{
+        .name = "moonsec-core",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("core/wasm.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm_step.dependOn(&wasm_lib.step);
+    const wasm_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("core/root.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi }),
+        .optimize = optimize,
+    }) });
+    wasm_step.dependOn(&wasm_tests.step);
+
     const shim = resolveShim(b, target, shim_source, shim_link, shim_dir_opt);
 
     // C header -> Zig module (the shim's ABI as Zig sees it).
@@ -57,7 +86,7 @@ pub fn build(b: *std.Build) void {
 
     const run_test = b.addRunArtifact(echo);
     run_test.addArg("selftest");
-    b.step("test", "Run the shim echo selftest").dependOn(&run_test.step);
+    b.step("test-shim", "Run the shim echo selftest (builds the shim)").dependOn(&run_test.step);
 }
 
 const Shim = struct {
