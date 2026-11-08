@@ -107,6 +107,23 @@ pub fn build(b: *std.Build) void {
     const run_test = b.addRunArtifact(echo);
     run_test.addArg("selftest");
     b.step("test-shim", "Run the shim echo selftest (builds the shim)").dependOn(&run_test.step);
+
+    // Simulated network behind PacketPipe (transport/sim.zig) and its scenario harness (sim/).
+    // Pure Zig: none of these steps build the shim.
+    const simnet_mod = b.addModule("simnet", .{ .root_source_file = b.path("transport/sim.zig"), .target = target, .optimize = optimize });
+    const sim_imports: []const std.Build.Module.Import = &.{.{ .name = "simnet", .module = simnet_mod }};
+    const sim_exe = b.addExecutable(.{ .name = "sim", .root_module = b.createModule(.{ .root_source_file = b.path("sim/main.zig"), .target = target, .optimize = optimize, .imports = sim_imports }) });
+    const run_sim = b.addRunArtifact(sim_exe);
+    if (b.args) |a| run_sim.addArgs(a);
+    b.step("sim", "Run the simulated-network scenarios (options: see sim/main.zig)").dependOn(&run_sim.step);
+    const check_sim = b.addRunArtifact(sim_exe);
+    check_sim.addArg("--check");
+    check_sim.addFileArg(b.path("sim/golden.txt"));
+    b.step("sim-check", "Run every scenario and compare digests with sim/golden.txt").dependOn(&check_sim.step);
+    const test_sim = b.step("test-sim", "Unit tests for PacketPipe, the sim network and the scenarios");
+    test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = simnet_mod })).step);
+    test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("sim/test.zig"), .target = target, .optimize = optimize, .imports = sim_imports }) })).step);
+    test_step.dependOn(test_sim);
 }
 
 const Shim = struct {
