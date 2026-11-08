@@ -80,6 +80,41 @@ Relative motion sets the delta fields games read and moves the cursor, clamped t
 displays. Absolute positions map 0..65535 onto the display given in `Options.display`.
 Gamepads are dropped for now.
 
+## Virtual display (headless host)
+
+[vdisplay.m](vdisplay.m) wraps CGVirtualDisplay, private CoreGraphics API (macOS 11+), so
+a Mac with no display attached (or a closed lid) still has one to stream. `Capture.start`
+creates it when `CaptureConfig.virtual_display` asks (`.when_headless`: only with no active
+display; `.always`: every time), at the client's size in pixels (no HiDPI) and the
+requested rate, then captures it with ScreenCaptureKit like any display. Absolute pointer
+moves follow it.
+
+- **Feature flag.** The classes are looked up at run time (`NSClassFromString`), never
+  linked, so a macOS without them makes `mh_vdisplay_available()` 0 and capture falls back
+  to the physical display. `-Dmac-virtual-display=false` builds without it.
+- **Lifecycle.** `Capture.stop` releases it and the window server removes it; it is also
+  removed when the host process exits, crash included.
+- **Mode changes.** A smaller mode is applied in place (`applySettings`); a larger one
+  than the display was made for makes a new display.
+- **Fallback.** Creation or capture failing falls back to `CaptureConfig.display`; with
+  no physical display either, `start` fails.
+- **Permissions.** Creating needs none; capturing needs Screen Recording.
+
+Tested on:
+
+| macOS | Where | Create / re-mode / remove | Capture |
+| --- | --- | --- | --- |
+| 15 (macos-15 runner) | CI | see the `macos` workflow summary | no TCC grant on the runner |
+
+The design calls for re-running `zig build test-mac` on every macOS beta; add a row here
+each time.
+
+Hardware check (Jeff's MacBook): grant Screen Recording to the terminal, then
+`MOONSEC_REQUIRE=vdisplay,capture zig build test-mac`. Then close the lid with no external
+display (on power, with "prevent automatic sleeping" on), stream with
+`virtual_display = .when_headless`, and check the client sees a desktop; kill the host and
+check the display is gone (`system_profiler SPDisplaysDataType`).
+
 ## Permissions
 
 Capture and audio need Screen Recording; injection needs Accessibility. `openHost` does

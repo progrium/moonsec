@@ -10,6 +10,7 @@ returns a `platform.HostBackend` (see [../../api.zig](../../api.zig)).
 | `AudioSource` | WASAPI loopback of the default render endpoint, 48 kHz float, event driven | audio.c |
 | `InputInjector` | `SendInput`: keys by scan code from HID usages, buttons, wheel, relative and absolute motion | input.c |
 | `Clock` | `QueryPerformanceCounter` | ../../windows/msw.c |
+| Virtual display | The moonsec IddCx driver ([../../windows/idd](../../windows/idd)): a display at the client's size, captured with Desktop Duplication | vdisp.c |
 
 C code follows [../../windows/README.md](../../windows/README.md): COM in C against Zig's
 bundled mingw-w64 headers, and Zig sees only [host_win.h](host_win.h).
@@ -41,7 +42,7 @@ the encoder runs on textures the caller fills (`msw_texture_create` / `msw_textu
 
 `zig build test-win` runs [test.zig](test.zig). Tests for missing hardware print `skip`;
 `MOONSEC_REQUIRE=mf,input` (set in CI) turns the named skips into failures. The names are
-`dup`, `mf`, `nvenc`, `audio` and `input`.
+`dup`, `mf`, `nvenc`, `audio`, `input` and `idd` (the virtual display driver installed).
 
 ## Not done yet
 
