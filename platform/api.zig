@@ -118,8 +118,12 @@ pub const Image = struct {
 // ---------------------------------------------------------------------------
 // Host: capture
 
+/// One display the host can capture (core/display).
+pub const DisplayInfo = core.display.DisplayInfo;
+
 pub const CaptureConfig = struct {
-    /// Display index (0 = primary).
+    /// Display id from `Capture.displays` (DisplayInfo.id). Backends without `displays`
+    /// read it as an index, 0 = primary.
     display: u32 = 0,
     /// Frames per second the app wants; a backend may deliver fewer when nothing changes.
     fps: u32 = 60,
@@ -130,6 +134,9 @@ pub const CaptureConfig = struct {
     height: u32 = 0,
 };
 
+/// A frame's size can differ from what `start` returned: the display's mode changed
+/// (resolution, rotation). The app then reconfigures the encoder for the new size and the
+/// session sends the client a mid-stream config; the backend keeps capturing.
 pub const CapturedFrame = struct {
     image: Image,
     /// Counts frames the backend produced (repeats keep the original's).
@@ -158,6 +165,11 @@ pub const Capture = struct {
         repeatLast: *const fn (ptr: *anyopaque) Error!?CapturedFrame,
         release: *const fn (ptr: *anyopaque, frame: *const CapturedFrame) void,
         stop: *const fn (ptr: *anyopaque) void,
+        /// Optional (Phase 5): the displays this backend can capture, into `out`; returns
+        /// how many (at most `out.len`). Cheap enough to call about once a second; the app
+        /// compares lists to spot hotplug and mode changes. Callable while capturing, from
+        /// the capture thread. Null: one display, the one `start` picks.
+        displays: ?*const fn (ptr: *anyopaque, out: []DisplayInfo) Error!usize = null,
     };
 
     pub fn start(c: Capture, cfg: CaptureConfig) Error!Size {
@@ -174,6 +186,11 @@ pub const Capture = struct {
     }
     pub fn stop(c: Capture) void {
         c.vtable.stop(c.ptr);
+    }
+    /// The displays (see `VTable.displays`); `error.Unsupported` when the backend has no list.
+    pub fn displays(c: Capture, out: []DisplayInfo) Error!usize {
+        const f = c.vtable.displays orelse return error.Unsupported;
+        return f(c.ptr, out);
     }
 };
 
@@ -569,7 +586,10 @@ pub fn bind(comptime Iface: type, comptime T: type, impl: *T) Iface {
         const vtable: V = blk: {
             var v: V = undefined;
             for (@typeInfo(V).@"struct".fields) |f| {
-                @field(v, f.name) = thunk(f.type, f.name);
+                // Optional methods (`?*const fn`, added after Phase 2): null when T lacks one.
+                if (@typeInfo(f.type) == .optional) {
+                    @field(v, f.name) = if (@hasDecl(T, f.name)) thunk(@typeInfo(f.type).optional.child, f.name) else null;
+                } else @field(v, f.name) = thunk(f.type, f.name);
             }
             break :blk v;
         };
@@ -658,12 +678,40 @@ test "bind builds vtables from methods" {
     try testing.expectError(error.Unsupported, c.repeatLast());
     c.stop();
     try testing.expect(!f.started);
+    // No `displays` method: the optional slot is null and the wrapper says Unsupported.
+    var ds: [2]DisplayInfo = undefined;
+    try testing.expectError(error.Unsupported, c.displays(&ds));
 }
 
 test "codec sets" {
     const s: CodecSet = .{ .h264 = true, .passthrough = true };
     try testing.expect(s.has(.h264) and s.has(.passthrough) and !s.has(.hevc));
     try testing.expect(!s.has(@enumFromInt(99)));
+}
+
+test "bind fills optional methods a type has" {
+    const Fake = struct {
+        pub fn start(_: *@This(), _: CaptureConfig) Error!Size {
+            return .{ .width = 2, .height = 2 };
+        }
+        pub fn acquire(_: *@This(), _: Micros) Error!?CapturedFrame {
+            return null;
+        }
+        pub fn repeatLast(_: *@This()) Error!?CapturedFrame {
+            return null;
+        }
+        pub fn release(_: *@This(), _: *const CapturedFrame) void {}
+        pub fn stop(_: *@This()) void {}
+        pub fn displays(_: *@This(), out: []DisplayInfo) Error!usize {
+            out[0] = .{ .id = 5, .width = 640, .height = 480 };
+            return 1;
+        }
+    };
+    var f: Fake = .{};
+    const c = bind(Capture, Fake, &f);
+    var ds: [2]DisplayInfo = undefined;
+    try testing.expectEqual(@as(usize, 1), try c.displays(&ds));
+    try testing.expectEqual(@as(u32, 5), ds[0].id);
 }
 
 /// The measurement test pattern (barcode timestamp, digits, flash square).

@@ -16,6 +16,12 @@ pub const Kind = enum(u8) {
     hello = 32,
     config = 33,
     bye = 34,
+    /// Host to client: `core.display.DisplayList`.
+    display_list = 35,
+    /// Client to host: `core.display.SelectDisplay`.
+    select_display = 36,
+    /// Client to host: `core.display.ConfigAck`.
+    config_ack = 37,
     _,
 };
 
@@ -47,6 +53,9 @@ pub const Hello = struct {
     }
 };
 
+/// The stream's settings. The host sends one per session and a new one (next `epoch`)
+/// whenever the size, frame rate, codec or display changes mid-stream; it takes effect at
+/// `first_frame`, which the host encodes as an IDR.
 pub const Config = struct {
     nonce: u32,
     codec: api.Codec,
@@ -55,8 +64,18 @@ pub const Config = struct {
     width: u32,
     height: u32,
     bitrate_bps: u64,
+    /// Increments per mid-stream change (wraps). 0 for the session's first config.
+    epoch: u32 = 0,
+    /// The first frame (video `frame_id`) encoded with these settings.
+    first_frame: u32 = 0,
+    /// The display being streamed (`DisplayInfo.id`).
+    display: u32 = 0,
+    /// The newest `select_display.request` applied (0: none yet).
+    request: u32 = 0,
 
-    pub const len = 24;
+    pub const len = 40;
+    /// The Phase 2 form: no epoch, first frame, display or request (all read as 0).
+    pub const len_v0 = 24;
 
     pub fn encode(c: Config, out: *[len]u8) void {
         std.mem.writeInt(u32, out[0..4], c.nonce, .little);
@@ -66,11 +85,15 @@ pub const Config = struct {
         std.mem.writeInt(u32, out[8..12], c.width, .little);
         std.mem.writeInt(u32, out[12..16], c.height, .little);
         std.mem.writeInt(u64, out[16..24], c.bitrate_bps, .little);
+        std.mem.writeInt(u32, out[24..28], c.epoch, .little);
+        std.mem.writeInt(u32, out[28..32], c.first_frame, .little);
+        std.mem.writeInt(u32, out[32..36], c.display, .little);
+        std.mem.writeInt(u32, out[36..40], c.request, .little);
     }
 
     pub fn decode(b: []const u8) ?Config {
-        if (b.len != len) return null;
-        const c: Config = .{
+        if (b.len != len and b.len != len_v0) return null;
+        var c: Config = .{
             .nonce = std.mem.readInt(u32, b[0..4], .little),
             .codec = @enumFromInt(b[4]),
             .slices = b[5],
@@ -79,8 +102,19 @@ pub const Config = struct {
             .height = std.mem.readInt(u32, b[12..16], .little),
             .bitrate_bps = std.mem.readInt(u64, b[16..24], .little),
         };
+        if (b.len == len) {
+            c.epoch = std.mem.readInt(u32, b[24..28], .little);
+            c.first_frame = std.mem.readInt(u32, b[28..32], .little);
+            c.display = std.mem.readInt(u32, b[32..36], .little);
+            c.request = std.mem.readInt(u32, b[36..40], .little);
+        }
         if (c.fps == 0 or c.slices == 0 or c.width == 0 or c.height == 0) return null;
         return c;
+    }
+
+    /// Whether the decoder and presenter need configuring again between `a` and `b`.
+    pub fn sameStream(a: Config, b: Config) bool {
+        return a.codec == b.codec and a.width == b.width and a.height == b.height and a.fps == b.fps;
     }
 };
 
@@ -119,9 +153,17 @@ test "session messages round trip" {
     try std.testing.expectEqual(@as(?Hello, null), Hello.decode(hb[1..]));
 
     var cb: [Config.len]u8 = undefined;
-    const c: Config = .{ .nonce = 9, .codec = .passthrough, .slices = 4, .fps = 60, .width = 640, .height = 360, .bitrate_bps = 8_000_000 };
+    const c: Config = .{ .nonce = 9, .codec = .passthrough, .slices = 4, .fps = 60, .width = 640, .height = 360, .bitrate_bps = 8_000_000, .epoch = 3, .first_frame = 1234, .display = 2, .request = 1 };
     c.encode(&cb);
     try std.testing.expectEqual(@as(?Config, c), Config.decode(&cb));
+    // The 24-byte Phase 2 form still parses, as epoch 0.
+    var v0 = c;
+    v0.epoch = 0;
+    v0.first_frame = 0;
+    v0.display = 0;
+    v0.request = 0;
+    try std.testing.expectEqual(@as(?Config, v0), Config.decode(cb[0..Config.len_v0]));
+    try std.testing.expectEqual(@as(?Config, null), Config.decode(cb[0..30]));
     cb[6] = 0;
     cb[7] = 0;
     try std.testing.expectEqual(@as(?Config, null), Config.decode(&cb));

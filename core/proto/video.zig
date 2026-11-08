@@ -15,7 +15,10 @@ pub const Flags = packed struct(u8) {
     /// This datagram re-sends a shard already sent (NACK response); `media_seq` is the
     /// original's, the envelope `seq` is new.
     retransmit: bool = false,
-    _reserved: u4 = 0,
+    /// First frame of a new stream config (size, frame rate or display changed; an IDR).
+    /// A client that has not received that config waits for it instead of decoding.
+    new_config: bool = false,
+    _reserved: u3 = 0,
 };
 
 /// Fixed 40-byte header. A frame is split into slices; each slice into FEC groups; each
@@ -119,7 +122,7 @@ pub const ShardHeader = struct {
         h.data_shards = try d.int(u8);
         h.parity_shards = try d.int(u8);
         const raw_flags = try d.int(u8);
-        h.flags = @bitCast(raw_flags & 0x0f); // reserved bits are ignored on receive
+        h.flags = @bitCast(raw_flags & 0x1f); // reserved bits are ignored on receive
         h.group_len = try d.int(u32);
         h.capture_us = try d.int(u64);
         const encode_delta = try d.int(u32);

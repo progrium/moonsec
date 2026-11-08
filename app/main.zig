@@ -25,7 +25,9 @@
 //! scripted path (app/pathsim.zig): --flaps T:D,T:D,... (direct-path outages at T ms for
 //! D ms), --drops T:D,... (connection drops), --idle-ms N (path idle timeout, default 300),
 //! --repunch-ms N (direct again N ms after an outage, default 500), --relay-delay-ms N,
-//! --no-stall-pause (keep sending video while the path is stalled).
+//! --no-stall-pause (keep sending video while the path is stalled), --displays WxH,WxH,...
+//! (the synthetic host's displays) and --switch T:ID,T:ID,... (the client selects display
+//! ID at T ms; the stream reconfigures mid-session).
 //! The iroh peers take --path-idle-ms N, --conn-idle-ms N, --bind IP:PORT, --relay-url URL
 //! [--relay-ca PEM] and --min-presented PCT (client pass bar, default 80), and redial
 //! (client) or accept again (host) when the connection drops.
@@ -89,6 +91,10 @@ const Args = struct {
     conn_idle_ms: u32 = 0,
     /// Client: share of `seconds × fps` that must be presented for a pass.
     min_presented_pct: u64 = 80,
+    displays: [8]api.Size = undefined,
+    n_displays: usize = 0,
+    switches: [16]simrun.DisplayEvent = undefined,
+    n_switches: usize = 0,
     p: pair_cmd.Args = .{},
 };
 
@@ -175,6 +181,22 @@ fn parseArgs(args: []const [:0]const u8) !Args {
                 a.profile = std.meta.stringToEnum(simrun.Profile, v) orelse return usage();
             } else if (eq(u8, s, "--fps")) a.fps = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--bitrate")) a.bitrate = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--slices")) a.slices = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--hub")) a.hub_port = try std.fmt.parseInt(u16, v, 10) else if (eq(u8, s, "--ticket-file")) a.ticket_file = v else if (eq(u8, s, "--out")) a.out = v else if (eq(u8, s, "--time-us")) a.time_us = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--frame")) a.frame = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--outage-at-ms")) a.outage_at_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--outage-ms")) a.outage_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--flaps")) {
                 a.n_flaps = try parseOutages(v, &a.flaps);
+            } else if (eq(u8, s, "--displays")) {
+                var it = std.mem.splitScalar(u8, v, ',');
+                while (it.next()) |d| {
+                    if (a.n_displays == a.displays.len) return usage();
+                    const x = std.mem.indexOfScalar(u8, d, 'x') orelse return usage();
+                    a.displays[a.n_displays] = .{ .width = try std.fmt.parseInt(u32, d[0..x], 10), .height = try std.fmt.parseInt(u32, d[x + 1 ..], 10) };
+                    a.n_displays += 1;
+                }
+            } else if (eq(u8, s, "--switch")) {
+                var it = std.mem.splitScalar(u8, v, ',');
+                while (it.next()) |d| {
+                    if (a.n_switches == a.switches.len) return usage();
+                    const c = std.mem.indexOfScalar(u8, d, ':') orelse return usage();
+                    a.switches[a.n_switches] = .{ .at_us = try std.fmt.parseInt(i64, d[0..c], 10) * 1000, .what = .{ .select = .{ .display = try std.fmt.parseInt(u32, d[c + 1 ..], 10) } } };
+                    a.n_switches += 1;
+                }
             } else if (eq(u8, s, "--drops")) {
                 a.n_drops = try parseOutages(v, &a.drops);
             } else if (eq(u8, s, "--idle-ms")) a.idle_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--repunch-ms")) a.repunch_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--relay-delay-ms")) a.relay_delay_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--path-idle-ms")) a.path_idle_ms = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--relay-url")) a.relay_url = v else if (eq(u8, s, "--relay-ca")) a.relay_ca = v else if (eq(u8, s, "--bind")) a.bind = v else if (eq(u8, s, "--conn-idle-ms")) a.conn_idle_ms = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--min-presented")) a.min_presented_pct = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--state-dir")) a.p.state_dir = v else if (eq(u8, s, "--name")) a.p.name = v else if (eq(u8, s, "--ticket")) a.p.ticket = v else if (eq(u8, s, "--pin")) a.p.pin = v else if (eq(u8, s, "--pin-file")) a.p.pin_file = v else if (eq(u8, s, "--qr-svg")) a.p.qr_svg = v else if (eq(u8, s, "--pairings")) a.p.pairings = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--size")) {
@@ -274,6 +296,8 @@ fn simOptions(a: *const Args, seconds: u32, progress: u32) simrun.Options {
         .outage_us = a.outage_ms * 1000,
         .rate_control = a.rate_control,
         .loss_policy = a.loss_policy,
+        .displays = a.displays[0..a.n_displays],
+        .display_events = a.switches[0..a.n_switches],
     };
 }
 

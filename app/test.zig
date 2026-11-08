@@ -216,3 +216,120 @@ test "clipboard: a copy made while the connection is down arrives after the reco
     try std.testing.expectEqualStrings("made while dropped", cs.host());
     try std.testing.expectEqualStrings("made while dropped", cs.client());
 }
+
+// --- Displays and mid-stream configs (Phase 5) -------------------------------
+
+const two_displays = [_]@import("platform").Size{ .{ .width = 320, .height = 180 }, .{ .width = 256, .height = 192 }, .{ .width = 400, .height = 160 } };
+
+fn printRun(r: simrun.Result) void {
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    r.print(&w) catch {};
+    std.debug.print("{s}  host: reconfigures {d}, display switches {d}, mode changes {d}, resends {d}, stream {d}x{d}@{d} display {d}; client: configs {d}, decoder reconfigures {d}, displays {d}, presented {d}x{d}\n", .{ w.buffered(), r.host.reconfigures, r.host.display_switches, r.host.mode_changes, r.host.config_resends, r.host.width, r.host.height, r.host.fps, r.host.display, r.client.config_changes, r.client.decoder_reconfigures, r.client.displays, r.client.width, r.client.height });
+}
+
+test "the client switches displays mid-stream" {
+    const o: simrun.Options = .{ .seed = 1, .profile = .lan, .seconds = 5, .displays = &two_displays, .display_events = &.{
+        .{ .at_us = 1_500_000, .what = .{ .select = .{ .display = 1 } } },
+        .{ .at_us = 3_000_000, .what = .{ .select = .{ .display = 2 } } },
+    } };
+    const r = try expectPass(o);
+    errdefer printRun(r);
+    try std.testing.expectEqual(@as(usize, 3), r.client.displays);
+    try std.testing.expectEqual(@as(u64, 2), r.host.display_switches);
+    try std.testing.expectEqual(@as(u64, 2), r.client.config_changes);
+    try std.testing.expectEqual(@as(u64, 2), r.client.decoder_reconfigures);
+    try std.testing.expectEqual(@as(u32, 2), r.host.display);
+    try std.testing.expectEqual(@as(u32, 400), r.client.width);
+    try std.testing.expectEqual(@as(u32, 160), r.client.height);
+    // One IDR to start and one per switch; no recovery IDRs on a LAN.
+    try std.testing.expectEqual(@as(u64, 3), r.host.keyframes);
+    try std.testing.expectEqual(@as(u64, 0), r.client.decode_errors);
+}
+
+test "a client cap scales the stream, and a host mode change follows the display" {
+    const o: simrun.Options = .{
+        .seed = 2,
+        .profile = .lan,
+        .seconds = 5,
+        .displays = &two_displays,
+        .display_events = &.{
+            // Same display, at most 160 wide and 30 fps: 160x90@30.
+            .{ .at_us = 1_000_000, .what = .{ .select = .{ .display = @import("core").display.keep_display, .max_width = 160, .max_fps = 30 } } },
+            // Back to its own size, then the display changes mode under the capture.
+            .{ .at_us = 2_000_000, .what = .{ .select = .{ .display = 0 } } },
+            .{ .at_us = 3_000_000, .what = .{ .mode = .{ .display = 0, .width = 240, .height = 160 } } },
+        },
+    };
+    // Fewer frames at 30 fps for a second: hold this run to frames at the rates it had.
+    const r = try simrun.run(std.testing.allocator, o, null);
+    errdefer printRun(r);
+    try std.testing.expectEqual(@as(u64, 3), r.host.reconfigures);
+    try std.testing.expectEqual(@as(u64, 1), r.host.mode_changes);
+    try std.testing.expectEqual(@as(u64, 0), r.host.display_switches);
+    try std.testing.expectEqual(@as(u64, 3), r.client.config_changes);
+    try std.testing.expectEqual(@as(u32, 240), r.client.width);
+    try std.testing.expectEqual(@as(u32, 160), r.client.height);
+    try std.testing.expectEqual(@as(u32, 60), r.host.fps);
+    try std.testing.expectEqual(@as(u64, 0), r.client.corrupt);
+    try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+    try std.testing.expectEqual(@as(u64, 0), r.client.decode_errors);
+    try std.testing.expectEqual(@as(u64, 0), r.client.freezes);
+    try std.testing.expect(r.client.presented >= (4 * 60 + 30) * 95 / 100);
+}
+
+test "a hotplugged display reaches the client's list" {
+    const r = try expectPass(.{ .seed = 3, .profile = .lan, .seconds = 3, .displays = two_displays[0..2], .display_events = &.{
+        .{ .at_us = 1_000_000, .what = .{ .hotplug = .{ .width = 200, .height = 100 } } },
+    } });
+    try std.testing.expectEqual(@as(usize, 3), r.client.displays);
+    try std.testing.expectEqual(@as(u64, 0), r.host.reconfigures);
+}
+
+test "switches on a lossy WAN: configs and the IDR get through or are repaired" {
+    for (1..4) |seed| {
+        const r = try simrun.run(std.testing.allocator, .{ .seed = seed, .profile = .wan, .seconds = 6, .displays = &two_displays, .display_events = &.{
+            .{ .at_us = 1_000_000, .what = .{ .select = .{ .display = 1 } } },
+            .{ .at_us = 1_050_000, .what = .{ .select = .{ .display = 2 } } },
+            .{ .at_us = 3_000_000, .what = .{ .select = .{ .display = 0 } } },
+            .{ .at_us = 4_000_000, .what = .{ .mode = .{ .display = 0, .width = 256, .height = 144 } } },
+        } }, null);
+        errdefer printRun(r);
+        try std.testing.expectEqual(@as(u32, 256), r.client.width);
+        try std.testing.expectEqual(@as(u32, 144), r.client.height);
+        try std.testing.expectEqual(@as(u64, 0), r.client.corrupt);
+        try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+        try std.testing.expect(r.client.longest_gap_us < 300_000);
+        try std.testing.expect(r.client.presented * 100 >= r.expectedFrames(60) * 90);
+    }
+}
+
+test "the rate ladder resizes the stream end to end" {
+    // 960x540 at 60 fps needs ~1.55 Mbit/s before the ladder steps down. The downlink
+    // drops from 4 to 1.2 Mbit/s at 3 s and comes back at 8 s; the ladder steps down to
+    // 640x360 (and 45 fps), then back up rung by rung, each step a mid-stream config the
+    // client's decoder follows.
+    const r = try simrun.run(std.testing.allocator, .{
+        .seed = 4,
+        .profile = .clean,
+        .seconds = 26,
+        .width = 960,
+        .height = 540,
+        .bitrate_bps = 2_500_000,
+        .rate_control = true,
+        .audio = false,
+        .downlink_queue_bytes = 60_000,
+        .downlink_steps = &.{ .{ .t_us = 0, .bps = 4e6 }, .{ .t_us = 3_000_000, .bps = 1.2e6 }, .{ .t_us = 8_000_000, .bps = 4e6 } },
+    }, null);
+    errdefer printRun(r);
+    try std.testing.expect(r.host.reconfigures >= 3);
+    try std.testing.expectEqual(r.host.reconfigures, r.client.config_changes);
+    // Every size change reconfigured the decoder (frame-rate-only steps need not).
+    try std.testing.expect(r.client.decoder_reconfigures >= 2);
+    try std.testing.expectEqual(@as(u64, 0), r.client.corrupt);
+    try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+    // Back at the top by the end.
+    try std.testing.expectEqual(@as(u32, 960), r.client.width);
+    try std.testing.expectEqual(@as(u32, 540), r.client.height);
+    try std.testing.expectEqual(@as(u32, 60), r.host.fps);
+}

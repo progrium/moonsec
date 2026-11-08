@@ -34,6 +34,9 @@ pub const pair = @import("pair/root.zig");
 /// Reliable control channel: framing, type registry, hello, clipboard (spec/control-v0.md).
 pub const control = @import("control/root.zig");
 
+/// Display list, display selection and mid-stream config scheduling.
+pub const display = @import("display/root.zig");
+
 /// Per-frame stage timing and rolling stats for the latency overlay.
 pub const telemetry = @import("telemetry/root.zig");
 

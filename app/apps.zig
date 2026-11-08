@@ -8,6 +8,13 @@
 //!     thread next to the network thread. One mutex guards the session; the slow backend
 //!     calls run outside it.
 //!
+//! Display changes (Phase 5) happen on the media stage, which owns capture and encoder:
+//! before each frame the host applies a client's display select, a rate-ladder step, or
+//! a new size the capture delivered (the display changed mode), by restarting capture
+//! and configuring the encoder, then tells the session (`onReconfigured`). It also polls
+//! the backend's display list about once a second. The client's decode stage configures
+//! the decoder and presenter again when a frame of a new size comes up.
+//!
 //! Audio rides the network stage: when the backend has an audio source (host) or sink
 //! (client), the Opus stage (codec/opus/stage.zig) encodes 10 ms frames from the source
 //! and sends them on the audio stream, and the client renders from its jitter buffer
@@ -51,6 +58,8 @@ pub const HostOptions = struct {
     /// The system clipboard to sync over the control channel (platform/clipboard).
     clipboard: ?clipboard.Clipboard = null,
     clipboard_poll_us: Micros = 250_000,
+    /// Poll the backend's display list this often (0: only at start).
+    display_poll_us: Micros = 1_000_000,
 };
 
 pub const HostApp = struct {
@@ -61,7 +70,13 @@ pub const HostApp = struct {
     last_frame_us: ?Micros = null,
     audio: ?*HostAudio = null,
     clip: ?clipsync.Sync = null,
-    stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0 } = .{},
+    /// What capture runs at now: display, frame rate, and whether at the display's own
+    /// size (the top of the ladder) or scaled. `cap` is the client's latest size and rate cap.
+    display: u32,
+    fps: u32,
+    cap: struct { width: u32 = 0, height: u32 = 0, fps: u32 = 0 } = .{},
+    next_display_poll: Micros = 0,
+    stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0, reconfigure_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: HostOptions, p: pipe_mod.PacketPipe) !HostApp {
         const size = try be.capture.start(.{ .display = o.display, .fps = o.fps, .width = o.width, .height = o.height });
@@ -70,8 +85,9 @@ pub const HostApp = struct {
         if (!caps.codecs.has(o.codec)) return error.Unsupported;
         const slices = @min(o.slices, caps.max_slices);
         try be.encoder.configure(.{ .codec = o.codec, .width = size.width, .height = size.height, .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = slices, .ltr = caps.ltr });
-        const s = try HostSession.init(gpa, .{
+        var s = try HostSession.init(gpa, .{
             .codec = o.codec,
+            .display = o.display,
             .width = size.width,
             .height = size.height,
             .fps = o.fps,
@@ -84,7 +100,10 @@ pub const HostApp = struct {
             .loss_policy = o.session.loss_policy,
             .pause_on_stall = o.pause_on_stall,
         }, p);
-        var app: HostApp = .{ .be = be, .s = s, .opts = o, .size = size };
+        var dl: [core.display.DisplayList.max_displays]api.DisplayInfo = undefined;
+        if (be.capture.displays(&dl)) |n| s.setDisplays(dl[0..n], be.clock.now()) else |_| {}
+        var app: HostApp = .{ .be = be, .s = s, .opts = o, .size = size, .display = o.display, .fps = o.fps };
+        app.next_display_poll = be.clock.now() + o.display_poll_us;
         errdefer app.s.deinit();
         if (o.control_stream) |cs| try app.s.control.attach(cs);
         if (o.clipboard) |cb| app.clip = .{ .cb = cb, .interval_us = o.clipboard_poll_us };
@@ -123,6 +142,19 @@ pub const HostApp = struct {
 
     /// One encode, given a captured frame: the lock is taken around the session calls only.
     fn encodeOne(a: *HostApp, f: *const api.CapturedFrame, lock: ?Lock) void {
+        if (f.image.width != a.size.width or f.image.height != a.size.height) {
+            // The display changed mode under the capture: encode at the new size from here.
+            const sz: api.Size = .{ .width = f.image.width, .height = f.image.height };
+            if (a.configureEncoder(sz, a.fps)) {
+                a.size = sz;
+                if (lock) |l| l.lock();
+                a.s.onReconfigured(.{ .width = sz.width, .height = sz.height, .fps = a.fps, .display = a.display, .why = .mode }, a.be.clock.now());
+                if (lock) |l| l.unlock();
+            } else |_| {
+                a.stats.reconfigure_errors += 1;
+                return;
+            }
+        }
         if (lock) |l| l.lock();
         const live = a.s.streaming();
         const params = if (live) a.s.encodeParams() else api.EncodeParams{};
@@ -142,10 +174,93 @@ pub const HostApp = struct {
         }
     }
 
+    fn configureEncoder(a: *HostApp, sz: api.Size, fps: u32) api.Error!void {
+        const caps = a.be.encoder.caps();
+        try a.be.encoder.configure(.{ .codec = a.opts.codec, .width = sz.width, .height = sz.height, .fps = fps, .bitrate_bps = a.s.bitrate_bps, .slices = a.s.cfg.slices, .ltr = caps.ltr });
+    }
+
+    /// Restart capture on `display` at `width`×`height` (0: its own size) and `fps`, and
+    /// configure the encoder for what capture delivers. On failure, capture goes back to
+    /// what it was.
+    fn restart(a: *HostApp, display: u32, width: u32, height: u32, fps: u32) api.Error!api.Size {
+        a.be.capture.stop();
+        const sz = a.be.capture.start(.{ .display = display, .fps = fps, .width = width, .height = height }) catch |e| {
+            a.size = a.be.capture.start(.{ .display = a.display, .fps = a.fps }) catch return e;
+            return e;
+        };
+        try a.configureEncoder(sz, fps);
+        a.size = sz;
+        a.display = display;
+        a.fps = fps;
+        a.last_frame_us = null;
+        return sz;
+    }
+
+    /// The display's own size, if listed.
+    fn displaySize(a: *HostApp, id: u32) ?api.Size {
+        var dl: [core.display.DisplayList.max_displays]api.DisplayInfo = undefined;
+        const n = a.be.capture.displays(&dl) catch return if (id == a.display) a.size else null;
+        for (dl[0..n]) |d| if (d.id == id) return .{ .width = d.width, .height = d.height };
+        return null;
+    }
+
+    /// Media stage, before each frame: poll the display list, apply a select or a ladder
+    /// step. The lock is taken around the session calls only.
+    fn applyChanges(a: *HostApp, lock: ?Lock) void {
+        const now = a.be.clock.now();
+        var dl: [core.display.DisplayList.max_displays]api.DisplayInfo = undefined;
+        const listed: ?usize = if (a.opts.display_poll_us > 0 and now >= a.next_display_poll) blk: {
+            a.next_display_poll = now + a.opts.display_poll_us;
+            break :blk a.be.capture.displays(&dl) catch null;
+        } else null;
+        if (lock) |l| l.lock();
+        if (listed) |n| a.s.setDisplays(dl[0..n], now);
+        const sel = a.s.takeSelect();
+        const rung = a.s.takeReconfigure();
+        if (lock) |l| l.unlock();
+        if (sel) |q| return a.applySelect(q, lock);
+        if (rung) |r| a.applyRung(r, lock);
+    }
+
+    fn applySelect(a: *HostApp, q: core.display.SelectDisplay, lock: ?Lock) void {
+        const id = if (q.display == core.display.keep_display) a.display else q.display;
+        const fps = if (q.max_fps != 0) @min(a.opts.fps, q.max_fps) else a.opts.fps;
+        a.cap = .{ .width = q.max_width, .height = q.max_height, .fps = q.max_fps };
+        const sz: ?api.Size = if (a.displaySize(id)) |full| blk: {
+            const f = core.display.fit(full.width, full.height, q.max_width, q.max_height);
+            // Its own size: capture follows the display's mode. Else ask capture to scale.
+            const native = f.width == full.width and f.height == full.height;
+            break :blk a.restart(id, if (native) 0 else f.width, if (native) 0 else f.height, fps) catch null;
+        } else null;
+        if (lock) |l| l.lock();
+        defer if (lock) |l| l.unlock();
+        const now = a.be.clock.now();
+        if (sz) |s| {
+            a.s.onReconfigured(.{ .width = s.width, .height = s.height, .fps = fps, .display = id, .request = q.request }, now);
+        } else {
+            a.stats.reconfigure_errors += 1;
+            a.s.onSelectFailed(q.request, now);
+        }
+    }
+
+    fn applyRung(a: *HostApp, r: core.rate.ladder.Rung, lock: ?Lock) void {
+        // The ladder's top rung is the capture's top size; anything below it is scaled.
+        const top = a.s.ladder.rungs[0];
+        const native = r.width == top.width and r.height == top.height and a.cap.width == 0 and a.cap.height == 0;
+        const sz = a.restart(a.display, if (native) 0 else r.width, if (native) 0 else r.height, r.fps) catch {
+            a.stats.reconfigure_errors += 1;
+            return;
+        };
+        if (lock) |l| l.lock();
+        defer if (lock) |l| l.unlock();
+        a.s.onReconfigured(.{ .width = sz.width, .height = sz.height, .fps = r.fps, .display = a.display, .rebase_ladder = false, .why = .ladder }, a.be.clock.now());
+    }
+
     /// Run every stage once, without blocking.
     pub fn tick(a: *HostApp) void {
         a.network(a.be.clock.now());
         if (!a.s.streaming()) return;
+        a.applyChanges(null);
         const f = (a.grab(0) catch return) orelse return;
         defer a.be.capture.release(&f);
         a.encodeOne(&f, null);
@@ -173,7 +288,6 @@ pub const HostApp = struct {
     }
 
     fn hostMedia(a: *HostApp, lock: Lock, stop: *std.atomic.Value(bool)) void {
-        const interval = @divTrunc(1_000_000, @as(Micros, a.opts.fps));
         while (!stop.load(.acquire)) {
             lock.lock();
             const live = a.s.streaming();
@@ -182,6 +296,8 @@ pub const HostApp = struct {
                 lock.io.sleep(.fromMilliseconds(2), .awake) catch {};
                 continue;
             }
+            a.applyChanges(lock);
+            const interval = @divTrunc(1_000_000, @as(Micros, @max(a.fps, 1)));
             const f = (a.grab(interval) catch {
                 lock.io.sleep(.fromMilliseconds(2), .awake) catch {};
                 continue;
@@ -264,6 +380,14 @@ pub const ClientApp = struct {
     fn configure(a: *ClientApp) bool {
         if (a.configured) return true;
         const c = a.s.config orelse return false;
+        if (!a.configureFor(c)) return false;
+        a.configured = true;
+        return true;
+    }
+
+    /// Decoder and presenter for `c` (first config, or a mid-stream one: the decoder
+    /// starts afresh, the window keeps going at the new size).
+    fn configureFor(a: *ClientApp, c: @import("wire.zig").Config) bool {
         a.be.decoder.configure(.{ .codec = c.codec, .width = c.width, .height = c.height }) catch {
             a.s.close(a.be.clock.now());
             return false;
@@ -272,7 +396,7 @@ pub const ClientApp = struct {
             a.s.close(a.be.clock.now());
             return false;
         };
-        a.configured = true;
+        a.s.decoderConfigured(c);
         return true;
     }
 
@@ -280,7 +404,10 @@ pub const ClientApp = struct {
     fn mediaOne(a: *ClientApp, lock: ?Lock) bool {
         if (lock) |l| l.lock();
         const ok = a.configure();
-        const au_ = if (ok) a.s.nextAccessUnit() else null;
+        var au_ = if (ok) a.s.nextAccessUnit() else null;
+        if (au_ != null) if (a.s.takeDecoderConfig()) |c| {
+            if (!a.configureFor(c)) au_ = null;
+        };
         const now = a.be.clock.now();
         if (now >= a.next_overlay) {
             a.overlay = a.s.overlay(now);

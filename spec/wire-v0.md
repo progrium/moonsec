@@ -96,7 +96,8 @@ Flags (bit 0 = LSB):
 | 1 | `ltr_refresh` | References only a long-term reference the client has acked: decodable after a gap. This is the recovery frame a stuck client waits for. |
 | 2 | `ltr` | This frame is a long-term reference; the client acks `ltr_token` after decoding it. |
 | 3 | `retransmit` | Re-sent shard (NACK response). |
-| 4–7 | | Reserved; ignored on receive. |
+| 4 | `new_config` | First frame of a new stream config (an IDR): see [display-v0.md](display-v0.md). |
+| 5–7 | | Reserved; ignored on receive. |
 
 **Shard sizes.** Let `S = ceil(group_len / data_shards)`. Every data shard carries `S`
 bytes except the last data shard, which carries `group_len − S·(data_shards − 1)` (at
@@ -181,7 +182,7 @@ same shard header plus `flags.retransmit` and a new envelope `seq`; it ignores t
 The client sends the first NACK for a gap after a reorder wait (adaptive, 1–5 ms by
 default) and repeats it every RTT plus slack while the shard's frame is still pending.
 
-### `control_fast` kinds 18 and 32–34: session (both directions)
+### `control_fast` kinds 18 and 32–37: session (both directions)
 
 Session setup on datagrams, until the reliable QUIC control streams land. Defined in
 `app/wire.zig`. Every field is little-endian; reserved bytes are 0.
@@ -190,15 +191,21 @@ Session setup on datagrams, until the reliable QUIC control streams land. Define
 | ---: | --- | --- | --- |
 | 18 | `clock_report` | client → host | `i64 offset_us` (host clock − client clock, from clock sync), `i64 error_bound_us`. 16 bytes. The host uses it to time input injection against capture. |
 | 32 | `hello` | client → host | `u32 nonce`, `u8 codecs` (bit 0 H.264, 1 HEVC, 2 AV1, 3 passthrough), 3 reserved, `u32 max_width`, `u32 max_height` (0 = any). 16 bytes. |
-| 33 | `config` | host → client | `u32 nonce` (echo), `u8 codec` (1 H.264, 2 HEVC, 3 AV1, 250 passthrough), `u8 slices`, `u16 fps`, `u32 width`, `u32 height`, `u64 bitrate_bps`. 24 bytes; `fps`, `slices`, `width`, `height` non-zero. |
+| 33 | `config` | host → client | `u32 nonce` (echo), `u8 codec` (1 H.264, 2 HEVC, 3 AV1, 250 passthrough), `u8 slices`, `u16 fps`, `u32 width`, `u32 height`, `u64 bitrate_bps`, then `u32 epoch`, `u32 first_frame`, `u32 display`, `u32 request` ([display-v0.md](display-v0.md), "stream_config"). 40 bytes (the 24-byte Phase 2 form is read as epoch 0); `fps`, `slices`, `width`, `height` non-zero. |
 | 34 | `bye` | both | `u8 reason` (0 done, 1 quit, 2 error). |
+| 35 | `display_list` | host → client | [display-v0.md](display-v0.md). |
+| 36 | `select_display` | client → host | [display-v0.md](display-v0.md). |
+| 37 | `config_ack` | client → host | [display-v0.md](display-v0.md). |
 
 The client sends `hello` every 100 ms until a `config` with its nonce arrives. The host
 answers every `hello` with `config`; a `hello` with a nonce it has not seen starts a new
 session from a keyframe. Either side leaves by sending `bye` three times, 20 ms apart; a
-side that hears nothing from the other for 5 s ends the session.
+side that hears nothing from the other for 5 s ends the session. Mid-stream configs, the
+display list and display selection (repeats, acks) are in [display-v0.md](display-v0.md).
 
 ## Changes
 
 - v0 (Nov 2026): first draft.
 - v0 (Nov 2026): session messages (`hello`, `config`, `bye`, `clock_report`) for the Phase 2 apps.
+- v0 (Nov 2026): mid-stream configs and displays: `config` grows to 40 bytes, kinds 35–37,
+  video flag `new_config` (Phase 5B).

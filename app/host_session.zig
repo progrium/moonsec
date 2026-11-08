@@ -27,6 +27,14 @@
 //! feedback for pacing and the overlay: the pipe paces at its rate, but never below
 //! `pace_floor` × the bitrate, so a frame always leaves faster than the encoder makes it.
 //!
+//! Displays and mid-stream configs (Phase 5): the app hands the session its display list
+//! (`setDisplays`); the session sends it to the client, and the client's `select_display`
+//! waits in `takeSelect` for the app to apply (restart capture on that display, at most
+//! the client's size and frame rate). Every change of size, frame rate or display (a
+//! select, a ladder step, the host's own display changing mode) goes through
+//! `onReconfigured`: a new config epoch that takes effect at the next frame, which is an
+//! IDR. The config and display list are repeated until the client acks them.
+//!
 //! With `rate_control` (Phase 3) the controller drives the encoder through the ladder
 //! (core/rate/ladder.zig): bitrate changes go out in `EncodeParams.bitrate_bps`, and
 //! resolution or frame-rate steps wait in `takeReconfigure` for the app to apply with
@@ -56,6 +64,8 @@ pub const Config = struct {
     fps: u32 = 60,
     bitrate_bps: u64 = 10_000_000,
     slices: u8 = 4,
+    /// The display being streamed (`DisplayInfo.id`).
+    display: u32 = 0,
     /// The encoder has long-term references (`EncoderCaps.ltr`).
     ltr: bool = true,
     /// Apply a pacing rate to the pipe.
@@ -85,6 +95,8 @@ pub const Config = struct {
     /// A stall reported this soon after a path change is the new path's backlog of probes
     /// and keep-alives (S5c lab: ~90 ms after a switch to the relay), not a dead path.
     stall_grace_us: Micros = 250_000,
+    /// Repeat an unacked config or display list this often (plus the RTT).
+    config_resend_us: Micros = 100_000,
     /// Byes sent when leaving, `bye_interval_us` apart.
     byes: u8 = 3,
     bye_interval_us: Micros = 20_000,
@@ -125,9 +137,35 @@ pub const Stats = struct {
     stall_frames: u64 = 0,
     /// Longest hold, us.
     stall_longest_us: Micros = 0,
+    /// Mid-stream configs (epochs after the first), of which display switches and
+    /// changes the host's display made; display selects from the client; repeats of an
+    /// unacked config or display list.
+    reconfigures: u64 = 0,
+    display_switches: u64 = 0,
+    mode_changes: u64 = 0,
+    selects: u64 = 0,
+    config_resends: u64 = 0,
+    display_lists: u64 = 0,
     malformed: u64 = 0,
     unknown: u64 = 0,
 };
+
+/// A change the app applied to capture and encoder (`onReconfigured`).
+pub const Reconfigured = struct {
+    width: u32,
+    height: u32,
+    fps: u32,
+    display: u32,
+    /// The client's select this answers, if any.
+    request: ?u32 = null,
+    /// The new size is the top of the rate ladder (a new display, a mode change, a client
+    /// cap); false for a ladder step, which keeps the ladder where it is.
+    rebase_ladder: bool = true,
+    why: enum { select, ladder, mode } = .select,
+};
+
+const display_mod = core.display;
+const DisplayInfo = display_mod.DisplayInfo;
 
 const Pending = struct { action: core.input.Action, time: Micros };
 
@@ -179,6 +217,19 @@ pub const HostSession = struct {
     input_rx: core.input.Receiver = .{},
     actions: std.Deque(Pending) = .empty,
     tele: *telemetry.Telemetry(512),
+
+    /// Config epoch and its first frame; what the client acked.
+    epoch: u32 = 0,
+    first_frame: u32 = 0,
+    acked_epoch: ?u32 = null,
+    /// Newest select applied (0 = none), and one waiting for the app.
+    request_applied: u32 = 0,
+    pending_select: ?display_mod.SelectDisplay = null,
+    displays: [display_mod.DisplayList.max_displays]DisplayInfo = undefined,
+    n_displays: usize = 0,
+    display_gen: u32 = 0,
+    acked_gen: ?u32 = null,
+    next_resend: Micros = 0,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config, p: PacketPipe) !HostSession {
         var history = try media.History.init(gpa, .{ .max_age_us = cfg.retransmit_age_us, .min_interval_us = cfg.retransmit_interval_us, .capacity = 8192 });
@@ -277,9 +328,81 @@ pub const HostSession = struct {
             .fps = @intCast(s.cfg.fps),
             .width = s.cfg.width,
             .height = s.cfg.height,
-            .bitrate_bps = s.cfg.bitrate_bps,
+            .bitrate_bps = s.bitrate_bps,
+            .epoch = s.epoch,
+            .first_frame = s.first_frame,
+            .display = s.cfg.display,
+            .request = s.request_applied,
         }).encode(&b);
         s.sendOther(.control_fast, @intFromEnum(wire.Kind.config), &b, now);
+        if (s.n_displays > 0) s.sendDisplayList(now);
+        s.next_resend = now + s.cfg.config_resend_us + @max(s.path.rtt_us, 0);
+    }
+
+    fn sendDisplayList(s: *HostSession, now: Micros) void {
+        var b: [proto.max_datagram - proto.Envelope.size]u8 = undefined;
+        const out = (display_mod.DisplayList{ .gen = s.display_gen, .current = s.cfg.display, .displays = s.displays[0..s.n_displays] }).encode(&b) catch unreachable;
+        s.sendOther(.control_fast, @intFromEnum(wire.Kind.display_list), out, now);
+        s.stats.display_lists += 1;
+    }
+
+    /// The host's displays, from `Capture.displays` (call it again whenever; a list that
+    /// differs from the last is sent to the client). At most `DisplayList.max_displays`.
+    pub fn setDisplays(s: *HostSession, list: []const DisplayInfo, now: Micros) void {
+        const l = list[0..@min(list.len, s.displays.len)];
+        if (display_mod.sameList(l, s.displays[0..s.n_displays])) return;
+        @memcpy(s.displays[0..l.len], l);
+        s.n_displays = l.len;
+        s.display_gen +%= 1;
+        if (s.state == .streaming and s.nonce != null) s.sendDisplayList(now);
+    }
+
+    /// A display select from the client, once, for the app to apply (then `onReconfigured`
+    /// with its `request`, or `onSelectFailed`).
+    pub fn takeSelect(s: *HostSession) ?display_mod.SelectDisplay {
+        if (!s.canReconfigure()) return null;
+        defer s.pending_select = null;
+        return s.pending_select;
+    }
+
+    /// A new config may start only after a frame of the current one went out: frames carry
+    /// no epoch, so two configs starting at the same frame would be ambiguous to a client
+    /// that has heard of only the first.
+    fn canReconfigure(s: *const HostSession) bool {
+        return s.epoch == 0 or s.next_frame_id != s.first_frame;
+    }
+
+    /// The app could not apply the select (unknown display, capture failed): the stream
+    /// carries on as it was, and the next config tells the client its request is done.
+    pub fn onSelectFailed(s: *HostSession, request: u32, now: Micros) void {
+        s.request_applied = request;
+        if (s.nonce != null) s.sendConfig(now);
+    }
+
+    /// The app changed capture and encoder (see `Reconfigured`): a new config epoch from
+    /// the next frame on, which is an IDR, sent to the client until it acks.
+    pub fn onReconfigured(s: *HostSession, r: Reconfigured, now: Micros) void {
+        const switched = r.display != s.cfg.display;
+        s.cfg.width = r.width;
+        s.cfg.height = r.height;
+        s.cfg.fps = r.fps;
+        s.cfg.display = r.display;
+        if (r.request) |q| s.request_applied = q;
+        s.epoch +%= 1;
+        s.first_frame = s.next_frame_id;
+        s.stats.reconfigures += 1;
+        if (switched) s.stats.display_switches += 1;
+        if (r.why == .mode) s.stats.mode_changes += 1;
+        if (r.rebase_ladder) {
+            s.ladder = rate.Ladder.init(.{ .width = r.width, .height = r.height, .fps = r.fps });
+            s.pending_reconfigure = null;
+        }
+        s.ctl.setFrameRate(@floatFromInt(r.fps));
+        // The decoder is configured afresh at the new size: nothing before this frame is a
+        // valid reference.
+        if (s.next_frame_id > 0 or s.nonce != null)
+            s.rec.onRecoveryRequest(.{ .first_missing = s.next_frame_id, .want_idr = true });
+        if (s.nonce != null and s.state == .streaming) s.sendConfig(now);
     }
 
     pub fn step(s: *HostSession, now: Micros) void {
@@ -306,6 +429,14 @@ pub const HostSession = struct {
             s.byes_left -= 1;
             s.next_bye = now + s.cfg.bye_interval_us;
             if (s.byes_left == 0) return s.finish(.closed, "closed");
+        }
+        if (s.state == .streaming and s.byes_left == 0 and now >= s.next_resend) {
+            const config_unacked = s.acked_epoch == null or s.acked_epoch.? != s.epoch;
+            const list_unacked = s.n_displays > 0 and (s.acked_gen == null or s.acked_gen.? != s.display_gen);
+            if (config_unacked or list_unacked) {
+                s.sendConfig(now);
+                s.stats.config_resends += 1;
+            }
         }
         if (s.state == .streaming) if (s.last_rx_us) |t| {
             const limit = if (s.pipe.canReconnect()) s.cfg.reconnect_timeout_us else s.cfg.peer_timeout_us;
@@ -372,6 +503,7 @@ pub const HostSession = struct {
 
     pub fn nextWake(s: *const HostSession, now: Micros) Micros {
         var t = now + 5_000;
+        if (s.state == .streaming) t = @min(t, s.next_resend);
         if (s.byes_left > 0) t = @min(t, s.next_bye);
         return @max(t, now);
     }
@@ -436,6 +568,7 @@ pub const HostSession = struct {
     /// A resolution or frame-rate step the ladder wants, once: the app applies it with
     /// `Encoder.configure` (expect a keyframe). Only with `rate_control`.
     pub fn takeReconfigure(s: *HostSession) ?rate.ladder.Rung {
+        if (!s.canReconfigure()) return null;
         defer s.pending_reconfigure = null;
         return s.pending_reconfigure;
     }
@@ -465,6 +598,27 @@ pub const HostSession = struct {
                         return;
                     }, now),
                     .bye => if (s.state != .waiting) s.finish(.client_bye, "client left"),
+                    .select_display => {
+                        const sel = display_mod.SelectDisplay.decode(payload) orelse {
+                            s.stats.malformed += 1;
+                            return;
+                        };
+                        if (s.state != .streaming) return;
+                        // Repeats of a request applied or waiting are copies in flight.
+                        if (!display_mod.newer(sel.request, s.request_applied)) return;
+                        if (s.pending_select) |p| if (!display_mod.newer(sel.request, p.request)) return;
+                        s.pending_select = sel;
+                        s.stats.selects += 1;
+                    },
+                    .config_ack => {
+                        const a = display_mod.ConfigAck.decode(payload) orelse {
+                            s.stats.malformed += 1;
+                            return;
+                        };
+                        if (s.nonce == null or a.nonce != s.nonce.?) return;
+                        s.acked_epoch = a.epoch;
+                        s.acked_gen = a.display_gen;
+                    },
                     .clock_report => {
                         const r = wire.ClockReport.decode(payload) orelse {
                             s.stats.malformed += 1;
@@ -517,6 +671,9 @@ pub const HostSession = struct {
             // A new session (or a restarted client): start from a keyframe.
             const first = s.nonce == null;
             s.nonce = h.nonce;
+            s.acked_epoch = null;
+            s.acked_gen = null;
+            if (first) s.first_frame = s.next_frame_id;
             s.stats.sessions += 1;
             if (!first) s.rec.onRecoveryRequest(.{ .first_missing = s.next_frame_id, .want_idr = true });
         }
@@ -557,7 +714,7 @@ pub const HostSession = struct {
         const id = s.next_frame_id;
         const flags = s.rec.onEncoded(id, ef.ltr_token, ef.keyframe);
         s.next_frame_id +%= 1;
-        var vflags: proto.video.Flags = .{ .keyframe = flags.keyframe, .ltr_refresh = flags.refresh, .ltr = ef.ltr_token != null };
+        var vflags: proto.video.Flags = .{ .keyframe = flags.keyframe, .ltr_refresh = flags.refresh, .ltr = ef.ltr_token != null, .new_config = s.epoch != 0 and id == s.first_frame };
         if (!ef.keyframe and ef.ltr_refresh) vflags.ltr_refresh = true;
         const cap: u64 = @bitCast(cf.captured_us);
         const enc: u64 = @bitCast(@max(ef.encoded_us, cf.captured_us));
@@ -659,6 +816,8 @@ pub const HostSession = struct {
         try w.print("  frames {d} (keyframes {d}, refreshes {d}, repeats {d}, encoder drops {d}), {d} MB in {d} shards\n", .{ st.frames, st.keyframes, st.refreshes, st.repeats, st.encode_drops, st.bytes / 1_000_000, st.shards });
         if (s.decision) |d| try w.print("  loss policy: {s}, loss {d:.2}%, FEC overhead {d:.0}%, {d} parity shards, {d} NACKs ignored, {d} mode switches\n", .{ @tagName(d.mode), d.loss * 100, d.overhead * 100, st.parity_shards, st.nacks_ignored, s.policy.switches });
         try w.print("  NACKs {d} -> retransmits {d}; feedback {d}; frame acks {d} (recovery requests {d}); pings {d}; inputs {d}\n", .{ st.nacks, st.retransmits, st.feedback, st.frame_acks, st.recovery_requests, st.pings, st.inputs_applied });
+        if (st.reconfigures + st.selects > 0)
+            try w.print("  configs: epoch {d}, {d} mid-stream ({d} display switches, {d} mode changes), {d} selects, {d} resends; stream {d}x{d}@{d} on display {d}\n", .{ s.epoch, st.reconfigures, st.display_switches, st.mode_changes, st.selects, st.config_resends, s.cfg.width, s.cfg.height, s.cfg.fps, s.cfg.display });
         if (st.path_changes + st.reconnects + st.stall_pauses > 0)
             try w.print("  path changes {d}, reconnects {d}; stalls {d} ({d} frames held, longest {d:.0} ms)\n", .{ st.path_changes, st.reconnects, st.stall_pauses, st.stall_frames, ms(st.stall_longest_us) });
         const snap = s.tele.snapshot();

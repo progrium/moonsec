@@ -55,3 +55,9 @@ export fn moonsec_control_events(ptr: [*]const u8, len: usize) u32 {
     while (ch.poll() catch return n) |_| n += 1;
     return n;
 }
+
+/// Parses a display list into `out` (up to `cap` entries); returns the count, or -1.
+export fn moonsec_display_list_decode(ptr: [*]const u8, len: usize, out: [*]core.display.DisplayInfo, cap: usize) i32 {
+    const d = core.display.DisplayList.decode(ptr[0..len], out[0..cap]) orelse return -1;
+    return @intCast(d.n);
+}
