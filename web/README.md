@@ -129,10 +129,10 @@ Headless Chromium on the Linux container (software decode, loopback, 640x360 fix
 | present (output to drawn) | 1.2 ms | 3.2 ms |
 | total (capture to drawn) | 2.7 ms | 22.6 ms |
 
-Not done here: input from `src/input` still goes through 6C's separate input sender in
-`moonsec-core.wasm`; the session in `moonsec-client.wasm` has its own (`ms_input_*` in
-`src/core.ts`), and capture should switch to it so input shares the session's envelope
-sequence and acks. HEVC and AV1 codec strings are parsed but untested (no browser here
+Page input (`src/input`'s `InputCapture`) goes through this session too: `WebClient`
+forwards it to the worker, so it shares the session's envelope sequence and acks.
+
+Not done here: HEVC and AV1 codec strings are parsed but untested (no browser here
 decodes HEVC; AV1 has no fixture). Draw time is when `drawImage` returns, not when the
 compositor shows the frame (about one to two frames more, per the design).
 
