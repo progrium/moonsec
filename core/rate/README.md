@@ -106,7 +106,7 @@ state for logs and the overlay. Everything is sans-I/O and builds for wasm32.
 
 ## Checked against S11
 
-1. **On S11's own simulator, bit-exact.** With `core/rate` swapped in for the
+1. **On S11's own simulator, bit-exact** (before the S11b follow-ups below changed it). With `core/rate` swapped in for the
    spike's `est.zig`, all 440 runs in S11's matrix (8 scenarios, 11 variants,
    5 seeds) give byte-identical `summary.csv` rows. Driving the full
    `Controller` API (send history, feedback join) is also identical, with one
@@ -123,36 +123,35 @@ state for logs and the overlay. Everything is sans-I/O and builds for wasm32.
 
 | scenario | variant | est | util | train | q p50 | q p99 | frame p50 | frame p99 | lost | start ms | down ms | peak ms | drain ms | up ms |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| wired-steps | gcc-hybrid | 0.86 | 0.89 | 1.00 | 2.2 | 11.8 | 15.9 | 100.1 | 1 | 1100 | 300 | 176 | 700 | 2100 |
+| wired-steps | gcc-hybrid | 0.86 | 0.89 | 1.00 | 2.2 | 10.8 | 15.9 | 95.6 | 1 | 1200 | 300 | 187 | 700 | 1600 |
 | wired-steps | S11 gcc-hybrid | 0.86 | 0.88 | | 2.1 | 10.8 | 15.9 | 95.5 | | 1600 | 300 | | 800 | 1700 |
-| wired-60ms | gcc-hybrid | 0.86 | 0.88 | 1.00 | 2.1 | 13.5 | 15.6 | 94.0 | 6 | 1400 | 300 | 200 | 900 | 2600 |
+| wired-60ms | gcc-hybrid | 0.86 | 0.88 | 1.00 | 2.2 | 14.7 | 15.9 | 92.8 | 6 | 1200 | 300 | 200 | 900 | 1600 |
 | wired-60ms | S11 gcc-hybrid | 0.86 | 0.88 | | 2.1 | 13.3 | 15.7 | 98.8 | | 1700 | 300 | | 900 | 1800 |
-| wifi-steps | gcc-hybrid | 0.78 | 0.80 | 1.02 | 3.6 | 53.9 | 14.4 | 95.4 | 5 | 2900 | 300 | 87 | 4300 | 1800 |
+| wifi-steps | gcc-hybrid | 0.76 | 0.77 | 1.02 | 3.7 | 52.7 | 13.9 | 89.8 | 0 | 1700 | 300 | 93 | 4300 | 1800 |
 | wifi-steps | S11 gcc-hybrid | 0.74 | 0.73 | | 3.6 | 53.0 | 13.7 | 82.7 | | 1300 | 300 | | 1700 | 1800 |
-| wifi-lan | gcc-hybrid | 0.75 | 0.76 | 1.02 | 3.5 | 42.5 | 13.8 | 73.4 | 20 | 1800 | 300 | 102 | 3100 | 1300 |
+| wifi-lan | gcc-hybrid | 0.72 | 0.75 | 1.02 | 3.6 | 44.0 | 13.7 | 72.2 | 27 | 1700 | 300 | 103 | 3100 | 1800 |
 | wifi-lan | S11 gcc-hybrid | 0.75 | 0.76 | | 3.6 | 47.8 | 14.2 | 78.9 | | 1600 | 300 | | 4300 | 1600 |
-| wifi-fade | gcc-hybrid | 0.69 | 0.69 | 1.02 | 3.6 | 71.2 | 13.3 | 96.9 | 32 | 2200 | – | – | – | – |
+| wifi-fade | gcc-hybrid | 0.73 | 0.75 | 1.02 | 3.7 | 70.3 | 13.5 | 92.9 | 29 | 1200 | – | – | – | – |
 | wifi-fade | S11 gcc-hybrid | 0.76 | 0.75 | | 3.5 | 91.1 | 13.8 | 98.2 | | 1700 | – | | – | – |
-| wifi-udp-cross | gcc-hybrid | 0.71 | 0.73 | 0.74 | 3.7 | 50.9 | 12.4 | 77.7 | 46 | 1600 | – | – | – | – |
+| wifi-udp-cross | gcc-hybrid | 0.68 | 0.72 | 0.96 | 3.9 | 51.6 | 11.3 | 70.2 | 63 | 1700 | – | – | – | – |
 | wifi-udp-cross | S11 gcc-hybrid | 0.68 | 0.70 | | 3.6 | 51.6 | 11.4 | 63.1 | | 1600 | – | | – | – |
-| wifi-tcp | gcc-hybrid | 0.69 | 0.68 | 1.00 | 3.8 | 73.2 | 20.7 | 107.3 | 5 | 2900 | – | – | – | – |
+| wifi-tcp | gcc-hybrid | 0.81 | 0.85 | 1.01 | 4.8 | 80.0 | 19.5 | 102.7 | 20 | 1700 | – | – | – | – |
 | wifi-tcp | S11 gcc-hybrid | 0.55 | 0.55 | | 3.8 | 65.0 | 17.9 | 87.3 | | 1300 | – | | – | – |
-| wifi-bursts | gcc-hybrid | 0.56 | 0.58 | 1.02 | 3.6 | 53.8 | 11.3 | 72.8 | 1 | 3100 | – | – | – | – |
+| wifi-bursts | gcc-hybrid | 0.56 | 0.56 | 1.03 | 3.7 | 56.4 | 11.0 | 73.1 | 1 | 3000 | – | – | – | – |
 | wifi-bursts | S11 gcc-hybrid | 0.57 | 0.57 | | 3.6 | 62.6 | 11.2 | 78.5 | | 3400 | – | | – | – |
 
 `gcc-hybrid-enc60` (`app_share` 0.6) is in the same output and within bands too.
 
-Wired rows match within a few percent. On Wi-Fi, accuracy and queueing match
-within seed noise, with two differences:
+These are with the S11b follow-ups on. Wired rows match S11 within a few
+percent; on Wi-Fi accuracy and queueing match within seed noise. Two
+differences:
 
-- **Startup on Wi-Fi is slower in 3 of 5 seeds** (2.9 s against S11's 1.3 s
-  median). A radio stall during the first jumps reads as overuse, and the
-  2 s jump gate after a decrease holds the target there. S11 shows the same
-  thing in some of its seeds (up to 3.2 s); here the stall timing lands on
-  the ramp more often.
-- **Against Reno we get 0.69 of fair share rather than 0.55.** The harness's
-  Reno flow is a separate implementation from S11's, so this says more about
-  the cross-traffic model than about the controller.
+- **Against Reno we now get 0.81 of fair share** (S11: 0.55, this module
+  before the follow-ups: 0.69). That is competing-flow mode working; the
+  check's upper band for `wifi-tcp` is a fair share instead of S11 + 0.2.
+- **Startup on Wi-Fi is 1.7 s against S11's 1.3 s median**: a radio stall
+  during the first jumps reads as overuse, and the 2 s jump gate after a
+  decrease holds the target there.
 
 The `drain ms` column on Wi-Fi is dominated by stalls pushing the 100 ms p95
 over 20 ms, so it is noisy in S11 too (1.7 to 4.4 s between variants).
