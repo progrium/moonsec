@@ -180,6 +180,16 @@ jobs:
           zig build netns-test -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
           sudo SHIM_ECHO=zig-out/bin/shim-echo IROH_RELAY="$(command -v iroh-relay)" zig-out/bin/iroh-netns-test
 
+      # The S5c lab (two NATs, lab relay, delay line): blackouts, a path switch, flaps and a
+      # dropped connection under the moonsec host and client (tools/netlab/run.sh).
+      - name: Netns lab (path changes and reconnect)
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        run: |
+          command -v ethtool && command -v strace || (sudo apt-get update -q && sudo apt-get install -yq ethtool strace)
+          zig build install-moonsec delayline -Dshim=dir -Dshim-dir="$DIST" -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+          sudo IROH_RELAY="$(command -v iroh-relay)" tools/netlab/run.sh all
+
       - name: Link into Zig (dynamic) and run echo
         shell: bash
         run: |

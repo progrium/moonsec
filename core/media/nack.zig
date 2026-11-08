@@ -46,6 +46,8 @@ pub const Stats = struct {
     nacks_sent: u64 = 0,
     gave_up: u64 = 0,
     overflow: u64 = 0,
+    /// Missing seqs dropped because their FEC group completed without them.
+    covered: u64 = 0,
 };
 
 pub const Tracker = struct {
@@ -109,6 +111,18 @@ pub const Tracker = struct {
             t.stats.recovered += 1;
             return;
         };
+    }
+
+    /// Forget missing seqs in `[first, first + count)`: their FEC group is complete,
+    /// so they are not needed (lost parity, or data FEC rebuilt).
+    pub fn forgetRange(t: *Tracker, first: u32, count: u16) void {
+        var i: usize = 0;
+        while (i < t.len) {
+            if (t.missing[i].seq -% first < count) {
+                t.removeAt(i);
+                t.stats.covered += 1;
+            } else i += 1;
+        }
     }
 
     /// Forget missing seqs up to and including `seq` (their frame was settled).

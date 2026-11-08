@@ -10,14 +10,34 @@
 //! rate controller, which sets pacing), NACKs, frame acks (to core/recovery), clock pings
 //! and reports, input events, bye.
 //!
+//! With `loss_policy` on, `core.media.Policy` picks the loss recovery per path: NACK on
+//! short RTTs, Reed-Solomon parity sized from transport-feedback loss on long ones, and
+//! relay mode (no FEC, caps for the rate ladder) on relayed paths. `lossDecision` is the
+//! current choice. Off, every NACK is answered and no parity is sent (Phase 2).
+//!
+//! Path changes and drops (Phase 3): when the pipe reports the selected path stalled (no
+//! ack progress), video stops going out, since it would only be lost or queue up stale
+//! behind a dead path; when acks resume or the path changes, the next frame is a recovery
+//! frame. A path change also restarts the rate controller's delay and capacity estimates,
+//! and a new connection (a reconnecting pipe's `conn_epoch`) gets the pacing rate again.
+//! With a pipe that can reconnect, silence ends the session only after
+//! `reconnect_timeout_us`, so the client has time to come back.
+//!
 //! Phase 2 runs at a fixed encoder bitrate. The rate controller still runs on the client's
 //! feedback for pacing and the overlay: the pipe paces at its rate, but never below
 //! `pace_floor` × the bitrate, so a frame always leaves faster than the encoder makes it.
+//!
+//! With `rate_control` (Phase 3) the controller drives the encoder through the ladder
+//! (core/rate/ladder.zig): bitrate changes go out in `EncodeParams.bitrate_bps`, and
+//! resolution or frame-rate steps wait in `takeReconfigure` for the app to apply with
+//! `Encoder.configure`. With `loss_policy`, relay mode's caps and the FEC share bound it (`setLimits` otherwise). Every frame also goes
+//! through `Controller.onFrame`, so probe frames leave at the probe rate.
 const std = @import("std");
 const core = @import("core");
 const api = @import("platform");
 const pipe_mod = @import("pipe");
 const wire = @import("wire.zig");
+const pathlog = @import("pathlog.zig");
 
 const proto = core.proto;
 const media = core.media;
@@ -39,6 +59,9 @@ pub const Config = struct {
     ltr: bool = true,
     /// Apply a pacing rate to the pipe.
     pace: bool = true,
+    /// Drive the encoder bitrate from the rate controller through the ladder, starting
+    /// at `bitrate_bps`. Off: `bitrate_bps` is fixed, as in Phase 2.
+    rate_control: bool = false,
     /// The pipe never paces below this × the encoder bitrate: a frame then takes at most
     /// 1/pace_floor of a frame interval to leave. The controller's rate (link capacity
     /// from frame trains) is used when it is higher.
@@ -48,8 +71,19 @@ pub const Config = struct {
     /// A shard is resent at most once per this long, however many NACKs name it: after an
     /// outage the NACKs repeat every RTT while the resends are still queued in the pacer.
     retransmit_interval_us: u64 = 20_000,
+    /// Choose NACK, FEC or relay mode per path (`core.media.policy`).
+    loss_policy: bool = false,
+    policy: media.policy.Config = .{},
     /// End the session when nothing arrives from the client for this long.
     peer_timeout_us: Micros = 5_000_000,
+    /// ...or this long when the pipe can reconnect (the client redials after a drop).
+    reconnect_timeout_us: Micros = 60_000_000,
+    /// Hold video while the pipe reports the selected path stalled, and send a recovery
+    /// frame when it recovers (see the file comment).
+    pause_on_stall: bool = true,
+    /// A stall reported this soon after a path change is the new path's backlog of probes
+    /// and keep-alives (S5c lab: ~90 ms after a switch to the relay), not a dead path.
+    stall_grace_us: Micros = 250_000,
     /// Byes sent when leaving, `bye_interval_us` apart.
     byes: u8 = 3,
     bye_interval_us: Micros = 20_000,
@@ -67,7 +101,10 @@ pub const Stats = struct {
     repeats: u64 = 0,
     bytes: u64 = 0,
     shards: u64 = 0,
+    parity_shards: u64 = 0,
     nacks: u64 = 0,
+    /// NACKs not answered because the policy said FEC only.
+    nacks_ignored: u64 = 0,
     retransmits: u64 = 0,
     feedback: u64 = 0,
     frame_acks: u64 = 0,
@@ -76,6 +113,14 @@ pub const Stats = struct {
     inputs_applied: u64 = 0,
     hellos: u64 = 0,
     sessions: u64 = 0,
+    /// The pipe's selected path changed / its connection was replaced.
+    path_changes: u64 = 0,
+    reconnects: u64 = 0,
+    /// Times video was held for a stalled path, and the frames not sent meanwhile.
+    stall_pauses: u64 = 0,
+    stall_frames: u64 = 0,
+    /// Longest hold, us.
+    stall_longest_us: Micros = 0,
     malformed: u64 = 0,
     unknown: u64 = 0,
 };
@@ -103,9 +148,27 @@ pub const HostSession = struct {
     /// Host minus client clock, from the client's reports.
     offset: ?Micros = null,
 
+    /// Path and connection the pipe last reported (null until the first stats).
+    path_epoch: ?u32 = null,
+    conn_epoch: u32 = 0,
+    /// Video held for a stalled path since this time; the first frame not sent.
+    paused_at: ?Micros = null,
+    paused_from: ?u32 = null,
+    log: pathlog.Log = .{},
+    path_changed_at: ?Micros = null,
+
     packetizer: media.Packetizer = .{},
+    parity_buf: *media.ParityBuffer,
+    policy: media.Policy,
+    decision: ?media.policy.Decision = null,
     history: media.History,
     ctl: *rate.Controller,
+    ladder: rate.Ladder,
+    limits: rate.ladder.Limits = .{},
+    /// The encoder's bitrate now, and a change not yet handed to it.
+    bitrate_bps: u64,
+    pending_bitrate: u64 = 0,
+    pending_reconfigure: ?rate.ladder.Rung = null,
     rec: *recovery.Host,
     input_rx: core.input.Receiver = .{},
     actions: std.Deque(Pending) = .empty,
@@ -116,13 +179,31 @@ pub const HostSession = struct {
         errdefer history.deinit(gpa);
         const ctl = try gpa.create(rate.Controller);
         errdefer gpa.destroy(ctl);
-        ctl.reset(.{});
+        if (cfg.rate_control) {
+            ctl.reset(.{ .gcc = .{ .start_bps = @floatFromInt(cfg.bitrate_bps) }, .fps = @floatFromInt(cfg.fps) });
+        } else ctl.reset(.{});
+        const ladder = rate.Ladder.init(.{ .width = cfg.width, .height = cfg.height, .fps = cfg.fps });
         const rec = try gpa.create(recovery.Host);
         errdefer gpa.destroy(rec);
         rec.* = recovery.Host.init(.{ .ltr = cfg.ltr });
         const tele = try gpa.create(telemetry.Telemetry(512));
+        errdefer gpa.destroy(tele);
         tele.* = .init();
-        return .{ .gpa = gpa, .cfg = cfg, .pipe = p, .history = history, .ctl = ctl, .rec = rec, .tele = tele };
+        const pb = try gpa.create(media.ParityBuffer);
+        return .{
+            .gpa = gpa,
+            .cfg = cfg,
+            .pipe = p,
+            .history = history,
+            .ctl = ctl,
+            .ladder = ladder,
+            .bitrate_bps = cfg.bitrate_bps,
+            .rec = rec,
+            .tele = tele,
+            .parity_buf = pb,
+            .packetizer = .{ .parity_buf = pb },
+            .policy = .init(cfg.policy),
+        };
     }
 
     pub fn deinit(s: *HostSession) void {
@@ -130,6 +211,7 @@ pub const HostSession = struct {
         s.gpa.destroy(s.ctl);
         s.gpa.destroy(s.rec);
         s.gpa.destroy(s.tele);
+        s.gpa.destroy(s.parity_buf);
         s.actions.deinit(s.gpa);
     }
 
@@ -206,6 +288,7 @@ pub const HostSession = struct {
         }
         if (s.state == .ended) return;
         s.path = s.pipe.stats();
+        s.onPathState(now);
         if (s.byes_left > 0 and now >= s.next_bye) {
             s.sendOther(.control_fast, @intFromEnum(wire.Kind.bye), &.{@intFromEnum(wire.ByeReason.done)}, now);
             s.byes_left -= 1;
@@ -213,8 +296,66 @@ pub const HostSession = struct {
             if (s.byes_left == 0) return s.finish(.closed, "closed");
         }
         if (s.state == .streaming) if (s.last_rx_us) |t| {
-            if (now - t > s.cfg.peer_timeout_us) return s.finish(.peer_timeout, "no datagrams from the client");
+            const limit = if (s.pipe.canReconnect()) s.cfg.reconnect_timeout_us else s.cfg.peer_timeout_us;
+            if (now - t > limit) return s.finish(.peer_timeout, "no datagrams from the client");
         };
+    }
+
+    /// React to what the pipe reports about its path: a new connection, a new path, a stall.
+    fn onPathState(s: *HostSession, now: Micros) void {
+        const p = s.path;
+        const last = s.path_epoch orelse {
+            s.path_epoch = p.path_epoch;
+            s.conn_epoch = p.conn_epoch;
+            s.log.start = now;
+            return;
+        };
+        if (p.conn_epoch != s.conn_epoch) {
+            // A new connection: what was in flight on the old one is gone, and it paces
+            // from scratch. Start the new path's estimates and send a recovery frame.
+            s.conn_epoch = p.conn_epoch;
+            s.path_epoch = p.path_epoch;
+            s.stats.reconnects += 1;
+            s.path_changed_at = now;
+            s.log.add(now, .reconnect, p.relayed);
+            s.ctl.onPathChange();
+            s.last_pacing = 0;
+            s.applyPacing(now);
+            s.resumeVideo(now, true);
+        } else if (p.path_epoch != last) {
+            s.path_epoch = p.path_epoch;
+            s.stats.path_changes += 1;
+            s.path_changed_at = now;
+            s.log.add(now, .path, p.relayed);
+            s.ctl.onPathChange();
+            // A path closed under a stall: what we sent since is lost.
+            if (s.paused_at != null) s.resumeVideo(now, false);
+        }
+        if (!s.cfg.pause_on_stall) return;
+        const settling = if (s.path_changed_at) |t| now - t < s.cfg.stall_grace_us else false;
+        if (p.stalled and !settling and s.paused_at == null and s.state == .streaming) {
+            s.paused_at = now;
+            s.paused_from = null;
+            s.stats.stall_pauses += 1;
+            s.log.add(now, .stall, p.relayed);
+        } else if (!p.stalled and s.paused_at != null) {
+            s.resumeVideo(now, false);
+            s.log.add(now, .resume_, p.relayed);
+        }
+    }
+
+    /// Send video again; the frames held (or, with `lost_in_flight`, any recent frame) are
+    /// missing at the client, so the next frame repairs the picture: an LTR refresh when
+    /// the client has acked a reference, else an IDR.
+    fn resumeVideo(s: *HostSession, now: Micros, lost_in_flight: bool) void {
+        if (s.paused_at) |t| s.stats.stall_longest_us = @max(s.stats.stall_longest_us, now - t);
+        const held = s.paused_from != null;
+        s.paused_at = null;
+        s.paused_from = null;
+        // Ask for the frame after the last one emitted: a recovery frame emitted while held
+        // never left, so it must not count as one in flight.
+        if ((held or lost_in_flight) and s.state == .streaming and s.next_frame_id > 0)
+            s.rec.onRecoveryRequest(.{ .first_missing = s.next_frame_id, .want_idr = false });
     }
 
     pub fn nextWake(s: *const HostSession, now: Micros) Micros {
@@ -231,8 +372,10 @@ pub const HostSession = struct {
         switch (m) {
             .feedback => |f| {
                 s.ctl.onFeedbackMsg(now, f.feedback);
+                s.policy.onCounts(@intCast(now), f.feedback.count, f.feedback.count - f.feedback.received);
                 s.stats.feedback += 1;
-                s.applyPacing();
+                if (s.cfg.rate_control) s.updateLadder(now);
+                s.applyPacing(now);
             },
             .frame_ack => |a| {
                 s.stats.frame_acks += 1;
@@ -244,14 +387,45 @@ pub const HostSession = struct {
         }
     }
 
-    fn applyPacing(s: *HostSession) void {
+    fn applyPacing(s: *HostSession, now: Micros) void {
         if (!s.cfg.pace) return;
-        const floor = s.cfg.pace_floor * @as(f64, @floatFromInt(s.cfg.bitrate_bps));
-        const p: u64 = @intFromFloat(@max(s.ctl.pacingBps(), s.ctl.capacityBps() orelse 0, floor));
+        const floor = s.cfg.pace_floor * @as(f64, @floatFromInt(s.bitrate_bps));
+        const p: u64 = @intFromFloat(@max(s.ctl.pacingAt(now), s.ctl.capacityBps() orelse 0, floor));
         if (p != s.last_pacing) {
             s.pipe.setPacingRate(p);
             s.last_pacing = p;
         }
+    }
+
+    fn updateLadder(s: *HostSession, now: Micros) void {
+        // With the loss policy on, its caps and FEC share bound the ladder.
+        if (s.decision) |d| s.limits = .{
+            .max_bitrate_bps = d.caps.max_bitrate_bps,
+            .max_height = d.caps.max_height,
+            .fec_overhead = d.overhead,
+        };
+        const req = s.ladder.update(now, s.ctl.encoderBps(), s.limits);
+        if (req.bitrate_bps != 0) {
+            s.bitrate_bps = req.bitrate_bps;
+            s.pending_bitrate = req.bitrate_bps;
+        }
+        if (req.reconfigure) |r| {
+            s.pending_reconfigure = r;
+            s.ctl.setFrameRate(@floatFromInt(r.fps));
+        }
+    }
+
+    /// Caps for the ladder. With `loss_policy`, each update takes them from
+    /// `lossDecision` (relay caps and the FEC share) instead.
+    pub fn setLimits(s: *HostSession, l: rate.ladder.Limits) void {
+        s.limits = l;
+    }
+
+    /// A resolution or frame-rate step the ladder wants, once: the app applies it with
+    /// `Encoder.configure` (expect a keyframe). Only with `rate_control`.
+    pub fn takeReconfigure(s: *HostSession) ?rate.ladder.Rung {
+        defer s.pending_reconfigure = null;
+        return s.pending_reconfigure;
     }
 
     fn onOther(s: *HostSession, m: proto.Message, env: proto.Envelope, payload: []const u8, now: Micros) void {
@@ -263,6 +437,10 @@ pub const HostSession = struct {
                 }) |it_| {
                     var it = it_;
                     s.stats.nacks += 1;
+                    if (s.decision) |d| if (!d.nack) {
+                        s.stats.nacks_ignored += 1;
+                        return;
+                    };
                     while (it.next()) |mseq| if (s.history.resend(mseq, @intCast(now))) |shard| {
                         s.sendShard(shard, now);
                         s.stats.retransmits += 1;
@@ -341,11 +519,12 @@ pub const HostSession = struct {
         std.debug.assert(!s.in_encoder);
         s.in_encoder = true;
         const d = s.rec.nextEncode();
+        defer s.pending_bitrate = 0;
         return .{ .force = switch (d.force) {
             .none => .none,
             .ltr_refresh => .ltr_refresh,
             .idr => .idr,
-        }, .acked_ltr_tokens = d.acked_tokens };
+        }, .acked_ltr_tokens = d.acked_tokens, .bitrate_bps = s.pending_bitrate };
     }
 
     pub fn onEncodeDropped(s: *HostSession) void {
@@ -371,6 +550,30 @@ pub const HostSession = struct {
         const cap: u64 = @bitCast(cf.captured_us);
         const enc: u64 = @bitCast(@max(ef.encoded_us, cf.captured_us));
         const n: u8 = @intCast(ef.slices.len);
+        if (s.paused_at != null) {
+            // The path is stalled: the frame counts as sent and lost, and the recovery
+            // frame on resume repairs it.
+            if (s.paused_from == null) s.paused_from = id;
+            s.stats.stall_frames += 1;
+            s.stats.frames += 1;
+            if (flags.keyframe) s.stats.keyframes += 1;
+            if (flags.refresh) s.stats.refreshes += 1;
+            return;
+        }
+        if (s.cfg.loss_policy) {
+            s.decision = s.policy.update(@intCast(now), .{
+                .rtt_us = @intCast(@max(s.path.rtt_us, 0)),
+                .frame_interval_us = 1_000_000 / @max(s.cfg.fps, 1),
+                .relayed = s.path.relayed,
+            });
+            s.packetizer.parity = s.policy.parity;
+        }
+        if (s.cfg.rate_control) {
+            var total: usize = 0;
+            for (ef.slices) |sl| total += sl.len;
+            s.ctl.onFrame(now, id, total);
+            s.applyPacing(now);
+        }
         for (ef.slices, 0..) |sl, i| {
             if (sl.len == 0) continue;
             var it = s.packetizer.slice(.{
@@ -386,6 +589,7 @@ pub const HostSession = struct {
                 s.history.record(shard, @intCast(now));
                 s.sendShard(shard, now);
                 s.stats.shards += 1;
+                if (shard.header.shard >= shard.header.data_shards) s.stats.parity_shards += 1;
             }
             s.stats.bytes += sl.len;
         }
@@ -404,7 +608,7 @@ pub const HostSession = struct {
         const dg = proto.encodeVideoShard(&buf, s.envSeq(), shard.header, shard.payload) catch unreachable;
         const last = shard.header.slice + 1 == shard.header.slice_count and
             shard.header.group + 1 == shard.header.group_count and
-            shard.header.shard + 1 == shard.header.data_shards;
+            shard.header.shard + 1 == shard.header.shardCount();
         s.ctl.onSent(s.seq, now, @intCast(dg.len), shard.header.frame_id, last);
         s.sendRaw(dg);
     }
@@ -414,6 +618,12 @@ pub const HostSession = struct {
     pub fn sendAudio(s: *HostSession, kind: u8, payload: []const u8, now: Micros) void {
         if (s.state != .streaming) return;
         s.sendOther(.audio, kind, payload, now);
+    }
+
+    /// The loss policy's current choice (null before the first frame, or with
+    /// `loss_policy` off): the mode, the FEC overhead and the caps for the rate ladder.
+    pub fn lossDecision(s: *const HostSession) ?media.policy.Decision {
+        return s.decision;
     }
 
     // --- input stage ----------------------------------------------------
@@ -435,11 +645,15 @@ pub const HostSession = struct {
         const st = s.stats;
         try w.print("host: {s}{s}{s}\n", .{ @tagName(s.end), if (s.reason.len > 0) ": " else "", s.reason });
         try w.print("  frames {d} (keyframes {d}, refreshes {d}, repeats {d}, encoder drops {d}), {d} MB in {d} shards\n", .{ st.frames, st.keyframes, st.refreshes, st.repeats, st.encode_drops, st.bytes / 1_000_000, st.shards });
+        if (s.decision) |d| try w.print("  loss policy: {s}, loss {d:.2}%, FEC overhead {d:.0}%, {d} parity shards, {d} NACKs ignored, {d} mode switches\n", .{ @tagName(d.mode), d.loss * 100, d.overhead * 100, st.parity_shards, st.nacks_ignored, s.policy.switches });
         try w.print("  NACKs {d} -> retransmits {d}; feedback {d}; frame acks {d} (recovery requests {d}); pings {d}; inputs {d}\n", .{ st.nacks, st.retransmits, st.feedback, st.frame_acks, st.recovery_requests, st.pings, st.inputs_applied });
+        if (st.path_changes + st.reconnects + st.stall_pauses > 0)
+            try w.print("  path changes {d}, reconnects {d}; stalls {d} ({d} frames held, longest {d:.0} ms)\n", .{ st.path_changes, st.reconnects, st.stall_pauses, st.stall_frames, ms(st.stall_longest_us) });
         const snap = s.tele.snapshot();
         try printStage(w, "capture", snap.stage(.capture));
         try printStage(w, "encode", snap.stage(.encode));
         try printStage(w, "input", snap.stage(.input));
+        try s.log.print(w, "host");
         const p = s.path;
         try w.print("  pipe: rtt {d} us, pacing {d} kbit/s, sent {d}, send drops {d}{s}\n", .{ p.rtt_us, p.pacing_bps / 1000, p.sent, p.send_drops, if (p.relayed) ", relayed" else "" });
     }

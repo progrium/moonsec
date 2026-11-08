@@ -86,6 +86,8 @@ pub struct PathCounters {
     pub ecn_events: AtomicU64,
     pub srtt_us: AtomicU64,
     pub min_rtt_us: AtomicU64,
+    /// Conservative RTT (the larger of smoothed and latest), for the stall threshold.
+    pub rtt_cons_us: AtomicU64,
     /// Base pacing rate (without burst gain) the controller last reported, bits/s (0 = unpaced).
     pub pacing_bps: AtomicU64,
     /// Shim-clock time (us) of the last ack; 0 = never.
@@ -198,6 +200,7 @@ impl Controller for AppRate {
         self.counters.acked_bytes.fetch_add(bytes, Relaxed);
         self.counters.srtt_us.store(rtt.get().as_micros() as u64, Relaxed);
         self.counters.min_rtt_us.store(rtt.min().as_micros() as u64, Relaxed);
+        self.counters.rtt_cons_us.store(rtt.conservative().as_micros() as u64, Relaxed);
         self.counters.last_ack_us.store(instant_us(now).max(1), Relaxed);
         self.counters.unacked_since_us.store(0, Relaxed);
     }

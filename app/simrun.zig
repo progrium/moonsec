@@ -9,6 +9,7 @@ const api = @import("platform");
 const simnet = @import("simnet");
 const synthetic = @import("synthetic");
 const apps = @import("apps.zig");
+pub const pathsim = @import("pathsim.zig");
 
 const Micros = i64;
 
@@ -18,6 +19,9 @@ pub const Profile = enum {
     lan,
     /// The Phase 1 gate's path: 10 ms each way, 3 ms jitter, 50 Mbit/s, 2% loss, 2% reordering.
     wan,
+    /// A long-haul path where NACK is too slow: 60 ms each way, 2 ms jitter, 50 Mbit/s,
+    /// 5% loss. A retransmit would land after the client's 100 ms frame timeout.
+    longhaul,
     /// No loss, no jitter.
     clean,
 
@@ -25,6 +29,7 @@ pub const Profile = enum {
         return switch (p) {
             .lan => .{ .steps = &.{.{ .t_us = 0, .bps = 100e6 }}, .delay_us = 1 * simnet.MS, .jitter_us = 300, .loss = 0.005, .reorder_p = 0.01, .reorder_extra_us = 1 * simnet.MS, .overhead_bytes = 48 },
             .wan => .{ .steps = &.{.{ .t_us = 0, .bps = 50e6 }}, .delay_us = 10 * simnet.MS, .jitter_us = 3 * simnet.MS, .loss = 0.02, .reorder_p = 0.02, .reorder_extra_us = 5 * simnet.MS, .overhead_bytes = 48 },
+            .longhaul => .{ .steps = &.{.{ .t_us = 0, .bps = 50e6 }}, .delay_us = 60 * simnet.MS, .jitter_us = 2 * simnet.MS, .loss = 0.05, .overhead_bytes = 48 },
             .clean => .{ .steps = &.{.{ .t_us = 0, .bps = 100e6 }}, .delay_us = 1 * simnet.MS, .overhead_bytes = 48 },
         };
     }
@@ -55,6 +60,14 @@ pub const Options = struct {
     outage_us: Micros = 0,
     /// Stream the synthetic tone over the Opus stage alongside the video.
     audio: bool = true,
+    /// Let the rate controller drive the encoder bitrate (Phase 3), from `bitrate_bps`.
+    rate_control: bool = false,
+    /// Host picks NACK, FEC or relay mode per path (`core.media.policy`).
+    loss_policy: bool = false,
+    /// Scripted path flaps (direct <-> relay) and connection drops (app/pathsim.zig).
+    path: ?pathsim.Config = null,
+    /// Host and client session settings that differ from the defaults.
+    pause_on_stall: bool = true,
 };
 
 pub const Result = struct {
@@ -64,9 +77,15 @@ pub const Result = struct {
         keyframes: u64,
         refreshes: u64,
         retransmits: u64,
+        parity_shards: u64,
+        shards: u64,
         keys: u64,
         keys_wrong: u64,
         audio_frames: u64,
+        path_changes: u64 = 0,
+        reconnects: u64 = 0,
+        stall_pauses: u64 = 0,
+        stall_frames: u64 = 0,
         end: []const u8,
     },
     client: struct {
@@ -82,6 +101,9 @@ pub const Result = struct {
         total_p50_us: Micros,
         total_p99_us: Micros,
         audio: Audio,
+        path_changes: u64 = 0,
+        reconnects: u64 = 0,
+        reconnect_requests: u64 = 0,
         end: []const u8,
     },
     sim_losses: u64,
@@ -107,6 +129,15 @@ pub const Result = struct {
     /// What `moonsec sim`/`soak` and the tests hold a run to. Null when it passes.
     pub fn failure(r: Result, o: Options) ?[]const u8 {
         const want = r.expectedFrames(o.fps);
+        if (o.path != null) {
+            // Scripted outages freeze the picture by design: hold the run to a clean end,
+            // an intact picture, and most frames.
+            if (r.client.corrupt > 0) return "the decoder saw a corrupt access unit";
+            if (r.client.unreadable > 0) return "a presented frame's pattern did not read back";
+            if (!std.mem.eql(u8, r.client.end, "closed") or !std.mem.eql(u8, r.host.end, "client_bye")) return "the session did not end cleanly";
+            if (r.client.presented * 100 < want * 50) return "client presented under half of the frames";
+            return null;
+        }
         if (r.client.presented * 100 < want * 95) return "client presented under 95% of the frames";
         if (r.client.freezes > 0) return "the freeze detector saw a freeze";
         if (r.client.unreadable > 0) return "a presented frame's pattern did not read back";
@@ -125,7 +156,7 @@ pub const Result = struct {
     }
 
     pub fn print(r: Result, w: *std.Io.Writer) !void {
-        try w.print("{d} s: host sent {d} frames (keyframes {d}, LTR refreshes {d}, retransmits {d}); client presented {d}, lost {d}, decode errors {d}, unreadable {d}, corrupt {d}\n", .{ r.seconds, r.host.frames, r.host.keyframes, r.host.refreshes, r.host.retransmits, r.client.presented, r.client.lost, r.client.decode_errors, r.client.unreadable, r.client.corrupt });
+        try w.print("{d} s: host sent {d} frames (keyframes {d}, LTR refreshes {d}, retransmits {d}, parity shards {d}); client presented {d}, lost {d}, decode errors {d}, unreadable {d}, corrupt {d}\n", .{ r.seconds, r.host.frames, r.host.keyframes, r.host.refreshes, r.host.retransmits, r.host.parity_shards, r.client.presented, r.client.lost, r.client.decode_errors, r.client.unreadable, r.client.corrupt });
         try w.print("  freezes {d}, longest gap {d:.1} ms, stalls >100 ms {d}; glass-to-glass p50 {d:.2} ms p99 {d:.2} ms; keys {d}/{d} (wrong {d}); sim losses {d}\n", .{
             r.client.freezes,
             @as(f64, @floatFromInt(r.client.longest_gap_us)) / 1000,
@@ -182,9 +213,12 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     const cb = sc.backend();
     defer cb.deinit();
 
-    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices }, net.pipeFor(.a));
+    var model: pathsim.Model = undefined;
+    if (o.path) |pc| model.init(pc, net);
+    const pipes = if (o.path != null) [2]@TypeOf(net.pipeFor(.a)){ model.pipeFor(.a), model.pipeFor(.b) } else .{ net.pipeFor(.a), net.pipeFor(.b) };
+    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices, .pause_on_stall = o.pause_on_stall, .session = .{ .rate_control = o.rate_control, .loss_policy = o.loss_policy } }, pipes[0]);
     defer host.deinit();
-    var client = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent }, net.pipeFor(.b));
+    var client = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent }, pipes[1]);
     defer client.deinit();
 
     const end_us: Micros = @as(Micros, o.seconds) * simnet.SEC;
@@ -194,9 +228,14 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     var closing = false;
     while (!(host.done() and client.done())) : (t += o.step_us) {
         if (!loss_on and t >= o.warmup_us) {
-            for (&net.links) |*l| l.cfg.loss = loss;
+            if (o.path != null) {
+                model.setLoss(loss);
+            } else for (&net.links) |*l| {
+                l.cfg.loss = loss;
+            }
             loss_on = true;
         }
+        if (o.path != null) model.update(t);
         if (o.outage_us > 0) {
             if (t == o.outage_at_us) net.links[0].cfg.loss = 1.0;
             if (t == o.outage_at_us + o.outage_us) net.links[0].cfg.loss = loss;
@@ -236,9 +275,15 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .keyframes = host.s.stats.keyframes,
             .refreshes = host.s.stats.refreshes,
             .retransmits = host.s.stats.retransmits,
+            .parity_shards = host.s.stats.parity_shards,
+            .shards = host.s.stats.shards,
             .keys = sh.injector.keys,
             .keys_wrong = sh.injector.wrong,
             .audio_frames = if (host.audio) |ha| ha.stats.frames else 0,
+            .path_changes = host.s.stats.path_changes,
+            .reconnects = host.s.stats.reconnects,
+            .stall_pauses = host.s.stats.stall_pauses,
+            .stall_frames = host.s.stats.stall_frames,
             .end = @tagName(host.s.end),
         },
         .client = .{
@@ -254,6 +299,9 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .total_p50_us = snap.stage(.total).p50,
             .total_p99_us = snap.stage(.total).p99,
             .audio = au,
+            .path_changes = client.s.stats.path_changes,
+            .reconnects = client.s.stats.reconnects,
+            .reconnect_requests = client.s.stats.reconnect_requests,
             .end = @tagName(client.s.end),
         },
         .sim_losses = net.linkStats(.a).random_losses + net.linkStats(.b).random_losses,

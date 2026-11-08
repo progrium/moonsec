@@ -1,4 +1,4 @@
-//! moonsec iroh shim: the C ABI the Zig core uses for networking (v0.1).
+//! moonsec iroh shim: the C ABI the Zig core uses for networking (v0.2).
 //!
 //! Beyond wrapping iroh, the shim owns what spikes S2-S5 and S10 showed it must:
 //! - congestion control and pacing (`AppRate`, one factory per connection, rate set by the core
@@ -79,6 +79,8 @@ const DEFAULT_PATH_KEEPALIVE_MS: u32 = 100;
 const DEFAULT_BURST_US: u32 = 20_000;
 const DEFAULT_NO_ACK_MS: u32 = 150;
 const EVENT_QUEUE: usize = 256;
+/// Bound on an accepted connection's handshake (see `iroh_endpoint_accept`).
+const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MONITOR_TICK: Duration = Duration::from_millis(5);
 /// Bytes of bookkeeping noq charges per queued datagram (`size_of::<frame::Datagram>()`).
 const DGRAM_OVERHEAD: usize = std::mem::size_of::<Bytes>();
@@ -176,7 +178,7 @@ pub extern "C" fn iroh_shim_init(on_thread_start: IrohThreadStartFn, ctx: *mut s
 /// Returns the shim ABI version as (major << 16) | (minor << 8) | patch.
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_shim_version() -> u32 {
-    0x00_01_00
+    0x00_02_00
 }
 
 /// Microseconds on the shim's monotonic clock (the clock event timestamps use).
@@ -226,7 +228,8 @@ pub struct IrohBindOpts {
     /// AppRate burst credit in us of the target rate (default 20000; IROH_BURST_OFF = none).
     pub burst_us: u32,
     /// Stall on the selected path that raises IROH_EV_NO_ACK_PROGRESS, in ms
-    /// (default 150; IROH_NO_ACK_OFF disables the event).
+    /// (default 150; IROH_NO_ACK_OFF disables the event). The shim never uses less than
+    /// 1.5 x the path's RTT + 25 ms, so a long path's normal ack delay is not a stall.
     pub no_ack_progress_ms: u32,
     /// Extra trusted root certificates (PEM, NUL-terminated, one or more CERTIFICATE blocks) for
     /// the TLS that relays and discovery use, on top of the built-in web roots. For a relay
@@ -494,20 +497,40 @@ pub unsafe extern "C" fn iroh_endpoint_accept(ep: *const IrohEndpoint, timeout_m
     };
     let endpoint = ep.ep.clone();
     let alpn = ep.alpn.clone();
+    // The timeout bounds the wait for an incoming connection, not its handshake: dropping a
+    // half-done handshake would close a connection the dialer already counts as up (a relayed
+    // handshake takes a few RTTs). The handshake gets its own bound.
     let fut = async move {
-        let incoming = endpoint.accept().await.ok_or((IROH_ERR_CLOSED, "endpoint closed".to_string()))?;
+        let d = Duration::from_millis(timeout_ms as u64);
+        let incoming = match tokio::time::timeout(d, endpoint.accept()).await {
+            Err(_) => return Err((IROH_ERR_TIMEOUT, "accept timed out".to_string())),
+            Ok(None) => return Err((IROH_ERR_CLOSED, "endpoint closed".to_string())),
+            Ok(Some(i)) => i,
+        };
         let sc = endpoint.create_server_config_builder(vec![alpn]).set_transport_config(tc).build();
         let accepting = incoming.accept_with(Arc::new(sc)).map_err(|e| (IROH_ERR_INTERNAL, format!("accept: {e}")))?;
-        accepting.await.map_err(|e| (IROH_ERR_INTERNAL, format!("accept: {e}")))
+        match tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT.max(d), accepting).await {
+            Err(_) => Err((IROH_ERR_TIMEOUT, "accept: handshake timed out".to_string())),
+            Ok(r) => r.map_err(|e| (IROH_ERR_INTERNAL, format!("accept: {e}"))),
+        }
     };
-    match block_on_timeout(timeout_ms, fut) {
-        Ok(Ok(conn)) => {
+    match run(fut) {
+        Ok(conn) => {
             unsafe { *out = wrap_conn(conn, cfg, knob, factory) };
             IROH_OK
         }
-        Ok(Err((code, msg))) => fail(code, msg),
-        Err(_) => fail(IROH_ERR_TIMEOUT, "accept timed out"),
+        Err((code, msg)) => fail(code, msg),
     }
+}
+
+/// Tells iroh the local network changed (interface up/down, new address, Wi-Fi to LTE), so
+/// it re-runs its net report and tries new paths right away instead of on its own schedule.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_endpoint_network_change(ep: *const IrohEndpoint) -> i32 {
+    let Some(ep) = (unsafe { ep.as_ref() }) else { return fail(IROH_ERR_INVALID, "null endpoint") };
+    let endpoint = ep.ep.clone();
+    runtime().spawn(async move { endpoint.network_change().await });
+    IROH_OK
 }
 
 /// Closes the endpoint (gracefully, blocking briefly) and frees it.
@@ -579,6 +602,12 @@ struct Shared {
     /// Path ID -> its controller's counters.
     paths: Mutex<HashMap<u32, Arc<PathCounters>>>,
     selected_path: AtomicU32,
+    /// Selections seen (PATH_SELECTED events), so a caller can see a change without events.
+    selections: AtomicU32,
+    /// A selected path whose controller could not be found yet: the monitor retries, so the
+    /// target never stays on the old path's controller.
+    pending_select: Mutex<Option<PathId>>,
+    selected_id: Mutex<Option<PathId>>,
     events: Mutex<VecDeque<IrohEvent>>,
     events_dropped: AtomicU64,
     closed: AtomicBool,
@@ -635,12 +664,53 @@ impl Shared {
         Some(ctl.counters.clone())
     }
 
-    /// Moves the target rate to `id`'s controller.
+    /// Moves the target rate to `id`'s controller. If iroh has not built (or no longer
+    /// reports) that controller yet, the move is retried by `retry_select`.
     fn select(&self, conn: &Connection, id: PathId) {
         self.selected_path.store(path_u32(id), Relaxed);
-        if let Some(c) = self.counters(conn, id) {
-            self.knob.selected.store(c.ctl_index, Relaxed);
+        *self.selected_id.lock().unwrap() = Some(id);
+        let mut pending = self.pending_select.lock().unwrap();
+        match self.counters(conn, id) {
+            Some(c) => {
+                self.knob.selected.store(c.ctl_index, Relaxed);
+                *pending = None;
+            }
+            None => *pending = Some(id),
         }
+    }
+
+    fn retry_select(&self, conn: &Connection) {
+        let id = *self.pending_select.lock().unwrap();
+        if let Some(id) = id
+            && path_u32(id) == self.selected_path.load(Relaxed)
+        {
+            self.select(conn, id);
+        }
+    }
+
+    /// Keeps the target on the selected path's live controller. noq can replace a path's
+    /// controller (a new one from the factory, with a new index) without a path event, which
+    /// would leave the target on the old one and the path paced at `IDLE_PATH_BPS`.
+    fn check_selected(&self, conn: &Connection) {
+        let Some(id) = *self.selected_id.lock().unwrap() else { return };
+        if self.pending_select.lock().unwrap().is_some() {
+            return;
+        }
+        let key = path_u32(id);
+        let Some(ctl) = conn.congestion_state(id).and_then(|c| c.into_any().downcast::<AppRate>().ok()) else { return };
+        let index = ctl.counters.ctl_index;
+        if self.knob.selected.load(Relaxed) != index {
+            self.paths.lock().unwrap().insert(key, ctl.counters.clone());
+            self.knob.selected.store(index, Relaxed);
+            eprintln!("iroh-shim: path {key} has a new congestion controller ({index}); the target moved to it");
+        }
+    }
+
+    /// The stall that counts as no ack progress on a path: the configured threshold, but at
+    /// least 1.5 x its RTT (the larger of smoothed and latest) plus QUIC's 25 ms max ack delay,
+    /// since an idle path's keep-alive is unacked for a whole RTT.
+    fn stall_threshold(&self, c: &PathCounters) -> Option<u64> {
+        self.cfg.no_ack_us.map(|t| t.max(c.rtt_cons_us.load(Relaxed) * 3 / 2 + 25_000))
     }
 
     /// Resolves which accepted datagrams have left the send buffer and how many were evicted.
@@ -690,6 +760,9 @@ fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Ar
         wake: Wakeup::new().expect("wakeup socket"),
         paths: Mutex::new(HashMap::new()),
         selected_path: AtomicU32::new(IROH_PATH_NONE),
+        selections: AtomicU32::new(0),
+        pending_select: Mutex::new(None),
+        selected_id: Mutex::new(None),
         events: Mutex::new(VecDeque::new()),
         events_dropped: AtomicU64::new(0),
         closed: AtomicBool::new(false),
@@ -761,6 +834,7 @@ fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Ar
                             }
                             PathEvent::Selected { id, remote_addr, .. } => {
                                 sh.select(&conn, id);
+                                sh.selections.fetch_add(1, Relaxed);
                                 IrohEvent::new(IROH_EV_PATH_SELECTED, path_u32(id), 0).with_addr(&remote_addr)
                             }
                             PathEvent::Closed { id, remote_addr, last_stats, .. } => {
@@ -778,8 +852,8 @@ fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Ar
         );
     }
 
-    // No-ack-progress monitor on the selected path.
-    if let Some(threshold) = cfg.no_ack_us {
+    // No-ack-progress monitor on the selected path; also retries a pending target move.
+    {
         let (conn, sh) = (conn.clone(), sh.clone());
         tasks.push(
             runtime()
@@ -793,12 +867,15 @@ fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Ar
                             sh.mark_closed();
                             return;
                         }
+                        sh.retry_select(&conn);
+                        sh.check_selected(&conn);
                         let sel = sh.knob.selected.load(Relaxed);
                         let ctl = {
                             let built = sh.factory.built.lock().unwrap();
                             if sel == NO_SELECTION { built.first().cloned() } else { built.get(sel as usize).cloned() }
                         };
                         let Some(ctl) = ctl else { continue };
+                        let Some(threshold) = sh.stall_threshold(&ctl) else { continue };
                         let stall = ctl.ack_stall_us(apprate::now_us());
                         let path = sh.selected_path.load(Relaxed);
                         if !stalled && stall >= threshold {
@@ -1004,7 +1081,8 @@ pub struct IrohConnStats {
     pub selected_path: u32,
     pub path_count: u32,
     pub closed: u32,
-    pub _pad: u32,
+    /// PATH_SELECTED events so far (a change of selected path bumps it).
+    pub path_selections: u32,
 }
 
 #[unsafe(no_mangle)]
@@ -1042,7 +1120,7 @@ pub unsafe extern "C" fn iroh_conn_stats(c: *const IrohConn, out: *mut IrohConnS
         selected_path: sh.selected_path.load(Relaxed),
         path_count: c.conn.paths().len() as u32,
         closed: (sh.closed.load(Relaxed) || c.conn.close_reason().is_some()) as u32,
-        _pad: 0,
+        path_selections: sh.selections.load(Relaxed),
     };
     unsafe { *out = o };
     IROH_OK
@@ -1102,7 +1180,7 @@ pub unsafe extern "C" fn iroh_conn_path_stats(
                 path_id: path_u32(p.id()),
                 is_relay: p.is_relay() as u8,
                 is_selected: p.is_selected() as u8,
-                no_ack_progress: c.sh.cfg.no_ack_us.is_some_and(|t| stall >= t) as u8,
+                no_ack_progress: ctl.as_ref().and_then(|k| c.sh.stall_threshold(k)).is_some_and(|t| stall >= t) as u8,
                 _pad: 0,
                 rtt_us: s.rtt.as_micros() as u64,
                 min_rtt_us: ld(|k| &k.min_rtt_us),

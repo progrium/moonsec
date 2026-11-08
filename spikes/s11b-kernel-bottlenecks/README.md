@@ -26,6 +26,42 @@
   fq_codel does not help a lone flow after a capacity drop. CoDel waits a 100 ms interval before it drops, so it peaks like a 250 KB droptail buffer, and our standing-queue drain still does the work.
 - **The train estimate locks onto our share under fair queueing.** Under fq_codel the frame-train estimate reads our round-robin share, not the link rate. Pacing then follows that estimate. When the competitor leaves, frames are paced at the old share, so the dispersion still reads the old share and the jump can't fire. Recovery falls back to GCC's ramp: 1.8 s after Cubic leaves, 6.2 s after BBR. On droptail it takes 1.7–2.1 s. The fix is cheap: now and then pace a frame well above the estimate (say 2×) so the train can see spare capacity.
 
+## Rerun with the follow-ups
+
+**Nov 8, 2026.** The three changes this spike called for are now in `core/rate` (competing-flow mode, a loss rule below 10%, and the train floor plus probe frames; see [core/rate/README.md](../../core/rate/README.md)). [`tools/ratenet`](../../tools/ratenet/main.zig) is `s11net` with `est.zig` replaced by `core/rate`: same wire format, CLI, CSV and RESULT line, so these scripts drive it unchanged. Every cell ran again in the same emulated 6.8 kernel, 3 runs each, with two controllers back to back:
+
+- `core`: `core/rate` with its defaults.
+- `core-s11b`: the same code with the follow-ups off, which is this spike's `gcc-hybrid`. Running it in the same VM session gives a like-for-like baseline, since the emulator's noise varies between sessions (the baseline's frame p50 here is 2–4× the original run's in some cells).
+
+Full tables: [`results/core-rerun/table.md`](results/core-rerun/table.md); per-run numbers and raw files under `results/core-rerun/`.
+
+### With a competing TCP flow (our share of a fair half, medians of 3)
+
+| competitor | bottleneck | `core-s11b` | `core` | original `gcc-hybrid` | Cubic in our seat | `core` q p50 / p95 with TCP | `core` recover |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Cubic | droptail 500 KB | 0.34 | **0.49** | 0.31 | 1.14 | 65 / 80 ms | 2.1 s |
+| Cubic | droptail 125 KB | 0.66 | **0.72** | 0.61 | 0.98 | 11 / 21 ms | 2.0 s |
+| BBR | droptail 500 KB | 0.28 | **0.32** | 0.29 | 0.77 | 13 / 38 ms | 1.9 s |
+| BBR | droptail 125 KB | 0.28 | **0.29** | 0.25 | 0.65 | 13 / 23 ms | 2.1 s |
+| Cubic | fq_codel | 0.84 | 0.80 | 0.86 | 0.94 | 1.8 / 9.7 ms | 6.7 s |
+| BBR | fq_codel | 0.80 | 0.75 | 0.88 | 0.91 | 1.6 / 8.5 ms | 6.2 s |
+
+- **Against Cubic in a deep FIFO, about half a fair share, up from a third.** Per run: 0.43–0.74 in tuning runs, 0.38–0.61 here. The drain now gives up after 600 ms when its cuts don't move the queue (it used to cut for 1.5 s, which handed Cubic most of the link before competing mode started), and in competing mode loss cuts are regained within a second. Cubic in our seat still gets 1.14, so this is a gain, not parity. Frame delay with Cubic is the queue Cubic keeps (65 ms p50), which nothing on our side can remove.
+- **BBR is unchanged at about 0.3.** Its queue (13 ms p50) stays under the drain's 30 ms threshold, so the drain never gives up and competing mode never starts; the trendline keeps cutting on BBR's probe cycles. An entry on "repeated overuse cuts that don't empty the queue" fixed the trigger but also fired on S11's simulated Wi-Fi stalls and filled the buffer there, so it is in the code but off (`competing_overuses = 0`). This needs a better signal, or the real Wi-Fi data to tell the two apart.
+- **fq_codel: not hurt beyond noise.** Shares are 0.04–0.05 lower than the baseline, within the run-to-run spread (0.63–0.81 for BBR), and competing mode started once in 6 runs. Our queueing p95 rose from 5 to 9–10 ms, from the probe frames.
+- **Recovery after the flow leaves an fq_codel bottleneck: 6.2–6.7 s, against 8.3–14.1 s for the baseline in the same session** (the original S11b run had 1.8 and 6.2 s). The probe frames do let the train see the link free up, but the jump still waits out the 2 s quiet after a decrease, and the drain's cuts as the queues settle reset that clock. Per run it is 3.3–7.6 s. This doesn't meet "regain the link in about a second" yet.
+- **The 16.6 s outlier is gone**: with the train floor, the target never fell under the 4-packet line, and droptail recovery is 1.9–2.1 s in every cell.
+
+### Capacity steps, alone
+
+Unchanged within noise on every bottleneck: utilization 0.78–0.83 / 0.68–0.71 / 0.86–0.88 at 25 / 10 / 40 Mbit/s, below the new rate in 300–400 ms, drained in 0.4–0.5 s, back to 80% in 1.8–1.9 s. Queueing p99 is 14–22 ms against 15–17 ms for the baseline; the probe frames add a few ms at the top. No competing-mode entries.
+
+```sh
+zig build ratenet -Doptimize=ReleaseFast -Dcpu=x86_64_v2 -p zig-out-v2     # from the repo root
+S11=$PWD/zig-out-v2/bin/ratenet OUT=/tmp/rerun CTLS="core core-s11b" \
+  CELLS="cubic,bfifo:500000 bbr,bfifo:500000" REPS=3 spikes/s11b-kernel-bottlenecks/scripts/run-all.sh
+```
+
 ## Setup
 
 - **Topology.** Three network namespaces: `snd` → `rtr` → `rcv`, connected by veth pairs with TSO, GSO and GRO off.

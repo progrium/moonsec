@@ -18,6 +18,9 @@ pub const history = @import("history.zig");
 pub const SendHistory = history.SendHistory;
 pub const Arrival = history.Arrival;
 
+pub const ladder = @import("ladder.zig");
+pub const Ladder = ladder.Ladder;
+
 const controller = @import("controller.zig");
 pub const Controller = controller.Controller;
 pub const Config = controller.Config;
@@ -31,4 +34,5 @@ test {
     _ = @import("history.zig");
     _ = @import("controller.zig");
     _ = @import("loop_test.zig");
+    _ = @import("ladder.zig");
 }
