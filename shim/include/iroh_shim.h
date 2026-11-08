@@ -60,6 +60,8 @@ typedef struct IrohBindOpts {
     uint64_t initial_target_bps;   /* default 0 = unpaced until iroh_conn_set_target_bitrate */
     uint32_t burst_us;             /* AppRate burst credit, default 20000; IROH_BURST_OFF = none */
     uint32_t no_ack_progress_ms;   /* stall that raises IROH_EV_NO_ACK_PROGRESS, default 150 */
+    const char *relay_ca_pem;      /* extra trusted roots (PEM) for relay TLS, e.g. a self-hosted
+                                      relay's private CA; NULL = built-in web roots only */
 } IrohBindOpts;
 
 typedef struct IrohEvent {
