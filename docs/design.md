@@ -434,7 +434,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 ### Phase 4: macOS host and more clients (about 5 weeks)
 
 - Host: ScreenCaptureKit, VideoToolbox, CGEvent input.
-- Clients: macOS (VideoToolbox, Metal) and Linux (VAAPI, Wayland/EGL).
+- Clients: macOS (VideoToolbox, Metal) and Linux (VAAPI, Wayland/EGL). Linux client built in [platform/client/linux](../platform/client/linux/README.md): libavcodec with VAAPI and a software fallback, Wayland/EGL (GLES 3, dma-buf import of VAAPI surfaces), PipeWire, evdev. CI runs it end to end against the synthetic host in headless Weston on llvmpipe; VAAPI decode and dma-buf import are untested without a GPU.
 - Gamepads on all clients; virtual gamepad on Windows host (driver path decided in Phase 3).
 
 **Gate:** every host/client pair in the target table streams with the Phase 2 latency bar.

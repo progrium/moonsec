@@ -41,6 +41,8 @@ zig build moonsec-sim -- sim --profile wan --seconds 60
 zig build soak                           # one hour of simulated LAN in virtual time (~5 min)
 zig build moonsec-sim -- run sim         # two processes over the sim hub, wall clock, threads
 zig build moonsec -- run all             # ...and over iroh on loopback (builds the shim)
+zig build moonsec-linux                  # with the Linux client backend (platform/client/linux):
+zig-out/bin/moonsec-linux run sim --client linux --uinput-script
 zig build install-moonsec                # then, on two machines:
 zig-out/bin/moonsec peer iroh host --ticket-file t --relay --seconds 60
 zig-out/bin/moonsec peer iroh client --ticket-file t --relay --seconds 60   # copy t over first
