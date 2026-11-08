@@ -65,6 +65,16 @@ pub fn d3dPtr(d: win.D3d) *c.msw_d3d {
     return @ptrCast(d.handle);
 }
 
+/// The client's D3D11 device. Video support (D3D11_CREATE_DEVICE_VIDEO_SUPPORT) is
+/// needed for D3D11VA through Media Foundation; WARP refuses the flag, and its video
+/// processor and the software decode path work without it, so fall back.
+pub fn createDevice(driver: win.Driver, adapter_index: u32) win.Error!win.D3d {
+    return win.D3d.create(.{ .driver = driver, .adapter_index = adapter_index, .video = true }) catch |e| {
+        log.info("D3D11 device without video support ({f})", .{win.fmtHr(win.last_hr)});
+        return win.D3d.create(.{ .driver = driver, .adapter_index = adapter_index }) catch return e;
+    };
+}
+
 fn ok(what: []const u8, hr: i32) api.Error!void {
     if (hr < 0) return hrFail(what, hr);
 }
@@ -419,7 +429,7 @@ pub const Client = struct {
 pub fn open(gpa: std.mem.Allocator, opts: Options) !*Client {
     const com = try win.ComThread.init();
     errdefer com.deinit();
-    const d3d = try win.D3d.create(.{ .driver = opts.driver, .adapter_index = opts.adapter_index, .video = true });
+    const d3d = try createDevice(opts.driver, opts.adapter_index);
     errdefer d3d.destroy();
 
     var flags: u32 = 0;

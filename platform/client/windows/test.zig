@@ -67,7 +67,7 @@ test "split the test stream into 6 access units" {
 }
 
 fn warp() !win.D3d {
-    return win.D3d.create(.{ .driver = .warp, .video = true });
+    return client.createDevice(.warp, 0);
 }
 
 test "software H.264 decode: one picture per access unit, right pixels" {
