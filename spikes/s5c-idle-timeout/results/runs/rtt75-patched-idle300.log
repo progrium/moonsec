@@ -1,0 +1,35 @@
+[1794101668.638] >> sample 2
+[1794101668.729] >> media 200
+time to direct: Some(313.1711483001709) ms
+[1794101673.881] >> block
+block -> relay: Some(345.48115730285645) ms
+[1794101677.653] >> unblock
+unblock -> direct: Some(459.06805992126465) ms
+[1794101681.183] >> blackout 100
+[1794101686.414] >> blackout 200
+[1794101691.883] >> blackout 300
+[1794101697.295] >> blackout 400
+[1794101702.806] >> blackout 600
+[1794101708.518] >> blackout 800
+[1794101714.429] >> blackout 1000
+[1794101720.534] >> blackout 1500
+[1794101727.145] >> blackout 2000
+[1794101734.259] >> blackout 100
+[1794101739.560] >> blackout 200
+[1794101745.018] >> blackout 300
+[1794101750.430] >> blackout 400
+[1794101755.934] >> blackout 600
+[1794101761.648] >> blackout 800
+[1794101767.558] >> blackout 1000
+[1794101773.670] >> blackout 1500
+[1794101780.278] >> blackout 2000
+[1794101787.390] >> blackout 100
+[1794101792.603] >> blackout 200
+[1794101798.058] >> blackout 300
+[1794101803.493] >> blackout 400
+[1794101809.010] >> blackout 600
+[1794101814.725] >> blackout 800
+[1794101820.634] >> blackout 1000
+[1794101826.750] >> blackout 1500
+[1794101833.358] >> blackout 2000
+wrote /home/claude/moonsec/spikes/s5c-idle-timeout/out/full/rtt75-patched-idle300
