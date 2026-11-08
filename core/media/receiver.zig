@@ -3,6 +3,8 @@
 //! Feed every video shard to `onShard`; call `poll` until it returns null to get
 //! frames and losses in order; call `nacks` to get a NACK datagram to send (if any).
 //! `deadline` says when to call back if no packet arrives first.
+//! FEC needs nothing here: shards carry their own parity counts, and a group completed
+//! by FEC (or with its parity lost) is taken off the NACK list.
 const std = @import("std");
 const proto = @import("../proto/root.zig");
 const reassembly = @import("reassembly.zig");
@@ -11,7 +13,8 @@ const nack = @import("nack.zig");
 pub const Config = struct {
     reassembly: reassembly.Config = .{},
     nack: nack.Config = .{},
-    /// Turn NACK off (FEC-only or relayed paths).
+    /// Turn NACK off. The host decides NACK vs FEC (policy.zig) and ignores NACKs it
+    /// does not want, so clients normally leave this on.
     nack_enabled: bool = true,
 };
 
@@ -39,6 +42,7 @@ pub const Receiver = struct {
             .rejected, .out_of_memory => {},
             else => r.tracker.onPacket(h.media_seq, h.flags.retransmit, now_us),
         }
+        if (r.reasm.completed) |c| r.tracker.forgetRange(c.first, c.count);
         return res;
     }
 

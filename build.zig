@@ -174,6 +174,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const netns_step = b.step("netns-test", "Install the Linux netns shim tests (run zig-out/bin/iroh-netns-test as root)");
+    // The netns lab (tools/netlab): a userspace delay line for kernels without netem.
+    const delayline = b.addExecutable(.{ .name = "delayline", .root_module = b.createModule(.{ .root_source_file = b.path("tools/netlab/delayline.zig"), .target = target, .optimize = optimize }) });
+    b.step("delayline", "Install zig-out/bin/delayline (Linux; the netns lab's delay line)").dependOn(&b.addInstallArtifact(delayline, .{}).step);
     netns_step.dependOn(&b.addInstallArtifact(netns_tests, .{}).step);
     netns_step.dependOn(b.getInstallStep());
 
@@ -310,6 +313,10 @@ pub fn build(b: *std.Build) void {
     const run_sim_rate = b.addRunArtifact(sim_rate);
     if (b.args) |a| run_sim_rate.addArgs(a);
     b.step("sim-rate", "Run core/rate over the S11 scenarios and print S11's metrics").dependOn(&run_sim_rate.step);
+
+    // tools/ratenet: core/rate over plain UDP for real-qdisc runs (S11b's scripts drive it).
+    const ratenet = b.addExecutable(.{ .name = "ratenet", .root_module = b.createModule(.{ .root_source_file = b.path("tools/ratenet/main.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "core", .module = core_mod }} }) });
+    b.step("ratenet", "Build tools/ratenet (core/rate over UDP, for S11b's qdisc scripts)").dependOn(&b.addInstallArtifact(ratenet, .{}).step);
 
     // Windows platform (platform/windows): COM/D3D11/DXGI code in small C files compiled
     // by zig cc against Zig's bundled mingw-w64 headers; Zig sees only msw.h's C ABI.

@@ -19,8 +19,20 @@ pub const OwdTracker = struct {
     rn: usize = 0,
     rh: usize = 0,
     last_recv: i64 = 0,
+    /// A baseline held by `freezeBase`: the base never rises above it.
+    frozen: ?i64 = null,
 
     const R = 512;
+
+    /// Keep the current baseline until `thawBase`, however long the window
+    /// stays above it (a foreign flow's standing queue, S11b).
+    pub fn freezeBase(self: *OwdTracker) void {
+        self.frozen = self.baseOwd();
+    }
+
+    pub fn thawBase(self: *OwdTracker) void {
+        self.frozen = null;
+    }
 
     pub fn add(self: *OwdTracker, r: PacketResult) void {
         const owd = r.recv_us - r.send_us;
@@ -38,6 +50,13 @@ pub const OwdTracker = struct {
         self.ro[i] = owd;
     }
 
+    /// The 10 s minimum OWD (propagation plus clock offset), null before any sample.
+    pub fn baseOwd(self: *const OwdTracker) ?i64 {
+        var b: i64 = self.frozen orelse std.math.maxInt(i64);
+        for (self.bucket_min) |m| b = @min(b, m);
+        return if (b == std.math.maxInt(i64)) null else b;
+    }
+
     /// Standing queue in microseconds, null before any sample.
     pub fn standing(self: *OwdTracker) ?f64 {
         while (self.rn > 0 and self.rt[self.rh] < self.last_recv - self.filter_us) {
@@ -47,8 +66,7 @@ pub const OwdTracker = struct {
         if (self.rn == 0) return null;
         var mn: i64 = std.math.maxInt(i64);
         for (0..self.rn) |k| mn = @min(mn, self.ro[(self.rh + k) % R]);
-        var base: i64 = std.math.maxInt(i64);
-        for (self.bucket_min) |b| base = @min(base, b);
+        const base = self.baseOwd() orelse return null;
         return @floatFromInt(mn - base);
     }
 };
@@ -67,4 +85,16 @@ test "standing queue ignores the clock offset" {
     // A 40 ms standing queue builds and stays.
     while (t < 1_200_000) : (t += 1000) o.add(pkt(t, t + 50_000 + offset));
     try std.testing.expectEqual(@as(?f64, 40_000), o.standing());
+}
+
+test "a frozen baseline outlasts the 10 s window" {
+    var o = OwdTracker{};
+    var t: i64 = 0;
+    while (t < 1_000_000) : (t += 1000) o.add(pkt(t, t + 10_000));
+    o.freezeBase();
+    // 60 ms of foreign queue for 15 s: the window alone would forget the 10 ms base.
+    while (t < 16_000_000) : (t += 1000) o.add(pkt(t, t + 70_000));
+    try std.testing.expectEqual(@as(?f64, 60_000), o.standing());
+    o.thawBase();
+    try std.testing.expectEqual(@as(?f64, 0), o.standing());
 }
