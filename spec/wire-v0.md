@@ -52,7 +52,7 @@ kind skips the datagram.
 | ---: | --- | --- | --- |
 | 0 | invalid | | Never sent. |
 | 1 | `video` | host → client | |
-| 2 | `audio` | host → client | Kinds defined with the audio module. |
+| 2 | `audio` | host → client | Frames and RS parity: [audio-v0.md](audio-v0.md). |
 | 3 | `input` | client → host | Kinds defined with the input module. |
 | 4 | `control_fast` | both | Small latency-critical control: frame acks, feedback. |
 | 5 | `mic` | client → host | Reserved; not in v1. |

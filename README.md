@@ -3,7 +3,7 @@
 Low-latency remote desktop and game streaming core in Zig, with networking from
 Rust [iroh](https://github.com/n0-computer/iroh) through a small in-repo shim.
 
-Design and plan: [docs/design.md](docs/design.md). Wire protocol: [spec/wire-v0.md](spec/wire-v0.md). Spike write-ups, code and results:
+Design and plan: [docs/design.md](docs/design.md). Wire protocol: [spec/wire-v0.md](spec/wire-v0.md) (audio: [spec/audio-v0.md](spec/audio-v0.md)). Spike write-ups, code and results:
 [spikes/](spikes) (status table in the design doc's "Spike status" section).
 
 Zig is pinned to **0.16.0** (`build.zig.zon` `minimum_zig_version`).
@@ -11,6 +11,7 @@ Zig is pinned to **0.16.0** (`build.zig.zon` `minimum_zig_version`).
 ```
 /core          pure Zig core (sans-I/O)
 /transport     PacketPipe, iroh binding, sim pipe
+/codec         libopus built from source and its Zig binding
 /platform      host/{windows,macos,linux}, client/{windows,macos,linux,web}
 /shim          Rust crate wrapping iroh (Cargo.lock, rust-toolchain.toml)
 /shim-web      Rust wasm-bindgen crate for the browser
@@ -26,7 +27,10 @@ Zig is pinned to **0.16.0** (`build.zig.zon` `minimum_zig_version`).
 
 ```sh
 zig build test            # core unit tests (pure Zig, no Rust needed)
-zig build check-wasm      # compile the core for wasm32
+zig build check-wasm      # compile the core for wasm32 (and libopus for wasm32-wasi)
+zig build test-audio      # libopus binding + audio stream scenarios over the sim
+zig build audio-sim -Doptimize=ReleaseSafe   # audio scenario table at full length
+zig build check-opus      # cross-compile libopus for every target
 zig build test-shim       # build the shim with cargo, run its loopback tests and the Phase 1 gate
 zig build gate-sim        # Phase 1 gate over the simulated network only (two processes, no Rust)
 zig build gate            # Phase 1 gate over iroh (loopback) and the sim; `-- run iroh --seed 3` etc.

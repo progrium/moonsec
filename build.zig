@@ -69,6 +69,22 @@ pub fn build(b: *std.Build) void {
     }) });
     wasm_step.dependOn(&wasm_tests.step);
 
+    // libopus from source (codec/opus/libopus.zig) and its Zig binding, for every target.
+    const opus = addOpus(b, target, optimize);
+    const opus_tests = b.addTest(.{ .name = "opus-test", .root_module = opus.module });
+    const run_opus_tests = b.addRunArtifact(opus_tests);
+    b.step("test-opus", "Run the libopus binding tests").dependOn(&run_opus_tests.step);
+    test_step.dependOn(&run_opus_tests.step);
+    // Browser client: libopus and the binding must build for wasm32-wasi (design, "Web").
+    const wasm_wasi = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
+    wasm_step.dependOn(&b.addTest(.{ .root_module = addOpus(b, wasm_wasi, optimize).module }).step);
+    // `zig build check-opus`: cross-compile libopus for every shipping target from one host.
+    const check_opus = b.step("check-opus", "Cross-compile libopus and its binding for every target");
+    for (opus_targets) |q| {
+        const t = b.resolveTargetQuery(q);
+        check_opus.dependOn(&b.addTest(.{ .root_module = addOpus(b, t, .ReleaseSafe).module }).step);
+    }
+
     const shim = resolveShim(b, target, shim_source, shim_link, shim_dir_opt);
 
     // C header -> Zig module (the shim's ABI as Zig sees it).
@@ -215,6 +231,22 @@ pub fn build(b: *std.Build) void {
     test_sim.dependOn(&b.addRunArtifact(gate_tests).step);
     test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = simlink_mod })).step);
 
+    // The audio stream with real libopus over the simulated network (sim/audio.zig).
+    // codec/opus/stage.zig: Opus plus core/audio, the host and client ends of the audio stage.
+    const audio_stage_mod = b.addModule("audio_stage", .{ .root_source_file = b.path("codec/opus/stage.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "core", .module = core_mod }, .{ .name = "opus", .module = opus.module } } });
+    const audio_imports: []const std.Build.Module.Import = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod }, .{ .name = "opus", .module = opus.module }, .{ .name = "audio_stage", .module = audio_stage_mod } };
+    const audio_sim = b.addExecutable(.{ .name = "audio-sim", .root_module = b.createModule(.{ .root_source_file = b.path("sim/audio_main.zig"), .target = target, .optimize = optimize, .imports = audio_imports }) });
+    const run_audio_sim = b.addRunArtifact(audio_sim);
+    if (b.args) |a| run_audio_sim.addArgs(a);
+    b.step("audio-sim", "Run the audio scenarios with libopus over the sim and print a table").dependOn(&run_audio_sim.step);
+    const audio_tests = b.addRunArtifact(b.addTest(.{ .name = "audio-sim-test", .root_module = b.createModule(.{ .root_source_file = b.path("sim/audio.zig"), .target = target, .optimize = optimize, .imports = audio_imports }) }));
+    b.step("test-audio", "Run the libopus binding tests and the audio sim scenarios").dependOn(&audio_tests.step);
+    b.top_level_steps.get("test-audio").?.step.dependOn(&run_opus_tests.step);
+    const stage_tests = b.addRunArtifact(b.addTest(.{ .name = "audio-stage-test", .root_module = audio_stage_mod }));
+    b.top_level_steps.get("test-audio").?.step.dependOn(&stage_tests.step);
+    test_sim.dependOn(&stage_tests.step);
+    test_sim.dependOn(&audio_tests.step);
+
     // Phase 2 session spine (app/): host and client sessions, the apps over any
     // platform backend, and the `moonsec` tool (sim runs, soak, iroh, test pattern).
     const app_imports = [_]std.Build.Module.Import{
@@ -224,6 +256,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "synthetic", .module = synthetic_mod },
         .{ .name = "simnet", .module = simnet_mod },
         .{ .name = "simlink", .module = simlink_mod },
+        .{ .name = "audio_stage", .module = audio_stage_mod },
     };
     const app_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("app/test.zig"), .target = target, .optimize = optimize, .imports = &app_imports }) });
     const test_app = b.step("test-app", "Host and client apps end to end over the in-process sim");
@@ -483,4 +516,40 @@ fn artifactSuffix(t: std.Target) []const u8 {
         .windows => if (t.cpu.arch == .aarch64) "windows_aarch64" else "windows_x86_64",
         else => @panic("unsupported os for the iroh shim"),
     };
+}
+
+/// Targets `check-opus` cross-compiles libopus for. Windows MSVC needs the Windows SDK, so
+/// CI builds it natively on the Windows runner instead (`-Dtarget=x86_64-windows-msvc`).
+const opus_targets = [_]std.Target.Query{
+    .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu },
+    .{ .cpu_arch = .x86_64, .os_tag = .macos },
+    .{ .cpu_arch = .aarch64, .os_tag = .macos },
+    .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
+    .{ .cpu_arch = .aarch64, .os_tag = .windows, .abi = .gnu },
+    .{ .cpu_arch = .wasm32, .os_tag = .wasi },
+};
+
+const Opus = struct {
+    lib: *std.Build.Step.Compile,
+    /// The Zig binding (codec/opus/opus.zig), linked against `lib`. Import it as "opus".
+    module: *std.Build.Module,
+};
+
+fn addOpus(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Opus {
+    const src = b.dependency("opus", .{});
+    const lib = @import("codec/opus/libopus.zig").library(b, src, target, optimize);
+    const translate = b.addTranslateC(.{ .root_source_file = b.path("codec/opus/ctl.h"), .target = target, .optimize = optimize });
+    translate.addIncludePath(src.path("include"));
+    const m = b.createModule(.{
+        .root_source_file = b.path("codec/opus/opus.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "opus_c", .module = translate.createModule() }},
+    });
+    m.addIncludePath(src.path("include"));
+    m.addCSourceFile(.{ .file = b.path("codec/opus/ctl.c"), .flags = &.{"-fno-sanitize=undefined"} });
+    m.linkLibrary(lib);
+    return .{ .lib = lib, .module = m };
 }
