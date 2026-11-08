@@ -16,6 +16,15 @@ pub const media = @import("media/root.zig");
 /// Loss recovery: LTR acks, freeze on gap, LTR refresh or IDR (docs/design.md, "Loss recovery").
 pub const recovery = @import("recovery/root.zig");
 
+/// Input events with redundancy, motion totals and gamepad snapshots.
+pub const input = @import("input/root.zig");
+
+/// Host/client clock offset and skew from round trips.
+pub const clock = @import("clock/root.zig");
+
+/// Per-frame stage timing and rolling stats for the latency overlay.
+pub const telemetry = @import("telemetry/root.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
