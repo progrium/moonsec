@@ -188,13 +188,15 @@ pub const ClientApp = struct {
     }
 
     fn network(a: *ClientApp, now: Micros) void {
-        if (a.be.input) |src| {
+        // Input is polled only while streaming: before the host's config there is no one
+        // to send it to, and the source keeps (or drops) it by its own rules.
+        if (a.be.input) |src| if (a.s.state == .streaming) {
             var evs: [64]api.InputEvent = undefined;
             const n = src.poll(&evs) catch 0;
             for (evs[0..n]) |e| {
                 if (e.what == .quit) a.quit = true else a.s.onInput(e);
             }
-        }
+        };
         if (a.quit) a.s.close(now);
         a.s.step(now);
     }
