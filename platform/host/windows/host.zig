@@ -40,13 +40,16 @@ pub const clock = api.clockFn(nowUs);
 
 fn hrError(what: []const u8, hr: i32) api.Error {
     const code: u32 = @bitCast(hr);
-    log.err("{s}: {f}", .{ what, win.fmtHr(hr) });
-    return switch (code) {
+    const e: api.Error = switch (code) {
         0x8007000E => error.OutOfMemory,
         0x887A0005, 0x887A0007, 0x887A0026 => error.DeviceLost, // device removed / reset / access lost
         0x887A0002, 0x887A0004, 0x80070490, 0x80004001 => error.Unsupported, // unsupported / not found / not implemented
         else => error.BackendFailed,
     };
+    // Missing hardware (no output to duplicate, no encoder) is expected on some machines
+    // and the caller decides what to do; only real failures are logged as errors.
+    if (e == error.Unsupported) log.warn("{s}: {f}", .{ what, win.fmtHr(hr) }) else log.err("{s}: {f}", .{ what, win.fmtHr(hr) });
+    return e;
 }
 
 /// The device as host_win.h's msw_d3d (a separate translation of the same C type).
