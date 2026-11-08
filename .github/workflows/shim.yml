@@ -1,7 +1,9 @@
 name: shim
 
-# Spike S1: build the iroh shim for every target, link it into Zig (static and dynamic),
-# run the datagram echo, and record artifact sizes. Tags `shim-v*` publish a release.
+# Build the iroh shim for every target, link it into Zig (static and dynamic), run the
+# datagram echo, check -Dshim=prebuilt against the fresh archives, and record artifact
+# sizes. Tags `shim-v*` publish a release; shim/pin-release.sh then pins it in
+# build.zig.zon, and the `prebuilt` job builds from those pinned archives without Rust.
 
 on:
   # Every branch push runs the matrix (also covers PR branches in this repo).
@@ -18,8 +20,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  notices:
+    name: third-party notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain (pinned by shim/rust-toolchain.toml)
+        working-directory: shim
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - name: Generate THIRD_PARTY_NOTICES.md
+        working-directory: shim
+        run: |
+          cargo about generate --locked --fail -c about.toml -o THIRD_PARTY_NOTICES.md about.hbs
+          grep -c '^- \[' THIRD_PARTY_NOTICES.md | xargs echo "crate entries:"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shim-notices
+          path: shim/THIRD_PARTY_NOTICES.md
+
   build:
     name: ${{ matrix.name }}
+    needs: notices
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -103,12 +127,18 @@ jobs:
               | grep native-static-libs | tee "target/$t/native-static-libs.txt" || true
           done
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: shim-notices
+          path: notices
+
       - name: Package shim
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$DIST/lib" "$DIST/include"
           cp shim/include/iroh_shim.h "$DIST/include/"
+          cp notices/THIRD_PARTY_NOTICES.md "$DIST/"
           case "${{ matrix.name }}" in
             macos-*)
               a=shim/target/aarch64-apple-darwin/release; x=shim/target/x86_64-apple-darwin/release
@@ -144,6 +174,22 @@ jobs:
           zig build -Dshim=dir -Dshim-dir="$DIST" -Dtarget=x86_64-macos.11.0 -Doptimize=ReleaseSafe -p out-x86_64
           file out-x86_64/bin/shim-echo
           if arch -x86_64 /usr/bin/true 2>/dev/null; then arch -x86_64 out-x86_64/bin/shim-echo selftest -n 200; else echo "Rosetta not available; link-only"; fi
+
+      # Same archive, through the build.zig.zon path that app builds use: serve dist/
+      # locally, pin it with shim/pin-release.sh, build with -Dshim=prebuilt.
+      - name: -Dshim=prebuilt from this archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          py=$(command -v python3 || command -v python)
+          "$py" -m http.server 8765 --bind 127.0.0.1 --directory dist >/dev/null 2>&1 &
+          srv=$!
+          trap 'kill $srv 2>/dev/null || true; git checkout -- build.zig.zon' EXIT
+          for i in $(seq 1 30); do curl -sf -o /dev/null "http://127.0.0.1:8765/iroh-shim-${{ matrix.name }}.tar.gz" && break; sleep 1; done
+          SHIM_TARGETS=${{ matrix.name }} shim/pin-release.sh --base-url http://127.0.0.1:8765
+          git diff build.zig.zon
+          zig build -Dshim=prebuilt -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -p out-prebuilt
+          out-prebuilt/bin/shim-echo selftest -n 200
 
       - name: Echo over n0 relays (informational)
         continue-on-error: true
@@ -194,6 +240,56 @@ jobs:
         run: |
           cd artifacts
           sha256sum *.tar.gz > SHA256SUMS
-          cat sizes-*.md > SIZES.md
+          {
+            echo "Pin this release for \`-Dshim=prebuilt\` with \`shim/pin-release.sh ${GITHUB_REF_NAME}\`."
+            echo "Each archive carries THIRD_PARTY_NOTICES.md (also attached)."
+            echo
+            cat sizes-*.md
+          } > NOTES.md
           gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" --notes-file SIZES.md *.tar.gz SHA256SUMS
+            --title "${GITHUB_REF_NAME}" --notes-file NOTES.md *.tar.gz SHA256SUMS THIRD_PARTY_NOTICES.md
+
+  # App-build path: no Rust, archives fetched by hash from build.zig.zon.
+  prebuilt:
+    name: prebuilt ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-22.04, zig_target: x86_64-linux-gnu }
+          - { name: linux-aarch64, os: ubuntu-22.04-arm, zig_target: aarch64-linux-gnu }
+          - { name: windows-x86_64, os: windows-2022, zig_target: x86_64-windows-msvc }
+          - { name: windows-aarch64, os: windows-11-arm, zig_target: aarch64-windows-msvc }
+          - { name: macos-universal, os: macos-15, zig_target: aarch64-macos.11.0 }
+    steps:
+      - uses: actions/checkout@v4
+      - id: pinned
+        shell: bash
+        run: |
+          if grep -q '^ *\.iroh_shim_' build.zig.zon; then echo "yes=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::build.zig.zon pins no shim release yet; skipping (run shim/pin-release.sh after tagging)"; fi
+      - uses: mlugg/setup-zig@v2
+        if: steps.pinned.outputs.yes && matrix.name != 'windows-aarch64'
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Zig (x86_64 under emulation)
+        if: steps.pinned.outputs.yes && matrix.name == 'windows-aarch64'
+        shell: bash
+        run: |
+          curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-windows-${ZIG_VERSION}.zip" -o "$RUNNER_TEMP/zig.zip"
+          unzip -q "$RUNNER_TEMP/zig.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-windows-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - name: Build and run echo (static)
+        if: steps.pinned.outputs.yes
+        shell: bash
+        run: |
+          if command -v cargo >/dev/null; then echo "cargo on PATH is not used by -Dshim=prebuilt"; fi
+          zig build -Dshim=prebuilt -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -p out-static
+          out-static/bin/shim-echo selftest -n 200
+      - name: Build and run echo (dynamic)
+        if: steps.pinned.outputs.yes
+        shell: bash
+        run: |
+          zig build -Dshim=prebuilt -Dshim-link=dynamic -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe -p out-dynamic
+          out-dynamic/bin/shim-echo selftest -n 200
