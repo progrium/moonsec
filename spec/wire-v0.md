@@ -125,13 +125,16 @@ repeated.
 
 | Offset | Size | Field | Meaning |
 | ---: | ---: | --- | --- |
-| 0 | 1 | `flags` | Bit 0 `recovery_needed`; others reserved. |
+| 0 | 1 | `flags` | Bit 0 `recovery_needed`; bit 1 `want_idr` (answer with an IDR, not an LTR refresh: the client has no keyframe yet, or an `ltr_refresh` frame failed to decode; only with `recovery_needed`); others reserved. |
 | 1 | 4 | `gap_frame` | First frame the client could not decode; must be 0 unless `recovery_needed`. |
 | 5 | 1 | `count` | Number of entries, 0–255. |
 | 6 | 12·count | entries | `frame_id u32`, `ltr_token u64` per decoded long-term reference. |
 
 No trailing bytes. On `recovery_needed` the host encodes its next frame against the newest
-acked long-term reference (`ltr_refresh`), or sends an IDR if it has none.
+acked long-term reference (`ltr_refresh`), or sends an IDR if it has none or `want_idr` is
+set. The client repeats the request if no recovery frame arrives within about RTT + 2 frames;
+the host treats repeats for a gap it answered less than about one RTT ago as copies in flight,
+and falls back to an IDR after repeated refreshes for the same gap (`core/recovery`).
 
 ### `control_fast` kind 2: transport-wide feedback (client → host)
 
@@ -154,6 +157,20 @@ cost about 230 bytes.
 
 A packet not reported as received in one message may be reported in a later one (late
 arrival); the host takes the latest report.
+
+### `control_fast` kind 3: NACK (client → host)
+
+Asks the host to resend video shards by `media_seq`. Defined in `core/media/nack.zig`.
+
+| Offset | Size | Field | Meaning |
+| ---: | ---: | --- | --- |
+| 0 | 6·n | entries | `base u32`, `mask u16` per entry, n ≥ 1. Names `media_seq` `base`, and `base+1+i` for each set bit `i` (LSB first). |
+
+A message whose length is not a positive multiple of 6 is invalid. The host resends each
+named shard it still holds and that is younger than its retransmit age limit, with the
+same shard header plus `flags.retransmit` and a new envelope `seq`; it ignores the rest.
+The client sends the first NACK for a gap after a reorder wait (adaptive, 1–5 ms by
+default) and repeats it every RTT plus slack while the shard's frame is still pending.
 
 ## Changes
 

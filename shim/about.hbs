@@ -1,0 +1,26 @@
+# Third-party notices for the moonsec iroh shim
+
+This archive contains the moonsec iroh shim, built from Rust crates by the authors
+listed below. Their licenses follow, grouped by license text.
+
+## Overview
+
+{{#each overview}}
+- {{{name}}} ({{count}})
+{{/each}}
+
+## Licenses
+{{#each licenses}}
+
+### {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- [{{crate.name}} {{crate.version}}]({{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}})
+{{/each}}
+
+```
+{{{text}}}
+```
+{{/each}}
