@@ -22,6 +22,9 @@ const pattern = api.pattern;
 
 const Micros = api.Micros;
 
+/// Replays a committed H.264/HEVC stream as an encoder (for real decoders; web/testdata).
+pub const fixture = @import("fixture.zig");
+
 /// Sleeps the calling thread. Null in virtual time, where nothing may block.
 pub const Sleeper = ?*const fn (ctx: ?*anyopaque, us: Micros) void;
 
@@ -889,4 +892,8 @@ test "audio source paces by the clock and the sink plays by it" {
     try testing.expectEqual(@as(usize, 0), sink.queued());
     try testing.expectEqual(@as(u64, 1), sink.stats.underruns);
     try testing.expectEqual(@as(u64, 720), sink.stats.underrun_frames);
+}
+
+test {
+    _ = fixture;
 }

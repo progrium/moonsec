@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "e2e": "npm run build && playwright test",
     "stub": "npm run build && node e2e/stub-host.mjs",
-    "safari": "npm run build && node e2e/safari.mjs"
+    "safari": "npm run build && node e2e/safari.mjs",
+    "media": "npm run build && node e2e/media-host.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",

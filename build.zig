@@ -330,10 +330,40 @@ pub fn build(b: *std.Build) void {
             if (b.args == null) run.addArgs(&.{ "sim", "--seconds", "10" });
             b.step("moonsec-sim", "Run the moonsec tool without the shim (sim, soak, run sim, pattern)").dependOn(&run.step);
             b.installArtifact(exe);
+            b.step("web-host", "Install zig-out/bin/moonsec-sim, the host the web client's tests stream from (web/README.md)").dependOn(&b.addInstallArtifact(exe, .{}).step);
             const soak = b.addRunArtifact(exe);
             soak.addArgs(if (b.args) |a| a else &.{ "soak", "--seconds", "3600" });
             b.step("soak", "One hour of streaming over the simulated LAN in virtual time (args override)").dependOn(&soak.step);
         }
+    }
+
+    // Web client media pipeline (web/README.md): the client session and the Opus stage for
+    // the browser (app/web.zig on wasm32-wasi), installed by `web-wasm` as
+    // zig-out/web/moonsec-client.wasm. The host its tests stream from is `web-host` below.
+    {
+        const web_opt = b.option(std.builtin.OptimizeMode, "web-optimize", "Optimize mode of the web client's wasm (default: ReleaseSafe)") orelse .ReleaseSafe;
+        const w_core = b.createModule(.{ .root_source_file = b.path("core/root.zig"), .target = wasm_wasi, .optimize = web_opt });
+        const w_platform = b.createModule(.{ .root_source_file = b.path("platform/api.zig"), .target = wasm_wasi, .optimize = web_opt, .imports = &.{.{ .name = "core", .module = w_core }} });
+        const w_pipe = b.createModule(.{ .root_source_file = b.path("transport/pipe.zig"), .target = wasm_wasi, .optimize = web_opt });
+        const w_opus = addOpus(b, wasm_wasi, web_opt);
+        const w_stage = b.createModule(.{ .root_source_file = b.path("codec/opus/stage.zig"), .target = wasm_wasi, .optimize = web_opt, .imports = &.{ .{ .name = "core", .module = w_core }, .{ .name = "opus", .module = w_opus.module } } });
+        const web_wasm = b.addExecutable(.{ .name = "moonsec-client", .root_module = b.createModule(.{
+            .root_source_file = b.path("app/web.zig"),
+            .target = wasm_wasi,
+            .optimize = web_opt,
+            .strip = true,
+            .imports = &.{
+                .{ .name = "core", .module = w_core },
+                .{ .name = "platform", .module = w_platform },
+                .{ .name = "pipe", .module = w_pipe },
+                .{ .name = "audio_stage", .module = w_stage },
+            },
+        }) });
+        web_wasm.entry = .disabled;
+        web_wasm.rdynamic = true;
+        web_wasm.wasi_exec_model = .reactor;
+        const install_wasm = b.addInstallArtifact(web_wasm, .{ .dest_dir = .{ .override = .{ .custom = "web" } } });
+        web_step.dependOn(&install_wasm.step);
     }
 
     // core/rate driving the simulated network with S11's metrics (sim/rate.zig).
