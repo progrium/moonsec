@@ -19,6 +19,7 @@ const gcc_mod = @import("gcc.zig");
 const Gcc = gcc_mod.Gcc;
 const TrainCap = @import("train.zig").TrainCap;
 const history = @import("history.zig");
+const proto = @import("../proto/root.zig");
 
 pub const Config = struct {
     gcc: gcc_mod.Config = .{},
@@ -54,6 +55,20 @@ pub const Telemetry = struct {
     jumps: u32,
     drain_giveups: u32,
 };
+
+/// The 64-bit sequence number nearest `ref` whose low 32 bits are `seq`.
+pub fn widen(ref: u64, seq: u32) u64 {
+    const lo: u32 = @truncate(ref);
+    const diff: i32 = @bitCast(seq -% lo);
+    const r = @as(i128, ref) + diff;
+    return if (r < 0) seq else @intCast(r);
+}
+
+test "widen" {
+    try std.testing.expectEqual(@as(u64, 5), widen(0, 5));
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0002), widen(0xffff_fff0, 2));
+    try std.testing.expectEqual(@as(u64, 0xffff_fff0), widen(0x1_0000_0002, 0xffff_fff0));
+}
 
 pub const Controller = struct {
     cfg: Config,
@@ -106,6 +121,25 @@ pub const Controller = struct {
             if (k == rest.len) break;
             rest = rest[k..];
         }
+    }
+
+    /// Feed a decoded transport-wide feedback message (`proto.Feedback`).
+    /// Its 32-bit sequence numbers are widened against the send history, so
+    /// `onSent` must be given the same transport sequence numbers, widened.
+    pub fn onFeedbackMsg(self: *Controller, now_us: i64, msg: proto.Feedback.View) void {
+        var buf: [256]history.Arrival = undefined;
+        var n: usize = 0;
+        var it = msg.iterator();
+        const ref = self.history.next_expected;
+        while (it.next()) |st| {
+            buf[n] = .{ .seq = widen(ref, st.seq), .recv_us = if (st.arrival_us) |a| @intCast(a) else PacketResult.lost };
+            n += 1;
+            if (n == buf.len) {
+                self.onArrivals(now_us, buf[0..n]);
+                n = 0;
+            }
+        }
+        if (n > 0) self.onArrivals(now_us, buf[0..n]);
     }
 
     /// Feed results already joined with the send records, in send order.

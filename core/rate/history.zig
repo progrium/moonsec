@@ -32,16 +32,20 @@ pub const SendHistory = struct {
     next_expected: u64 = 0,
     started: bool = false,
 
+    fn slot(seq: u64) usize {
+        return @intCast(seq % N);
+    }
+
     pub fn onSent(self: *SendHistory, seq: u64, send_us: i64, size: u32, frame: u32, frame_last: bool) void {
         if (!self.started) {
             self.started = true;
             self.next_expected = seq;
         }
-        self.ring[seq % N] = .{ .seq = seq, .send_us = send_us, .size = size, .frame = frame, .frame_last = frame_last };
+        self.ring[slot(seq)] = .{ .seq = seq, .send_us = send_us, .size = size, .frame = frame, .frame_last = frame_last };
     }
 
     fn result(self: *const SendHistory, seq: u64, recv_us: i64) ?PacketResult {
-        const e = self.ring[seq % N];
+        const e = self.ring[slot(seq)];
         if (e.seq != seq) return null;
         return .{ .seq = seq, .send_us = e.send_us, .recv_us = recv_us, .size = e.size, .frame = e.frame, .frame_last = e.frame_last };
     }

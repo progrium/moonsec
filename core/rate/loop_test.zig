@@ -141,3 +141,22 @@ test "app_share scales the encoder rate without spiralling down" {
     const tgt = at(s.items, 9_000_000).target;
     try std.testing.expect(tgt > 0.7 * 50e6);
 }
+
+test "proto feedback message drives the controller" {
+    const proto = @import("../proto/root.zig");
+    const gpa = std.testing.allocator;
+    const c = try gpa.create(Controller);
+    defer gpa.destroy(c);
+    c.reset(.{});
+    // 4 packets of one frame; the third is lost.
+    for (0..4) |i| c.onSent(i, @intCast(i * 100), 1200, 0, i == 3);
+    const arrivals = [_]?u64{ 1_000_000, 1_000_400, null, 1_001_200 };
+    var buf: [64]u8 = undefined;
+    var e = proto.wire.Encoder.init(&buf);
+    try (proto.Feedback{ .feedback_seq = 0, .base_seq = 0, .ref_time_us = 1_000_000, .arrivals = &arrivals }).encode(&e);
+    var d = proto.wire.Decoder.init(e.written());
+    c.onFeedbackMsg(50_000, try proto.Feedback.decode(&d));
+    try std.testing.expectEqual(@as(u64, 4), c.history.next_expected);
+    try std.testing.expectEqual(@as(u32, 1), c.gcc.win_lost);
+    try std.testing.expectEqual(@as(u32, 4), c.gcc.win_sent);
+}
