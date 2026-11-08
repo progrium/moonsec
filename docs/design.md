@@ -85,7 +85,7 @@ We use Rust iroh 1.x (pinned at 1.4.1) through a Rust shim that lives in the rep
 
 **What iroh carries**
 
-- Identity and pairing: endpoint ID = Ed25519 key; pairing adds a client key to the host allowlist via PIN or QR ticket.
+- Identity and pairing: endpoint ID = Ed25519 key; pairing adds a client key to the host allowlist via PIN or QR ticket, with an HMAC exchange bound to both endpoint IDs over a reliable stream ([spec/pairing-v0.md](../spec/pairing-v0.md)). Keys sit behind a `KeyStore` interface (file-backed now; DPAPI and Keychain later).
 - Discovery: DNS/pkarr and self-hosted relays; mDNS for LAN.
 - Control: reliable QUIC streams for session setup, clipboard, display config and file transfer.
 - Media: unreliable QUIC datagrams, tagged with stream IDs.
