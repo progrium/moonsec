@@ -1,4 +1,4 @@
-//! Zig binding for the moonsec iroh shim (shim/include/iroh_shim.h, ABI v0.1).
+//! Zig binding for the moonsec iroh shim (shim/include/iroh_shim.h, ABI v0.2).
 //! Thin, allocation-free wrapper: Zig owns every buffer passed to the shim.
 //! Tests: transport/iroh_test.zig (loopback) and transport/iroh_netns_test.zig (Linux netns).
 const std = @import("std");
@@ -85,6 +85,7 @@ pub const BindOptions = struct {
     /// AppRate burst credit, us (null = default 20 ms, 0 = none).
     burst_us: ?u32 = null,
     /// Selected-path stall that raises `.no_ack_progress`, ms (null = default 150, 0 = off).
+    /// The shim never uses less than 1.5 x the path's RTT + 25 ms.
     no_ack_progress_ms: ?u32 = null,
     /// Extra trusted roots (PEM text) for relay TLS, on top of the built-in web roots: the
     /// private CA of a self-hosted relay (relay/lab-cert.sh). null = built-in roots only.
@@ -120,6 +121,11 @@ pub const Endpoint = struct {
 
     pub fn deinit(self: Endpoint) void {
         c.iroh_endpoint_free(self.handle);
+    }
+
+    /// The local network changed: iroh re-runs its net report and tries new paths now.
+    pub fn networkChange(self: Endpoint) void {
+        _ = c.iroh_endpoint_network_change(self.handle);
     }
 
     /// Wait until the endpoint has registered with its home relay.

@@ -10,6 +10,8 @@ a session, and a `PacketPipe`, wired into the pipeline.
 | [apps.zig](apps.zig) | `HostApp`/`ClientApp`: `tick()` runs every stage on one thread without blocking (virtual time); `runThreaded()` gives capture+encode or decode+present its own thread next to the network thread. |
 | [wire.zig](wire.zig) | Session messages (spec/wire-v0.md, "session"). |
 | [simrun.zig](simrun.zig) | Both apps with the synthetic backend over the in-process sim, in virtual time. |
+| [pathsim.zig](pathsim.zig) | Scripted path flaps (direct <-> relay) and connection drops over the sim, for the session tests. |
+| [pathlog.zig](pathlog.zig) | The sessions' path log. |
 | [main.zig](main.zig) | The `moonsec` tool. |
 | [pairing.zig](pairing.zig) | Pairing on a device: the state directory, and the pairing exchange and session admission over any reliable stream ([spec/pairing-v0.md](../spec/pairing-v0.md)). |
 | [keystore.zig](keystore.zig) | `KeyStore` interface for the device key; file-backed store (0600) and an in-memory one. |
@@ -71,6 +73,33 @@ from the network stage, and the client renders from the jitter buffer into the s
 about one frame queued. The synthetic backend plays a 440/660 Hz stereo tone; runs report what
 the buffer did (decoded, FEC, RS rebuilt, concealed, late) and sink underruns, and the sim runs
 fail if under 95% of the audio frames play, the sink runs dry, or it plays mostly silence.
+
+## Path changes and drops
+
+The pipe reports the selected path (`PathStats.path_epoch`, `relayed`), whether it is
+`stalled` (the shim's no-ack-progress signal) and, for a reconnecting pipe, `conn_epoch`.
+Over iroh, `IrohLink` ([transport/iroh_pipe.zig](../transport/iroh_pipe.zig)) is that pipe:
+the client redials when its connection closes or when the session asks, keeping the old
+connection until the new one is up; the host accepts in the background and moves to a new
+connection once it delivers.
+
+- **Stall**: the host stops sending video (the frames would only be lost, or wait behind the
+  dead path), and when acks resume or the path changes, the next frame is a recovery frame
+  (LTR refresh, else IDR). A stall within 250 ms of a path change is ignored.
+- **Path change**: the rate controller restarts its delay and capacity estimates for the new
+  path (`Controller.onPathChange`); the shim has already moved the pacing target.
+- **New connection**: the host sets the pacing rate again and sends a recovery frame; the
+  client says hello until it hears from the host.
+- **Drop**: with a pipe that can reconnect, the client asks for a new connection after 2 s
+  without a datagram (`reconnect_after_us`, again every 2 s), and both sides wait up to 60 s
+  (`reconnect_timeout_us`) instead of the 5 s peer timeout.
+
+Each session keeps a short path log (stalls, path changes, reconnects) and prints it with
+its report. `moonsec sim --flaps 2000:1500 --idle-ms 300` and `--drops 2000:1000` script the
+same events over the simulated network ([pathsim.zig](pathsim.zig)); the netns lab
+([tools/netlab](../tools/netlab/README.md)) runs them over iroh through two NATs.
+
+A host process that restarts is a new session; the client does not detect that yet.
 
 ## Not yet
 
