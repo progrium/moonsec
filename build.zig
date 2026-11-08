@@ -221,14 +221,18 @@ pub fn build(b: *std.Build) void {
     const check_win = b.step("check-win", "Cross-compile the Windows platform tests for x86_64 and aarch64 Windows");
     for ([_]std.Target.Cpu.Arch{ .x86_64, .aarch64 }) |arch| {
         const wt = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .windows, .abi = .gnu });
-        const t = b.addTest(.{ .name = b.fmt("win-test-{s}", .{@tagName(arch)}), .root_module = windowsTestModule(b, wt, optimize) });
-        // Install (not just compile) so the link step runs and catches missing import libs/IIDs.
-        check_win.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "win-test" } } }).step);
+        for (windowsTests(b, wt, optimize)) |m| {
+            const t = b.addTest(.{ .name = b.fmt("{s}-{s}", .{ m.name, @tagName(arch) }), .root_module = m.module });
+            // Install (not just compile) so the link step runs and catches missing import libs/IIDs.
+            check_win.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "win-test" } } }).step);
+        }
     }
     const test_win = b.step("test-win", "Run the Windows platform tests (Windows host; WARP and software paths run without a GPU)");
     if (target.result.os.tag == .windows) {
-        const t = b.addTest(.{ .name = "win-test", .root_module = windowsTestModule(b, target, optimize) });
-        test_win.dependOn(&b.addRunArtifact(t).step);
+        for (windowsTests(b, target, optimize)) |m| {
+            const t = b.addTest(.{ .name = m.name, .root_module = m.module });
+            test_win.dependOn(&b.addRunArtifact(t).step);
+        }
     } else {
         test_win.dependOn(&b.addFail("test-win needs a Windows host; use check-win to cross-compile").step);
     }
@@ -270,13 +274,56 @@ pub fn windowsModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     return m;
 }
 
-fn windowsTestModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    return b.createModule(.{
+/// The Windows host backend (platform/host/windows): Desktop Duplication, NVENC and
+/// Media Foundation encoders, WASAPI loopback, SendInput. Imported as "win_host";
+/// `openHost` returns a platform.HostBackend.
+pub fn windowsHostModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, win: *std.Build.Module) *std.Build.Module {
+    const m = b.createModule(.{
+        .root_source_file = b.path("platform/host/windows/host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "win", .module = win },
+            .{ .name = "platform", .module = b.modules.get("platform").? },
+            .{ .name = "core", .module = b.modules.get("core").? },
+            .{ .name = "host_win_c", .module = translatePlatformHeader(b, target, optimize, "platform/host/windows/host_win.h") },
+        },
+    });
+    m.addIncludePath(b.path("third_party/nvenc"));
+    addWindowsC(b, m, &.{
+        "platform/host/windows/capture.c",
+        "platform/host/windows/enc.c",
+        "platform/host/windows/enc_mf.c",
+        "platform/host/windows/enc_nvenc.c",
+        "platform/host/windows/audio.c",
+        "platform/host/windows/input.c",
+    }, &.{ "user32", "mfplat", "mf", "mfuuid", "oleaut32", "avrt" });
+    return m;
+}
+
+const NamedModule = struct { name: []const u8, module: *std.Build.Module };
+
+fn windowsTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) []const NamedModule {
+    const win = windowsModule(b, target, optimize);
+    const host = windowsHostModule(b, target, optimize, win);
+    const list = b.allocator.alloc(NamedModule, 2) catch @panic("OOM");
+    list[0] = .{ .name = "win-test", .module = b.createModule(.{
         .root_source_file = b.path("platform/windows/test.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "win", .module = windowsModule(b, target, optimize) }},
-    });
+        .imports = &.{.{ .name = "win", .module = win }},
+    }) };
+    list[1] = .{ .name = "win-host-test", .module = b.createModule(.{
+        .root_source_file = b.path("platform/host/windows/test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "win", .module = win },
+            .{ .name = "host", .module = host },
+            .{ .name = "platform", .module = b.modules.get("platform").? },
+        },
+    }) };
+    return list;
 }
 
 const Shim = struct {

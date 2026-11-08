@@ -27,6 +27,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Windows platform tests
+        # Fail instead of skipping for what this runner has: Media Foundation's software
+        # H.264 encoder and an interactive desktop for SendInput. Desktop Duplication,
+        # NVENC and loopback audio need hardware the runner lacks and skip.
+        env:
+          MOONSEC_REQUIRE: mf,input
         run: zig build test-win --summary all
 
   cross:

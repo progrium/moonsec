@@ -187,3 +187,74 @@ done:
     MSW_RELEASE(rt);
     return hr;
 }
+
+msw_hr msw_texture_create(msw_d3d *d, uint32_t w, uint32_t h, uint32_t bgra, void **out_texture) {
+    *out_texture = NULL;
+    D3D11_TEXTURE2D_DESC td = {0};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    ID3D11Texture2D *t = NULL;
+    HRESULT hr = ID3D11Device_CreateTexture2D(d->device, &td, NULL, &t);
+    if (FAILED(hr)) return hr;
+    hr = msw_texture_fill(d, t, 0, 0, w, h, bgra);
+    if (FAILED(hr)) {
+        MSW_RELEASE(t);
+        return hr;
+    }
+    *out_texture = t;
+    return S_OK;
+}
+
+void msw_texture_release(void *texture) {
+    ID3D11Texture2D *t = (ID3D11Texture2D *)texture;
+    MSW_RELEASE(t);
+}
+
+msw_hr msw_texture_fill(msw_d3d *d, void *texture, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t bgra) {
+    ID3D11Texture2D *t = (ID3D11Texture2D *)texture;
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D_GetDesc(t, &td);
+    if (x >= td.Width || y >= td.Height) return E_INVALIDARG;
+    if (w > td.Width - x) w = td.Width - x;
+    if (h > td.Height - y) h = td.Height - y;
+    uint32_t *row = (uint32_t *)malloc((size_t)w * 4);
+    if (!row) return E_OUTOFMEMORY;
+    for (uint32_t i = 0; i < w; i++) row[i] = bgra;
+    for (uint32_t r = 0; r < h; r++) {
+        D3D11_BOX box = {x, y + r, 0, x + w, y + r + 1, 1};
+        ID3D11DeviceContext_UpdateSubresource(d->context, (ID3D11Resource *)t, 0, &box, row, w * 4, 0);
+    }
+    free(row);
+    return S_OK;
+}
+
+msw_hr msw_texture_read(msw_d3d *d, void *texture, uint32_t index, uint8_t *dst, uint32_t stride) {
+    ID3D11Texture2D *t = (ID3D11Texture2D *)texture, *staging = NULL;
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D_GetDesc(t, &td);
+    uint32_t w = td.Width, h = td.Height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    HRESULT hr;
+    MSW_TRY(ID3D11Device_CreateTexture2D(d->device, &td, NULL, &staging), done);
+    ID3D11DeviceContext_CopySubresourceRegion(d->context, (ID3D11Resource *)staging, 0, 0, 0, 0,
+                                              (ID3D11Resource *)t, index, NULL);
+    D3D11_MAPPED_SUBRESOURCE m;
+    MSW_TRY(ID3D11DeviceContext_Map(d->context, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m), done);
+    for (uint32_t r = 0; r < h; r++) memcpy(dst + (size_t)r * stride, (const uint8_t *)m.pData + (size_t)r * m.RowPitch, (size_t)w * 4);
+    ID3D11DeviceContext_Unmap(d->context, (ID3D11Resource *)staging, 0);
+done:
+    MSW_RELEASE(staging);
+    return hr;
+}
