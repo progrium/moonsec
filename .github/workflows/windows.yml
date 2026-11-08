@@ -49,6 +49,38 @@ jobs:
           name: moonsec-idd-x64
           path: platform/windows/idd/out/package-x64
           if-no-files-found: error
+      # Experimental: install the test-signed package on the runner (trusting its
+      # certificate; test-signing mode is off and needs a reboot, so Windows may refuse)
+      # and run the virtual display tests. Neither step fails the job; the summary says
+      # how far it got. The real check is on a GPU machine (platform/windows/idd/README.md).
+      - name: Try installing the driver on the runner
+        id: install
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          ./platform/windows/idd/out/package-x64/install.ps1
+          pnputil /enum-drivers | Select-String -Context 0,6 moonsecidd
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Virtual display tests on the runner
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          zig build test-win --summary all 2>&1 | tee idd-test.log
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          touch idd-test.log
+          {
+            echo '### Virtual display driver on the windows-2022 runner'
+            echo "install: ${{ steps.install.outcome }}"
+            echo '```'
+            grep -E 'virtual display|skip idd|active as|idd' idd-test.log | head -40 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   cross:
     name: cross-compile (ubuntu-24.04)
