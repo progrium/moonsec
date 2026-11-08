@@ -134,6 +134,9 @@ enum Cmd {
         /// AppRate target in Mbit/s of QUIC payload; default is 1.05x the offered load.
         #[arg(long)]
         target_mbps: Option<f64>,
+        /// AppRate burst credit in microseconds at the target rate (0 = noq's ~2 ms bucket).
+        #[arg(long, default_value_t = 0)]
+        burst_us: u64,
         /// Seconds of warm-up traffic at the target rate before measured traffic starts.
         #[arg(long, default_value_t = 2.0)]
         warmup: f64,
@@ -314,6 +317,7 @@ async fn run_send(
     warmup: f64,
     cc: String,
     target_mbps: Option<f64>,
+    burst_us: u64,
 ) -> Result<()> {
     let factory = match cc.as_str() {
         "cubic" => None,
@@ -322,6 +326,7 @@ async fn run_send(
             // The knob paces QUIC packet bytes; scale payload Mbit/s by the ~30 B/datagram overhead.
             let t = target_mbps.unwrap_or(a.mbps * 1.05) * 1e6 * (a.size as f64 + 30.0) / a.size as f64;
             knob.set_target_bps(t as u64);
+            knob.burst_us.store(burst_us, Ordering::Relaxed);
             Some(apprate::AppRateFactory::new(knob))
         }
         other => bail!("unknown cc {other}"),
@@ -379,6 +384,7 @@ async fn run_send(
         "max_datagram": max,
         "cc": cc,
         "cc_paths_built": factory.as_ref().map(|f| f.built_count()),
+        "burst_us": burst_us,
         "conn": conn_summary(&conn),
     });
     std::fs::write(&a.out, serde_json::to_string_pretty(&j)?)?;
@@ -517,7 +523,7 @@ fn main() -> Result<()> {
             rt.block_on(async move {
                 match cmd {
                     Cmd::Recv { bind, seed, csv, out, rbuf } => run_recv(bind, seed, csv, out, rbuf).await,
-                    Cmd::Send { a, bind, seed, mode, sbuf, warmup, cc, target_mbps } => run_send(a, bind, seed, mode, sbuf, warmup, cc, target_mbps).await,
+                    Cmd::Send { a, bind, seed, mode, sbuf, warmup, cc, target_mbps, burst_us } => run_send(a, bind, seed, mode, sbuf, warmup, cc, target_mbps, burst_us).await,
                     _ => unreachable!(),
                 }
             })
