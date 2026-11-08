@@ -15,6 +15,14 @@
 //! relay mode (no FEC, caps for the rate ladder) on relayed paths. `lossDecision` is the
 //! current choice. Off, every NACK is answered and no parity is sent (Phase 2).
 //!
+//! Path changes and drops (Phase 3): when the pipe reports the selected path stalled (no
+//! ack progress), video stops going out, since it would only be lost or queue up stale
+//! behind a dead path; when acks resume or the path changes, the next frame is a recovery
+//! frame. A path change also restarts the rate controller's delay and capacity estimates,
+//! and a new connection (a reconnecting pipe's `conn_epoch`) gets the pacing rate again.
+//! With a pipe that can reconnect, silence ends the session only after
+//! `reconnect_timeout_us`, so the client has time to come back.
+//!
 //! Phase 2 runs at a fixed encoder bitrate. The rate controller still runs on the client's
 //! feedback for pacing and the overlay: the pipe paces at its rate, but never below
 //! `pace_floor` × the bitrate, so a frame always leaves faster than the encoder makes it.
@@ -23,6 +31,7 @@ const core = @import("core");
 const api = @import("platform");
 const pipe_mod = @import("pipe");
 const wire = @import("wire.zig");
+const pathlog = @import("pathlog.zig");
 
 const proto = core.proto;
 const media = core.media;
@@ -58,6 +67,14 @@ pub const Config = struct {
     policy: media.policy.Config = .{},
     /// End the session when nothing arrives from the client for this long.
     peer_timeout_us: Micros = 5_000_000,
+    /// ...or this long when the pipe can reconnect (the client redials after a drop).
+    reconnect_timeout_us: Micros = 60_000_000,
+    /// Hold video while the pipe reports the selected path stalled, and send a recovery
+    /// frame when it recovers (see the file comment).
+    pause_on_stall: bool = true,
+    /// A stall reported this soon after a path change is the new path's backlog of probes
+    /// and keep-alives (S5c lab: ~90 ms after a switch to the relay), not a dead path.
+    stall_grace_us: Micros = 250_000,
     /// Byes sent when leaving, `bye_interval_us` apart.
     byes: u8 = 3,
     bye_interval_us: Micros = 20_000,
@@ -87,6 +104,14 @@ pub const Stats = struct {
     inputs_applied: u64 = 0,
     hellos: u64 = 0,
     sessions: u64 = 0,
+    /// The pipe's selected path changed / its connection was replaced.
+    path_changes: u64 = 0,
+    reconnects: u64 = 0,
+    /// Times video was held for a stalled path, and the frames not sent meanwhile.
+    stall_pauses: u64 = 0,
+    stall_frames: u64 = 0,
+    /// Longest hold, us.
+    stall_longest_us: Micros = 0,
     malformed: u64 = 0,
     unknown: u64 = 0,
 };
@@ -113,6 +138,15 @@ pub const HostSession = struct {
     last_pacing: u64 = 0,
     /// Host minus client clock, from the client's reports.
     offset: ?Micros = null,
+
+    /// Path and connection the pipe last reported (null until the first stats).
+    path_epoch: ?u32 = null,
+    conn_epoch: u32 = 0,
+    /// Video held for a stalled path since this time; the first frame not sent.
+    paused_at: ?Micros = null,
+    paused_from: ?u32 = null,
+    log: pathlog.Log = .{},
+    path_changed_at: ?Micros = null,
 
     packetizer: media.Packetizer = .{},
     parity_buf: *media.ParityBuffer,
@@ -234,6 +268,7 @@ pub const HostSession = struct {
         }
         if (s.state == .ended) return;
         s.path = s.pipe.stats();
+        s.onPathState(now);
         if (s.byes_left > 0 and now >= s.next_bye) {
             s.sendOther(.control_fast, @intFromEnum(wire.Kind.bye), &.{@intFromEnum(wire.ByeReason.done)}, now);
             s.byes_left -= 1;
@@ -241,8 +276,66 @@ pub const HostSession = struct {
             if (s.byes_left == 0) return s.finish(.closed, "closed");
         }
         if (s.state == .streaming) if (s.last_rx_us) |t| {
-            if (now - t > s.cfg.peer_timeout_us) return s.finish(.peer_timeout, "no datagrams from the client");
+            const limit = if (s.pipe.canReconnect()) s.cfg.reconnect_timeout_us else s.cfg.peer_timeout_us;
+            if (now - t > limit) return s.finish(.peer_timeout, "no datagrams from the client");
         };
+    }
+
+    /// React to what the pipe reports about its path: a new connection, a new path, a stall.
+    fn onPathState(s: *HostSession, now: Micros) void {
+        const p = s.path;
+        const last = s.path_epoch orelse {
+            s.path_epoch = p.path_epoch;
+            s.conn_epoch = p.conn_epoch;
+            s.log.start = now;
+            return;
+        };
+        if (p.conn_epoch != s.conn_epoch) {
+            // A new connection: what was in flight on the old one is gone, and it paces
+            // from scratch. Start the new path's estimates and send a recovery frame.
+            s.conn_epoch = p.conn_epoch;
+            s.path_epoch = p.path_epoch;
+            s.stats.reconnects += 1;
+            s.path_changed_at = now;
+            s.log.add(now, .reconnect, p.relayed);
+            s.ctl.onPathChange();
+            s.last_pacing = 0;
+            s.applyPacing();
+            s.resumeVideo(now, true);
+        } else if (p.path_epoch != last) {
+            s.path_epoch = p.path_epoch;
+            s.stats.path_changes += 1;
+            s.path_changed_at = now;
+            s.log.add(now, .path, p.relayed);
+            s.ctl.onPathChange();
+            // A path closed under a stall: what we sent since is lost.
+            if (s.paused_at != null) s.resumeVideo(now, false);
+        }
+        if (!s.cfg.pause_on_stall) return;
+        const settling = if (s.path_changed_at) |t| now - t < s.cfg.stall_grace_us else false;
+        if (p.stalled and !settling and s.paused_at == null and s.state == .streaming) {
+            s.paused_at = now;
+            s.paused_from = null;
+            s.stats.stall_pauses += 1;
+            s.log.add(now, .stall, p.relayed);
+        } else if (!p.stalled and s.paused_at != null) {
+            s.resumeVideo(now, false);
+            s.log.add(now, .resume_, p.relayed);
+        }
+    }
+
+    /// Send video again; the frames held (or, with `lost_in_flight`, any recent frame) are
+    /// missing at the client, so the next frame repairs the picture: an LTR refresh when
+    /// the client has acked a reference, else an IDR.
+    fn resumeVideo(s: *HostSession, now: Micros, lost_in_flight: bool) void {
+        if (s.paused_at) |t| s.stats.stall_longest_us = @max(s.stats.stall_longest_us, now - t);
+        const held = s.paused_from != null;
+        s.paused_at = null;
+        s.paused_from = null;
+        // Ask for the frame after the last one emitted: a recovery frame emitted while held
+        // never left, so it must not count as one in flight.
+        if ((held or lost_in_flight) and s.state == .streaming and s.next_frame_id > 0)
+            s.rec.onRecoveryRequest(.{ .first_missing = s.next_frame_id, .want_idr = false });
     }
 
     pub fn nextWake(s: *const HostSession, now: Micros) Micros {
@@ -404,6 +497,16 @@ pub const HostSession = struct {
         const cap: u64 = @bitCast(cf.captured_us);
         const enc: u64 = @bitCast(@max(ef.encoded_us, cf.captured_us));
         const n: u8 = @intCast(ef.slices.len);
+        if (s.paused_at != null) {
+            // The path is stalled: the frame counts as sent and lost, and the recovery
+            // frame on resume repairs it.
+            if (s.paused_from == null) s.paused_from = id;
+            s.stats.stall_frames += 1;
+            s.stats.frames += 1;
+            if (flags.keyframe) s.stats.keyframes += 1;
+            if (flags.refresh) s.stats.refreshes += 1;
+            return;
+        }
         if (s.cfg.loss_policy) {
             s.decision = s.policy.update(@intCast(now), .{
                 .rtt_us = @intCast(@max(s.path.rtt_us, 0)),
@@ -485,10 +588,13 @@ pub const HostSession = struct {
         try w.print("  frames {d} (keyframes {d}, refreshes {d}, repeats {d}, encoder drops {d}), {d} MB in {d} shards\n", .{ st.frames, st.keyframes, st.refreshes, st.repeats, st.encode_drops, st.bytes / 1_000_000, st.shards });
         if (s.decision) |d| try w.print("  loss policy: {s}, loss {d:.2}%, FEC overhead {d:.0}%, {d} parity shards, {d} NACKs ignored, {d} mode switches\n", .{ @tagName(d.mode), d.loss * 100, d.overhead * 100, st.parity_shards, st.nacks_ignored, s.policy.switches });
         try w.print("  NACKs {d} -> retransmits {d}; feedback {d}; frame acks {d} (recovery requests {d}); pings {d}; inputs {d}\n", .{ st.nacks, st.retransmits, st.feedback, st.frame_acks, st.recovery_requests, st.pings, st.inputs_applied });
+        if (st.path_changes + st.reconnects + st.stall_pauses > 0)
+            try w.print("  path changes {d}, reconnects {d}; stalls {d} ({d} frames held, longest {d:.0} ms)\n", .{ st.path_changes, st.reconnects, st.stall_pauses, st.stall_frames, ms(st.stall_longest_us) });
         const snap = s.tele.snapshot();
         try printStage(w, "capture", snap.stage(.capture));
         try printStage(w, "encode", snap.stage(.encode));
         try printStage(w, "input", snap.stage(.input));
+        try s.log.print(w, "host");
         const p = s.path;
         try w.print("  pipe: rtt {d} us, pacing {d} kbit/s, sent {d}, send drops {d}{s}\n", .{ p.rtt_us, p.pacing_bps / 1000, p.sent, p.send_drops, if (p.relayed) ", relayed" else "" });
     }

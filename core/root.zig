@@ -28,6 +28,9 @@ pub const input = @import("input/root.zig");
 /// Host/client clock offset and skew from round trips.
 pub const clock = @import("clock/root.zig");
 
+/// Pairing: identity, tickets, PIN/QR, the paired-device list and the pairing exchange.
+pub const pair = @import("pair/root.zig");
+
 /// Per-frame stage timing and rolling stats for the latency overlay.
 pub const telemetry = @import("telemetry/root.zig");
 

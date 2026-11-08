@@ -1,0 +1,22 @@
+# iroh-relay 1.4.1 config for the lab: the same shape as iroh-relay.toml (HTTPS, QUIC address
+# discovery, client limits) but with a manual cert from relay/lab-cert.sh, unprivileged ports and
+# IPv4 binds (some CI hosts have no IPv6). The relay reads default.crt and default.key from its
+# working directory. Clients use https://<addr>:3443 and trust the lab CA (relay_ca_pem).
+# The netns tests (transport/iroh_netns_test.zig) run the relay with this file.
+
+http_bind_addr = "0.0.0.0:3340"
+enable_quic_addr_discovery = true
+key_cache_capacity = 1024
+enable_metrics = true
+metrics_bind_addr = "127.0.0.1:9091"
+
+[tls]
+cert_mode = "Manual"
+https_bind_addr = "0.0.0.0:3443"
+quic_bind_addr = "0.0.0.0:7842"
+
+[limits.client.rx]
+bytes_per_second = 6250000 # 50 Mbit/s
+max_burst_bytes = 1048576
+
+access = "everyone"

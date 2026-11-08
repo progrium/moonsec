@@ -1,4 +1,4 @@
-/* moonsec iroh shim C ABI (v0.1).
+/* moonsec iroh shim C ABI (v0.2).
  * Status codes: 0 = ok, negative = error; iroh_last_error() has the message (thread-local).
  * The caller owns all buffers. Handles are opaque and freed with their *_free call.
  * See shim/README.md for the design behind each call. */
@@ -54,12 +54,14 @@ typedef struct IrohBindOpts {
     size_t datagram_send_buffer;   /* bytes, default 1 MiB; must hold the largest frame (S10) */
     size_t datagram_recv_buffer;   /* bytes, default 2 MiB (QUIC's receive buffer) */
     uint32_t recv_queue_len;       /* datagrams the shim queues for the caller, default 4096 */
-    uint32_t path_idle_timeout_ms; /* default 300 (S5); S5b's question is open */
+    uint32_t path_idle_timeout_ms; /* default 300 (S5); the S5c decision is open */
     uint32_t path_keepalive_ms;    /* default 100; must be below the idle timeout */
     uint32_t conn_idle_timeout_ms; /* default: iroh's */
     uint64_t initial_target_bps;   /* default 0 = unpaced until iroh_conn_set_target_bitrate */
     uint32_t burst_us;             /* AppRate burst credit, default 20000; IROH_BURST_OFF = none */
     uint32_t no_ack_progress_ms;   /* stall that raises IROH_EV_NO_ACK_PROGRESS, default 150 */
+    const char *relay_ca_pem;      /* extra trusted roots (PEM) for relay TLS, e.g. a self-hosted
+                                      relay's private CA; NULL = built-in web roots only */
 } IrohBindOpts;
 
 typedef struct IrohEvent {
@@ -95,7 +97,7 @@ typedef struct IrohConnStats {
     uint32_t selected_path;         /* or IROH_PATH_NONE */
     uint32_t path_count;
     uint32_t closed;
-    uint32_t _pad;
+    uint32_t path_selections;       /* PATH_SELECTED events so far */
 } IrohConnStats;
 
 typedef struct IrohPathStats {
@@ -140,6 +142,8 @@ int32_t iroh_endpoint_ticket(const IrohEndpoint *ep, char *buf, size_t cap, size
 int32_t iroh_endpoint_connect(const IrohEndpoint *ep, const char *ticket, const uint8_t *alpn,
                               size_t alpn_len, uint32_t timeout_ms, IrohConn **out);
 int32_t iroh_endpoint_accept(const IrohEndpoint *ep, uint32_t timeout_ms, IrohConn **out);
+/* The local network changed: re-run iroh's net report and try new paths now. */
+int32_t iroh_endpoint_network_change(const IrohEndpoint *ep);
 void iroh_endpoint_free(IrohEndpoint *ep);
 
 /* --- Datagrams ---

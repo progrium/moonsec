@@ -156,6 +156,15 @@ pub const Controller = struct {
         }
     }
 
+    /// The transport switched paths (direct <-> relay) or connections. Delay and capacity
+    /// estimates start over on the new path; the target and the send history stay, so
+    /// feedback for packets sent before the switch still joins (lost ones count as lost).
+    pub fn onPathChange(self: *Controller) void {
+        self.gcc.onPathChange();
+        self.train = .{};
+        self.capacity = null;
+    }
+
     /// The rate the path can take from us, bits per second.
     pub fn targetBps(self: *const Controller) f64 {
         return self.gcc.target();
@@ -203,3 +212,21 @@ pub const Controller = struct {
         };
     }
 };
+
+test "onPathChange keeps the target and drops the path estimates" {
+    // About 1.9 MB: on the heap, not a test thread's stack.
+    const c = try std.testing.allocator.create(Controller);
+    defer std.testing.allocator.destroy(c);
+    c.reset(.{});
+    c.gcc.bitrate = 7e6;
+    c.capacity = 40e6;
+    c.gcc.link_cap = 30_000;
+    c.gcc.smoothed = 3;
+    c.gcc.num_deltas = 50;
+    c.onPathChange();
+    try std.testing.expectEqual(@as(f64, 7e6), c.targetBps());
+    try std.testing.expectEqual(@as(?f64, null), c.capacityBps());
+    try std.testing.expectEqual(@as(?f64, null), c.gcc.link_cap);
+    try std.testing.expectEqual(@as(u32, 0), c.gcc.num_deltas);
+    try std.testing.expectEqual(@as(f64, 2.5 * 7e6), c.pacingBps());
+}

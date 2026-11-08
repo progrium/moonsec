@@ -174,6 +174,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const netns_step = b.step("netns-test", "Install the Linux netns shim tests (run zig-out/bin/iroh-netns-test as root)");
+    // The netns lab (tools/netlab): a userspace delay line for kernels without netem.
+    const delayline = b.addExecutable(.{ .name = "delayline", .root_module = b.createModule(.{ .root_source_file = b.path("tools/netlab/delayline.zig"), .target = target, .optimize = optimize }) });
+    b.step("delayline", "Install zig-out/bin/delayline (Linux; the netns lab's delay line)").dependOn(&b.addInstallArtifact(delayline, .{}).step);
     netns_step.dependOn(&b.addInstallArtifact(netns_tests, .{}).step);
     netns_step.dependOn(b.getInstallStep());
 
@@ -286,6 +289,14 @@ pub fn build(b: *std.Build) void {
             const run_all = b.addRunArtifact(exe);
             run_all.addArgs(&.{ "run", "all", "--seconds", "8" });
             b.top_level_steps.get("test-shim").?.step.dependOn(&run_all.step);
+            // Pairing (QR ticket, PIN) and session admission, end to end over iroh.
+            const run_pair = b.addRunArtifact(exe);
+            run_pair.addArgs(&.{ "run", "pair", "--seconds", "3" });
+            run_pair.step.dependOn(&run_all.step); // one loopback run at a time
+            b.top_level_steps.get("test-shim").?.step.dependOn(&run_pair.step);
+            const run_pair_only = b.addRunArtifact(exe);
+            run_pair_only.addArgs(&.{ "run", "pair", "--seconds", "3" });
+            b.step("test-pair", "Pairing and admission end to end over iroh on loopback (builds the shim)").dependOn(&run_pair_only.step);
         } else {
             if (b.args == null) run.addArgs(&.{ "sim", "--seconds", "10" });
             b.step("moonsec-sim", "Run the moonsec tool without the shim (sim, soak, run sim, pattern)").dependOn(&run.step);
