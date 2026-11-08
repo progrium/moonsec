@@ -1,0 +1,5 @@
+plan=sweep
+cfg=300:100
+pps=200
+t_connect=1794101666.553620
+first_direct=1794101666.866067
