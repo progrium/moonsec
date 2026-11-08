@@ -6,9 +6,8 @@ name: relay
 # started to check that it parses and binds 80/443/7842 as non-root; ACME points at a dead URL
 # so CI never talks to Let's Encrypt.
 
+# Automatic triggers are off (turned off on request); run it from the Actions tab.
 on:
-  push:
-    branches: ["**"]
   workflow_dispatch:
 
 permissions:

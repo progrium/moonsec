@@ -6,9 +6,8 @@ name: soak
 # 200 ms), lost or reordered input, or a frame that does not check out. Takes about
 # five minutes. The shorter soak runs on every push in sim.yml.
 
+# Automatic triggers are off (turned off on request); run it from the Actions tab.
 on:
-  schedule:
-    - cron: "17 6 * * *"
   workflow_dispatch:
     inputs:
       seconds:
