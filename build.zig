@@ -28,6 +28,16 @@ pub fn build(b: *std.Build) void {
     const core_tests = b.addTest(.{ .root_module = core_mod });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
+    // Platform interface (platform/api.zig): what each OS backend implements for the
+    // host and client apps. Pure Zig; backends live under platform/<os>/.
+    const platform_mod = b.addModule("platform", .{
+        .root_source_file = b.path("platform/api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core_mod }},
+    });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = platform_mod })).step);
+
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
     const pipe_mod = b.addModule("pipe", .{ .root_source_file = b.path("transport/pipe.zig"), .target = target, .optimize = optimize });
@@ -235,6 +245,70 @@ pub fn build(b: *std.Build) void {
     const run_sim_rate = b.addRunArtifact(sim_rate);
     if (b.args) |a| run_sim_rate.addArgs(a);
     b.step("sim-rate", "Run core/rate over the S11 scenarios and print S11's metrics").dependOn(&run_sim_rate.step);
+
+    // Windows platform (platform/windows): COM/D3D11/DXGI code in small C files compiled
+    // by zig cc against Zig's bundled mingw-w64 headers; Zig sees only msw.h's C ABI.
+    // `check-win` cross-compiles the Windows tests from any host; `test-win` runs them
+    // and needs a Windows host.
+    const check_win = b.step("check-win", "Cross-compile the Windows platform tests for x86_64 and aarch64 Windows");
+    for ([_]std.Target.Cpu.Arch{ .x86_64, .aarch64 }) |arch| {
+        const wt = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .windows, .abi = .gnu });
+        const t = b.addTest(.{ .name = b.fmt("win-test-{s}", .{@tagName(arch)}), .root_module = windowsTestModule(b, wt, optimize) });
+        // Install (not just compile) so the link step runs and catches missing import libs/IIDs.
+        check_win.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "win-test" } } }).step);
+    }
+    const test_win = b.step("test-win", "Run the Windows platform tests (Windows host; WARP and software paths run without a GPU)");
+    if (target.result.os.tag == .windows) {
+        const t = b.addTest(.{ .name = "win-test", .root_module = windowsTestModule(b, target, optimize) });
+        test_win.dependOn(&b.addRunArtifact(t).step);
+    } else {
+        test_win.dependOn(&b.addFail("test-win needs a Windows host; use check-win to cross-compile").step);
+    }
+}
+
+/// Compiler flags for every C file under platform/ on Windows.
+pub const windows_c_flags: []const []const u8 = &.{
+    "-std=c11",              "-Wall",     "-Wextra",    "-Werror",
+    "-Wno-unused-parameter", "-DUNICODE", "-D_UNICODE",
+};
+
+/// Adds Windows C sources (paths relative to the repo root) to `m`, with
+/// platform/windows on the include path so they can include msw_internal.h, and
+/// links the given system libraries (resolved from Zig's mingw-w64 import libs).
+pub fn addWindowsC(b: *std.Build, m: *std.Build.Module, files: []const []const u8, libs: []const []const u8) void {
+    m.link_libc = true;
+    m.addIncludePath(b.path("platform/windows"));
+    m.addCSourceFiles(.{ .root = b.path("."), .files = files, .flags = windows_c_flags });
+    for (libs) |l| m.linkSystemLibrary(l, .{});
+}
+
+/// Translates a Zig-facing platform header (one that does not include windows.h).
+pub fn translatePlatformHeader(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, header: []const u8) *std.Build.Module {
+    const tc = b.addTranslateC(.{ .root_source_file = b.path(header), .target = target, .optimize = optimize });
+    tc.addIncludePath(b.path("platform/windows"));
+    return tc.createModule();
+}
+
+/// The shared Windows module ("win", platform/windows/win.zig) with msw.c linked in.
+/// Host and client backends import it and add their own C files with addWindowsC.
+pub fn windowsModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const m = b.createModule(.{
+        .root_source_file = b.path("platform/windows/win.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "msw_c", .module = translatePlatformHeader(b, target, optimize, "platform/windows/msw.h") }},
+    });
+    addWindowsC(b, m, &.{"platform/windows/msw.c"}, &.{ "d3d11", "dxgi", "ole32", "uuid" });
+    return m;
+}
+
+fn windowsTestModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("platform/windows/test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "win", .module = windowsModule(b, target, optimize) }},
+    });
 }
 
 const Shim = struct {
