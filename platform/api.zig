@@ -451,6 +451,9 @@ pub const Overlay = struct {
     freezes: u32 = 0,
     /// False until the host/client clock offset is known (cross-clock stages are empty).
     clock_synced: bool = false,
+    /// Multi-user sessions: who is here and who holds input (`core.multi.View.presence`);
+    /// empty when the session has one client. Valid until the next overlay update.
+    presence: []const u8 = "",
 };
 
 pub const Presented = struct {

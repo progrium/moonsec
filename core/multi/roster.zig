@@ -260,7 +260,8 @@ pub const View = struct {
         };
     }
 
-    /// One overlay line: "3 here · input: Alice (you)" / "· view only". Cut to `buf`.
+    /// One overlay line, ASCII apart from names (the overlay font): "3 here  input: Alice
+    /// (you)", "3 here  view only". Cut to `buf`.
     pub fn presence(v: *const View, buf: []u8) []const u8 {
         if (!v.have) return "";
         var w = std.Io.Writer.fixed(buf);
@@ -268,10 +269,10 @@ pub const View = struct {
         switch (v.policy) {
             .owner => {
                 const who: []const u8 = if (v.owner == host_id) "host" else if (v.find(v.owner)) |m| m.name() else "?";
-                w.print(" \u{b7} input: {s}{s}", .{ who, if (v.owner == v.you) " (you)" else "" }) catch {};
+                w.print("  input: {s}{s}", .{ who, if (v.owner == v.you) " (you)" else "" }) catch {};
             },
-            .everyone => w.writeAll(" \u{b7} input: everyone") catch {},
-            else => w.writeAll(" \u{b7} view only") catch {},
+            .everyone => w.writeAll("  input: everyone") catch {},
+            else => w.writeAll("  view only") catch {},
         }
         return w.buffered();
     }
@@ -343,13 +344,13 @@ test "the client view follows the roster and ignores stale epochs" {
     vb.onRoster(r.encodeFor(b, &buf));
     try testing.expect(!vb.haveInput());
     var pb: [64]u8 = undefined;
-    try testing.expectEqualStrings("2 here \u{b7} input: Alice", vb.presence(&pb));
+    try testing.expectEqualStrings("2 here  input: Alice", vb.presence(&pb));
     var old: [msg.max_roster_len]u8 = undefined;
     const old_body = old[0..r.encodeFor(b, &old).len];
     _ = r.give(a, b);
     vb.onRoster(r.encodeFor(b, &buf));
     try testing.expect(vb.haveInput());
-    try testing.expectEqualStrings("2 here \u{b7} input: Bob (you)", vb.presence(&pb));
+    try testing.expectEqualStrings("2 here  input: Bob (you)", vb.presence(&pb));
     vb.onRoster(old_body);
     try testing.expectEqual(@as(u64, 1), vb.stats.stale);
     try testing.expect(vb.haveInput());

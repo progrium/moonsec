@@ -32,6 +32,11 @@
 //! resolution or frame-rate steps wait in `takeReconfigure` for the app to apply with
 //! `Encoder.configure`. With `loss_policy`, relay mode's caps and the FEC share bound it (`setLimits` otherwise). Every frame also goes
 //! through `Controller.onFrame`, so probe frames leave at the probe rate.
+//!
+//! Multi-user (app/multi_host.zig): with `shared`, the session is one client's peer of a
+//! `MultiHost` that owns the encoder side. The peer keeps its own pipe, pacing, rate
+//! estimate, NACK/FEC policy, stall handling and input stream; recovery (`rec`) is the
+//! multi host's, acks go through its `AckJoin`, and frames arrive through `sendFrame`.
 const std = @import("std");
 const core = @import("core");
 const api = @import("platform");
@@ -87,6 +92,9 @@ pub const Config = struct {
     /// Byes sent when leaving, `bye_interval_us` apart.
     byes: u8 = 3,
     bye_interval_us: Micros = 20_000,
+    /// One client's peer of a `MultiHost` (see the file comment): `rec` is shared and not
+    /// owned, frame acks go through `join`, the multi host runs the ladder and the encoder.
+    shared: bool = false,
 };
 
 pub const State = enum { waiting, streaming, ended };
@@ -173,8 +181,24 @@ pub const HostSession = struct {
     input_rx: core.input.Receiver = .{},
     actions: std.Deque(Pending) = .empty,
     tele: *telemetry.Telemetry(512),
+    /// With `cfg.shared`: the multi host's ack intersection and this peer's member bit.
+    join: ?*core.multi.AckJoin = null,
+    join_bit: u5 = 0,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config, p: PacketPipe) !HostSession {
+        return initWith(gpa, cfg, p, null);
+    }
+
+    /// A `shared` peer: recovery is the multi host's `rec`.
+    pub fn initPeer(gpa: std.mem.Allocator, cfg: Config, p: PacketPipe, rec: *recovery.Host, join: *core.multi.AckJoin, bit: u5) !HostSession {
+        std.debug.assert(cfg.shared);
+        var s = try initWith(gpa, cfg, p, rec);
+        s.join = join;
+        s.join_bit = bit;
+        return s;
+    }
+
+    fn initWith(gpa: std.mem.Allocator, cfg: Config, p: PacketPipe, shared_rec: ?*recovery.Host) !HostSession {
         var history = try media.History.init(gpa, .{ .max_age_us = cfg.retransmit_age_us, .min_interval_us = cfg.retransmit_interval_us, .capacity = 8192 });
         errdefer history.deinit(gpa);
         const ctl = try gpa.create(rate.Controller);
@@ -183,9 +207,12 @@ pub const HostSession = struct {
             ctl.reset(.{ .gcc = .{ .start_bps = @floatFromInt(cfg.bitrate_bps) }, .fps = @floatFromInt(cfg.fps) });
         } else ctl.reset(.{});
         const ladder = rate.Ladder.init(.{ .width = cfg.width, .height = cfg.height, .fps = cfg.fps });
-        const rec = try gpa.create(recovery.Host);
-        errdefer gpa.destroy(rec);
-        rec.* = recovery.Host.init(.{ .ltr = cfg.ltr });
+        const rec = shared_rec orelse blk: {
+            const r = try gpa.create(recovery.Host);
+            r.* = recovery.Host.init(.{ .ltr = cfg.ltr });
+            break :blk r;
+        };
+        errdefer if (shared_rec == null) gpa.destroy(rec);
         const tele = try gpa.create(telemetry.Telemetry(512));
         errdefer gpa.destroy(tele);
         tele.* = .init();
@@ -209,7 +236,7 @@ pub const HostSession = struct {
     pub fn deinit(s: *HostSession) void {
         s.history.deinit(s.gpa);
         s.gpa.destroy(s.ctl);
-        s.gpa.destroy(s.rec);
+        if (!s.cfg.shared) s.gpa.destroy(s.rec);
         s.gpa.destroy(s.tele);
         s.gpa.destroy(s.parity_buf);
         s.actions.deinit(s.gpa);
@@ -374,13 +401,15 @@ pub const HostSession = struct {
                 s.ctl.onFeedbackMsg(now, f.feedback);
                 s.policy.onCounts(@intCast(now), f.feedback.count, f.feedback.count - f.feedback.received);
                 s.stats.feedback += 1;
-                if (s.cfg.rate_control) s.updateLadder(now);
+                if (s.cfg.rate_control and !s.cfg.shared) s.updateLadder(now);
                 s.applyPacing(now);
             },
             .frame_ack => |a| {
                 s.stats.frame_acks += 1;
                 if (a.ack.flags.recovery_needed) s.stats.recovery_requests += 1;
-                recovery.wire.applyFrameAck(s.rec, a.ack);
+                if (s.join) |j| {
+                    recovery.wire.applyFrameAck(j.member(s.join_bit, s.rec), a.ack);
+                } else recovery.wire.applyFrameAck(s.rec, a.ack);
             },
             .video_shard => s.stats.unknown += 1,
             .other => |o| s.onOther(m, o.envelope, o.payload, now),
@@ -506,7 +535,8 @@ pub const HostSession = struct {
             const first = s.nonce == null;
             s.nonce = h.nonce;
             s.stats.sessions += 1;
-            if (!first) s.rec.onRecoveryRequest(.{ .first_missing = s.next_frame_id, .want_idr = true });
+            // A peer joining a shared stream mid-way has no reference either.
+            if (!first or (s.cfg.shared and s.next_frame_id > 0)) s.rec.onRecoveryRequest(.{ .first_missing = s.next_frame_id, .want_idr = true });
         }
         s.state = .streaming;
         s.sendConfig(now);
@@ -544,7 +574,20 @@ pub const HostSession = struct {
         }
         const id = s.next_frame_id;
         const flags = s.rec.onEncoded(id, ef.ltr_token, ef.keyframe);
-        s.next_frame_id +%= 1;
+        if (s.sendFrame(id, flags, ef, cf, now)) s.rec.setRetryWindow(s.retryWindow());
+    }
+
+    /// Recovery's retry window for this client's path: about one RTT in frames, plus one.
+    pub fn retryWindow(s: *const HostSession) u32 {
+        const rtt: u64 = if (s.path.rtt_us > 0) @intCast(s.path.rtt_us) else 20_000;
+        return @intCast(rtt * s.cfg.fps / 1_000_000 + 2);
+    }
+
+    /// Packetize and send frame `id`, which recovery already stamped with `flags`. The
+    /// multi host calls this on every streaming peer; `onEncoded` does for one client.
+    /// False when the frame did not go out (held for a stalled path, or the session failed).
+    pub fn sendFrame(s: *HostSession, id: u32, flags: recovery.FrameFlags, ef: api.EncodedFrame, cf: *const api.CapturedFrame, now: Micros) bool {
+        s.next_frame_id = id +% 1;
         var vflags: proto.video.Flags = .{ .keyframe = flags.keyframe, .ltr_refresh = flags.refresh, .ltr = ef.ltr_token != null };
         if (!ef.keyframe and ef.ltr_refresh) vflags.ltr_refresh = true;
         const cap: u64 = @bitCast(cf.captured_us);
@@ -558,7 +601,7 @@ pub const HostSession = struct {
             s.stats.frames += 1;
             if (flags.keyframe) s.stats.keyframes += 1;
             if (flags.refresh) s.stats.refreshes += 1;
-            return;
+            return false;
         }
         if (s.cfg.loss_policy) {
             s.decision = s.policy.update(@intCast(now), .{
@@ -584,7 +627,10 @@ pub const HostSession = struct {
                 .capture_us = cap,
                 .encode_done_us = enc,
                 .ltr_token = ef.ltr_token orelse 0,
-            }, sl) catch return s.finish(.failed, "encoded slice too large to packetize");
+            }, sl) catch {
+                s.finish(.failed, "encoded slice too large to packetize");
+                return false;
+            };
             while (it.next()) |shard| {
                 s.history.record(shard, @intCast(now));
                 s.sendShard(shard, now);
@@ -598,9 +644,7 @@ pub const HostSession = struct {
         if (flags.refresh) s.stats.refreshes += 1;
         if (cf.repeat) s.stats.repeats += 1;
         s.tele.record(.{ .frame_id = id, .capture_start = cf.capture_start_us, .captured = cf.captured_us, .encoded = ef.encoded_us }, null);
-        // Recovery's retry window: about one RTT in frames, plus one.
-        const rtt: u64 = if (s.path.rtt_us > 0) @intCast(s.path.rtt_us) else 20_000;
-        s.rec.setRetryWindow(@intCast(rtt * s.cfg.fps / 1_000_000 + 2));
+        return true;
     }
 
     fn sendShard(s: *HostSession, shard: media.Shard, now: Micros) void {
