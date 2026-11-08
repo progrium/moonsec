@@ -28,6 +28,10 @@ pub fn build(b: *std.Build) void {
     const core_tests = b.addTest(.{ .root_module = core_mod });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
+    // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
+    // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
+    const pipe_mod = b.addModule("pipe", .{ .root_source_file = b.path("transport/pipe.zig"), .target = target, .optimize = optimize });
+
     // The core must build for the browser unchanged: compile it (and its tests) for wasm32.
     const wasm_step = b.step("check-wasm", "Compile the core for wasm32-freestanding and its tests for wasm32-wasi");
     const wasm_lib = b.addLibrary(.{
@@ -138,7 +142,7 @@ pub fn build(b: *std.Build) void {
 
     // Simulated network behind PacketPipe (transport/sim.zig) and its scenario harness (sim/).
     // Pure Zig: none of these steps build the shim.
-    const simnet_mod = b.addModule("simnet", .{ .root_source_file = b.path("transport/sim.zig"), .target = target, .optimize = optimize });
+    const simnet_mod = b.addModule("simnet", .{ .root_source_file = b.path("transport/sim.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "pipe", .module = pipe_mod }} });
     const sim_imports: []const std.Build.Module.Import = &.{.{ .name = "simnet", .module = simnet_mod }};
     const sim_exe = b.addExecutable(.{ .name = "sim", .root_module = b.createModule(.{ .root_source_file = b.path("sim/main.zig"), .target = target, .optimize = optimize, .imports = sim_imports }) });
     const run_sim = b.addRunArtifact(sim_exe);
@@ -150,8 +154,47 @@ pub fn build(b: *std.Build) void {
     b.step("sim-check", "Run every scenario and compare digests with sim/golden.txt").dependOn(&check_sim.step);
     const test_sim = b.step("test-sim", "Unit tests for PacketPipe, the sim network and the scenarios");
     test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = simnet_mod })).step);
+    test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = pipe_mod })).step);
     test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("sim/test.zig"), .target = target, .optimize = optimize, .imports = sim_imports }) })).step);
     test_step.dependOn(test_sim);
+
+    // Phase 1 gate (tools/gate): two processes exchange stream-tagged datagrams through
+    // the core, over iroh and over the simulated network. `gate-sim` is built without the
+    // shim so the sim half runs without Rust; `gate` (part of test-shim) runs both.
+    const simlink_mod = b.addModule("simlink", .{ .root_source_file = b.path("transport/simlink.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "pipe", .module = pipe_mod } } });
+    const iroh_pipe_mod = b.addModule("iroh_pipe", .{ .root_source_file = b.path("transport/iroh_pipe.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "iroh", .module = iroh_mod }, .{ .name = "pipe", .module = pipe_mod } } });
+    const gate_imports = [_]std.Build.Module.Import{
+        .{ .name = "core", .module = core_mod },
+        .{ .name = "pipe", .module = pipe_mod },
+        .{ .name = "simnet", .module = simnet_mod },
+        .{ .name = "simlink", .module = simlink_mod },
+    };
+    const gate_args: []const []const u8 = if (b.args) |a| a else &.{ "run", "all" };
+    for ([_]bool{ false, true }) |with_iroh| {
+        const opts = b.addOptions();
+        opts.addOption(bool, "iroh", with_iroh);
+        const m = b.createModule(.{ .root_source_file = b.path("tools/gate/main.zig"), .target = target, .optimize = optimize, .imports = &gate_imports });
+        m.addOptions("gate_options", opts);
+        if (with_iroh) {
+            m.addImport("iroh", iroh_mod);
+            m.addImport("iroh_pipe", iroh_pipe_mod);
+        }
+        const exe = b.addExecutable(.{ .name = if (with_iroh) "gate" else "gate-sim", .root_module = m });
+        const run = b.addRunArtifact(exe);
+        if (with_iroh) {
+            run.addArgs(gate_args);
+            b.step("gate", "Run the Phase 1 gate over iroh and the sim (builds the shim; args: see tools/gate/main.zig)").dependOn(&run.step);
+            const run_all = b.addRunArtifact(exe);
+            run_all.addArgs(&.{ "run", "all" });
+            b.top_level_steps.get("test-shim").?.step.dependOn(&run_all.step);
+        } else {
+            run.addArgs(if (b.args) |a| a else &.{ "run", "sim" });
+            b.step("gate-sim", "Run the Phase 1 gate over the simulated network only (no Rust needed)").dependOn(&run.step);
+        }
+    }
+    const gate_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tools/gate/test.zig"), .target = target, .optimize = optimize, .imports = &gate_imports }) });
+    test_sim.dependOn(&b.addRunArtifact(gate_tests).step);
+    test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = simlink_mod })).step);
 
     // core/rate driving the simulated network with S11's metrics (sim/rate.zig).
     const sim_rate = b.addExecutable(.{ .name = "sim-rate", .root_module = b.createModule(.{ .root_source_file = b.path("sim/rate.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod } } }) });
