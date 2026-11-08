@@ -50,6 +50,19 @@ pub const PathStats = struct {
     send_queue_bytes: u64 = 0,
     /// True when the selected path goes through a relay.
     relayed: bool = false,
+    /// The selected path (pipe-specific id; 0 for a pipe with one path).
+    path_id: u32 = 0,
+    /// Bumped each time the selected path changes (direct <-> relay, a new direct path).
+    /// The new path has its own RTT and capacity, so the core's estimates start over.
+    path_epoch: u32 = 0,
+    /// Bumped each time a reconnecting pipe replaces its connection. Datagrams in flight
+    /// on the old one are gone, and a pacing rate set before applies to the new one.
+    conn_epoch: u32 = 0,
+    /// The selected path has had data unacknowledged for longer than the transport's
+    /// no-ack-progress threshold: it is probably dead. Sending more only queues stale media.
+    stalled: bool = false,
+    /// False while a reconnecting pipe has no connection (sends are dropped, not queued).
+    connected: bool = true,
 };
 
 /// A type-erased packet pipe. Implementations: `transport/sim.zig` (tests and
@@ -64,6 +77,9 @@ pub const PacketPipe = struct {
         setPacingRate: *const fn (ptr: *anyopaque, bps: u64) void,
         stats: *const fn (ptr: *anyopaque) PathStats,
         maxDatagramSize: *const fn (ptr: *anyopaque) usize,
+        /// Optional: drop the connection and dial a new one (keeping the old one until the
+        /// new one is up). Null for pipes that cannot reconnect.
+        reconnect: ?*const fn (ptr: *anyopaque) void = null,
     };
 
     /// Queue one unreliable datagram. It may still be dropped later; drops the
@@ -88,6 +104,18 @@ pub const PacketPipe = struct {
 
     pub fn maxDatagramSize(self: PacketPipe) usize {
         return self.vtable.maxDatagramSize(self.ptr);
+    }
+
+    /// The pipe can replace a dead connection (`reconnect`, `PathStats.conn_epoch`).
+    pub fn canReconnect(self: PacketPipe) bool {
+        return self.vtable.reconnect != null;
+    }
+
+    /// Ask for a new connection: the session saw nothing from its peer for too long.
+    /// The pipe keeps the old connection until the new one is up, so a path that comes
+    /// back by itself wins. A no-op while a reconnect is already under way.
+    pub fn reconnect(self: PacketPipe) void {
+        if (self.vtable.reconnect) |f| f(self.ptr);
     }
 };
 
