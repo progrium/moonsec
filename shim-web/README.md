@@ -101,8 +101,8 @@ node shim-web/test/run.mjs --browsers chromium,firefox,webkit
 4. **admission**: `moonsec peer iroh host --state-dir` refuses an unpaired browser key
    (`not_paired`) and admits the paired one.
 
-CI: [`.github/workflows/shim-web.yml`](../.github/workflows/shim-web.yml). Chromium gates;
-Firefox and WebKit run with `continue-on-error` until they have been seen green.
+CI: [`.github/workflows/shim-web.yml`](../.github/workflows/shim-web.yml), run from the Actions
+tab (manual, like the other workflows). All three browsers pass on ubuntu-24.04.
 
 ## Measurements (local relay, one machine)
 
@@ -127,8 +127,7 @@ over TCP under loss) is the Phase 6 gate's question and needs the deployed relay
 
 ## Not covered yet
 
-- **Firefox and WebKit** run in CI only (the container has no Playwright Firefox/WebKit
-  builds); real Safari is 6C's harness.
+- **Real Safari** (not Playwright's WebKit) is 6C's harness.
 - **A public relay** with a real certificate, and real networks between browser and relay.
 - **A full session**: admission passes, then `moonsec peer iroh host` waits for the client's
   session setup, which the web client (6B) sends. The admission test counts 0 media datagrams

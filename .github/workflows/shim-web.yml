@@ -3,12 +3,10 @@ name: shim-web
 # The browser iroh transport (shim-web/): build the wasm crate, its bindings and the pairing
 # module, then run headless browsers through a local iroh-relay (relay/lab.toml) against
 # native moonsec: datagram and stream echo, datagram throughput both ways, pairing (QR and
-# PIN) and session admission (shim-web/test/run.mjs). Chromium gates; Firefox and WebKit run
-# too but don't fail the workflow until they have been seen green.
+# PIN) and session admission (shim-web/test/run.mjs), in Chromium, Firefox and WebKit.
 
+# Automatic triggers are off, like every workflow here; run it from the Actions tab.
 on:
-  push:
-    branches: ["**"]
   workflow_dispatch:
 
 permissions:
@@ -69,10 +67,8 @@ jobs:
       - name: Chromium
         run: node shim-web/test/run.mjs --browsers chromium --json shim-web-chromium.json
       - name: Firefox
-        continue-on-error: true
         run: node shim-web/test/run.mjs --browsers firefox --json shim-web-firefox.json
       - name: WebKit
-        continue-on-error: true
         run: node shim-web/test/run.mjs --browsers webkit --json shim-web-webkit.json
       - uses: actions/upload-artifact@v4
         if: always()
