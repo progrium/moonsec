@@ -19,6 +19,9 @@ pub const Profile = enum {
     lan,
     /// The Phase 1 gate's path: 10 ms each way, 3 ms jitter, 50 Mbit/s, 2% loss, 2% reordering.
     wan,
+    /// A long-haul path where NACK is too slow: 60 ms each way, 2 ms jitter, 50 Mbit/s,
+    /// 5% loss. A retransmit would land after the client's 100 ms frame timeout.
+    longhaul,
     /// No loss, no jitter.
     clean,
 
@@ -26,6 +29,7 @@ pub const Profile = enum {
         return switch (p) {
             .lan => .{ .steps = &.{.{ .t_us = 0, .bps = 100e6 }}, .delay_us = 1 * simnet.MS, .jitter_us = 300, .loss = 0.005, .reorder_p = 0.01, .reorder_extra_us = 1 * simnet.MS, .overhead_bytes = 48 },
             .wan => .{ .steps = &.{.{ .t_us = 0, .bps = 50e6 }}, .delay_us = 10 * simnet.MS, .jitter_us = 3 * simnet.MS, .loss = 0.02, .reorder_p = 0.02, .reorder_extra_us = 5 * simnet.MS, .overhead_bytes = 48 },
+            .longhaul => .{ .steps = &.{.{ .t_us = 0, .bps = 50e6 }}, .delay_us = 60 * simnet.MS, .jitter_us = 2 * simnet.MS, .loss = 0.05, .overhead_bytes = 48 },
             .clean => .{ .steps = &.{.{ .t_us = 0, .bps = 100e6 }}, .delay_us = 1 * simnet.MS, .overhead_bytes = 48 },
         };
     }
@@ -56,6 +60,8 @@ pub const Options = struct {
     outage_us: Micros = 0,
     /// Stream the synthetic tone over the Opus stage alongside the video.
     audio: bool = true,
+    /// Host picks NACK, FEC or relay mode per path (`core.media.policy`).
+    loss_policy: bool = false,
     /// Scripted path flaps (direct <-> relay) and connection drops (app/pathsim.zig).
     path: ?pathsim.Config = null,
     /// Host and client session settings that differ from the defaults.
@@ -69,6 +75,8 @@ pub const Result = struct {
         keyframes: u64,
         refreshes: u64,
         retransmits: u64,
+        parity_shards: u64,
+        shards: u64,
         keys: u64,
         keys_wrong: u64,
         audio_frames: u64,
@@ -146,7 +154,7 @@ pub const Result = struct {
     }
 
     pub fn print(r: Result, w: *std.Io.Writer) !void {
-        try w.print("{d} s: host sent {d} frames (keyframes {d}, LTR refreshes {d}, retransmits {d}); client presented {d}, lost {d}, decode errors {d}, unreadable {d}, corrupt {d}\n", .{ r.seconds, r.host.frames, r.host.keyframes, r.host.refreshes, r.host.retransmits, r.client.presented, r.client.lost, r.client.decode_errors, r.client.unreadable, r.client.corrupt });
+        try w.print("{d} s: host sent {d} frames (keyframes {d}, LTR refreshes {d}, retransmits {d}, parity shards {d}); client presented {d}, lost {d}, decode errors {d}, unreadable {d}, corrupt {d}\n", .{ r.seconds, r.host.frames, r.host.keyframes, r.host.refreshes, r.host.retransmits, r.host.parity_shards, r.client.presented, r.client.lost, r.client.decode_errors, r.client.unreadable, r.client.corrupt });
         try w.print("  freezes {d}, longest gap {d:.1} ms, stalls >100 ms {d}; glass-to-glass p50 {d:.2} ms p99 {d:.2} ms; keys {d}/{d} (wrong {d}); sim losses {d}\n", .{
             r.client.freezes,
             @as(f64, @floatFromInt(r.client.longest_gap_us)) / 1000,
@@ -206,7 +214,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     var model: pathsim.Model = undefined;
     if (o.path) |pc| model.init(pc, net);
     const pipes = if (o.path != null) [2]@TypeOf(net.pipeFor(.a)){ model.pipeFor(.a), model.pipeFor(.b) } else .{ net.pipeFor(.a), net.pipeFor(.b) };
-    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices, .pause_on_stall = o.pause_on_stall }, pipes[0]);
+    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices, .pause_on_stall = o.pause_on_stall, .session = .{ .loss_policy = o.loss_policy } }, pipes[0]);
     defer host.deinit();
     var client = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent }, pipes[1]);
     defer client.deinit();
@@ -265,6 +273,8 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .keyframes = host.s.stats.keyframes,
             .refreshes = host.s.stats.refreshes,
             .retransmits = host.s.stats.retransmits,
+            .parity_shards = host.s.stats.parity_shards,
+            .shards = host.s.stats.shards,
             .keys = sh.injector.keys,
             .keys_wrong = sh.injector.wrong,
             .audio_frames = if (host.audio) |ha| ha.stats.frames else 0,
