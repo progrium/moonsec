@@ -46,9 +46,18 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = synthetic_mod })).step);
 
+    // Linux input plumbing shared by the host and client backends (platform/linux):
+    // event codes, the KEY_* <-> HID table, uinput devices.
+    const linux_uinput_mod = b.createModule(.{ .root_source_file = b.path("platform/linux/uinput.zig"), .target = target, .optimize = optimize });
+    if (target.result.os.tag == .linux) test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "linux-uinput-test", .root_module = linux_uinput_mod })).step);
+
     // Client platform backends (platform/client/build.zig).
-    @import("platform/client/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
-    @import("platform/client/build.zig").addLinuxTests(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod });
+    @import("platform/client/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .linux_uinput = linux_uinput_mod }, test_step);
+    @import("platform/client/build.zig").addLinuxTests(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod, .linux_uinput = linux_uinput_mod });
+    // Linux host backend (platform/host/linux/build.zig).
+    const host_linux_mods: @import("platform/host/linux/build.zig").Modules = .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod, .linux_uinput = linux_uinput_mod };
+    @import("platform/host/linux/build.zig").add(b, target, optimize, host_linux_mods, test_step);
+    @import("platform/host/linux/build.zig").addTests(b, target, optimize, host_linux_mods);
 
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
@@ -273,6 +282,7 @@ pub fn build(b: *std.Build) void {
         const opts = b.addOptions();
         opts.addOption(bool, "iroh", with_iroh);
         opts.addOption(bool, "linux_client", false);
+        opts.addOption(bool, "linux_host", false);
         const m = b.createModule(.{ .root_source_file = b.path("app/main.zig"), .target = target, .optimize = optimize, .imports = &app_imports });
         m.addOptions("app_options", opts);
         if (with_iroh) {
@@ -310,16 +320,25 @@ pub fn build(b: *std.Build) void {
     }
 
     // `moonsec-linux`: moonsec-sim plus the Linux client backend (platform/client/linux),
-    // `--client linux` on the client peer. Needs the libraries in platform/client/build.zig.
+    // `--client linux` on the client peer, and the Linux host backend (platform/host/linux),
+    // `--host linux` on the host peer. Needs the libraries in platform/client/build.zig.
+    // -Dlinux-iroh adds the iroh shim (`peer iroh`, `run iroh`).
     {
-        const step = b.step("moonsec-linux", "Install zig-out/bin/moonsec-linux: moonsec-sim with the Linux client backend (Linux host)");
+        const linux_iroh = b.option(bool, "linux-iroh", "moonsec-linux: include the iroh shim (default: false)") orelse false;
+        const step = b.step("moonsec-linux", "Install zig-out/bin/moonsec-linux: moonsec-sim with the Linux client and host backends (Linux host)");
         if (target.result.os.tag == .linux) {
             const opts = b.addOptions();
-            opts.addOption(bool, "iroh", false);
+            opts.addOption(bool, "iroh", linux_iroh);
             opts.addOption(bool, "linux_client", true);
+            opts.addOption(bool, "linux_host", true);
             const m = b.createModule(.{ .root_source_file = b.path("app/main.zig"), .target = target, .optimize = optimize, .imports = &app_imports });
             m.addOptions("app_options", opts);
-            m.addImport("client_linux", @import("platform/client/build.zig").linuxClientModule(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod }));
+            if (linux_iroh) {
+                m.addImport("iroh", iroh_mod);
+                m.addImport("iroh_pipe", iroh_pipe_mod);
+            }
+            m.addImport("client_linux", @import("platform/client/build.zig").linuxClientModule(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod, .linux_uinput = linux_uinput_mod }));
+            m.addImport("host_linux", @import("platform/host/linux/build.zig").hostModule(b, target, optimize, host_linux_mods));
             const exe = b.addExecutable(.{ .name = "moonsec-linux", .root_module = m });
             step.dependOn(&b.addInstallArtifact(exe, .{}).step);
         } else step.dependOn(&b.addFail("moonsec-linux needs a Linux host").step);

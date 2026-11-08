@@ -1,0 +1,6 @@
+# moonsec host: let the `moonsec` group create virtual input devices through /dev/uinput.
+# Installed to /usr/lib/udev/rules.d/ (or /etc/udev/rules.d/) by the Linux packages.
+#   sudo groupadd --system moonsec && sudo usermod -aG moonsec "$USER"   (then log in again)
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=misc
+# static_node lets the rule apply when uinput is built in or loaded before udev starts.
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="moonsec", MODE="0660", OPTIONS+="static_node=uinput"

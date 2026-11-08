@@ -4,18 +4,20 @@ The platform interface ([api.zig](api.zig)) is what every OS backend implements 
 host and client apps run on it. The apps (session spine) drive these objects and never
 learn which OS, GPU API or codec library is underneath.
 
-| Side | Object | Thread | Windows (Phase 2) | Linux client (Phase 4) |
+| Side | Object | Thread | Windows (Phase 2) | Linux (client Phase 4, host Phase 7) |
 | --- | --- | --- | --- | --- |
-| host | `Capture` | capture | Desktop Duplication | |
-| host | `Encoder` | encode | NVENC | |
-| host | `AudioSource` | audio | WASAPI loopback | |
-| host | `InputInjector` | network | SendInput | |
+| host | `Capture` | capture | Desktop Duplication | PipeWire (7A; synthetic until then) |
+| host | `Encoder` | encode | NVENC | VAAPI, NVENC, software (7B; synthetic until then) |
+| host | `AudioSource` | audio | WASAPI loopback | PipeWire (7A; synthetic until then) |
+| host | `InputInjector` | network | SendInput | uinput |
 | client | `Decoder` | decode | D3D11VA | libavcodec: VAAPI, software fallback |
 | client | `Presenter` | present | flip-model swapchain | Wayland + EGL/GLES 3 |
 | client | `AudioSink` | audio | WASAPI | PipeWire |
 | client | `InputSource` | input/network | Raw Input | evdev |
 
-The Linux client is in [client/linux](client/linux/README.md).
+The Linux client is in [client/linux](client/linux/README.md) and the Linux host in
+[host/linux](host/linux/README.md); they share the uinput plumbing and key table in
+[linux/uinput.zig](linux/uinput.zig).
 
 A backend lives in `platform/<name>/` and exports `openHost(...) !HostBackend` and/or
 `openClient(...) !ClientBackend`. Write plain methods on your own types and turn them
