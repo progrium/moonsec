@@ -10,6 +10,9 @@ const std = @import("std");
 /// Wire protocol v0 (spec/wire-v0.md).
 pub const proto = @import("proto/root.zig");
 
+/// Packetizer, reassembly, NACK/retransmit (and the FEC codec).
+pub const media = @import("media/root.zig");
+
 /// Loss recovery: LTR acks, freeze on gap, LTR refresh or IDR (docs/design.md, "Loss recovery").
 pub const recovery = @import("recovery/root.zig");
 
