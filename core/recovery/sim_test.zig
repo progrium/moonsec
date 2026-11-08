@@ -264,7 +264,8 @@ const Run = struct {
 
 fn parseRuns(a: std.mem.Allocator) !std.ArrayListUnmanaged(Run) {
     var runs: std.ArrayListUnmanaged(Run) = .empty;
-    var lines = std.mem.tokenizeScalar(u8, @embedFile("testdata/s7b_runs.txt"), '\n');
+    // Any line ending: a Windows checkout may turn the file into CRLF.
+    var lines = std.mem.tokenizeAny(u8, @embedFile("testdata/s7b_runs.txt"), "\r\n");
     while (lines.next()) |line| {
         if (line[0] == '#') continue;
         var f = std.mem.tokenizeScalar(u8, line, ' ');
