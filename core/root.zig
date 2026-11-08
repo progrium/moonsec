@@ -10,6 +10,9 @@ const std = @import("std");
 /// Wire protocol v0 (spec/wire-v0.md).
 pub const proto = @import("proto/root.zig");
 
+/// Packetizer, reassembly, NACK/retransmit (and the FEC codec).
+pub const media = @import("media/root.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
