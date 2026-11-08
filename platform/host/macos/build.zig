@@ -22,8 +22,11 @@ const objc_files: []const []const u8 = &.{
 };
 
 const objc_flags: []const []const u8 = &.{
-    "-fobjc-arc",                   "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
+    "-fobjc-arc",                   "-std=gnu11",              "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
     "-Wno-deprecated-declarations",
+    // Zig turns on UBSan for C in Debug; SDK inline code (dispatch_once's
+    // __builtin_assume) trips its builtin check, so framework code goes without it.
+    "-fno-sanitize=undefined",
 };
 
 const frameworks: []const []const u8 = &.{
