@@ -82,6 +82,10 @@ up)
   ip -n x3i addr add 10.80.9.1/32 dev lo
   for l in "x3h vh0" "x3hn vhi" "x3hn vhn" "x3i vih" "x3i vic" "x3cn vcn" "x3cn vci" "x3c vc0" "x3d dc" "x3d di"; do
     set -- $l; ip -n $1 link set $2 up
+    # The peers' own interfaces keep their offloads: with checksum offload off, the 6.8
+    # kernel (GitHub's runners) fails every UDP GSO send with EIO, which noq-udp drops
+    # silently. The first forwarding hop (offloads off) then checksums and segments.
+    case "$l" in "x3h vh0" | "x3c vc0") continue ;; esac
     # One feature at a time: ethtool -K gives up on the rest when one can't change, and a
     # GSO or GRO super-packet is more than the delay line can write to the other side.
     for f in tso gso gro lro tx rx tx-udp-segmentation rx-udp-gro-forwarding rx-gro-list; do
