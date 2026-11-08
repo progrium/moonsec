@@ -46,6 +46,14 @@ jobs:
         run: npx tsc --noEmit
       - name: Install ${{ matrix.browser }}
         run: npx playwright install --with-deps ${{ matrix.browser }}
+      # The runner has no sound card or sound server. Chromium falls back to a fake output;
+      # Firefox (and WebKit's GStreamer sink) play through PulseAudio, so give them a null sink.
+      - name: Audio sink (PulseAudio null sink)
+        run: |
+          sudo apt-get install -y --no-install-recommends pulseaudio pulseaudio-utils
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=harness
+          pactl set-default-sink harness
       - name: Harness
         run: npm run e2e -- --project=${{ matrix.browser }}
       - uses: actions/upload-artifact@v4

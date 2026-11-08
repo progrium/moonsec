@@ -171,21 +171,26 @@ export interface AudioResult {
   hz?: number;
 }
 
+/** Reject after `ms` naming the stage, so a stalled audio stack reports where it stalled. */
+function within<T>(p: Promise<T>, ms: number, stage: string): Promise<T> {
+  return Promise.race([p, new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${stage} timed out after ${ms} ms`)), ms))]);
+}
+
 async function audioProbe(ms = 1000): Promise<AudioResult> {
   if (typeof AudioContext === "undefined") return { ok: false, error: "no AudioContext" };
   const ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
   try {
     if (!ctx.audioWorklet) return { ok: false, error: "no AudioWorklet" };
-    await ctx.audioWorklet.addModule("/dist/audio-worklet.js");
+    await within(ctx.audioWorklet.addModule("/dist/audio-worklet.js"), 10_000, "audioWorklet.addModule");
     const node = new AudioWorkletNode(ctx, "pcm-player", { numberOfInputs: 0, outputChannelCount: [1] });
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 2048;
     node.connect(analyser);
     analyser.connect(ctx.destination);
-    await ctx.resume();
+    await within(ctx.resume(), 10_000, "AudioContext.resume");
     let rms = 0;
     let hz = 0;
-    await new Promise<void>((resolve, reject) => {
+    await within(new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(`ws://${location.host}/media`);
       ws.binaryType = "arraybuffer";
       ws.onopen = () => ws.send(JSON.stringify({ audio: true, ms }));
@@ -213,11 +218,11 @@ async function audioProbe(ms = 1000): Promise<AudioResult> {
           hz = (crossings * ctx.sampleRate) / buf.length;
         }
       };
-    });
-    const stats = await new Promise<{ played: number; underruns: number; peak: number }>((resolve) => {
+    }), ms + 10_000, "tone stream");
+    const stats = await within(new Promise<{ played: number; underruns: number; peak: number }>((resolve) => {
       node.port.onmessage = (e) => resolve(e.data);
       node.port.postMessage("stats");
-    });
+    }), 5_000, "worklet stats");
     return {
       ok: true,
       state: ctx.state,
@@ -231,7 +236,7 @@ async function audioProbe(ms = 1000): Promise<AudioResult> {
   } catch (e) {
     return { ok: false, error: String(e), state: ctx.state };
   } finally {
-    await ctx.close();
+    void ctx.close().catch(() => {});
   }
 }
 
