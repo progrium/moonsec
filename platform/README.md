@@ -13,7 +13,7 @@ learn which OS, GPU API or codec library is underneath.
 | client | `Decoder` | decode | D3D11VA |
 | client | `Presenter` | present | flip-model swapchain |
 | client | `AudioSink` | audio | WASAPI |
-| client | `InputSource` | input/network | Raw Input |
+| client | `InputSource` | input/network | Raw Input; XInput pads ([client/gamepad](client/gamepad/README.md)) |
 
 A backend lives in `platform/<name>/` and exports `openHost(...) !HostBackend` and/or
 `openClient(...) !ClientBackend`. Write plain methods on your own types and turn them

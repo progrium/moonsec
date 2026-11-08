@@ -325,3 +325,15 @@ test "openClient: the bundle through the platform interface" {
     // An unsupported codec is reported as such.
     try testing.expectError(error.Unsupported, be.decoder.configure(.{ .codec = .av1, .width = 1, .height = 1 }));
 }
+
+test "XInput: loads, and the input source polls pads alongside Raw Input" {
+    var pads = client.gamepad.xinput.Source.open(client.clock);
+    defer pads.close();
+    // xinput1_4.dll ships with Windows 8 and later, Server editions included.
+    try testing.expect(pads.available());
+    try testing.expectEqualStrings("xinput1_4.dll", pads.dll);
+    var evs: [8]api.InputEvent = undefined;
+    // Runners have no controllers; any event must be a pad event in a valid slot.
+    const n = try pads.poll(&evs);
+    for (evs[0..n]) |e| try testing.expect(e.what == .pad and e.what.pad.index < 4);
+}

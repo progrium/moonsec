@@ -435,7 +435,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 - Host: ScreenCaptureKit, VideoToolbox, CGEvent input.
 - Clients: macOS (VideoToolbox, Metal) and Linux (VAAPI, Wayland/EGL).
-- Gamepads on all clients; virtual gamepad on Windows host (driver path decided in Phase 3).
+- Gamepads on all clients; virtual gamepad on Windows host (driver path decided in Phase 3). (Client capture built: `platform/client/gamepad`, XInput on Windows, GameController on macOS, evdev on Linux, one `core.input.Gamepad.Button` layout; the Linux source is tested against a uinput virtual pad in CI. The Windows client polls it from `InputSource.poll`; the macOS and Linux client backends call theirs the same way once they land.)
 
 **Gate:** every host/client pair in the target table streams with the Phase 2 latency bar.
 
