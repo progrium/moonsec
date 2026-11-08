@@ -342,6 +342,16 @@ pub fn build(b: *std.Build) void {
     }
     // Windows client backend tests join both steps (platform/client/build.zig).
     @import("platform/client/build.zig").addWindowsTests(b, target, optimize, check_win, test_win);
+
+    // Phase 5 recovery gate (tools/recovery/build.zig): recovery, test-recovery; check-win
+    // also cross-compiles it.
+    @import("tools/recovery/build.zig").add(b, target, optimize, .{
+        .core = core_mod,
+        .platform = platform_mod,
+        .synthetic = synthetic_mod,
+        .check_win = check_win,
+        .test_step = test_step,
+    });
 }
 
 /// Compiler flags for every C file under platform/ on Windows.
@@ -380,8 +390,8 @@ pub fn windowsModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     return m;
 }
 
-/// The Windows host backend (platform/host/windows): Desktop Duplication, NVENC and
-/// Media Foundation encoders, WASAPI loopback, SendInput. Imported as "win_host";
+/// The Windows host backend (platform/host/windows): Desktop Duplication, NVENC, AMF,
+/// oneVPL and Media Foundation encoders, WASAPI loopback, SendInput. Imported as "win_host";
 /// `openHost` returns a platform.HostBackend.
 pub fn windowsHostModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, win: *std.Build.Module) *std.Build.Module {
     const m = b.createModule(.{
@@ -396,11 +406,15 @@ pub fn windowsHostModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
         },
     });
     m.addIncludePath(b.path("third_party/nvenc"));
+    m.addIncludePath(b.path("third_party/amf"));
+    m.addIncludePath(b.path("third_party/vpl"));
     addWindowsC(b, m, &.{
         "platform/host/windows/capture.c",
         "platform/host/windows/enc.c",
         "platform/host/windows/enc_mf.c",
         "platform/host/windows/enc_nvenc.c",
+        "platform/host/windows/enc_amf.c",
+        "platform/host/windows/enc_vpl.c",
         "platform/host/windows/audio.c",
         "platform/host/windows/input.c",
     }, &.{ "user32", "mfplat", "mf", "mfuuid", "oleaut32", "avrt" });

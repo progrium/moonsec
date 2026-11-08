@@ -1,4 +1,4 @@
-/* Encoder dispatch: one msw_enc API over the NVENC and Media Foundation backends. */
+/* Encoder dispatch: one msw_enc API over the NVENC, AMF, oneVPL and Media Foundation backends. */
 #include "enc_internal.h"
 
 #include <string.h>
@@ -8,6 +8,8 @@ msw_hr msw_enc_create(msw_d3d *d, msw_enc_kind kind, msw_enc **out) {
     switch (kind) {
     case MSW_ENC_NVENC: return msw_enc_nvenc_create(d, out);
     case MSW_ENC_MF_SOFTWARE: return msw_enc_mf_create(d, out);
+    case MSW_ENC_AMF: return msw_enc_amf_create(d, out);
+    case MSW_ENC_VPL: return msw_enc_vpl_create(d, out);
     default: return E_INVALIDARG;
     }
 }
@@ -60,4 +62,19 @@ HRESULT msw_enc_append(msw_enc *e, const void *data, size_t len) {
     memcpy(e->out + e->out_len, data, len);
     e->out_len += len;
     return S_OK;
+}
+
+int msw_annexb_has_idr(const uint8_t *p, size_t len, uint32_t codec) {
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (p[i] != 0 || p[i + 1] != 0 || p[i + 2] != 1) continue;
+        const uint8_t h = p[i + 3];
+        if (codec == MSW_CODEC_HEVC) {
+            const uint8_t t = (h >> 1) & 0x3f;
+            if (t == 19 || t == 20) return 1; /* IDR_W_RADL, IDR_N_LP */
+        } else if ((h & 0x1f) == 5) {
+            return 1;
+        }
+        i += 2;
+    }
+    return 0;
 }

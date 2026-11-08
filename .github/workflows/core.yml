@@ -27,11 +27,15 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - name: zig fmt
         if: runner.os == 'Linux'
-        run: zig fmt --check build.zig core platform codec sim/audio.zig sim/audio_main.zig
+        run: zig fmt --check build.zig core platform codec tools/recovery sim/audio.zig sim/audio_main.zig
       - name: Core tests (Debug)
         run: zig build test --summary all
       - name: Core tests (ReleaseSafe)
         run: zig build test -Doptimize=ReleaseSafe --summary all
+      # Phase 5 recovery gate (tools/recovery) on the synthetic encoder and decoder:
+      # LTR refreshes, no IDR after the first, every freeze recovered.
+      - name: Recovery gate (synthetic)
+        run: zig build recovery -Doptimize=ReleaseSafe -- --backend synthetic --frames 1800 --loss 2 --burst 2
       - name: wasm32 compile check
         if: runner.os == 'Linux'
         run: zig build check-wasm --summary all

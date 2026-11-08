@@ -447,6 +447,8 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 **Gate:** loss recovery without keyframe spikes on NVENC and VideoToolbox; headless host works.
 
+The recovery half of the gate is a tool: `zig build recovery -- --backend win-nvenc|mac-vt` ([tools/recovery](../tools/recovery/README.md)) drives the encoder through `core/recovery` with injected frame loss and fails on any IDR after the first or a recovery frame near IDR size.
+
 ### Phase 6: Web client (about 4 weeks)
 
 - wasm-bindgen iroh crate; Zig core in WASM; WebCodecs, libopus WASM, Worker rendering.

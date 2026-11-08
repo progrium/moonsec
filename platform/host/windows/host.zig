@@ -1,5 +1,5 @@
-//! Windows host backend: Desktop Duplication capture, NVENC (loaded at run time) or the
-//! Media Foundation software H.264 encoder, WASAPI loopback audio and SendInput, behind
+//! Windows host backend: Desktop Duplication capture, NVENC, AMF or oneVPL (each loaded
+//! at run time) or the Media Foundation software H.264 encoder, WASAPI loopback audio and SendInput, behind
 //! the platform interface (platform/api.zig).
 //!
 //! On a GPU-less machine (the windows-2022 CI runner) open with `.driver = .warp` and
@@ -14,10 +14,22 @@ pub const c = @import("host_win_c");
 const log = std.log.scoped(.win_host);
 
 pub const EncoderKind = enum {
-    /// NVENC when an NVIDIA driver is there, else Media Foundation.
+    /// The GPU vendor's encoder (NVENC, AMF or oneVPL, whichever the device's adapter
+    /// has), else Media Foundation.
     auto,
     nvenc,
+    amf,
+    vpl,
     mf_software,
+
+    pub fn cKind(k: EncoderKind) c.msw_enc_kind {
+        return switch (k) {
+            .nvenc => c.MSW_ENC_NVENC,
+            .amf => c.MSW_ENC_AMF,
+            .vpl => c.MSW_ENC_VPL,
+            .mf_software, .auto => c.MSW_ENC_MF_SOFTWARE,
+        };
+    }
 };
 
 pub const Options = struct {
@@ -158,14 +170,14 @@ pub const Encoder = struct {
 
     pub fn create(d3d: win.D3d, kind: EncoderKind) api.Error!Encoder {
         const kinds: []const EncoderKind = switch (kind) {
-            .auto => &.{ .nvenc, .mf_software },
+            // Each vendor backend returns not-found at once on another vendor's adapter.
+            .auto => &.{ .nvenc, .amf, .vpl, .mf_software },
             else => &.{kind},
         };
         var last_hr: i32 = 0;
         for (kinds) |k| {
             var e: ?*c.msw_enc = null;
-            const ck: c.msw_enc_kind = if (k == .nvenc) c.MSW_ENC_NVENC else c.MSW_ENC_MF_SOFTWARE;
-            last_hr = c.msw_enc_create(dev(d3d), ck, &e);
+            last_hr = c.msw_enc_create(dev(d3d), k.cKind(), &e);
             if (ok(last_hr)) {
                 var self: Encoder = .{ .enc = e.?, .kind = k };
                 c.msw_enc_caps_get(e, &self.caps_);
@@ -404,7 +416,11 @@ pub fn openHost(allocator: std.mem.Allocator, opts: Options) (api.Error || win.E
     errdefer allocator.destroy(self);
     const com = try win.ComThread.init();
     errdefer com.deinit();
-    const d3d = win.D3d.create(.{ .driver = opts.driver, .adapter_index = opts.adapter, .debug = opts.debug }) catch |e| {
+    // oneVPL needs a device with video support; WARP has none, and a driver that refuses
+    // it still gets a device for the other encoders.
+    const want_video = opts.driver == .hardware and (opts.encoder == .auto or opts.encoder == .vpl);
+    const d3d = win.D3d.create(.{ .driver = opts.driver, .adapter_index = opts.adapter, .debug = opts.debug, .video = want_video }) catch
+        win.D3d.create(.{ .driver = opts.driver, .adapter_index = opts.adapter, .debug = opts.debug }) catch |e| {
         log.err("D3D11 device: {f}", .{win.fmtHr(win.last_hr)});
         return e;
     };

@@ -1,7 +1,7 @@
 //! Windows host backend tests (zig build test-win). They run on the GPU-less windows-2022
 //! runner: WARP for the device, Media Foundation's software encoder, and skips for
-//! hardware that is not there. Set MOONSEC_REQUIRE to a comma list (dup, mf, nvenc, audio,
-//! input) to turn those skips into failures; CI requires what its runner has.
+//! hardware that is not there. Set MOONSEC_REQUIRE to a comma list (dup, mf, nvenc, amf,
+//! vpl, audio, input) to turn those skips into failures; CI requires what its runner has.
 const std = @import("std");
 const api = @import("platform");
 const win = @import("win");
@@ -110,10 +110,21 @@ test "Desktop Duplication delivers BGRA frames" {
 fn encodeSequence(d: win.D3d, kind: c.msw_enc_kind, codec: u32, ltr: bool) !void {
     var e: ?*c.msw_enc = null;
     const hr = c.msw_enc_create(host.dev(d), kind, &e);
-    if (hr < 0) return skip(if (kind == c.MSW_ENC_NVENC) "nvenc" else "mf", "encoder unavailable:", hr);
+    const name: []const u8 = switch (kind) {
+        c.MSW_ENC_NVENC => "nvenc",
+        c.MSW_ENC_AMF => "amf",
+        c.MSW_ENC_VPL => "vpl",
+        else => "mf",
+    };
+    if (hr < 0) return skip(name, "encoder unavailable:", hr);
     defer c.msw_enc_destroy(e);
     var caps: c.msw_enc_caps = undefined;
     c.msw_enc_caps_get(e, &caps);
+    if ((codec == c.MSW_CODEC_HEVC and caps.hevc == 0) or (codec == c.MSW_CODEC_H264 and caps.h264 == 0)) {
+        std.debug.print("{s}: codec {d} not offered\n", .{ name, codec });
+        return;
+    }
+    std.debug.print("{s}: h264={d} hevc={d} ltr={d}\n", .{ name, caps.h264, caps.hevc, caps.ltr });
     const w: u32 = 640;
     const h: u32 = 360;
     const cfg: c.msw_enc_config = .{ .codec = codec, .width = w, .height = h, .fps = 60, .bitrate_bps = 2_000_000, .slices = 1, .ltr = @intFromBool(ltr and caps.ltr != 0) };
@@ -181,6 +192,41 @@ test "NVENC H.264 and HEVC with LTR (NVIDIA GPU only)" {
     defer d.destroy();
     try encodeSequence(d, c.MSW_ENC_NVENC, c.MSW_CODEC_H264, true);
     try encodeSequence(d, c.MSW_ENC_NVENC, c.MSW_CODEC_HEVC, true);
+}
+
+test "AMF H.264 and HEVC with LTR (AMD GPU only)" {
+    const com = try win.ComThread.init();
+    defer com.deinit();
+    const d = try win.D3d.create(.{ .driver = .hardware });
+    defer d.destroy();
+    try encodeSequence(d, c.MSW_ENC_AMF, c.MSW_CODEC_H264, true);
+    try encodeSequence(d, c.MSW_ENC_AMF, c.MSW_CODEC_HEVC, true);
+}
+
+test "oneVPL H.264 and HEVC with LTR (Intel GPU only)" {
+    const com = try win.ComThread.init();
+    defer com.deinit();
+    const d = win.D3d.create(.{ .driver = .hardware, .video = true }) catch |e| {
+        std.debug.print("skip vpl: no video-capable device ({s})\n", .{@errorName(e)});
+        if (required("vpl")) return error.RequiredFeatureMissing;
+        return error.SkipZigTest;
+    };
+    defer d.destroy();
+    try encodeSequence(d, c.MSW_ENC_VPL, c.MSW_CODEC_H264, true);
+    try encodeSequence(d, c.MSW_ENC_VPL, c.MSW_CODEC_HEVC, true);
+}
+
+test "vendor encoders report not-found on WARP" {
+    const com = try win.ComThread.init();
+    defer com.deinit();
+    const d = try win.D3d.create(.{ .driver = .warp });
+    defer d.destroy();
+    for ([_]c.msw_enc_kind{ c.MSW_ENC_AMF, c.MSW_ENC_VPL }) |k| {
+        var e: ?*c.msw_enc = null;
+        const hr = c.msw_enc_create(host.dev(d), k, &e);
+        try testing.expectEqual(@as(u32, 0x80070490), @as(u32, @bitCast(hr)));
+        try testing.expect(e == null);
+    }
 }
 
 test "WASAPI loopback opens and reads" {
