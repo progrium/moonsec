@@ -1,5 +1,6 @@
-//! Zig binding for the moonsec iroh shim (shim/include/iroh_shim.h).
+//! Zig binding for the moonsec iroh shim (shim/include/iroh_shim.h, ABI v0.1).
 //! Thin, allocation-free wrapper: Zig owns every buffer passed to the shim.
+//! Tests: transport/iroh_test.zig (loopback) and transport/iroh_netns_test.zig (Linux netns).
 const std = @import("std");
 pub const c = @import("iroh_shim_c");
 
@@ -46,18 +47,45 @@ pub fn version() u32 {
     return c.iroh_shim_version();
 }
 
+/// Microseconds on the shim's monotonic clock (the clock `Event.t_us` uses).
+pub fn nowUs() u64 {
+    return c.iroh_shim_now_us();
+}
+
+pub const path_none: u32 = c.IROH_PATH_NONE;
+
 pub const RelayMode = enum(u32) {
     default = c.IROH_RELAY_DEFAULT,
     disabled = c.IROH_RELAY_DISABLED,
     custom = c.IROH_RELAY_CUSTOM,
+    /// Custom relays without n0 discovery (dial by ticket).
+    custom_only = c.IROH_RELAY_CUSTOM_ONLY,
 };
 
+/// Endpoint options. Numeric fields left at 0 take the shim's defaults (see iroh_shim.h).
 pub const BindOptions = struct {
     secret_key: ?*const [32]u8 = null,
     alpn: []const u8 = "",
     relay_mode: RelayMode = .default,
     relay_urls: ?[*:0]const u8 = null,
     bind_addr: ?[*:0]const u8 = null,
+    /// QUIC datagram send buffer, bytes (default 1 MiB). Must hold the largest frame.
+    datagram_send_buffer: usize = 0,
+    /// QUIC datagram receive buffer, bytes (default 2 MiB).
+    datagram_recv_buffer: usize = 0,
+    /// Datagrams the shim queues for the caller (default 4096).
+    recv_queue_len: u32 = 0,
+    /// Per-path idle timeout (default 300 ms) and keep-alive (default 100 ms).
+    path_idle_timeout_ms: u32 = 0,
+    path_keepalive_ms: u32 = 0,
+    /// Connection idle timeout (default: iroh's).
+    conn_idle_timeout_ms: u32 = 0,
+    /// Pacing target for new connections, bits/s (0 = unpaced until `Conn.setTargetBitrate`).
+    initial_target_bps: u64 = 0,
+    /// AppRate burst credit, us (null = default 20 ms, 0 = none).
+    burst_us: ?u32 = null,
+    /// Selected-path stall that raises `.no_ack_progress`, ms (null = default 150, 0 = off).
+    no_ack_progress_ms: ?u32 = null,
 };
 
 pub const Endpoint = struct {
@@ -71,6 +99,15 @@ pub const Endpoint = struct {
             .relay_mode = @intFromEnum(opts.relay_mode),
             .relay_urls = opts.relay_urls,
             .bind_addr = opts.bind_addr,
+            .datagram_send_buffer = opts.datagram_send_buffer,
+            .datagram_recv_buffer = opts.datagram_recv_buffer,
+            .recv_queue_len = opts.recv_queue_len,
+            .path_idle_timeout_ms = opts.path_idle_timeout_ms,
+            .path_keepalive_ms = opts.path_keepalive_ms,
+            .conn_idle_timeout_ms = opts.conn_idle_timeout_ms,
+            .initial_target_bps = opts.initial_target_bps,
+            .burst_us = if (opts.burst_us) |v| (if (v == 0) c.IROH_BURST_OFF else v) else 0,
+            .no_ack_progress_ms = if (opts.no_ack_progress_ms) |v| (if (v == 0) c.IROH_NO_ACK_OFF else v) else 0,
         };
         var out: ?*c.IrohEndpoint = null;
         try check(c.iroh_endpoint_bind(&raw, &out));
@@ -112,6 +149,45 @@ pub const Endpoint = struct {
     }
 };
 
+pub const EventKind = enum(u32) {
+    path_opened = c.IROH_EV_PATH_OPENED,
+    path_selected = c.IROH_EV_PATH_SELECTED,
+    path_closed = c.IROH_EV_PATH_CLOSED,
+    lagged = c.IROH_EV_LAGGED,
+    no_ack_progress = c.IROH_EV_NO_ACK_PROGRESS,
+    ack_resumed = c.IROH_EV_ACK_RESUMED,
+    conn_closed = c.IROH_EV_CONN_CLOSED,
+    _,
+};
+
+pub const Event = struct {
+    raw: c.IrohEvent,
+
+    pub fn kind(self: *const Event) EventKind {
+        return @enumFromInt(self.raw.kind);
+    }
+    pub fn pathId(self: *const Event) u32 {
+        return self.raw.path_id;
+    }
+    pub fn isRelay(self: *const Event) bool {
+        return self.raw.is_relay != 0;
+    }
+    pub fn remoteAddr(self: *const Event) []const u8 {
+        const p: [*:0]const u8 = @ptrCast(&self.raw.remote_addr);
+        return std.mem.span(p);
+    }
+};
+
+/// Exact datagram accounting; see iroh_shim.h.
+pub const ConnStats = c.IrohConnStats;
+pub const PathStats = c.IrohPathStats;
+
+/// `PathStats.remote_addr` as a slice.
+pub fn pathRemoteAddr(p: *const PathStats) []const u8 {
+    const z: [*:0]const u8 = @ptrCast(&p.remote_addr);
+    return std.mem.span(z);
+}
+
 pub const Conn = struct {
     handle: *c.IrohConn,
 
@@ -141,5 +217,87 @@ pub const Conn = struct {
     pub fn remoteId(self: Conn, buf: []u8) Error![:0]const u8 {
         try check(c.iroh_conn_remote_id(self.handle, buf.ptr, buf.len));
         return cstr(buf);
+    }
+
+    /// Pacing target for the selected path, bits/s (the core's capacity estimate; 0 = unpaced).
+    pub fn setTargetBitrate(self: Conn, bps: u64) Error!void {
+        try check(c.iroh_conn_set_target_bitrate(self.handle, bps));
+    }
+
+    /// AppRate burst credit in us of the target rate (0 = none).
+    pub fn setBurst(self: Conn, burst_us: u32) Error!void {
+        try check(c.iroh_conn_set_burst(self.handle, burst_us));
+    }
+
+    /// Pollable handle (fd on Unix, SOCKET on Windows) that turns readable when a datagram or
+    /// event arrives or the connection closes. Call `clearWakeup` before draining.
+    pub fn wakeupHandle(self: Conn) i64 {
+        return c.iroh_conn_wakeup_handle(self.handle);
+    }
+
+    pub fn clearWakeup(self: Conn) void {
+        c.iroh_conn_wakeup_clear(self.handle);
+    }
+
+    /// Next path event or signal, or null if none is pending.
+    pub fn pollEvent(self: Conn) Error!?Event {
+        var ev: Event = .{ .raw = undefined };
+        check(c.iroh_conn_poll_event(self.handle, &ev.raw)) catch |e| switch (e) {
+            error.WouldBlock => return null,
+            else => return e,
+        };
+        return ev;
+    }
+
+    pub fn stats(self: Conn) Error!ConnStats {
+        var s: ConnStats = undefined;
+        try check(c.iroh_conn_stats(self.handle, &s));
+        return s;
+    }
+
+    /// Fills `buf` with per-path stats; returns the filled prefix (at most `buf.len` paths).
+    pub fn pathStats(self: Conn, buf: []PathStats) Error![]PathStats {
+        var n: usize = 0;
+        try check(c.iroh_conn_path_stats(self.handle, buf.ptr, buf.len, &n));
+        return buf[0..@min(n, buf.len)];
+    }
+
+    /// Opens a bidirectional stream (the peer sees it after the first write).
+    pub fn openBi(self: Conn, timeout_ms: u32) Error!Stream {
+        var out: ?*c.IrohStream = null;
+        try check(c.iroh_conn_open_bi(self.handle, timeout_ms, &out));
+        return .{ .handle = out.? };
+    }
+
+    /// Accepts a peer-opened bidirectional stream; `timeout_ms == 0` polls (error.WouldBlock).
+    pub fn acceptBi(self: Conn, timeout_ms: u32) Error!Stream {
+        var out: ?*c.IrohStream = null;
+        try check(c.iroh_conn_accept_bi(self.handle, timeout_ms, &out));
+        return .{ .handle = out.? };
+    }
+};
+
+pub const Stream = struct {
+    handle: *c.IrohStream,
+
+    /// A nonzero `error_code` resets the stream; 0 lets an unfinished send side finish.
+    pub fn deinit(self: Stream, error_code: u32) void {
+        c.iroh_stream_free(self.handle, error_code);
+    }
+
+    pub fn writeAll(self: Stream, data: []const u8, timeout_ms: u32) Error!void {
+        try check(c.iroh_stream_write(self.handle, data.ptr, data.len, timeout_ms));
+    }
+
+    /// Reads into `buf`; an empty slice means the peer finished the stream.
+    /// `timeout_ms == 0` polls (error.WouldBlock).
+    pub fn read(self: Stream, buf: []u8, timeout_ms: u32) Error![]u8 {
+        var n: usize = 0;
+        try check(c.iroh_stream_read(self.handle, buf.ptr, buf.len, timeout_ms, &n));
+        return buf[0..n];
+    }
+
+    pub fn finish(self: Stream) Error!void {
+        try check(c.iroh_stream_finish(self.handle));
     }
 };

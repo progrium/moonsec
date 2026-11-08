@@ -18,6 +18,7 @@ iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring", "
 iroh-tickets = "=1.0.0"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time", "sync"] }
 bytes = "1.11"
+n0-future = "0.3"
 
 [profile.release]
 opt-level = "s"
