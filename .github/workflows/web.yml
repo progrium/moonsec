@@ -46,9 +46,11 @@ jobs:
         run: npx tsc --noEmit
       - name: Install ${{ matrix.browser }}
         run: npx playwright install --with-deps ${{ matrix.browser }}
-      # The runner has no sound card or sound server. Chromium falls back to a fake output;
-      # Firefox (and WebKit's GStreamer sink) play through PulseAudio, so give them a null sink.
-      - name: Audio sink (PulseAudio null sink)
+      # The runner has no sound card or sound server. Chromium and WebKit fall back to a fake
+      # output on their own (and Chromium stops rendering when it finds this PulseAudio);
+      # Firefox only plays through PulseAudio, so it gets a null sink.
+      - name: Audio sink for Firefox (PulseAudio null sink)
+        if: matrix.browser == 'firefox'
         run: |
           sudo apt-get install -y --no-install-recommends pulseaudio pulseaudio-utils
           pulseaudio --start --exit-idle-time=-1
