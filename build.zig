@@ -124,6 +124,13 @@ pub fn build(b: *std.Build) void {
     test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = simnet_mod })).step);
     test_sim.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("sim/test.zig"), .target = target, .optimize = optimize, .imports = sim_imports }) })).step);
     test_step.dependOn(test_sim);
+
+    // core/rate driving the simulated network with S11's metrics (sim/rate.zig).
+    const sim_rate = b.addExecutable(.{ .name = "sim-rate", .root_module = b.createModule(.{ .root_source_file = b.path("sim/rate.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod } } }) });
+    b.installArtifact(sim_rate);
+    const run_sim_rate = b.addRunArtifact(sim_rate);
+    if (b.args) |a| run_sim_rate.addArgs(a);
+    b.step("sim-rate", "Run core/rate over the S11 scenarios and print S11's metrics").dependOn(&run_sim_rate.step);
 }
 
 const Shim = struct {
