@@ -1,7 +1,7 @@
 //! Windows host backend tests (zig build test-win). They run on the GPU-less windows-2022
 //! runner: WARP for the device, Media Foundation's software encoder, and skips for
 //! hardware that is not there. Set MOONSEC_REQUIRE to a comma list (dup, mf, nvenc, audio,
-//! input) to turn those skips into failures; CI requires what its runner has.
+//! input, idd) to turn those skips into failures; CI requires what its runner has.
 const std = @import("std");
 const api = @import("platform");
 const win = @import("win");
@@ -256,4 +256,85 @@ test "openHost on WARP: the bundle encodes through the platform interface" {
     // No LTR on the software encoder: a refresh is an IDR.
     try testing.expect(out2.keyframe and !out2.ltr_refresh);
     if (b.input) |inj| try inj.inject(.{ .pad = .{ .index = 0, .connected = true, .state = .{} } });
+}
+
+// ---------------------------------------------------------------------------
+// Virtual displays (platform/windows/idd). They need the driver installed: CI's "idd"
+// job installs its test-signed build on the runner when Windows lets it.
+
+fn openVdisp() !*c.msw_vdisp {
+    var v: ?*c.msw_vdisp = null;
+    const hr = c.msw_vdisp_open(1, &v);
+    if (hr < 0) try skip("idd", "virtual display driver not available:", hr);
+    return v.?;
+}
+
+test "virtual display driver: add, activate, set mode, remove" {
+    const v = try openVdisp();
+    defer c.msw_vdisp_close(v);
+    const before = c.msw_display_count_active(0);
+    var m: c.msw_vdisp_monitor = undefined;
+    try hrOk(c.msw_vdisp_add(v, 1280, 720, 60, 0, &m));
+    std.debug.print("virtual display {d}: adapter 0x{X} target {d}\n", .{ m.id, m.adapter_luid, m.target_id });
+    var n: u32 = 0;
+    try hrOk(c.msw_vdisp_active(v, &n));
+    try testing.expect(n >= 1);
+    var name: [32]u8 = undefined;
+    try hrOk(c.msw_display_activate(m.adapter_luid, m.target_id, 1280, 720, 60, 5000, &name));
+    std.debug.print("active as {s}; displays {d} -> {d}\n", .{ std.mem.sliceTo(&name, 0), before, c.msw_display_count_active(0) });
+    try testing.expectEqual(before, c.msw_display_count_active(m.adapter_luid));
+
+    var m2: c.msw_vdisp_monitor = undefined;
+    try hrOk(c.msw_vdisp_set_mode(v, m.id, 1920, 1080, 60, &m2));
+    try testing.expectEqual(m.id, m2.id);
+    try hrOk(c.msw_display_activate(m2.adapter_luid, m2.target_id, 1920, 1080, 60, 5000, &name));
+
+    try hrOk(c.msw_vdisp_remove(v, m.id));
+    try hrOk(c.msw_vdisp_active(v, &n));
+    try testing.expectEqual(@as(u32, 0), n);
+}
+
+test "virtual display driver: displays go away when the host stops pinging" {
+    const v = try openVdisp();
+    defer c.msw_vdisp_close(v);
+    var m: c.msw_vdisp_monitor = undefined;
+    try hrOk(c.msw_vdisp_add(v, 1280, 720, 60, 0, &m));
+    c.msw_vdisp_stop_pinging(v);
+    // Timeout plus one watchdog tick, and some slack.
+    try std.testing.io.sleep(.fromMilliseconds(4500), .awake);
+    var n: u32 = 99;
+    try hrOk(c.msw_vdisp_active(v, &n));
+    try testing.expectEqual(@as(u32, 0), n);
+}
+
+test "virtual display: the backend captures it at the requested size" {
+    // Probe first so a machine without the driver skips rather than fails below.
+    c.msw_vdisp_close(try openVdisp());
+    const be = host.openHost(testing.allocator, .{ .driver = .hardware, .encoder = .mf_software, .audio = false, .input = false }) catch |e| {
+        std.debug.print("skip idd: no hardware D3D11 device: {s}\n", .{@errorName(e)});
+        if (required("idd")) return error.RequiredFeatureMissing;
+        return error.SkipZigTest;
+    };
+    defer be.deinit();
+    const size = be.capture.start(.{ .virtual_display = .always, .width = 1280, .height = 720, .fps = 60 }) catch |e| {
+        std.debug.print("skip idd: virtual display capture: {s}\n", .{@errorName(e)});
+        if (required("idd")) return error.RequiredFeatureMissing;
+        return error.SkipZigTest;
+    };
+    defer be.capture.stop();
+    try testing.expectEqual(api.Size{ .width = 1280, .height = 720 }, size);
+    const hb: *host.Host = @ptrCast(@alignCast(be.deinit_ptr.?));
+    try testing.expectEqual(api.virtual_display.Source.virtual, hb.capture.source);
+    // DWM presents to the new display at least once (it starts with a desktop to draw).
+    var got: ?api.CapturedFrame = null;
+    var tries: u32 = 0;
+    while (got == null and tries < 20) : (tries += 1) got = try be.capture.acquire(100_000);
+    if (got) |f| {
+        try testing.expectEqual(@as(u32, 1280), f.image.width);
+        be.capture.release(&f);
+    } else std.debug.print("no frame from the virtual display in 2 s (nothing drew to it)\n", .{});
+
+    // A new size mid-session re-modes the same display.
+    const size2 = try be.capture.start(.{ .virtual_display = .always, .width = 1600, .height = 900, .fps = 60 });
+    try testing.expectEqual(api.Size{ .width = 1600, .height = 900 }, size2);
 }

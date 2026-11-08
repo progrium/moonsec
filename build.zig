@@ -405,7 +405,8 @@ pub fn windowsHostModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
         "platform/host/windows/enc_nvenc.c",
         "platform/host/windows/audio.c",
         "platform/host/windows/input.c",
-    }, &.{ "user32", "mfplat", "mf", "mfuuid", "oleaut32", "avrt" });
+        "platform/host/windows/vdisp.c",
+    }, &.{ "user32", "mfplat", "mf", "mfuuid", "oleaut32", "avrt", "cfgmgr32" });
     return m;
 }
 

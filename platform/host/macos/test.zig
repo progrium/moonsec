@@ -2,7 +2,7 @@
 //! VideoToolbox does, including the macos-15 CI runner (a VM: they take whatever encoder
 //! VideoToolbox gives it and say which). Capture and audio need Screen Recording and
 //! injection needs Accessibility; without them those tests skip. Set MOONSEC_REQUIRE to a
-//! comma list (capture, audio, input, hardware, ltr) to turn those skips into failures.
+//! comma list (capture, audio, input, hardware, ltr, vdisplay) to turn those skips into failures.
 const std = @import("std");
 const api = @import("platform");
 const core = @import("core");
@@ -444,4 +444,64 @@ test "CGEvent: absolute and relative pointer moves" {
     try inj.inject(.{ .key = .{ .code = 0x01, .down = true, .time = 0 } });
     try testing.expectEqual(@as(u32, 1), inj.unmapped);
     try testing.expectEqual(@as(u32, 0), inj.failed);
+}
+
+// ---------------------------------------------------------------------------
+// Virtual displays (CGVirtualDisplay, private API). Creating one needs no permission, so
+// this runs on the CI runner; capturing it needs Screen Recording like any display.
+
+test "CGVirtualDisplay: create, re-mode, remove" {
+    if (c.mh_vdisplay_available() == 0) return skip("vdisplay", "CGVirtualDisplay classes not available on this macOS");
+    const before = c.mh_display_count(0);
+    var v: ?*c.mh_vdisplay = null;
+    const rc = c.mh_vdisplay_create(1280, 720, 60, 3000, &v);
+    if (rc != c.MH_OK) {
+        std.debug.print("CGVirtualDisplay create failed ({d}): {s}\n", .{ rc, host.lastError() });
+        return skip("vdisplay", "CGVirtualDisplay create failed");
+    }
+    const id = c.mh_vdisplay_id(v);
+    var index: u32 = 0;
+    try ok(c.mh_vdisplay_index(v, &index));
+    std.debug.print("CGVirtualDisplay: id {d}, index {d}, displays {d} -> {d}\n", .{ id, index, before, c.mh_display_count(0) });
+    try testing.expectEqual(before + 1, c.mh_display_count(0));
+    try testing.expectEqual(before, c.mh_display_count(id));
+    var w: u32 = 0;
+    var h: u32 = 0;
+    try ok(c.mh_display_pixels(index, &w, &h));
+    try testing.expectEqual(@as(u32, 1280), w);
+    try testing.expectEqual(@as(u32, 720), h);
+
+    // A smaller mode fits the display as made; a larger one needs a new display.
+    try ok(c.mh_vdisplay_set_mode(v, 1024, 576, 60));
+    try ok(c.mh_display_pixels(index, &w, &h));
+    try testing.expectEqual(@as(u32, 1024), w);
+    try testing.expectEqual(@as(c_int, c.MH_ERR_UNSUPPORTED), c.mh_vdisplay_set_mode(v, 1920, 1080, 60));
+
+    c.mh_vdisplay_destroy(v);
+    try testing.expectEqual(before, c.mh_display_count(0));
+}
+
+test "virtual display: the backend captures it at the requested size" {
+    if (c.mh_vdisplay_available() == 0) return skip("vdisplay", "CGVirtualDisplay classes not available on this macOS");
+    if (!host.screenCaptureAllowed()) return skip("capture", "no Screen Recording permission (virtual display capture)");
+    const be = try host.openHost(testing.allocator, .{ .audio = false, .input = false });
+    defer be.deinit();
+    const before = c.mh_display_count(0);
+    const size = try be.capture.start(.{ .virtual_display = .always, .width = 1280, .height = 720, .fps = 60 });
+    try testing.expectEqual(api.Size{ .width = 1280, .height = 720 }, size);
+    const h = host.Host.fromBackend(be);
+    try testing.expectEqual(api.virtual_display.Source.virtual, h.capture.source);
+    try testing.expectEqual(before + 1, c.mh_display_count(0));
+    var got: ?api.CapturedFrame = null;
+    var tries: u32 = 0;
+    while (got == null and tries < 20) : (tries += 1) got = try be.capture.acquire(100_000);
+    if (got) |f| {
+        try testing.expectEqual(@as(u32, 1280), f.image.width);
+        be.capture.release(&f);
+    } else std.debug.print("no frame from the virtual display in 2 s\n", .{});
+    // A new size mid-session: larger than made, so a new display replaces it.
+    const size2 = try be.capture.start(.{ .virtual_display = .always, .width = 1920, .height = 1080, .fps = 60 });
+    try testing.expectEqual(api.Size{ .width = 1920, .height = 1080 }, size2);
+    be.capture.stop();
+    try testing.expectEqual(before, c.mh_display_count(0));
 }

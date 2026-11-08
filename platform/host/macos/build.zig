@@ -19,7 +19,12 @@ const objc_files: []const []const u8 = &.{
     "platform/host/macos/audio.m",
     "platform/host/macos/encode.m",
     "platform/host/macos/input.m",
+    "platform/host/macos/vdisplay.m",
 };
+
+/// -Dmac-virtual-display=false builds without CGVirtualDisplay (private API; see
+/// vdisplay.m). Read once in `add`.
+var virtual_display_enabled = true;
 
 const objc_flags: []const []const u8 = &.{
     "-fobjc-arc",                   "-std=gnu11",              "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
@@ -51,7 +56,8 @@ pub fn macosHostModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize
     });
     if (native) {
         mod.addIncludePath(b.path("platform/host/macos"));
-        mod.addCSourceFiles(.{ .root = b.path("."), .files = objc_files, .flags = objc_flags });
+        const flags: []const []const u8 = if (virtual_display_enabled) objc_flags else objc_flags ++ &[_][]const u8{"-DMH_NO_CGVIRTUALDISPLAY"};
+        mod.addCSourceFiles(.{ .root = b.path("."), .files = objc_files, .flags = flags });
         for (frameworks) |f| mod.linkFramework(f, .{});
     }
     return mod;
@@ -84,6 +90,7 @@ fn modulesFor(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 }
 
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: Modules, test_step: *std.Build.Step) void {
+    virtual_display_enabled = b.option(bool, "mac-virtual-display", "macOS host: CGVirtualDisplay virtual displays (private API; default true)") orelse true;
     const keymap = b.createModule(.{ .root_source_file = b.path("platform/host/macos/keymap.zig"), .target = target, .optimize = optimize });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "mac-keymap-test", .root_module = keymap })).step);
 

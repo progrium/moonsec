@@ -19,14 +19,13 @@ struct msw_dup {
     DXGI_OUTDUPL_POINTER_POSITION pointer;
 };
 
-msw_hr msw_dup_create(msw_d3d *d, uint32_t output_index, msw_dup **out) {
+/* Duplicates output `o` (not consumed) with d's device. */
+static msw_hr dup_init(msw_d3d *d, IDXGIOutput *o, msw_dup **out) {
     *out = NULL;
     msw_dup *p = (msw_dup *)calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
     p->d = d;
     HRESULT hr;
-    IDXGIOutput *o = NULL;
-    MSW_TRY(IDXGIAdapter1_EnumOutputs(d->adapter, output_index, &o), fail);
     MSW_TRY(IDXGIOutput_QueryInterface(o, &IID_IDXGIOutput1, (void **)&p->output), fail);
     DXGI_OUTPUT_DESC od;
     MSW_TRY(IDXGIOutput1_GetDesc(p->output, &od), fail);
@@ -46,12 +45,58 @@ msw_hr msw_dup_create(msw_d3d *d, uint32_t output_index, msw_dup **out) {
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     MSW_TRY(ID3D11Device_CreateTexture2D(d->device, &td, NULL, &p->copy), fail);
-    MSW_RELEASE(o);
     *out = p;
     return S_OK;
 fail:
-    MSW_RELEASE(o);
     msw_dup_destroy(p);
+    return hr;
+}
+
+msw_hr msw_dup_create(msw_d3d *d, uint32_t output_index, msw_dup **out) {
+    *out = NULL;
+    IDXGIOutput *o = NULL;
+    HRESULT hr = IDXGIAdapter1_EnumOutputs(d->adapter, output_index, &o);
+    if (FAILED(hr)) return hr;
+    hr = dup_init(d, o, out);
+    MSW_RELEASE(o);
+    return hr;
+}
+
+static msw_hr dup_find_named(msw_d3d *d, const char *gdi_name, msw_dup **out) {
+    *out = NULL;
+    /* A fresh factory: adapters from an older one keep the output list they started
+     * with, and this output may have appeared since. */
+    DXGI_ADAPTER_DESC1 want;
+    HRESULT hr = IDXGIAdapter1_GetDesc1(d->adapter, &want);
+    if (FAILED(hr)) return hr;
+    IDXGIFactory1 *f = NULL;
+    hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f);
+    if (FAILED(hr)) return hr;
+    hr = MSW_E_NOTFOUND;
+    IDXGIAdapter1 *a = NULL;
+    for (UINT i = 0; IDXGIFactory1_EnumAdapters1(f, i, &a) == S_OK; i++) {
+        DXGI_ADAPTER_DESC1 ad;
+        int same = SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &ad)) && ad.AdapterLuid.LowPart == want.AdapterLuid.LowPart &&
+                   ad.AdapterLuid.HighPart == want.AdapterLuid.HighPart;
+        if (same) {
+            IDXGIOutput *o = NULL;
+            for (UINT k = 0; IDXGIAdapter1_EnumOutputs(a, k, &o) == S_OK; k++) {
+                DXGI_OUTPUT_DESC od;
+                char name[64];
+                int match = 0;
+                if (SUCCEEDED(IDXGIOutput_GetDesc(o, &od))) {
+                    msw_utf8(od.DeviceName, name, sizeof name);
+                    match = strcmp(name, gdi_name) == 0;
+                }
+                if (match) hr = dup_init(d, o, out);
+                MSW_RELEASE(o);
+                if (match) break;
+            }
+        }
+        MSW_RELEASE(a);
+        if (same) break;
+    }
+    MSW_RELEASE(f);
     return hr;
 }
 
@@ -152,4 +197,17 @@ msw_hr msw_dup_pointer_shape(msw_dup *p, void *buf, uint32_t len, uint32_t *need
     if (len < p->shape_len) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     memcpy(buf, p->shape, p->shape_len);
     return S_OK;
+}
+
+msw_hr msw_dup_create_named(msw_d3d *d, const char *gdi_name, uint32_t timeout_ms, msw_dup **out) {
+    ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    for (;;) {
+        /* A display that was just plugged in shows up in DXGI a little after the
+         * display configuration has it, and refuses duplication for a moment. */
+        msw_hr hr = dup_find_named(d, gdi_name, out);
+        int retry = hr == MSW_E_NOTFOUND || hr == MSW_DXGI_ERROR_UNSUPPORTED || hr == E_ACCESSDENIED ||
+                    hr == MSW_DXGI_ERROR_ACCESS_LOST || hr == (msw_hr)0x887A0022u /* NOT_CURRENTLY_AVAILABLE */;
+        if (!retry || GetTickCount64() >= deadline) return hr;
+        Sleep(50);
+    }
 }

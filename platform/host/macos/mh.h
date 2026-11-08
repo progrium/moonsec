@@ -213,6 +213,29 @@ int mh_input_move_abs(mh_input *in, uint16_t x, uint16_t y);
 void mh_input_cursor(double *x, double *y);
 void mh_input_destroy(mh_input *in);
 
+/* ---- virtual display (CGVirtualDisplay, private API; vdisplay.m) ------------ */
+
+typedef struct mh_vdisplay mh_vdisplay;
+
+/* 1 when this build has CGVirtualDisplay support (-Dmac-virtual-display, on by default)
+ * and the running macOS has the classes; 0 otherwise. Needs no permission. */
+int mh_vdisplay_available(void);
+/* Creates a display of width x height pixels (no HiDPI) at refresh_hz and waits up to
+ * timeout_ms for it to be in the active display list. MH_ERR_UNSUPPORTED when the API
+ * is missing. The display lives until mh_vdisplay_destroy or until this process exits. */
+int mh_vdisplay_create(uint32_t width, uint32_t height, uint32_t refresh_hz, uint32_t timeout_ms, mh_vdisplay **out);
+/* Changes the mode in place when it fits the size the display was made with; otherwise
+ * MH_ERR_UNSUPPORTED (destroy and create a new one). */
+int mh_vdisplay_set_mode(mh_vdisplay *v, uint32_t width, uint32_t height, uint32_t refresh_hz);
+uint32_t mh_vdisplay_id(const mh_vdisplay *v);
+/* Its index in the active display list (as mh_display_id), for capture and input. */
+int mh_vdisplay_index(const mh_vdisplay *v, uint32_t *index);
+/* Waits up to timeout_ms for ScreenCaptureKit to list it (needs Screen Recording). */
+int mh_vdisplay_wait_shareable(const mh_vdisplay *v, uint32_t timeout_ms);
+void mh_vdisplay_destroy(mh_vdisplay *v);
+/* Active displays, leaving out display id `exclude` (0 = none). */
+uint32_t mh_display_count(uint32_t exclude);
+
 #ifdef __cplusplus
 }
 #endif

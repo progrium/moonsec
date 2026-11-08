@@ -30,6 +30,10 @@ pub const Options = struct {
     input: bool = true,
     /// D3D11 debug layer (needs the Graphics Tools optional feature).
     debug: bool = false,
+    /// For CaptureConfig.virtual_display: create the driver's software device (lives as
+    /// long as this process) when no device exists. Off = use only a device made at
+    /// install time (install.ps1 -RootDevice).
+    virtual_display_device: bool = true,
 };
 
 pub fn nowUs() api.Micros {
@@ -72,17 +76,101 @@ pub const Capture = struct {
     height: u32 = 0,
     /// The output's rectangle on the virtual desktop, for absolute pointer moves.
     rect: [4]i32 = .{ 0, 0, 0, 0 },
+    /// Virtual display (CaptureConfig.virtual_display): the driver connection, opened on
+    /// first use and kept until the bundle closes, and our display while there is one.
+    vdisp: ?*c.msw_vdisp = null,
+    vmon: ?c.msw_vdisp_monitor = null,
+    /// Create the driver's software device when there is none (Options.virtual_display_device).
+    vdisp_create_device: bool = true,
+    source: api.virtual_display.Source = .physical,
 
     pub fn start(self: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
-        self.stop();
+        self.stopDup();
         self.cfg = cfg;
+        const vd = api.virtual_display;
+        if (cfg.virtual_display != .off) {
+            const exclude: i64 = if (self.vmon) |m| m.adapter_luid else 0;
+            const physical = c.msw_display_count_active(exclude);
+            if (vd.shouldCreate(cfg.virtual_display, physical)) {
+                if (self.startVirtual(cfg)) |size| return size else |e| {
+                    self.removeVirtual();
+                    switch (vd.onCreateFailed(physical)) {
+                        .fail => {
+                            log.err("virtual display failed ({s}) and no physical display is attached", .{@errorName(e)});
+                            return e;
+                        },
+                        .physical => log.warn("virtual display failed ({s}); capturing physical display {d}", .{ @errorName(e), cfg.display }),
+                    }
+                }
+            } else self.removeVirtual();
+        } else self.removeVirtual();
+        return self.startPhysical(cfg.display);
+    }
+
+    fn startPhysical(self: *Capture, display: u32) api.Error!api.Size {
         var dup: ?*c.msw_dup = null;
-        const hr = c.msw_dup_create(dev(self.d3d), cfg.display, &dup);
+        const hr = c.msw_dup_create(dev(self.d3d), display, &dup);
         if (!ok(hr)) return hrError("DuplicateOutput", hr);
+        self.useDup(dup.?, .physical);
+        return .{ .width = self.width, .height = self.height };
+    }
+
+    fn useDup(self: *Capture, dup: *c.msw_dup, source: api.virtual_display.Source) void {
         self.dup = dup;
+        self.source = source;
         c.msw_dup_size(dup, &self.width, &self.height);
         c.msw_dup_desktop_rect(dup, &self.rect[0], &self.rect[1], &self.rect[2], &self.rect[3]);
+    }
+
+    /// Plugs in our display at the client's mode (or changes the mode of the one we
+    /// have), makes sure it is on the desktop at that mode, and duplicates it.
+    fn startVirtual(self: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
+        const mode = api.virtual_display.modeFor(cfg.width, cfg.height, cfg.fps);
+        if (self.vdisp == null) {
+            var v: ?*c.msw_vdisp = null;
+            const hr = c.msw_vdisp_open(@intFromBool(self.vdisp_create_device), &v);
+            if (!ok(hr)) return hrError("virtual display driver (platform/windows/idd)", hr);
+            self.vdisp = v;
+        }
+        const v = self.vdisp.?;
+        var mon: c.msw_vdisp_monitor = undefined;
+        if (self.vmon) |m| {
+            if (m.width != mode.width or m.height != mode.height or m.refresh_hz != mode.refresh_hz) {
+                const hr = c.msw_vdisp_set_mode(v, m.id, mode.width, mode.height, mode.refresh_hz, &mon);
+                if (!ok(hr)) return hrError("virtual display set mode", hr);
+                self.vmon = mon;
+            }
+        } else {
+            const hr = c.msw_vdisp_add(v, mode.width, mode.height, mode.refresh_hz, self.d3d.info().luid, &mon);
+            if (!ok(hr)) return hrError("virtual display add", hr);
+            self.vmon = mon;
+        }
+        const m = self.vmon.?;
+        var name: [32]u8 = undefined;
+        var hr = c.msw_display_activate(m.adapter_luid, m.target_id, mode.width, mode.height, mode.refresh_hz, 5000, &name);
+        if (!ok(hr)) return hrError("virtual display activate", hr);
+        var dup: ?*c.msw_dup = null;
+        hr = c.msw_dup_create_named(dev(self.d3d), &name, 3000, &dup);
+        if (!ok(hr)) return hrError("DuplicateOutput (virtual display)", hr);
+        self.useDup(dup.?, .virtual);
+        log.info("capturing virtual display {s} ({d}x{d}@{d})", .{ std.mem.sliceTo(&name, 0), self.width, self.height, mode.refresh_hz });
         return .{ .width = self.width, .height = self.height };
+    }
+
+    fn removeVirtual(self: *Capture) void {
+        const m = self.vmon orelse return;
+        self.vmon = null;
+        if (self.vdisp) |v| {
+            const hr = c.msw_vdisp_remove(v, m.id);
+            if (!ok(hr)) log.warn("virtual display remove: {f}", .{win.fmtHr(hr)});
+        }
+    }
+
+    /// Closes the driver connection (removes any display left). Called when the bundle closes.
+    fn closeVirtual(self: *Capture) void {
+        self.removeVirtual();
+        if (self.vdisp) |v| c.msw_vdisp_close(v);
+        self.vdisp = null;
     }
 
     pub fn acquire(self: *Capture, timeout_us: api.Micros) api.Error!?api.CapturedFrame {
@@ -134,7 +222,13 @@ pub const Capture = struct {
         // The copy texture stays ours; nothing is held from DXGI between calls.
     }
 
+    /// Ends the capture and removes our virtual display, if any (session end).
     pub fn stop(self: *Capture) void {
+        self.stopDup();
+        self.removeVirtual();
+    }
+
+    fn stopDup(self: *Capture) void {
         if (self.dup) |d| c.msw_dup_destroy(d);
         self.dup = null;
         self.have_last = false;
@@ -385,6 +479,7 @@ pub const Host = struct {
     fn deinitFn(p: ?*anyopaque) void {
         const self: *Host = @ptrCast(@alignCast(p.?));
         self.capture.stop();
+        self.capture.closeVirtual();
         self.audio.stop();
         self.encoder.deinit();
         self.d3d.destroy();
@@ -412,7 +507,7 @@ pub fn openHost(allocator: std.mem.Allocator, opts: Options) (api.Error || win.E
         .allocator = allocator,
         .com = com,
         .d3d = d3d,
-        .capture = .{ .d3d = d3d },
+        .capture = .{ .d3d = d3d, .vdisp_create_device = opts.virtual_display_device },
         .encoder = try Encoder.create(d3d, opts.encoder),
     };
     self.injector.capture = &self.capture;

@@ -86,6 +86,14 @@ pub const Capture = struct {
     last: ?api.CapturedFrame = null,
     /// Restarts after the stream stopped under us.
     restarts: u32 = 0,
+    /// Virtual display (CaptureConfig.virtual_display) while we have one.
+    vdisp: ?*c.mh_vdisplay = null,
+    vmode: api.virtual_display.Mode = api.virtual_display.default_mode,
+    source: api.virtual_display.Source = .physical,
+    /// The injector, so absolute pointer moves follow the display being streamed, and
+    /// the display they go to otherwise (Options.display).
+    input: ?*c.mh_input = null,
+    input_display: u32 = 0,
 
     pub fn create(format: api.PixelFormat) api.Error!Capture {
         _ = try fmtToC(format);
@@ -100,9 +108,75 @@ pub const Capture = struct {
     }
 
     pub fn start(self: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
-        self.stop();
+        self.stopStream();
+        const vd = api.virtual_display;
+        if (cfg.virtual_display != .off) {
+            const physical = c.mh_display_count(if (self.vdisp) |v| c.mh_vdisplay_id(v) else 0);
+            if (vd.shouldCreate(cfg.virtual_display, physical)) {
+                if (self.startVirtual(cfg)) |size| return size else |e| {
+                    self.removeVirtual();
+                    switch (vd.onCreateFailed(physical)) {
+                        .fail => {
+                            log.err("virtual display failed ({s}) and no physical display is active", .{@errorName(e)});
+                            return e;
+                        },
+                        .physical => log.warn("virtual display failed ({s}); capturing display {d}", .{ @errorName(e), cfg.display }),
+                    }
+                }
+            } else self.removeVirtual();
+        } else self.removeVirtual();
+        return self.startStream(cfg, cfg.display);
+    }
+
+    /// Creates our CGVirtualDisplay at the client's mode (or re-modes the one we have)
+    /// and streams it.
+    fn startVirtual(self: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
+        const mode = api.virtual_display.modeFor(cfg.width, cfg.height, cfg.fps);
+        if (self.vdisp) |v| {
+            if (!mode.eql(self.vmode)) {
+                const rc = c.mh_vdisplay_set_mode(v, mode.width, mode.height, mode.refresh_hz);
+                if (rc == c.MH_ERR_UNSUPPORTED) {
+                    // Larger than the display was made for: make a new one.
+                    self.removeVirtual();
+                } else {
+                    try check("CGVirtualDisplay set mode", rc);
+                    self.vmode = mode;
+                }
+            }
+        }
+        if (self.vdisp == null) {
+            var v: ?*c.mh_vdisplay = null;
+            try check("CGVirtualDisplay create", c.mh_vdisplay_create(mode.width, mode.height, mode.refresh_hz, 3000, &v));
+            self.vdisp = v;
+            self.vmode = mode;
+            log.info("virtual display {d} created ({d}x{d}@{d})", .{ c.mh_vdisplay_id(v), mode.width, mode.height, mode.refresh_hz });
+        }
+        const v = self.vdisp.?;
+        // ScreenCaptureKit lists a new display a moment after CoreGraphics does.
+        try check("virtual display in ScreenCaptureKit", c.mh_vdisplay_wait_shareable(v, 3000));
+        var index: u32 = 0;
+        try check("virtual display index", c.mh_vdisplay_index(v, &index));
+        var vcfg = cfg;
+        vcfg.width = mode.width;
+        vcfg.height = mode.height;
+        const size = try self.startStream(vcfg, index);
+        self.cfg = cfg;
+        self.source = .virtual;
+        if (self.input) |in| c.mh_input_set_display(in, index);
+        return size;
+    }
+
+    fn removeVirtual(self: *Capture) void {
+        const v = self.vdisp orelse return;
+        c.mh_vdisplay_destroy(v);
+        self.vdisp = null;
+        self.source = .physical;
+        if (self.input) |in| c.mh_input_set_display(in, self.input_display);
+    }
+
+    fn startStream(self: *Capture, cfg: api.CaptureConfig, display: u32) api.Error!api.Size {
         const cc: c.mh_capture_config = .{
-            .display = cfg.display,
+            .display = display,
             .fps = cfg.fps,
             .width = cfg.width,
             .height = cfg.height,
@@ -118,6 +192,7 @@ pub const Capture = struct {
         };
         self.cfg = cfg;
         self.started = true;
+        self.source = .physical;
         self.size = .{ .width = w, .height = h };
         return self.size;
     }
@@ -165,7 +240,13 @@ pub const Capture = struct {
         c.mh_cf_release(frame.image.gpu);
     }
 
+    /// Ends the capture and removes our virtual display, if any (session end).
     pub fn stop(self: *Capture) void {
+        self.stopStream();
+        self.removeVirtual();
+    }
+
+    fn stopStream(self: *Capture) void {
         if (self.last) |l| c.mh_cf_release(l.image.gpu);
         self.last = null;
         if (self.started) c.mh_capture_stop(self.cap);
@@ -476,6 +557,8 @@ pub fn openHost(allocator: std.mem.Allocator, opts: Options) api.Error!api.HostB
     self.* = .{ .allocator = allocator, .capture = capture, .encoder = encoder };
     if (opts.audio) self.audio = Audio.create(opts.display) catch null;
     if (opts.input) self.injector = Injector.create(opts.display) catch null;
+    self.capture.input_display = opts.display;
+    if (self.injector) |i| self.capture.input = i.in;
     if (opts.input and !postEventAllowed()) log.warn("no Accessibility permission: injected input will be dropped", .{});
     return .{
         .clock = clock,

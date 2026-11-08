@@ -34,6 +34,10 @@ typedef struct msw_dup_frame {
  * hardware device on the adapter that owns the output (WARP has no outputs:
  * MSW_DXGI_ERROR_NOT_FOUND). */
 msw_hr msw_dup_create(msw_d3d *d, uint32_t output_index, msw_dup **out);
+/* Duplicates the output whose GDI device name (\\.\DISPLAYn, UTF-8) is gdi_name, if it
+ * is on the device's adapter, retrying up to timeout_ms while it is not there yet;
+ * MSW_E_NOTFOUND otherwise. For virtual displays, which appear after the device was made. */
+msw_hr msw_dup_create_named(msw_d3d *d, const char *gdi_name, uint32_t timeout_ms, msw_dup **out);
 void msw_dup_destroy(msw_dup *dup);
 void msw_dup_size(const msw_dup *dup, uint32_t *w, uint32_t *h);
 /* The output's rectangle in virtual-desktop pixels. */
@@ -49,6 +53,46 @@ void *msw_dup_last_texture(const msw_dup *dup);
  * hotspot) into buf; *needed gets the size required. */
 msw_hr msw_dup_pointer_shape(msw_dup *dup, void *buf, uint32_t len, uint32_t *needed, uint32_t *type,
                              uint32_t *width, uint32_t *height, uint32_t *pitch, int32_t *hot_x, int32_t *hot_y);
+
+/* ---- Virtual displays (vdisp.c, driver in platform/windows/idd) ------------- */
+
+typedef struct msw_vdisp msw_vdisp;
+
+typedef struct msw_vdisp_monitor {
+    uint32_t id; /* driver slot, for set_mode and remove */
+    /* The display path's adapter LUID (packed like msw_adapter_info.luid) and target. */
+    int64_t adapter_luid;
+    uint32_t target_id;
+    uint32_t width, height, refresh_hz;
+} msw_vdisp_monitor;
+
+/* Connects to the moonsec virtual display driver. With create_device, and no device
+ * yet, creates a software device that lives as long as this process. MSW_E_NOTFOUND
+ * when the driver is not installed. Starts a thread that pings the driver; displays are
+ * removed if the pings stop (a crashed host). */
+msw_hr msw_vdisp_open(uint32_t create_device, msw_vdisp **out);
+/* Removes every display, stops pinging, closes the software device. */
+void msw_vdisp_close(msw_vdisp *v);
+/* Plugs in a display with this preferred mode, rendered on render_luid's adapter (0 =
+ * the OS picks). */
+msw_hr msw_vdisp_add(msw_vdisp *v, uint32_t width, uint32_t height, uint32_t refresh_hz, int64_t render_luid,
+                     msw_vdisp_monitor *out);
+/* Replugs display `id` with a new preferred mode; *out gets its new path. */
+msw_hr msw_vdisp_set_mode(msw_vdisp *v, uint32_t id, uint32_t width, uint32_t height, uint32_t refresh_hz,
+                          msw_vdisp_monitor *out);
+msw_hr msw_vdisp_remove(msw_vdisp *v, uint32_t id);
+/* Tests: stop pinging as a crashed host would; the driver then removes the displays. */
+void msw_vdisp_stop_pinging(msw_vdisp *v);
+/* How many displays the driver has plugged in (all clients). */
+msw_hr msw_vdisp_active(msw_vdisp *v, uint32_t *count);
+
+/* Active display paths, leaving out those on adapter exclude_luid (0 = count all). */
+uint32_t msw_display_count_active(int64_t exclude_luid);
+/* Waits up to timeout_ms for the path to (adapter_luid, target_id) to be active
+ * (extending the desktop onto it if Windows did not), sets its mode, and writes its GDI
+ * device name (UTF-8) for msw_dup_create_named. */
+msw_hr msw_display_activate(int64_t adapter_luid, uint32_t target_id, uint32_t width, uint32_t height,
+                            uint32_t refresh_hz, uint32_t timeout_ms, char gdi_name[32]);
 
 /* ---- Video encoders (enc_mf.c, enc_nvenc.c) -------------------------------- */
 

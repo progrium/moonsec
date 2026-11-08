@@ -44,6 +44,11 @@ jobs:
             sed -n '/VTCopyVideoEncoderList/,/^chosen:/p' test-mac.log
             grep -E '^(h264|hevc): |^LTR |^mean frame|^skip ' test-mac.log || true
             echo '```'
+            echo '### CGVirtualDisplay on the macos-15 runner'
+            echo '```'
+            sw_vers
+            grep -E 'CGVirtualDisplay|virtual display|skip vdisplay' test-mac.log || true
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
   check:
