@@ -9,6 +9,7 @@ const api = @import("platform");
 const simnet = @import("simnet");
 const synthetic = @import("synthetic");
 const apps = @import("apps.zig");
+pub const pathsim = @import("pathsim.zig");
 
 const Micros = i64;
 
@@ -55,6 +56,10 @@ pub const Options = struct {
     outage_us: Micros = 0,
     /// Stream the synthetic tone over the Opus stage alongside the video.
     audio: bool = true,
+    /// Scripted path flaps (direct <-> relay) and connection drops (app/pathsim.zig).
+    path: ?pathsim.Config = null,
+    /// Host and client session settings that differ from the defaults.
+    pause_on_stall: bool = true,
 };
 
 pub const Result = struct {
@@ -67,6 +72,10 @@ pub const Result = struct {
         keys: u64,
         keys_wrong: u64,
         audio_frames: u64,
+        path_changes: u64 = 0,
+        reconnects: u64 = 0,
+        stall_pauses: u64 = 0,
+        stall_frames: u64 = 0,
         end: []const u8,
     },
     client: struct {
@@ -82,6 +91,9 @@ pub const Result = struct {
         total_p50_us: Micros,
         total_p99_us: Micros,
         audio: Audio,
+        path_changes: u64 = 0,
+        reconnects: u64 = 0,
+        reconnect_requests: u64 = 0,
         end: []const u8,
     },
     sim_losses: u64,
@@ -107,6 +119,15 @@ pub const Result = struct {
     /// What `moonsec sim`/`soak` and the tests hold a run to. Null when it passes.
     pub fn failure(r: Result, o: Options) ?[]const u8 {
         const want = r.expectedFrames(o.fps);
+        if (o.path != null) {
+            // Scripted outages freeze the picture by design: hold the run to a clean end,
+            // an intact picture, and most frames.
+            if (r.client.corrupt > 0) return "the decoder saw a corrupt access unit";
+            if (r.client.unreadable > 0) return "a presented frame's pattern did not read back";
+            if (!std.mem.eql(u8, r.client.end, "closed") or !std.mem.eql(u8, r.host.end, "client_bye")) return "the session did not end cleanly";
+            if (r.client.presented * 100 < want * 50) return "client presented under half of the frames";
+            return null;
+        }
         if (r.client.presented * 100 < want * 95) return "client presented under 95% of the frames";
         if (r.client.freezes > 0) return "the freeze detector saw a freeze";
         if (r.client.unreadable > 0) return "a presented frame's pattern did not read back";
@@ -182,9 +203,12 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     const cb = sc.backend();
     defer cb.deinit();
 
-    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices }, net.pipeFor(.a));
+    var model: pathsim.Model = undefined;
+    if (o.path) |pc| model.init(pc, net);
+    const pipes = if (o.path != null) [2]@TypeOf(net.pipeFor(.a)){ model.pipeFor(.a), model.pipeFor(.b) } else .{ net.pipeFor(.a), net.pipeFor(.b) };
+    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices, .pause_on_stall = o.pause_on_stall }, pipes[0]);
     defer host.deinit();
-    var client = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent }, net.pipeFor(.b));
+    var client = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent }, pipes[1]);
     defer client.deinit();
 
     const end_us: Micros = @as(Micros, o.seconds) * simnet.SEC;
@@ -194,9 +218,14 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     var closing = false;
     while (!(host.done() and client.done())) : (t += o.step_us) {
         if (!loss_on and t >= o.warmup_us) {
-            for (&net.links) |*l| l.cfg.loss = loss;
+            if (o.path != null) {
+                model.setLoss(loss);
+            } else for (&net.links) |*l| {
+                l.cfg.loss = loss;
+            }
             loss_on = true;
         }
+        if (o.path != null) model.update(t);
         if (o.outage_us > 0) {
             if (t == o.outage_at_us) net.links[0].cfg.loss = 1.0;
             if (t == o.outage_at_us + o.outage_us) net.links[0].cfg.loss = loss;
@@ -239,6 +268,10 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .keys = sh.injector.keys,
             .keys_wrong = sh.injector.wrong,
             .audio_frames = if (host.audio) |ha| ha.stats.frames else 0,
+            .path_changes = host.s.stats.path_changes,
+            .reconnects = host.s.stats.reconnects,
+            .stall_pauses = host.s.stats.stall_pauses,
+            .stall_frames = host.s.stats.stall_frames,
             .end = @tagName(host.s.end),
         },
         .client = .{
@@ -254,6 +287,9 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .total_p50_us = snap.stage(.total).p50,
             .total_p99_us = snap.stage(.total).p99,
             .audio = au,
+            .path_changes = client.s.stats.path_changes,
+            .reconnects = client.s.stats.reconnects,
+            .reconnect_requests = client.s.stats.reconnect_requests,
             .end = @tagName(client.s.end),
         },
         .sim_losses = net.linkStats(.a).random_losses + net.linkStats(.b).random_losses,

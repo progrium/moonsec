@@ -19,6 +19,8 @@ iroh-tickets = "=1.0.0"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time", "sync"] }
 bytes = "1.11"
 n0-future = "0.3"
+# PEM parsing for `relay_ca_pem` (already in the tree through rustls).
+rustls-pki-types = { version = "1", features = ["std"] }
 
 [profile.release]
 opt-level = "s"

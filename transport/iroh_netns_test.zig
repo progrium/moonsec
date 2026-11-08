@@ -1,5 +1,5 @@
-//! Linux network-namespace tests for the shim: rate handoff on a path change, the
-//! no-ack-progress signal, and drop accounting behind a real bottleneck.
+//! Linux network-namespace tests for the shim: rate handoff on a path change (to the relay
+//! and back), the no-ack-progress signal, and drop accounting behind a real bottleneck.
 //!
 //! Needs root, iproute2 (ip, tc with tbf) and iptables. Build and run from the repo root:
 //!   zig build netns-test && sudo zig-out/bin/iroh-netns-test
@@ -331,6 +331,31 @@ test "netns: target rate moves from a dead direct path to the relay" {
     std.debug.print("relay: delivered {d} kbit/s at target {d}\n", .{ halved / 1000, target / 2000 });
     try std.testing.expect(within(halved, target / 2, 20));
     try std.testing.expectEqual(target / 2, (try pathById(peer.conn, &pbuf, sel.pathId())).?.pacing_bps);
+
+    // Unblock: when iroh punches a direct path again, the target moves back to it. Stock
+    // iroh may take up to its 60 s upgrade check for that (S5c), so this half is reported,
+    // not required.
+    try blackhole('a', false);
+    const t_open = iroh.nowUs();
+    try d.run(target / 2, 20_000, onDirect);
+    if (!onDirect(&d)) {
+        std.debug.print("direct path not back within 20 s of unblocking; skipping the move back\n", .{});
+        return;
+    }
+    try d.run(target / 2, 300, null);
+    try printPaths(peer.conn);
+    const s2 = try peer.conn.stats();
+    const back = (try pathById(peer.conn, &pbuf, s2.selected_path)).?;
+    std.debug.print("direct again after {d} ms; path selections {d}\n", .{ (iroh.nowUs() - t_open) / 1000, s2.path_selections });
+    try std.testing.expectEqual(@as(u8, 0), back.is_relay);
+    try std.testing.expectEqual(target / 2, back.pacing_bps);
+    try std.testing.expect(s2.path_selections > s1.path_selections);
+    for (try peer.conn.pathStats(&pbuf)) |p| {
+        if (p.path_id != back.path_id) try std.testing.expect(p.pacing_bps <= 1_000_000);
+    }
+    const again = try d.measure(target, 1500);
+    std.debug.print("direct again: delivered {d} kbit/s at target {d}\n", .{ again / 1000, target / 2000 });
+    try std.testing.expect(within(again, target / 2, 20));
 }
 
 test "netns: every datagram is accounted for behind a bottleneck" {

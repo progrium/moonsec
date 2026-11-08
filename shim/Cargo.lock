@@ -1578,6 +1578,7 @@ dependencies = [
  "iroh",
  "iroh-tickets",
  "n0-future",
+ "rustls-pki-types",
  "tokio",
 ]
 

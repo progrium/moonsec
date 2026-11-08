@@ -68,3 +68,83 @@ test "an outage loses frames and recovery brings the picture back" {
     try std.testing.expectEqual(@as(u64, 0), r.client.audio.underruns);
     try std.testing.expect(r.client.audio.decoded > 300);
 }
+
+/// The run's report, printed when a check fails (the build runner fails a test that
+/// writes to stderr otherwise).
+fn printPath(r: simrun.Result) void {
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    r.print(&w) catch {};
+    std.debug.print("{s}  host: path changes {d}, reconnects {d}, stall pauses {d} ({d} frames held); client: path changes {d}, reconnects {d} (asked {d})\n", .{ w.buffered(), r.host.path_changes, r.host.reconnects, r.host.stall_pauses, r.host.stall_frames, r.client.path_changes, r.client.reconnects, r.client.reconnect_requests });
+}
+
+fn runPath(o: simrun.Options) !simrun.Result {
+    const r = try simrun.run(std.testing.allocator, o, null);
+    errdefer printPath(r);
+    try std.testing.expectEqual(@as(u64, 0), r.client.corrupt);
+    try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+    // Keys older than the sender's 500 ms redundancy window are dropped by design, which
+    // the synthetic injector's script check reads as out of order: only check without drops.
+    if (o.path.?.drops.len == 0) try std.testing.expectEqual(@as(u64, 0), r.host.keys_wrong);
+    try std.testing.expectEqualStrings("client_bye", r.host.end);
+    try std.testing.expectEqualStrings("closed", r.client.end);
+    return r;
+}
+
+test "an outage under the idle timeout holds video on the stall and resumes with a refresh" {
+    // 1 s idle timeout: a 500 ms outage does not close the direct path.
+    const r = try runPath(.{ .seed = 2, .profile = .lan, .seconds = 4, .path = .{ .idle_us = 1_000_000, .flaps = &.{.{ .at_us = 2_000_000, .outage_us = 500_000 }} } });
+    errdefer printPath(r);
+    try std.testing.expectEqual(@as(u64, 0), r.host.path_changes);
+    try std.testing.expectEqual(@as(u64, 1), r.host.stall_pauses);
+    // Held from 150 ms into the outage to its end: about 21 frames at 60 fps.
+    try std.testing.expect(r.host.stall_frames >= 18 and r.host.stall_frames <= 24);
+    try std.testing.expect(r.host.refreshes + r.host.keyframes >= 2);
+    try std.testing.expect(r.client.longest_gap_us < 650_000);
+    try std.testing.expect(r.client.presented > 3 * 60);
+}
+
+test "an outage over the idle timeout moves to the relay and back to the direct path" {
+    const r = try runPath(.{ .seed = 3, .profile = .lan, .seconds = 6, .path = .{ .idle_us = 300_000, .flaps = &.{.{ .at_us = 2_000_000, .outage_us = 1_500_000 }} } });
+    errdefer printPath(r);
+    // direct -> relay at 300 ms, relay -> direct 500 ms after the outage.
+    try std.testing.expectEqual(@as(u64, 2), r.host.path_changes);
+    try std.testing.expectEqual(@as(u64, 2), r.client.path_changes);
+    try std.testing.expectEqual(@as(u64, 1), r.host.stall_pauses);
+    // The gap is about the idle timeout, not the outage: the relay carries the stream.
+    try std.testing.expect(r.client.longest_gap_us < 500_000);
+    try std.testing.expectEqual(@as(u64, 0), r.client.reconnect_requests);
+    try std.testing.expect(r.client.presented > 5 * 60);
+}
+
+test "path flaps: five outages a second and a half apart" {
+    var flaps: [5]simrun.pathsim.Outage = undefined;
+    for (&flaps, 0..) |*f, i| f.* = .{ .at_us = 1_500_000 + @as(i64, @intCast(i)) * 1_500_000, .outage_us = 400_000 + @as(i64, @intCast(i % 2)) * 400_000 };
+    const r = try runPath(.{ .seed = 4, .profile = .wan, .seconds = 10, .path = .{ .idle_us = 300_000, .repunch_us = 300_000, .flaps = &flaps } });
+    errdefer printPath(r);
+    try std.testing.expectEqual(@as(u64, 10), r.host.path_changes);
+    try std.testing.expectEqual(@as(u64, 5), r.host.stall_pauses);
+    try std.testing.expect(r.client.longest_gap_us < 600_000);
+    try std.testing.expect(r.client.presented > 8 * 60);
+}
+
+test "a dropped connection: the client redials and the session carries on" {
+    // Dead for 1 s; the client asks for a new connection after 2 s of silence, and the
+    // new one is up 300 ms later.
+    const r = try runPath(.{ .seed = 5, .profile = .lan, .seconds = 8, .path = .{ .drops = &.{.{ .at_us = 2_000_000, .outage_us = 1_000_000 }} } });
+    errdefer printPath(r);
+    try std.testing.expectEqual(@as(u64, 1), r.client.reconnects);
+    try std.testing.expectEqual(@as(u64, 1), r.host.reconnects);
+    try std.testing.expect(r.client.reconnect_requests >= 1);
+    try std.testing.expect(r.client.longest_gap_us > 2_000_000 and r.client.longest_gap_us < 2_800_000);
+    try std.testing.expect(r.client.presented > 5 * 60);
+}
+
+test "a drop longer than the 5 s peer timeout still reconnects" {
+    const r = try runPath(.{ .seed = 6, .profile = .clean, .seconds = 12, .path = .{ .drops = &.{.{ .at_us = 2_000_000, .outage_us = 7_000_000 }} } });
+    errdefer printPath(r);
+    try std.testing.expectEqual(@as(u64, 1), r.client.reconnects);
+    // Asked every 2 s while silent.
+    try std.testing.expect(r.client.reconnect_requests >= 3);
+    try std.testing.expect(r.client.presented > 4 * 60);
+}

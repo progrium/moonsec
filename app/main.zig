@@ -17,7 +17,14 @@
 //!       Write the measurement test pattern as a PPM.
 //!
 //! Options: --fps N, --bitrate BPS, --size WxH, --slices N; sim and soak also take
-//! --outage-at-ms T --outage-ms D (drop everything host to client for D ms at T).
+//! --outage-at-ms T --outage-ms D (drop everything host to client for D ms at T), and a
+//! scripted path (app/pathsim.zig): --flaps T:D,T:D,... (direct-path outages at T ms for
+//! D ms), --drops T:D,... (connection drops), --idle-ms N (path idle timeout, default 300),
+//! --repunch-ms N (direct again N ms after an outage, default 500), --relay-delay-ms N,
+//! --no-stall-pause (keep sending video while the path is stalled).
+//! The iroh peers take --path-idle-ms N, --conn-idle-ms N, --bind IP:PORT, --relay-url URL
+//! [--relay-ca PEM] and --min-presented PCT (client pass bar, default 80), and redial
+//! (client) or accept again (host) when the connection drops.
 const std = @import("std");
 const builtin = @import("builtin");
 const options = @import("app_options");
@@ -57,7 +64,35 @@ const Args = struct {
     frame: u32 = 0,
     outage_at_ms: i64 = 0,
     outage_ms: i64 = 0,
+    flaps: [16]simrun.pathsim.Outage = undefined,
+    n_flaps: usize = 0,
+    drops: [16]simrun.pathsim.Outage = undefined,
+    n_drops: usize = 0,
+    idle_ms: ?i64 = null,
+    repunch_ms: ?i64 = null,
+    relay_delay_ms: ?i64 = null,
+    no_stall_pause: bool = false,
+    path_idle_ms: u32 = 0,
+    relay_url: ?[:0]const u8 = null,
+    relay_ca: ?[:0]const u8 = null,
+    bind: ?[:0]const u8 = null,
+    conn_idle_ms: u32 = 0,
+    /// Client: share of `seconds × fps` that must be presented for a pass.
+    min_presented_pct: u64 = 80,
 };
+
+/// "T:D,T:D" (ms) into `out`.
+fn parseOutages(v: []const u8, out: []simrun.pathsim.Outage) !usize {
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, v, ',');
+    while (it.next()) |item| {
+        if (n == out.len) return error.Usage;
+        const c = std.mem.indexOfScalar(u8, item, ':') orelse return error.Usage;
+        out[n] = .{ .at_us = 1000 * try std.fmt.parseInt(i64, item[0..c], 10), .outage_us = 1000 * try std.fmt.parseInt(i64, item[c + 1 ..], 10) };
+        n += 1;
+    }
+    return n;
+}
 
 fn usage() error{Usage} {
     std.debug.print(
@@ -68,6 +103,8 @@ fn usage() error{Usage} {
         \\       moonsec peer iroh host|client --ticket-file PATH [--relay] [opts]
         \\       moonsec pattern --out FILE.ppm [--time-us N] [--frame N] [--size WxH]
         \\opts:  --fps N --bitrate BPS --size WxH --slices N
+        \\sim:   --flaps T:D,.. --drops T:D,.. --idle-ms N --repunch-ms N --relay-delay-ms N --no-stall-pause
+        \\iroh:  --relay-url URL --relay-ca PEM --bind IP:PORT --path-idle-ms N --conn-idle-ms N --min-presented PCT
         \\
     , .{});
     return error.Usage;
@@ -84,6 +121,10 @@ fn parseArgs(args: []const [:0]const u8) !Args {
             a.relay = true;
             continue;
         }
+        if (std.mem.eql(u8, s, "--no-stall-pause")) {
+            a.no_stall_pause = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, s, "--")) {
             if (i + 1 >= args.len) return usage();
             i += 1;
@@ -91,7 +132,11 @@ fn parseArgs(args: []const [:0]const u8) !Args {
             const eq = std.mem.eql;
             if (eq(u8, s, "--seed")) a.seed = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--seconds")) a.seconds = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--profile")) {
                 a.profile = std.meta.stringToEnum(simrun.Profile, v) orelse return usage();
-            } else if (eq(u8, s, "--fps")) a.fps = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--bitrate")) a.bitrate = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--slices")) a.slices = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--hub")) a.hub_port = try std.fmt.parseInt(u16, v, 10) else if (eq(u8, s, "--ticket-file")) a.ticket_file = v else if (eq(u8, s, "--out")) a.out = v else if (eq(u8, s, "--time-us")) a.time_us = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--frame")) a.frame = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--outage-at-ms")) a.outage_at_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--outage-ms")) a.outage_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--size")) {
+            } else if (eq(u8, s, "--fps")) a.fps = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--bitrate")) a.bitrate = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--slices")) a.slices = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--hub")) a.hub_port = try std.fmt.parseInt(u16, v, 10) else if (eq(u8, s, "--ticket-file")) a.ticket_file = v else if (eq(u8, s, "--out")) a.out = v else if (eq(u8, s, "--time-us")) a.time_us = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--frame")) a.frame = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--outage-at-ms")) a.outage_at_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--outage-ms")) a.outage_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--flaps")) {
+                a.n_flaps = try parseOutages(v, &a.flaps);
+            } else if (eq(u8, s, "--drops")) {
+                a.n_drops = try parseOutages(v, &a.drops);
+            } else if (eq(u8, s, "--idle-ms")) a.idle_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--repunch-ms")) a.repunch_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--relay-delay-ms")) a.relay_delay_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--path-idle-ms")) a.path_idle_ms = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--relay-url")) a.relay_url = v else if (eq(u8, s, "--relay-ca")) a.relay_ca = v else if (eq(u8, s, "--bind")) a.bind = v else if (eq(u8, s, "--conn-idle-ms")) a.conn_idle_ms = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--min-presented")) a.min_presented_pct = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--size")) {
                 const x = std.mem.indexOfScalar(u8, v, 'x') orelse return usage();
                 a.width = try std.fmt.parseInt(u32, v[0..x], 10);
                 a.height = try std.fmt.parseInt(u32, v[x + 1 ..], 10);
@@ -122,9 +167,9 @@ pub fn main(init: std.process.Init) !void {
     const w = &stdout.interface;
     const eq = std.mem.eql;
     const ok: bool = if (eq(u8, a.cmd, "sim"))
-        try cmdSim(gpa, a, w, a.seconds orelse 10, 0)
+        try cmdSim(gpa, &a, w, a.seconds orelse 10, 0)
     else if (eq(u8, a.cmd, "soak"))
-        try cmdSim(gpa, a, w, a.seconds orelse 3600, 300)
+        try cmdSim(gpa, &a, w, a.seconds orelse 3600, 300)
     else if (eq(u8, a.cmd, "run"))
         try cmdRun(gpa, io, a)
     else if (eq(u8, a.cmd, "peer"))
@@ -137,8 +182,15 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(if (ok) 0 else 1);
 }
 
-fn simOptions(a: Args, seconds: u32, progress: u32) simrun.Options {
+fn simOptions(a: *const Args, seconds: u32, progress: u32) simrun.Options {
+    const scripted = a.n_flaps + a.n_drops > 0;
+    var path: simrun.pathsim.Config = .{ .flaps = a.flaps[0..a.n_flaps], .drops = a.drops[0..a.n_drops] };
+    if (a.idle_ms) |v| path.idle_us = v * 1000;
+    if (a.repunch_ms) |v| path.repunch_us = v * 1000;
+    if (a.relay_delay_ms) |v| path.relay_delay_us = v * 1000;
     return .{
+        .path = if (scripted) path else null,
+        .pause_on_stall = !a.no_stall_pause,
         .seed = a.seed,
         .profile = a.profile,
         .seconds = seconds,
@@ -153,14 +205,15 @@ fn simOptions(a: Args, seconds: u32, progress: u32) simrun.Options {
     };
 }
 
-fn cmdSim(gpa: std.mem.Allocator, a: Args, w: *Io.Writer, seconds: u32, progress: u32) !bool {
+fn cmdSim(gpa: std.mem.Allocator, a: *const Args, w: *Io.Writer, seconds: u32, progress: u32) !bool {
     const o = simOptions(a, seconds, progress);
     try w.print("== {d} s of {s} streaming over the {s} sim profile (seed {d}, {d}x{d}@{d}, {d} kbit/s) ==\n", .{ seconds, "synthetic", @tagName(o.profile), o.seed, o.width, o.height, o.fps, o.bitrate_bps / 1000 });
     try w.flush();
     const r = try simrun.run(gpa, o, w);
     try r.print(w);
     const why = r.failure(o);
-    try w.print("{s}: {s}\n", .{ if (why == null) "PASS" else "FAIL", why orelse "no freezes, every frame and input checked" });
+    const pass_why = if (o.path != null) "clean end, every presented frame checked" else "no freezes, every frame and input checked";
+    try w.print("{s}: {s}\n", .{ if (why == null) "PASS" else "FAIL", why orelse pass_why });
     return why == null;
 }
 
@@ -358,7 +411,7 @@ fn cmdPeer(gpa: std.mem.Allocator, io: Io, a: Args) !bool {
 fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketPipe) !bool {
     const clock = api.clockFn(wallNow);
     const seconds = a.seconds orelse 10;
-    var buf: [4096]u8 = undefined;
+    var buf: [16384]u8 = undefined;
     var w = Io.Writer.fixed(&buf);
     var ok = false;
     switch (role) {
@@ -366,13 +419,16 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             const sh = try synthetic.openHost(gpa, .{ .clock = clock, .sleeper = wallSleep, .width = a.width, .height = a.height });
             const hb = sh.backend();
             defer hb.deinit();
-            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices }, p);
+            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause }, p);
             defer app.deinit();
             try app.runThreaded(io);
             try app.s.report(&w);
-            try w.print("  injected keys {d} (out of order {d}), capture timeouts {d}, encode errors {d}\n", .{ sh.injector.keys, sh.injector.wrong, app.stats.capture_timeouts, app.stats.encode_errors });
+            const lost_input = app.s.input_rx.stats.lost_events;
+            try w.print("  injected keys {d} (out of order {d}, lost {d}), capture timeouts {d}, encode errors {d}\n", .{ sh.injector.keys, sh.injector.wrong, lost_input, app.stats.capture_timeouts, app.stats.encode_errors });
             if (app.audio) |au| try w.print("  audio: {d} frames encoded, {d} datagrams, {d} errors; source skipped {d} frames\n", .{ au.stats.frames, au.stats.datagrams, au.stats.errors, sh.audio.stats.skipped });
-            ok = app.s.end == .client_bye and sh.injector.wrong == 0 and sh.injector.keys > 0 and app.s.stats.frames > 0;
+            // Keys older than the sender's 500 ms window are dropped by design (an outage);
+            // the injector's script check then reads the rest as out of order.
+            ok = app.s.end == .client_bye and (sh.injector.wrong == 0 or lost_input > 0) and sh.injector.keys > 0 and app.s.stats.frames > 0;
         },
         .client => {
             const sc = try synthetic.openClient(gpa, .{ .clock = clock, .input_interval_us = 25_000 });
@@ -392,12 +448,12 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
                 const bs = au.bufferStats();
                 const ss = sc.audio.stats;
                 try w.print("  audio: played {d} (FEC {d}, RS rebuilt {d}), concealed {d}, late {d}, silence {d}; sink underruns {d} ({d} frames), buffer delay {d:.1} ms\n", .{ bs.decoded + bs.fec, bs.fec, bs.rs_recovered, bs.concealed, bs.late, bs.silence, ss.underruns, ss.underrun_frames, @as(f64, @floatFromInt(bs.delay_us)) / 1000 });
-                audio_ok = (bs.decoded + bs.fec) * 100 >= @as(u64, seconds) * 100 * 80 and ss.loud * 2 >= ss.written;
+                audio_ok = (bs.decoded + bs.fec) * 100 >= @as(u64, seconds) * 100 * a.min_presented_pct and ss.loud * 2 >= ss.written;
             }
             const want = @as(u64, seconds) * a.fps;
             // Wall-clock runs on shared CI machines get scheduling stalls the sim never
             // has; hold them to most frames and no corruption, and report freezes.
-            ok = app.s.end == .closed and app.s.stats.frames_presented * 100 >= want * 80 and
+            ok = app.s.end == .closed and app.s.stats.frames_presented * 100 >= want * a.min_presented_pct and
                 sc.presenter.stats.unreadable == 0 and sc.decoder.stats.corrupt == 0 and audio_ok;
         },
     }
@@ -418,29 +474,38 @@ fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
         std.debug.print("iroh init: {s}\n", .{iroh.lastError()});
         return e;
     };
+    const any_relay = a.relay or a.relay_url != null;
     const ep = iroh.Endpoint.bind(.{
         .alpn = if (role == .host) alpn else "",
-        .relay_mode = if (a.relay) .default else .disabled,
-        .bind_addr = if (a.relay) "0.0.0.0:0" else "127.0.0.1:0",
+        .relay_mode = if (a.relay_url != null) .custom_only else if (a.relay) .default else .disabled,
+        .relay_urls = if (a.relay_url) |u| u.ptr else null,
+        .relay_ca_pem = if (a.relay_ca) |p| p.ptr else null,
+        .bind_addr = a.bind orelse if (any_relay) "0.0.0.0:0" else "127.0.0.1:0",
+        .conn_idle_timeout_ms = a.conn_idle_ms,
+        .path_idle_timeout_ms = a.path_idle_ms,
+        // Keep-alive at a third of the idle timeout (the shim's 100 ms suits its 300 ms).
+        .path_keepalive_ms = if (a.path_idle_ms > 0) @max(a.path_idle_ms / 3, 50) else 0,
     }) catch |e| {
         std.debug.print("bind: {s}\n", .{iroh.lastError()});
         return e;
     };
     defer ep.deinit();
-    const conn = switch (role) {
-        .host => blk: {
+    if (a.relay_url != null) ep.online(15_000) catch |e| {
+        std.debug.print("relay: {s}\n", .{iroh.lastError()});
+        return e;
+    };
+    var ticket_z: ?[:0]u8 = null;
+    defer if (ticket_z) |t| gpa.free(t);
+    switch (role) {
+        .host => {
             var tbuf: [4096]u8 = undefined;
             const t = try ep.ticket(&tbuf);
             var tmp_buf: [256]u8 = undefined;
             const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{a.ticket_file});
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = t });
             try Io.Dir.rename(.cwd(), tmp, .cwd(), a.ticket_file, io);
-            break :blk ep.accept(if (a.relay) 600_000 else 30_000) catch |e| {
-                std.debug.print("accept: {s}\n", .{iroh.lastError()});
-                return e;
-            };
         },
-        .client => blk: {
+        .client => {
             var ticket: ?[]u8 = null;
             defer if (ticket) |t| gpa.free(t);
             for (0..1200) |_| {
@@ -449,17 +514,28 @@ fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
                 io.sleep(.fromMilliseconds(25), .awake) catch {};
             }
             const t = ticket orelse return error.NoTicket;
-            const tz = try gpa.dupeZ(u8, std.mem.trim(u8, t, " \r\n"));
-            defer gpa.free(tz);
-            break :blk ep.connect(tz, alpn, 30_000) catch |e| {
-                std.debug.print("connect: {s}\n", .{iroh.lastError()});
-                return e;
-            };
+            ticket_z = try gpa.dupeZ(u8, std.mem.trim(u8, t, " \r\n"));
         },
-    };
-    defer conn.deinit(0);
-    var ip = iroh_pipe.IrohPipe.init(conn);
-    const ok = try peer(gpa, io, a, role, ip.packetPipe());
+    }
+    // The link accepts (host) or dials (client) in the background, and again after a drop.
+    const link = try gpa.create(iroh_pipe.IrohLink);
+    defer gpa.destroy(link);
+    try link.start(io, ep, .{ .role = if (role == .host) .accept else .dial, .ticket = ticket_z orelse "", .alpn = alpn });
+    defer link.deinit();
+    const p = link.packetPipe();
+    // The first connection, within the old accept/connect timeouts.
+    const wait_ms: u64 = if (role == .host and a.relay) 600_000 else 30_000;
+    var waited: u64 = 0;
+    while (!p.stats().connected) : (waited += 10) {
+        if (waited >= wait_ms) {
+            std.debug.print("{s}: no connection after {d} s ({d} dials, {d} failed): {s}\n", .{ @tagName(role), wait_ms / 1000, link.linkStats().dials, link.linkStats().dial_failures, iroh.lastError() });
+            return error.Timeout;
+        }
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    const ok = try peer(gpa, io, a, role, p);
+    const ls = link.linkStats();
+    std.debug.print("  {s} link: {d} dials ({d} failed), {d} accepts, {d} reconnects, {d} discarded, {d} datagrams dropped offline\n", .{ @tagName(role), ls.dials, ls.dial_failures, ls.accepts, ls.switches, ls.discarded, ls.offline_drops });
     io.sleep(.fromMilliseconds(200), .awake) catch {};
     return ok;
 }

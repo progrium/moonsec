@@ -9,12 +9,19 @@
 //! client receive, decode and present) and records them in the telemetry window once the
 //! frame is presented, with the clock offset from ping/pong; the freeze detector sees
 //! every present.
+//!
+//! Drops (Phase 3): with a pipe that can reconnect, the client asks it for a new connection
+//! after `reconnect_after_us` without a datagram from the host, and again every
+//! `reconnect_after_us` while the silence lasts; the session ends only after
+//! `reconnect_timeout_us`. On a new connection it repeats `hello` until the host answers,
+//! and recovery repairs the picture as after any loss.
 const std = @import("std");
 const core = @import("core");
 const api = @import("platform");
 const pipe_mod = @import("pipe");
 const wire = @import("wire.zig");
 const host_session = @import("host_session.zig");
+const pathlog = @import("pathlog.zig");
 
 const proto = core.proto;
 const media = core.media;
@@ -36,6 +43,12 @@ pub const Config = struct {
     /// How long reassembly and NACKs keep trying for a frame.
     recovery_window_us: u64 = 100_000,
     peer_timeout_us: Micros = 5_000_000,
+    /// With a pipe that can reconnect: ask for a new connection after this long without a
+    /// datagram from the host (0: never), and end the session only after `reconnect_timeout_us`.
+    /// Under `peer_timeout_us`'s 5 s and well over the path idle timeout (0.3-1 s), so iroh
+    /// gets to move to the relay first.
+    reconnect_after_us: Micros = 2_000_000,
+    reconnect_timeout_us: Micros = 60_000_000,
     /// Give up if no config comes within this long.
     connect_timeout_us: Micros = 10_000_000,
     freeze: telemetry.freeze.Config = .{},
@@ -73,6 +86,10 @@ pub const Stats = struct {
     input_packets: u64 = 0,
     malformed: u64 = 0,
     unknown: u64 = 0,
+    path_changes: u64 = 0,
+    /// Reconnects asked of the pipe, and new connections it made.
+    reconnect_requests: u64 = 0,
+    reconnects: u64 = 0,
 };
 
 const Queued = struct {
@@ -107,6 +124,13 @@ pub const ClientSession = struct {
     rtt_us: Micros = 0,
     byes_left: u8 = 0,
     next_bye: Micros = 0,
+    /// Path and connection the pipe last reported (null until the first stats).
+    path_epoch: ?u32 = null,
+    conn_epoch: u32 = 0,
+    next_reconnect: Micros = 0,
+    /// On a new connection: say hello until the host is heard from on it.
+    resync: bool = false,
+    log: pathlog.Log = .{},
 
     receiver: media.Receiver,
     rec: recovery.Client,
@@ -235,10 +259,29 @@ pub const ClientSession = struct {
             };
             const got = r orelse break;
             s.last_rx_us = now;
+            s.resync = false;
             s.onDatagram(buf[0..got.len], now);
         }
         if (s.state == .ended) return;
         s.path = s.pipe.stats();
+        if (s.path_epoch) |last| {
+            if (s.path.conn_epoch != s.conn_epoch) {
+                s.conn_epoch = s.path.conn_epoch;
+                s.stats.reconnects += 1;
+                s.log.add(now, .reconnect, s.path.relayed);
+                if (s.state == .streaming) {
+                    s.resync = true;
+                    s.next_hello = now;
+                }
+            } else if (s.path.path_epoch != last) {
+                s.stats.path_changes += 1;
+                s.log.add(now, .path, s.path.relayed);
+            }
+        } else {
+            s.conn_epoch = s.path.conn_epoch;
+            s.log.start = now;
+        }
+        s.path_epoch = s.path.path_epoch;
         s.rec.setRtt(s.rttUs());
 
         if (s.byes_left > 0) {
@@ -254,14 +297,26 @@ pub const ClientSession = struct {
             .connecting => {
                 if (now - start > s.cfg.connect_timeout_us) return s.finish(.connect_timeout, "no config from the host");
                 if (now >= s.next_hello) {
-                    var b: [wire.Hello.len]u8 = undefined;
-                    (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height }).encode(&b);
-                    s.sendOther(.control_fast, @intFromEnum(wire.Kind.hello), &b);
+                    s.sendHello();
                     s.next_hello = now + s.cfg.hello_interval_us;
                 }
             },
             .streaming => {
-                if (s.last_rx_us) |t| if (now - t > s.cfg.peer_timeout_us) return s.finish(.peer_timeout, "no datagrams from the host");
+                if (s.last_rx_us) |t| {
+                    const silent = now - t;
+                    const can = s.pipe.canReconnect();
+                    if (silent > (if (can) s.cfg.reconnect_timeout_us else s.cfg.peer_timeout_us)) return s.finish(.peer_timeout, "no datagrams from the host");
+                    if (can and s.cfg.reconnect_after_us > 0 and silent > s.cfg.reconnect_after_us and now >= s.next_reconnect) {
+                        s.pipe.reconnect();
+                        s.stats.reconnect_requests += 1;
+                        s.log.add(now, .redial, s.path.relayed);
+                        s.next_reconnect = now + s.cfg.reconnect_after_us;
+                    }
+                }
+                if (s.resync and now >= s.next_hello) {
+                    s.sendHello();
+                    s.next_hello = now + s.cfg.hello_interval_us;
+                }
                 s.pollFrames(now);
             },
             .ended => return,
@@ -293,9 +348,15 @@ pub const ClientSession = struct {
         }
     }
 
+    fn sendHello(s: *ClientSession) void {
+        var b: [wire.Hello.len]u8 = undefined;
+        (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height }).encode(&b);
+        s.sendOther(.control_fast, @intFromEnum(wire.Kind.hello), &b);
+    }
+
     pub fn nextWake(s: *ClientSession, now: Micros) Micros {
         var t = @min(now + 5_000, s.next_feedback, s.next_ping);
-        if (s.state == .connecting) t = @min(t, s.next_hello);
+        if (s.state == .connecting or s.resync) t = @min(t, s.next_hello);
         if (s.byes_left > 0) t = @min(t, s.next_bye);
         if (s.sender.nextSendTime(now)) |x| t = @min(t, x);
         if (s.receiver.deadline(s.rttUs())) |d| t = @min(t, @as(Micros, @intCast(d)));
@@ -578,6 +639,9 @@ pub const ClientSession = struct {
         });
         const snap = s.tele.snapshot();
         inline for (.{ "network", "decode", "present", "total" }) |n| try host_session.printStage(w, n, snap.stage(@field(telemetry.Stage, n)));
+        if (st.path_changes + st.reconnects + st.reconnect_requests > 0)
+            try w.print("  path changes {d}, reconnects {d} (asked {d})\n", .{ st.path_changes, st.reconnects, st.reconnect_requests });
+        try s.log.print(w, "client");
         if (s.est.estimate()) |e| try w.print("  clock offset {d} us (±{d}), rtt {d} us\n", .{ e.offsetAt(s.last_rx_us orelse 0), e.error_bound, s.rtt_us });
     }
 };

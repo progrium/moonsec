@@ -41,6 +41,8 @@ pub const HostOptions = struct {
     /// Stream the backend's audio source, if it has one.
     audio: bool = true,
     session: struct { peer_timeout_us: Micros = 5_000_000, pace: bool = true } = .{},
+    /// Hold video while the path is stalled (host_session.Config.pause_on_stall).
+    pause_on_stall: bool = true,
 };
 
 pub const HostApp = struct {
@@ -69,6 +71,7 @@ pub const HostApp = struct {
             .ltr = caps.ltr,
             .pace = o.session.pace,
             .peer_timeout_us = o.session.peer_timeout_us,
+            .pause_on_stall = o.pause_on_stall,
         }, p);
         var app: HostApp = .{ .be = be, .s = s, .opts = o, .size = size };
         errdefer app.s.deinit();

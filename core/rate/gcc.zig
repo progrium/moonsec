@@ -140,6 +140,25 @@ pub const Gcc = struct {
         return g;
     }
 
+    /// The transport moved to another network path: its base delay, delay trend and link
+    /// capacity are not the old path's. Restart the delay detector and forget the capacity
+    /// and loss window, but keep the rate (the new path is probed from where we were).
+    pub fn onPathChange(self: *Gcc) void {
+        var g = Gcc.init(self.cfg);
+        g.bitrate = self.bitrate;
+        g.in_ramp = false;
+        g.last_change_us = self.last_change_us;
+        g.last_decrease_us = self.last_decrease_us;
+        g.last_jump_us = self.last_jump_us;
+        g.acked = self.acked;
+        g.last_recv = self.last_recv;
+        g.overuse_events = self.overuse_events;
+        g.drains = self.drains;
+        g.jumps = self.jumps;
+        g.drain_giveups = self.drain_giveups;
+        self.* = g;
+    }
+
     /// The rate the controller allows, bits per second.
     pub fn target(self: *const Gcc) f64 {
         return std.math.clamp(@min(self.bitrate, self.loss_cap), self.cfg.min_bps, self.cfg.max_bps);

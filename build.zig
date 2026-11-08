@@ -174,6 +174,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const netns_step = b.step("netns-test", "Install the Linux netns shim tests (run zig-out/bin/iroh-netns-test as root)");
+    // The netns lab (tools/netlab): a userspace delay line for kernels without netem.
+    const delayline = b.addExecutable(.{ .name = "delayline", .root_module = b.createModule(.{ .root_source_file = b.path("tools/netlab/delayline.zig"), .target = target, .optimize = optimize }) });
+    b.step("delayline", "Install zig-out/bin/delayline (Linux; the netns lab's delay line)").dependOn(&b.addInstallArtifact(delayline, .{}).step);
     netns_step.dependOn(&b.addInstallArtifact(netns_tests, .{}).step);
     netns_step.dependOn(b.getInstallStep());
 
