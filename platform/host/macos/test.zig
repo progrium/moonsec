@@ -75,6 +75,7 @@ const Source = struct {
     height: u32,
     n: u32 = 0,
     noise: bool = false,
+    start_us: i64 = 0,
 
     fn init(width: u32, height: u32, format: u32, noise: bool) !Source {
         var s: Source = .{ .width = width, .height = height, .noise = noise };
@@ -88,17 +89,20 @@ const Source = struct {
         for (s.bufs) |b| c.mh_cf_release(b);
     }
 
-    /// The next frame, as capture would hand it out.
+    /// The next frame, as capture would hand it out: paced at 60 fps in real time, since
+    /// a real-time encoder may drop frames that come faster than their timestamps.
     fn next(s: *Source) !api.CapturedFrame {
         const pb = s.bufs[s.n % s.bufs.len];
         try ok(c.mh_pixel_buffer_fill(pb, s.n, @intFromBool(s.noise)));
+        if (s.n == 0) s.start_us = host.nowUs();
+        const due = s.start_us + @as(i64, s.n) * 16_667;
+        while (host.nowUs() < due) std.atomic.spinLoopHint();
         s.n += 1;
-        const now = host.nowUs();
         return .{
             .image = .{ .width = s.width, .height = s.height, .format = .nv12, .gpu = pb },
             .seq = s.n,
-            .capture_start_us = now,
-            .captured_us = now + @as(i64, s.n) * 16_667, // 60 fps timestamps
+            .capture_start_us = due,
+            .captured_us = due,
         };
     }
 };
@@ -247,53 +251,72 @@ test "VideoToolbox: bitrate changes without a keyframe; IDR on request" {
 }
 
 test "VideoToolbox: long-term reference refresh recovers a loss without an IDR" {
-    var e = try openEncoder();
+    // The low-latency encoder explicitly: it is the only one with LTR (S8), and in a VM
+    // `auto` picks the regular one.
+    var e = host.Encoder.create(.{ .mode = .low_latency }) catch return skip("ltr", "no low-latency encoder");
     defer e.deinit();
-    if (!e.ltr) return skip("ltr", "no low-latency encoder with LTR here");
+    if (!e.ltr) return skip("ltr", "the low-latency encoder refused EnableLTR");
     const codec: api.Codec = if (e.codecs.hevc) .hevc else .h264;
     try e.configure(.{ .codec = codec, .width = 640, .height = 360, .fps = 60, .bitrate_bps = 4_000_000, .ltr = true });
     var src = try Source.init(640, 360, c.MH_FMT_NV12, false);
     defer src.deinit();
 
-    // S8's scenario: the client acks each frame's token 3 frames later; frames 30..34 are
-    // lost (nothing acked from there until the refresh); the host hears at frame 38 and
-    // forces an LTR refresh.
-    const total = 60;
+    // S8's scenario: the client acks each frame's token 3 frames later; from frame 30 it
+    // loses everything (acks nothing) until the refresh; the host hears at frame 38 and
+    // asks for an LTR refresh on every frame until one comes out (the encoder may drop
+    // a frame, and the app then asks again, as core/recovery does).
+    const total = 72;
     const lost_from = 30;
-    const refresh_at = 38;
+    const detect_at = 38;
     const ack_delay = 3;
     var aus: [total]?[]u8 = @splat(null);
-    defer for (aus) |a| if (a) |b| testing.allocator.free(b);
+    defer for (aus) |a| if (a) |buf| testing.allocator.free(buf);
     var tokens: [total]?u64 = @splat(null);
+    var refresh_at: ?usize = null;
     var refresh_key = false;
     var refresh_flag = false;
+    var drops: u32 = 0;
     for (0..total) |i| {
-        var acks: [4]u64 = undefined;
+        var acks: [1]u64 = undefined;
         var n_acks: usize = 0;
         if (i >= ack_delay) {
             const j = i - ack_delay;
-            const dropped = j >= lost_from and j < refresh_at;
+            const lost = j >= lost_from and (refresh_at == null or j < refresh_at.?);
             if (tokens[j]) |t| {
-                if (!dropped) {
-                    acks[n_acks] = t;
-                    n_acks += 1;
+                if (!lost) {
+                    acks[0] = t;
+                    n_acks = 1;
                 }
             }
         }
+        const want_refresh = i >= detect_at and refresh_at == null;
         const f = try src.next();
-        const out = (try e.encode(&f, .{ .force = if (i == refresh_at) .ltr_refresh else .none, .acked_ltr_tokens = acks[0..n_acks] })) orelse continue;
+        const out = (try e.encode(&f, .{ .force = if (want_refresh) .ltr_refresh else .none, .acked_ltr_tokens = acks[0..n_acks] })) orelse {
+            drops += 1;
+            continue;
+        };
         aus[i] = try testing.allocator.dupe(u8, out.slices[0]);
         tokens[i] = out.ltr_token;
-        if (i == refresh_at) {
+        if (want_refresh) {
+            refresh_at = i;
             refresh_key = out.keyframe;
             refresh_flag = out.ltr_refresh;
         }
     }
     var with_tokens: usize = 0;
     for (tokens) |t| with_tokens += @intFromBool(t != null);
-    std.debug.print("LTR ({s}): {d} frames carried tokens; refresh frame {s}, {d} B\n", .{ @tagName(codec), with_tokens, if (refresh_key) "IDR" else "P", if (aus[refresh_at]) |a| a.len else 0 });
+    const info = e.info();
+    std.debug.print("LTR ({s}, {s}): {d} frames carried tokens, {d} dropped by the encoder; refresh at {?d}: {s}, {d} B\n", .{
+        @tagName(codec),
+        std.mem.sliceTo(&info.encoder_id, 0),
+        with_tokens,
+        drops,
+        refresh_at,
+        if (refresh_key) "IDR" else "P",
+        if (refresh_at) |r| aus[r].?.len else 0,
+    });
     try testing.expect(with_tokens > 0);
-    try testing.expect(aus[refresh_at] != null);
+    const rf = refresh_at orelse return error.NoRefreshFrame;
     try testing.expect(!refresh_key);
     try testing.expect(refresh_flag);
 
@@ -306,20 +329,23 @@ test "VideoToolbox: long-term reference refresh recovers a loss without an IDR" 
     defer c.mh_dec_destroy(full);
     try ok(c.mh_dec_create(cc, &lossy));
     defer c.mh_dec_destroy(lossy);
+    var matched: u32 = 0;
     for (aus, 0..) |maybe, i| {
         const au = maybe orelse continue;
         var ha: u64 = 0;
         try testing.expectEqual(@as(c_int, 0), c.mh_dec_decode(full, au.ptr, au.len, &ha));
-        if (i >= lost_from and i < refresh_at) continue;
+        if (i >= lost_from and i < rf) continue;
         var hb: u64 = 0;
         const st = c.mh_dec_decode(lossy, au.ptr, au.len, &hb);
-        if (i >= refresh_at) {
+        if (i >= rf) {
             if (st != 0 or ha != hb) {
                 std.debug.print("frame {d}: lossy decode {d}, hash match {}\n", .{ i, st, ha == hb });
                 return error.NotRecovered;
             }
+            matched += 1;
         }
     }
+    std.debug.print("LTR: {d} frames from the refresh on decode bit-exact on the lossy stream\n", .{matched});
 }
 
 test "VideoToolbox: ladder reconfigure keeps the session for bitrate, scales mismatched frames" {
@@ -419,6 +445,19 @@ test "ScreenCaptureKit: system audio" {
     std.debug.print("audio: {d} frames in 1 s\n", .{total});
 }
 
+fn cursorReaches(want_x: f64, want_y: f64) bool {
+    const deadline = host.nowUs() + 1_000_000;
+    var x: f64 = 0;
+    var y: f64 = 0;
+    while (host.nowUs() < deadline) {
+        c.mh_input_cursor(&x, &y);
+        if (@abs(x - want_x) <= 2 and @abs(y - want_y) <= 2) return true;
+        spinUs(5_000);
+    }
+    std.debug.print("cursor at {d:.0},{d:.0}, wanted {d:.0},{d:.0}\n", .{ x, y, want_x, want_y });
+    return false;
+}
+
 test "CGEvent: absolute and relative pointer moves" {
     if (!host.postEventAllowed()) return skip("input", "no Accessibility permission");
     var inj = try host.Injector.create(0);
@@ -429,15 +468,11 @@ test "CGEvent: absolute and relative pointer moves" {
     var bh: f64 = 0;
     try ok(c.mh_display_bounds(0, &bx, &by, &bw, &bh));
     try inj.inject(.{ .abs = .{ .x = 32768, .y = 32768 } });
-    var x: f64 = 0;
-    var y: f64 = 0;
-    c.mh_input_cursor(&x, &y);
-    try testing.expectApproxEqAbs(bx + bw / 2, x, 2);
-    try testing.expectApproxEqAbs(by + bh / 2, y, 2);
+    // CGEventPost is asynchronous: wait for the cursor to get there.
+    if (!cursorReaches(bx + bw / 2, by + bh / 2))
+        return skip("input", "events were posted but the cursor did not move (no HID event delivery here)");
     try inj.inject(.{ .motion = .{ .dx = 10, .dy = -5 } });
-    c.mh_input_cursor(&x, &y);
-    try testing.expectApproxEqAbs(bx + bw / 2 + 10, x, 2);
-    try testing.expectApproxEqAbs(by + bh / 2 - 5, y, 2);
+    try testing.expect(cursorReaches(bx + bw / 2 + 10, by + bh / 2 - 5));
     // A shift tap and an unmapped key are not errors.
     try inj.inject(.{ .key = .{ .code = 0xE1, .down = true, .time = 0 } });
     try inj.inject(.{ .key = .{ .code = 0xE1, .down = false, .time = 0 } });

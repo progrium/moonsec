@@ -3,6 +3,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreVideo/CoreVideo.h>
 #include <mach/mach_time.h>
+#include <sys/sysctl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +32,13 @@ int mh_fail(int code, const char *fmt, ...) {
 void mh_clear_error(void) { g_err[0] = 0; }
 
 const char *mh_last_error(void) { return g_err; }
+
+int mh_is_vm(void) {
+    int v = 0;
+    size_t n = sizeof v;
+    if (sysctlbyname("kern.hv_vmm_present", &v, &n, NULL, 0) != 0) return 0;
+    return v ? 1 : 0;
+}
 
 int mh_screen_capture_allowed(void) { return CGPreflightScreenCaptureAccess() ? 1 : 0; }
 

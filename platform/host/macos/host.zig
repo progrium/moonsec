@@ -42,6 +42,10 @@ pub fn postEventAllowed() bool {
     return c.mh_post_event_allowed() != 0;
 }
 
+pub fn inVm() bool {
+    return c.mh_is_vm() != 0;
+}
+
 pub fn lastError() []const u8 {
     return std.mem.span(c.mh_last_error());
 }
@@ -227,8 +231,12 @@ pub const Encoder = struct {
     /// Picks the first encoder that VideoToolbox can make: low-latency then regular, each
     /// on hardware first, then (unless required) in software.
     pub fn create(o: EncoderOptions) api.Error!Encoder {
+        // In a VM (the CI runners) the low-latency encoder runs in software and drops
+        // most frames, while the regular one is the paravirtualized hardware encoder.
+        // UsingHardwareAcceleratedVideoEncoder can't tell them apart: the low-latency
+        // encoder reports "no" on real Apple silicon too (S7b), though it runs on AVE.
         const modes: []const EncoderMode = switch (o.mode) {
-            .auto => &.{ .low_latency, .regular },
+            .auto => if (inVm()) &.{ .regular, .low_latency } else &.{ .low_latency, .regular },
             else => &.{o.mode},
         };
         const hws: []const bool = if (o.require_hardware) &.{true} else &.{ true, false };

@@ -52,6 +52,12 @@ Created by probing VideoToolbox in this order, taking the first that works:
 3. The regular encoder, `RealTime=false` (S7: faster, but no LTR, so recovery is IDR).
 4. The regular encoder in software.
 
+In a VM (`kern.hv_vmm_present`, like the macos-15 CI runner) `auto` tries the regular
+encoder first: there it is the paravirtualized hardware encoder, while the low-latency one
+runs in software and drops most frames. `UsingHardwareAcceleratedVideoEncoder` can't make
+that call, because the low-latency encoder reports "no" on real Apple silicon too (S7b),
+where it runs on the hardware encoder.
+
 `EncoderOptions.mode` pins one path and `require_hardware` refuses software. All paths
 use no frame reordering, no periodic keyframes, and `PrioritizeEncodingSpeedOverQuality`.
 VideoToolbox emits length-prefixed NAL units; the backend converts to Annex B and puts the

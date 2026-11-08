@@ -39,6 +39,8 @@ const char *mh_last_error(void);
 /* TCC checks that never prompt: CGPreflightScreenCaptureAccess and
  * CGPreflightPostEventAccess. 1 = allowed. */
 int mh_screen_capture_allowed(void);
+/* 1 when running in a virtual machine (kern.hv_vmm_present), like the CI runners. */
+int mh_is_vm(void);
 int mh_post_event_allowed(void);
 
 /* Display `index` in CGGetActiveDisplayList order (0 = main display); 0 when out of range. */
