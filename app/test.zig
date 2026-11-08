@@ -4,6 +4,7 @@ const simrun = @import("simrun.zig");
 
 test {
     _ = @import("wire.zig");
+    _ = @import("host_session.zig");
     _ = @import("keystore.zig");
     _ = @import("pairing.zig");
 }
@@ -180,4 +181,53 @@ test "a drop longer than the 5 s peer timeout still reconnects" {
     // Asked every 2 s while silent.
     try std.testing.expect(r.client.reconnect_requests >= 3);
     try std.testing.expect(r.client.presented > 4 * 60);
+}
+
+test "format negotiation: every combination of decoder formats, preferences and HDR streams" {
+    const api = @import("platform");
+    const fmt = api.format;
+    // Client decoders from baseline-only to everything, both preferences, HDR source and
+    // display on and off: the run must pass with the format `negotiate` predicts.
+    const decoders = [_]api.Formats{
+        api.Formats.baseline,
+        .{ .yuv420_8 = true, .yuv444_8 = true },
+        .{ .yuv420_8 = true, .yuv420_10 = true },
+        .{ .yuv420_8 = true, .yuv420_10 = true, .hdr10 = true },
+        .{ .yuv420_8 = true, .yuv444_8 = true, .yuv444_10 = true, .hdr10 = true },
+        api.Formats.all,
+    };
+    var hdr_runs: u32 = 0;
+    var yuv444_runs: u32 = 0;
+    for (decoders) |dec| for ([_]bool{ false, true }) |y444| for ([_]bool{ false, true }) |ten| for ([_]bool{ false, true }) |hdr| {
+        const o: simrun.Options = .{
+            .profile = .clean,
+            .seconds = 1,
+            .audio = false,
+            .input_interval_us = 0,
+            .decoder_formats = dec,
+            .yuv444 = y444,
+            .ten_bit = ten,
+            .hdr_source = if (hdr) api.HdrMetadata.default_hdr10 else null,
+            .client_display = .{ .hdr10 = hdr, .peak_nits = 600 },
+        };
+        const r = try expectPass(o);
+        const want = fmt.negotiate(.{
+            .codecs = .of(&.{@intFromEnum(api.Codec.passthrough)}),
+            .yuv444 = y444,
+            .ten_bit = ten,
+            .source_is_hdr = hdr,
+            .source_hdr = o.hdr_source,
+        }, .{ .passthrough = api.Formats.all }, .{ .passthrough = dec }, o.client_display).?.format;
+        try std.testing.expect(r.host.format.eql(want));
+        try std.testing.expect(r.client.format.eql(want));
+        try std.testing.expectEqual(@as(u64, 1), r.host.keyframes);
+        if (want.color == .hdr10) hdr_runs += 1;
+        if (want.chroma == .yuv444) yuv444_runs += 1;
+    };
+    try std.testing.expect(hdr_runs >= 4 and yuv444_runs >= 4);
+}
+
+test "format negotiation: an encoder without 4:4:4 streams 4:2:0 to a client that wants it" {
+    const r = try expectPass(.{ .profile = .clean, .seconds = 1, .audio = false, .input_interval_us = 0, .yuv444 = true, .encoder_formats = .{ .yuv420_8 = true, .yuv420_10 = true } });
+    try std.testing.expect(r.host.format.eql(.{}));
 }
