@@ -431,9 +431,7 @@ pub const HostSession = struct {
             if (s.byes_left == 0) return s.finish(.closed, "closed");
         }
         if (s.state == .streaming and s.byes_left == 0 and now >= s.next_resend) {
-            const config_unacked = s.acked_epoch == null or s.acked_epoch.? != s.epoch;
-            const list_unacked = s.n_displays > 0 and (s.acked_gen == null or s.acked_gen.? != s.display_gen);
-            if (config_unacked or list_unacked) {
+            if (s.unacked()) {
                 s.sendConfig(now);
                 s.stats.config_resends += 1;
             }
@@ -501,9 +499,16 @@ pub const HostSession = struct {
             s.rec.onRecoveryRequest(.{ .first_missing = s.next_frame_id, .want_idr = false });
     }
 
+    /// The client has not acked the current config or display list.
+    fn unacked(s: *const HostSession) bool {
+        const config = s.acked_epoch == null or s.acked_epoch.? != s.epoch;
+        const list = s.n_displays > 0 and (s.acked_gen == null or s.acked_gen.? != s.display_gen);
+        return config or list;
+    }
+
     pub fn nextWake(s: *const HostSession, now: Micros) Micros {
         var t = now + 5_000;
-        if (s.state == .streaming) t = @min(t, s.next_resend);
+        if (s.state == .streaming and s.unacked()) t = @min(t, s.next_resend);
         if (s.byes_left > 0) t = @min(t, s.next_bye);
         return @max(t, now);
     }
