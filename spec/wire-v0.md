@@ -58,8 +58,8 @@ kind skips the datagram.
 | 5 | `mic` | client → host | Reserved; not in v1. |
 | 6–255 | | | Unassigned. |
 
-Reliable control (session setup, clipboard, display config, file transfer) runs on QUIC
-streams, not datagrams, and is out of scope for this document.
+Reliable control (session setup, clipboard, display config, file transfer) runs on a QUIC
+stream, not datagrams: [control-v0.md](control-v0.md).
 
 ## Video
 

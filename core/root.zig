@@ -31,6 +31,9 @@ pub const clock = @import("clock/root.zig");
 /// Pairing: identity, tickets, PIN/QR, the paired-device list and the pairing exchange.
 pub const pair = @import("pair/root.zig");
 
+/// Reliable control channel: framing, type registry, hello, clipboard (spec/control-v0.md).
+pub const control = @import("control/root.zig");
+
 /// Per-frame stage timing and rolling stats for the latency overlay.
 pub const telemetry = @import("telemetry/root.zig");
 
