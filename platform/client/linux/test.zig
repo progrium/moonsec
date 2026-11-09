@@ -589,6 +589,37 @@ test "evdev: a uinput keyboard's keys and motion arrive as HID events" {
     for (got[1..n], got[0 .. n - 1]) |b, a| try testing.expect(b.time_us >= a.time_us);
 }
 
+test "gamepads: a uinput pad goes to the gamepad source, not the keyboard/mouse side" {
+    var name_buf: [48]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "moonsec test pad {d}", .{std.os.linux.getpid()}) catch unreachable;
+    const pad = uinput.Device.createPad(name) catch |e| return skip("uinput", @errorName(e));
+    defer pad.destroy();
+    // The keyboard/mouse side leaves the pad's node alone.
+    var devs: evdev.Devices = .{};
+    defer devs.deinit();
+    _ = devs.scan();
+    for (devs.devs[0..devs.n]) |d| try testing.expect(d.node != pad.node);
+    // The gamepad source (the one InputSource polls) picks it up and sees A.
+    var src = try client.gamepad.evdev.Source.open(client.clock, .{ .name_filter = name });
+    defer src.close();
+    var out: [16]api.InputEvent = undefined;
+    var pressed = false;
+    var tries: usize = 0;
+    while (!pressed and tries < 300) : (tries += 1) {
+        if (src.deviceCount() > 0 and tries % 10 == 0) pad.key(evdev.BTN_SOUTH, true);
+        const n = try src.poll(&out);
+        for (out[0..n]) |e| switch (e.what) {
+            .pad => |p| if (p.state) |st| {
+                if (st.buttons & core.input.Gamepad.Button.a != 0) pressed = true;
+            },
+            else => return error.TestUnexpectedResult,
+        };
+        uinput.sleepMs(10);
+    }
+    if (src.deviceCount() == 0) return skip("uinput", "the pad's node is not readable");
+    try testing.expect(pressed);
+}
+
 test {
     _ = evdev;
     _ = uinput;

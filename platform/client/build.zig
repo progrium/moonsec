@@ -115,6 +115,7 @@ pub fn linuxClientModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
             .{ .name = "synthetic", .module = m.synthetic },
             .{ .name = "client_overlay", .module = overlayModule(b, target, optimize, .{ .core = m.core, .platform = m.platform }) },
             .{ .name = "mlc_c", .module = tc.createModule() },
+            .{ .name = "client_gamepad", .module = gamepadModule(b, target, optimize, .{ .core = m.core, .platform = m.platform }) },
         },
     });
     mod.addIncludePath(b.path("platform/client/linux"));

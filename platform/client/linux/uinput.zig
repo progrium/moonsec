@@ -14,6 +14,8 @@ const ui_dev_setup = ioc(1, 3, @sizeOf(Setup));
 const ui_set_evbit = ioc(1, 100, @sizeOf(c_int));
 const ui_set_keybit = ioc(1, 101, @sizeOf(c_int));
 const ui_set_relbit = ioc(1, 102, @sizeOf(c_int));
+const ui_set_absbit = ioc(1, 103, @sizeOf(c_int));
+const ui_abs_setup = ioc(1, 4, @sizeOf(AbsSetup));
 fn uiGetSysname(len: u32) u32 {
     return ioc(2, 44, len);
 }
@@ -27,6 +29,17 @@ const Setup = extern struct {
     ff_effects_max: u32,
 };
 
+const AbsSetup = extern struct {
+    code: u16,
+    _pad: u16 = 0,
+    value: i32 = 0,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32 = 0,
+    flat: i32 = 0,
+    resolution: i32 = 0,
+};
+
 pub const Error = error{ NoUinput, SetupFailed, NoEventNode };
 
 pub const Device = struct {
@@ -38,9 +51,7 @@ pub const Device = struct {
     /// five buttons), then waits up to 3 s for its event node to be openable (udev may
     /// still be setting its permissions).
     pub fn create(name: []const u8) Error!Device {
-        const rc = linux.open("/dev/uinput", .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
-        if (linux.errno(rc) != .SUCCESS) return error.NoUinput;
-        const fd: i32 = @intCast(rc);
+        const fd = try openUinput();
         errdefer _ = linux.close(fd);
         try set(fd, ui_set_evbit, evdev.EV_KEY);
         try set(fd, ui_set_evbit, evdev.EV_REL);
@@ -48,6 +59,36 @@ pub const Device = struct {
         while (k < 249) : (k += 1) try set(fd, ui_set_keybit, k);
         for ([_]c_int{ evdev.BTN_LEFT, evdev.BTN_RIGHT, evdev.BTN_MIDDLE, evdev.BTN_SIDE, evdev.BTN_EXTRA }) |b| try set(fd, ui_set_keybit, b);
         for ([_]c_int{ evdev.REL_X, evdev.REL_Y, evdev.REL_WHEEL, evdev.REL_HWHEEL }) |r| try set(fd, ui_set_relbit, r);
+        return finish(fd, name);
+    }
+
+    /// A gamepad: the face buttons, shoulders, start/select and two sticks
+    /// (ABS_X/Y, ABS_RX/RY at -32768..32767), as the kernel gamepad spec lays them out.
+    pub fn createPad(name: []const u8) Error!Device {
+        const fd = try openUinput();
+        errdefer _ = linux.close(fd);
+        try set(fd, ui_set_evbit, evdev.EV_KEY);
+        try set(fd, ui_set_evbit, ev_abs);
+        // BTN_SOUTH .. BTN_THUMBR (0x130..0x13e).
+        var k: c_int = evdev.BTN_SOUTH;
+        while (k <= 0x13e) : (k += 1) try set(fd, ui_set_keybit, k);
+        for ([_]u16{ 0x00, 0x01, 0x03, 0x04 }) |axis| {
+            try set(fd, ui_set_absbit, axis);
+            var a: AbsSetup = .{ .code = axis, .minimum = -32768, .maximum = 32767 };
+            if (linux.errno(linux.ioctl(fd, ui_abs_setup, @intFromPtr(&a))) != .SUCCESS) return error.SetupFailed;
+        }
+        return finish(fd, name);
+    }
+
+    const ev_abs = 0x03;
+
+    fn openUinput() Error!i32 {
+        const rc = linux.open("/dev/uinput", .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.NoUinput;
+        return @intCast(rc);
+    }
+
+    fn finish(fd: i32, name: []const u8) Error!Device {
         var s: Setup = std.mem.zeroes(Setup);
         s.bustype = 0x06; // BUS_VIRTUAL
         s.vendor = 0x6d73;
