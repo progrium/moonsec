@@ -76,7 +76,7 @@ fn deviceName(c: Ctx, buf: []u8, fallback: []const u8) []const u8 {
     return fallback;
 }
 
-fn unixNow(io: Io) u64 {
+pub fn unixNow(io: Io) u64 {
     return @intCast(@max(0, Io.Clock.real.now(io).toSeconds()));
 }
 
@@ -131,11 +131,11 @@ pub fn cmdUnpair(c: Ctx, prefix: []const u8, w: *Io.Writer) !bool {
 
 // --- over iroh ----------------------------------------------------------------------
 
-const IrohStream = struct {
+pub const IrohStream = struct {
     s: if (options.iroh) iroh.Stream else void,
     timeout_ms: u32 = 10_000,
 
-    fn stream(self: *IrohStream) pairing.Stream {
+    pub fn stream(self: *IrohStream) pairing.Stream {
         return .{ .ptr = self, .writeFn = write, .readFn = read };
     }
     fn write(ptr: *anyopaque, bytes: []const u8) anyerror!void {
@@ -149,7 +149,7 @@ const IrohStream = struct {
 
     /// Finish our side and wait (briefly) for the peer to finish theirs, so the last
     /// message is delivered before the connection closes.
-    fn close(self: *IrohStream) void {
+    pub fn close(self: *IrohStream) void {
         self.s.finish() catch {};
         var junk: [256]u8 = undefined;
         for (0..16) |_| {
@@ -160,7 +160,7 @@ const IrohStream = struct {
     }
 };
 
-fn initIroh() !void {
+pub fn initIroh() !void {
     iroh.init(null, null) catch |e| switch (e) {
         error.Invalid => {}, // already started
         else => {
@@ -197,7 +197,7 @@ pub fn bind(c: Ctx, secret: *const [32]u8, accept: bool) !iroh.Endpoint {
     return ep;
 }
 
-fn remoteId(conn: iroh.Conn) !pair.Id {
+pub fn remoteId(conn: iroh.Conn) !pair.Id {
     var b: [128]u8 = undefined;
     return pair.id.parseHex(try conn.remoteId(&b)) orelse error.BadRemoteId;
 }
@@ -317,7 +317,7 @@ pub fn cmdPairHost(c: Ctx, w: *Io.Writer) !bool {
 }
 
 /// Copies the first message out of the framer's scratch so later reads can't clobber it.
-fn readFirst(s: pairing.Stream, f: *ex.Framer, out: *[ex.max_message]u8) !?[]const u8 {
+pub fn readFirst(s: pairing.Stream, f: *ex.Framer, out: *[ex.max_message]u8) !?[]const u8 {
     var tmp: [ex.max_message]u8 = undefined;
     const m = (try pairing.readMessage(s, f, &tmp)) orelse return null;
     @memcpy(out[0..m.len], m);

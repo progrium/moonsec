@@ -374,6 +374,14 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // The public C ABI (include/moonsec.h, app/abi.zig, abi/build.zig).
+    @import("abi/build.zig").add(b, target, optimize, .{
+        .app_imports = &app_imports,
+        .iroh = iroh_mod,
+        .iroh_pipe = iroh_pipe_mod,
+        .shim_archive = if (shim_link == .static and !(target.result.os.tag == .windows and target.result.abi == .msvc)) shim.lib_dir.path(b, "libiroh_shim.a") else null,
+    }, test_step);
+
     // Web client media pipeline (web/README.md): the client session and the Opus stage for
     // the browser (app/web.zig on wasm32-wasi), installed by `web-wasm` as
     // zig-out/web/moonsec-client.wasm. The host its tests stream from is `web-host` below.
