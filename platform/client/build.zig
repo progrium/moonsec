@@ -1,7 +1,7 @@
 //! Build steps for the client platform backends, kept out of the root
 //! build.zig so the per-OS threads don't collide there. The root calls `add`
-//! (portable tests, part of `zig build test`) and `addWindowsTests` (part of
-//! `check-win` and `test-win`).
+//! (portable tests, part of `zig build test`), `addWindowsTests` (part of
+//! `check-win` and `test-win`) and `addLinuxTests` (`test-linux`).
 
 const std = @import("std");
 const root = @import("../../build.zig");
@@ -31,6 +31,83 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .imports = &.{.{ .name = "platform", .module = m.platform }},
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "client-rawinput-test", .root_module = rawinput_mod })).step);
+
+    // The evdev translation is pure; its device code needs Linux.
+    if (target.result.os.tag == .linux) {
+        const evdev_mod = b.createModule(.{
+            .root_source_file = b.path("platform/client/linux/evdev.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "platform", .module = m.platform }},
+        });
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "client-evdev-test", .root_module = evdev_mod })).step);
+    }
+}
+
+/// System libraries the Linux client links (found with pkg-config): libavcodec and libva
+/// (decode), Wayland, EGL and GLES (present), PipeWire (audio). On Ubuntu 24.04:
+///   libavcodec-dev libva-dev libwayland-dev libegl-dev libgles-dev libpipewire-0.3-dev
+pub const linux_client_libs: []const []const u8 = &.{ "libavcodec", "libavutil", "libva", "wayland-client", "wayland-egl", "egl", "glesv2", "libpipewire-0.3" };
+
+pub const LinuxModules = struct {
+    core: *std.Build.Module,
+    platform: *std.Build.Module,
+    synthetic: *std.Build.Module,
+};
+
+/// The Linux client backend ("client_linux", platform/client/linux/backend.zig) with its
+/// C files and system libraries. Pass the app's own core/platform/synthetic modules so
+/// the bundle's types are the app's.
+pub fn linuxClientModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: LinuxModules) *std.Build.Module {
+    const tc = b.addTranslateC(.{ .root_source_file = b.path("platform/client/linux/mlc.h"), .target = target, .optimize = optimize });
+    const mod = b.createModule(.{
+        .root_source_file = b.path("platform/client/linux/backend.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "platform", .module = m.platform },
+            .{ .name = "core", .module = m.core },
+            .{ .name = "synthetic", .module = m.synthetic },
+            .{ .name = "client_overlay", .module = overlayModule(b, target, optimize, .{ .core = m.core, .platform = m.platform }) },
+            .{ .name = "mlc_c", .module = tc.createModule() },
+        },
+    });
+    mod.addIncludePath(b.path("platform/client/linux"));
+    mod.addCSourceFiles(.{
+        .root = b.path("platform/client/linux"),
+        .files = &.{ "mlc_window.c", "mlc_decode.c", "mlc_audio.c", "protocol/xdg-shell-protocol.c", "protocol/tearing-control-v1-protocol.c" },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-fno-sanitize=undefined" },
+    });
+    for (linux_client_libs) |lib| mod.linkSystemLibrary(lib, .{});
+    return mod;
+}
+
+/// `test-linux`: the Linux client tests (Linux host with the libraries above; see
+/// platform/client/linux/test.zig for what they need at run time).
+pub fn addLinuxTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: LinuxModules) void {
+    const step = b.step("test-linux", "Run the Linux client backend tests (Linux host; Wayland, PipeWire and uinput tests skip without them)");
+    if (target.result.os.tag != .linux) {
+        step.dependOn(&b.addFail("test-linux needs a Linux host").step);
+        return;
+    }
+    const client = linuxClientModule(b, target, optimize, m);
+    const tm = b.createModule(.{
+        .root_source_file = b.path("platform/client/linux/test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "client_linux", .module = client },
+            .{ .name = "platform", .module = m.platform },
+            .{ .name = "core", .module = m.core },
+            .{ .name = "synthetic", .module = m.synthetic },
+        },
+    });
+    const t = b.addTest(.{ .name = "client-linux-test", .root_module = tm });
+    const run = b.addRunArtifact(t);
+    run.has_side_effects = true; // depends on the display, PipeWire and /dev/uinput
+    step.dependOn(&run.step);
 }
 
 /// The Windows client backend ("client_windows", platform/client/windows/backend.zig)

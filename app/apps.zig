@@ -419,7 +419,7 @@ pub const ClientAudio = struct {
     stage: audio_stage.ClientAudio,
     channels: u8,
     /// One rendered frame (up to 60 ms stereo), and how much of it the sink has taken.
-    buf: [2880 * 2]f32 = undefined,
+    buf: [audio_stage.ClientAudio.max_frame_samples * 2]f32 = undefined,
     pending: []const f32 = &.{},
     stats: struct { rendered: u64 = 0, errors: u64 = 0 } = .{},
 

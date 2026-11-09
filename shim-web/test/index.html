@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>shim-web test</title>
+<p id="status">loading</p>
+<script type="module">
+  import init, * as iroh from "../pkg/iroh_web.js";
+  import { loadPair } from "../js/pair.js";
+  import * as tests from "./tests.js";
+  await init();
+  const pair = await loadPair(new URL("../pkg/moonsec-pair.wasm", import.meta.url));
+  window.shimWeb = { iroh, pair, tests: Object.fromEntries(Object.entries(tests).map(([k, f]) => [k, (o) => f(iroh, pair, o)])) };
+  document.getElementById("status").textContent = `ready (iroh-web v${iroh.version().toString(16)})`;
+</script>

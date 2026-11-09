@@ -51,6 +51,9 @@ pub fn build(b: *std.Build) void {
 
     // Client platform backends (platform/client/build.zig).
     @import("platform/client/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
+    @import("platform/client/build.zig").addLinuxTests(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod });
+    // Linux host backend (platform/host/linux/build.zig): `test-linux-host`.
+    @import("platform/host/linux/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod });
 
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
@@ -74,6 +77,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     wasm_step.dependOn(&wasm_tests.step);
+
+    // Browser pairing (shim-web/pair/pair.zig): core/pair as a small wasm module that the
+    // browser transport (shim-web/) drives. `zig build web-pair` -> zig-out/web/moonsec-pair.wasm.
+    const wasm_free = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const web_pair = b.addExecutable(.{
+        .name = "moonsec-pair",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("shim-web/pair/pair.zig"),
+            .target = wasm_free,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "core", .module = b.createModule(.{ .root_source_file = b.path("core/root.zig"), .target = wasm_free, .optimize = .ReleaseSmall }) }},
+        }),
+    });
+    web_pair.entry = .disabled;
+    web_pair.rdynamic = true;
+    const install_web_pair = b.addInstallArtifact(web_pair, .{ .dest_dir = .{ .override = .{ .custom = "web" } } });
+    b.step("web-pair", "Build core/pair for the browser: zig-out/web/moonsec-pair.wasm").dependOn(&install_web_pair.step);
+    wasm_step.dependOn(&web_pair.step);
 
     // libopus from source (codec/opus/libopus.zig) and its Zig binding, for every target.
     const opus = addOpus(b, target, optimize);
@@ -275,6 +296,7 @@ pub fn build(b: *std.Build) void {
     for ([_]bool{ false, true }) |with_iroh| {
         const opts = b.addOptions();
         opts.addOption(bool, "iroh", with_iroh);
+        opts.addOption(bool, "linux_client", false);
         const m = b.createModule(.{ .root_source_file = b.path("app/main.zig"), .target = target, .optimize = optimize, .imports = &app_imports });
         m.addOptions("app_options", opts);
         if (with_iroh) {
@@ -311,6 +333,25 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // `moonsec-linux`: moonsec-sim plus the Linux client backend (platform/client/linux),
+    // `--client linux` on the client peer. Needs the libraries in platform/client/build.zig.
+    {
+        const step = b.step("moonsec-linux", "Install zig-out/bin/moonsec-linux: moonsec-sim with the Linux client backend (Linux host)");
+        if (target.result.os.tag == .linux) {
+            const opts = b.addOptions();
+            opts.addOption(bool, "iroh", false);
+            opts.addOption(bool, "linux_client", true);
+            const m = b.createModule(.{ .root_source_file = b.path("app/main.zig"), .target = target, .optimize = optimize, .imports = &app_imports });
+            m.addOptions("app_options", opts);
+            m.addImport("client_linux", @import("platform/client/build.zig").linuxClientModule(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod }));
+            const exe = b.addExecutable(.{ .name = "moonsec-linux", .root_module = m });
+            step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        } else step.dependOn(&b.addFail("moonsec-linux needs a Linux host").step);
+    }
+
+    // Fuzz harnesses for every parser (fuzz/, docs/fuzzing.md): `zig build fuzz --fuzz`.
+    @import("fuzz/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod }, fuzzOpus, test_step, wasm_step);
+
     // core/rate driving the simulated network with S11's metrics (sim/rate.zig).
     const sim_rate = b.addExecutable(.{ .name = "sim-rate", .root_module = b.createModule(.{ .root_source_file = b.path("sim/rate.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod } } }) });
     b.installArtifact(sim_rate);
@@ -329,14 +370,18 @@ pub fn build(b: *std.Build) void {
     const check_win = b.step("check-win", "Cross-compile the Windows platform tests for x86_64 and aarch64 Windows");
     for ([_]std.Target.Cpu.Arch{ .x86_64, .aarch64 }) |arch| {
         const wt = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .windows, .abi = .gnu });
-        const t = b.addTest(.{ .name = b.fmt("win-test-{s}", .{@tagName(arch)}), .root_module = windowsTestModule(b, wt, optimize) });
-        // Install (not just compile) so the link step runs and catches missing import libs/IIDs.
-        check_win.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "win-test" } } }).step);
+        for (windowsTests(b, wt, optimize)) |m| {
+            const t = b.addTest(.{ .name = b.fmt("{s}-{s}", .{ m.name, @tagName(arch) }), .root_module = m.module });
+            // Install (not just compile) so the link step runs and catches missing import libs/IIDs.
+            check_win.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "win-test" } } }).step);
+        }
     }
     const test_win = b.step("test-win", "Run the Windows platform tests (Windows host; WARP and software paths run without a GPU)");
     if (target.result.os.tag == .windows) {
-        const t = b.addTest(.{ .name = "win-test", .root_module = windowsTestModule(b, target, optimize) });
-        test_win.dependOn(&b.addRunArtifact(t).step);
+        for (windowsTests(b, target, optimize)) |m| {
+            const t = b.addTest(.{ .name = m.name, .root_module = m.module });
+            test_win.dependOn(&b.addRunArtifact(t).step);
+        }
     } else {
         test_win.dependOn(&b.addFail("test-win needs a Windows host; use check-win to cross-compile").step);
     }
@@ -380,13 +425,56 @@ pub fn windowsModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     return m;
 }
 
-fn windowsTestModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    return b.createModule(.{
+/// The Windows host backend (platform/host/windows): Desktop Duplication, NVENC and
+/// Media Foundation encoders, WASAPI loopback, SendInput. Imported as "win_host";
+/// `openHost` returns a platform.HostBackend.
+pub fn windowsHostModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, win: *std.Build.Module) *std.Build.Module {
+    const m = b.createModule(.{
+        .root_source_file = b.path("platform/host/windows/host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "win", .module = win },
+            .{ .name = "platform", .module = b.modules.get("platform").? },
+            .{ .name = "core", .module = b.modules.get("core").? },
+            .{ .name = "host_win_c", .module = translatePlatformHeader(b, target, optimize, "platform/host/windows/host_win.h") },
+        },
+    });
+    m.addIncludePath(b.path("third_party/nvenc"));
+    addWindowsC(b, m, &.{
+        "platform/host/windows/capture.c",
+        "platform/host/windows/enc.c",
+        "platform/host/windows/enc_mf.c",
+        "platform/host/windows/enc_nvenc.c",
+        "platform/host/windows/audio.c",
+        "platform/host/windows/input.c",
+    }, &.{ "user32", "mfplat", "mf", "mfuuid", "oleaut32", "avrt" });
+    return m;
+}
+
+const NamedModule = struct { name: []const u8, module: *std.Build.Module };
+
+fn windowsTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) []const NamedModule {
+    const win = windowsModule(b, target, optimize);
+    const host = windowsHostModule(b, target, optimize, win);
+    const list = b.allocator.alloc(NamedModule, 2) catch @panic("OOM");
+    list[0] = .{ .name = "win-test", .module = b.createModule(.{
         .root_source_file = b.path("platform/windows/test.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "win", .module = windowsModule(b, target, optimize) }},
-    });
+        .imports = &.{.{ .name = "win", .module = win }},
+    }) };
+    list[1] = .{ .name = "win-host-test", .module = b.createModule(.{
+        .root_source_file = b.path("platform/host/windows/test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "win", .module = win },
+            .{ .name = "host", .module = host },
+            .{ .name = "platform", .module = b.modules.get("platform").? },
+        },
+    }) };
+    return list;
 }
 
 const Shim = struct {
@@ -559,6 +647,13 @@ const Opus = struct {
     /// The Zig binding (codec/opus/opus.zig), linked against `lib`. Import it as "opus".
     module: *std.Build.Module,
 };
+
+/// libopus, its binding and the audio stage over a given core module, for fuzz/build.zig.
+fn fuzzOpus(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module) @import("fuzz/build.zig").Opus {
+    const opus = addOpus(b, target, optimize);
+    const stage = b.createModule(.{ .root_source_file = b.path("codec/opus/stage.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "opus", .module = opus.module } } });
+    return .{ .opus = opus.module, .audio_stage = stage };
+}
 
 fn addOpus(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Opus {
     const src = b.dependency("opus", .{});
