@@ -53,7 +53,9 @@ async function runVariant(browser, name) {
   const logs = collectLogs([["host", host], ["client", client]]);
   try {
     const t0 = Date.now();
-    await host.goto(`${base}/host.html?autostart&relay=${encodeURIComponent(relayUrl)}${variantQuery[name] ?? ""}`);
+    // The media variant starts with a real click: WebKit plays media only from a gesture.
+    await host.goto(`${base}/host.html?${name === "media" ? "" : "autostart&"}relay=${encodeURIComponent(relayUrl)}${variantQuery[name] ?? ""}`);
+    if (name === "media") await host.click("#start");
     // The invite link pairs the client (the window's secret), then it asks for a session.
     const invite = await waitFor("host invite", () => host.evaluate(() => window.moonsecHost.inviteUrl), 30000);
     r.hostReadyMs = Date.now() - t0;

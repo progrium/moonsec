@@ -116,6 +116,8 @@ function show(r: HostReport) {
 
 async function start() {
   document.getElementById("start")!.remove();
+  // Still inside the click: WebKit lets media play only from a gesture.
+  if (q.get("media") === "1") playTone();
   // This click is the user gesture the game's audio needs: remote clicks are synthetic.
   for (const ctx of window.__moonsecHost.contexts) void ctx.resume();
   const host = await BrowserHost.start({
@@ -144,7 +146,6 @@ async function start() {
     },
   });
   window.moonsecHost.host = host;
-  if (q.get("media") === "1") playTone();
   const n = Number(q.get("invite") ?? 1);
   if (n > 0) host.invite({ pairings: n });
   const btn = document.getElementById("invite-btn") as HTMLButtonElement;
