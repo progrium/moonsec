@@ -51,6 +51,8 @@ pub fn build(b: *std.Build) void {
     @import("platform/client/build.zig").addLinuxTests(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod });
     // Linux host backend (platform/host/linux/build.zig): `test-linux-host`.
     @import("platform/host/linux/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod });
+    // macOS host backend (platform/host/macos/build.zig): test-mac, check-mac.
+    @import("platform/host/macos/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
 
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
@@ -384,13 +386,9 @@ pub fn build(b: *std.Build) void {
     // Windows client backend tests join both steps (platform/client/build.zig).
     @import("platform/client/build.zig").addWindowsTests(b, target, optimize, check_win, test_win);
 
-    // macOS platform tests: Objective-C against the SDK's frameworks, so they build and
-    // run on a macOS host only (platform/client/build.zig).
-    const test_mac = b.step("test-mac", "Run the macOS platform tests (macOS host; Metal and VideoToolbox software paths run in a VM)");
-    if (target.result.os.tag != .macos) {
-        test_mac.dependOn(&b.addFail("test-mac needs a macOS host").step);
-    }
-    @import("platform/client/build.zig").addMacosTests(b, target, optimize, test_mac);
+    // macOS client backend tests (platform/client/build.zig): their own `test-mac-client`
+    // step, which also joins the macOS host's `test-mac` and `check-mac`.
+    @import("platform/client/build.zig").addMacosTests(b, target, optimize, &b.top_level_steps.get("test-mac").?.step, &b.top_level_steps.get("check-mac").?.step);
 }
 
 /// Points `m` at the macOS SDK's frameworks, headers and libraries (Zig does not

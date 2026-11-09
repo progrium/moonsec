@@ -188,9 +188,10 @@ pub const macos_objc_flags: []const []const u8 = &.{
 };
 
 /// The macOS client backend ("client_macos", platform/client/macos/backend.zig) for a
-/// macOS target, with its Objective-C files compiled and the frameworks linked. Needs
-/// the macOS SDK, so a macOS host.
-pub fn macosClientModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+/// macOS target. With `native`, its Objective-C files are compiled and the frameworks
+/// linked, which needs the macOS SDK and so a macOS host; without, the Zig side only
+/// (type-checking from any host).
+pub fn macosClientModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, native: bool) *std.Build.Module {
     const core = b.createModule(.{ .root_source_file = b.path("core/root.zig"), .target = target, .optimize = optimize });
     const platform = b.createModule(.{
         .root_source_file = b.path("platform/api.zig"),
@@ -211,25 +212,46 @@ pub fn macosClientModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
             .{ .name = "macc_c", .module = tc.createModule() },
         },
     });
-    root.addMacosSdkPaths(b, m, target);
-    m.addIncludePath(b.path("platform/client/macos"));
-    m.addCSourceFiles(.{
-        .root = b.path("platform/client/macos"),
-        .files = &.{ "macc_window.m", "macc_decode.m", "macc_present.m", "macc_audio.m" },
-        .flags = macos_objc_flags,
-    });
-    for ([_][]const u8{
-        "Foundation",   "AppKit",       "QuartzCore", "Metal",        "CoreVideo", "CoreMedia",
-        "VideoToolbox", "AudioToolbox", "CoreAudio",  "CoreGraphics", "IOSurface",
-    }) |f| m.linkFramework(f, .{});
+    if (native) {
+        root.addMacosSdkPaths(b, m, target);
+        m.addIncludePath(b.path("platform/client/macos"));
+        m.addCSourceFiles(.{
+            .root = b.path("platform/client/macos"),
+            .files = &.{ "macc_window.m", "macc_decode.m", "macc_present.m", "macc_audio.m" },
+            .flags = macos_objc_flags,
+        });
+        for ([_][]const u8{
+            "Foundation",   "AppKit",       "QuartzCore", "Metal",        "CoreVideo", "CoreMedia",
+            "VideoToolbox", "AudioToolbox", "CoreAudio",  "CoreGraphics", "IOSurface",
+        }) |f| m.linkFramework(f, .{});
+    }
     return m;
 }
 
-/// Adds the macOS client tests to `test-mac` (run, on a macOS host).
-pub fn addMacosTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_mac: *std.Build.Step) void {
-    if (target.result.os.tag != .macos) return;
-    const client = macosClientModule(b, target, optimize);
-    const tm = b.createModule(.{
+/// `test-mac-client` runs the macOS client tests (macOS host); they also join `test-mac`.
+/// `check-mac` type-checks them for aarch64 and x86_64 macOS from any host.
+pub fn addMacosTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_mac: *std.Build.Step, check_mac: *std.Build.Step) void {
+    for ([_]std.Target.Cpu.Arch{ .aarch64, .x86_64 }) |arch| {
+        const mt = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .macos });
+        const t = b.addTest(.{ .name = b.fmt("client-mac-check-{s}", .{@tagName(arch)}), .root_module = macosTestModule(b, mt, optimize, false) });
+        // Compile only: nothing asks for the binary, so it is analyzed but not linked.
+        check_mac.dependOn(&t.step);
+    }
+    const step = b.step("test-mac-client", "Run the macOS client backend tests (macOS host; window and audio tests skip without a window server or output device)");
+    if (target.result.os.tag != .macos) {
+        step.dependOn(&b.addFail("test-mac-client needs a macOS host; use check-mac to type-check").step);
+        return;
+    }
+    const t = b.addTest(.{ .name = "client-mac-test", .root_module = macosTestModule(b, target, optimize, true) });
+    const run = b.addRunArtifact(t);
+    run.has_side_effects = true; // depends on the GPU, window server and audio device
+    step.dependOn(&run.step);
+    test_mac.dependOn(&run.step);
+}
+
+fn macosTestModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, native: bool) *std.Build.Module {
+    const client = macosClientModule(b, target, optimize, native);
+    return b.createModule(.{
         .root_source_file = b.path("platform/client/macos/test.zig"),
         .target = target,
         .optimize = optimize,
@@ -239,6 +261,4 @@ pub fn addMacosTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
             .{ .name = "core", .module = client.import_table.get("core").? },
         },
     });
-    const t = b.addTest(.{ .name = "client-mac-test", .root_module = tm });
-    test_mac.dependOn(&b.addRunArtifact(t).step);
 }
