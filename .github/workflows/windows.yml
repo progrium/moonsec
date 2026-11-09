@@ -44,3 +44,5 @@ jobs:
         run: zig fmt --check platform
       - name: Cross-compile for x86_64 and aarch64 Windows
         run: zig build check-win --summary all
+      - name: Shared NVENC core (fake NVENC) and Linux NVENC (compile, not-found path)
+        run: zig build test-nvenc-core check-nvenc-linux test-nvenc-linux --summary all
