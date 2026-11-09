@@ -137,11 +137,18 @@ pub const State = struct {
     dir: Io.Dir,
     files: keystore.FileKeyStore,
 
-    /// Opens (creating, 0700 on POSIX) the state directory at `path`.
+    /// Opens (creating, 0700 on POSIX) the state directory at `path`. On POSIX it refuses a
+    /// directory that group or others can write: whoever can write it can swap
+    /// `paired-clients` (and so admit their own device) or the identity key.
     pub fn open(gpa: std.mem.Allocator, io: Io, path: []const u8) !State {
         const perms: Io.File.Permissions = if (comptime Io.File.Permissions.has_executable_bit) .fromMode(0o700) else .default_dir;
         _ = try Io.Dir.cwd().createDirPathStatus(io, path, perms);
-        const dir = try Io.Dir.cwd().openDir(io, path, .{});
+        var dir = try Io.Dir.cwd().openDir(io, path, .{});
+        errdefer dir.close(io);
+        if (comptime Io.File.Permissions.has_executable_bit) {
+            const st = try dir.stat(io);
+            if (st.permissions.toMode() & 0o022 != 0) return error.InsecurePermissions;
+        }
         return .{ .gpa = gpa, .io = io, .dir = dir, .files = .{ .io = io, .dir = dir } };
     }
 
@@ -175,7 +182,8 @@ pub const State = struct {
         var aw: Io.Writer.Allocating = .init(self.gpa);
         defer aw.deinit();
         try list.write(&aw.writer);
-        try keystore.writeFileAtomic(self.io, self.dir, which.fileName(), aw.written(), false);
+        // Private (0600 on POSIX): the lists say which devices this one trusts.
+        try keystore.writeFileAtomic(self.io, self.dir, which.fileName(), aw.written(), true);
     }
 };
 
@@ -334,6 +342,31 @@ test "state directory: identity and both lists persist" {
     var h = try st2.loadList(.hosts);
     defer h.deinit();
     try testing.expectEqual(@as(usize, 0), h.len());
+}
+
+test "state directory: lists are private, a group-writable directory is refused" {
+    if (comptime !Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = pb[0..try tmp.dir.realPath(testing.io, &pb)];
+    const path = try std.fs.path.join(testing.allocator, &.{ base, "state" });
+    defer testing.allocator.free(path);
+    {
+        var st = try State.open(testing.allocator, testing.io, path);
+        defer st.close();
+        var l = try st.loadList(.clients);
+        defer l.deinit();
+        try l.put(.{ .id = client_id, .paired_unix_s = 7, .name = "laptop" });
+        try st.saveList(.clients, &l);
+        const fst = try st.dir.statFile(testing.io, "paired-clients", .{});
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), fst.permissions.toMode() & 0o777);
+    }
+    try tmp.dir.setFilePermissions(testing.io, "state", .fromMode(0o770), .{});
+    try testing.expectError(error.InsecurePermissions, State.open(testing.allocator, testing.io, path));
+    try tmp.dir.setFilePermissions(testing.io, "state", .fromMode(0o750), .{});
+    var st = try State.open(testing.allocator, testing.io, path);
+    st.close();
 }
 
 test "default state directory" {
