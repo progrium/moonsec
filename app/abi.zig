@@ -334,7 +334,7 @@ export fn moonsec_host_create(config: ?*const c.moonsec_host_config, out: ?*?*c.
     const st = checkCommon(cfg.backend, cfg.clipboard, cfg.relay_mode, cfg.relay_url);
     if (st != ok) return st;
     if (cfg.max_clients > 1) return fail(c.MOONSEC_ERR_UNSUPPORTED, "more than one client needs MOONSEC_FEATURE_MULTI_USER", .{});
-    if (cfg.codec != 0 and api.CodecSet.has(.{ .h264 = true, .hevc = true, .av1 = true, .passthrough = true }, @enumFromInt(@as(u8, @truncate(cfg.codec)))) == false)
+    if (cfg.codec != 0 and (cfg.codec > 255 or !api.CodecSet.has(.{ .h264 = true, .hevc = true, .av1 = true, .passthrough = true }, @enumFromInt(@as(u8, @intCast(cfg.codec))))))
         return invalid("unknown codec");
     if (cfg.flags & c.MOONSEC_HOST_REQUIRE_PAIRED != 0 and cfg.state_dir != null and cfg.state_dir[0] == 0)
         return invalid("MOONSEC_HOST_REQUIRE_PAIRED needs a state directory");
@@ -376,25 +376,19 @@ export fn moonsec_client_create(config: ?*const c.moonsec_client_config, out: ?*
 }
 
 fn destroyEndpoint(e: *Endpoint) void {
-    // Sessions first: each is closed (bye to the peer) and its threads joined.
-    while (true) {
-        e.lock();
-        const s = e.sessions.pop() orelse {
-            e.unlock();
-            break;
-        };
-        e.unlock();
-        // Put it back for releaseSession's bookkeeping.
-        e.lock();
-        e.sessions.append(gpa, s) catch {};
-        e.unlock();
-        releaseSession(s);
-    }
+    // Stop accepting first, so no session starts while the others close.
     if (options.iroh) {
         e.net.stopping.store(true, .release);
         if (e.net.accept) |*f| f.await(io());
-        if (e.net.ep) |ep| ep.deinit();
     }
+    // Each session is closed (a bye to the peer) and its threads joined.
+    while (true) {
+        e.lock();
+        const last: ?*Session = if (e.sessions.items.len > 0) e.sessions.items[e.sessions.items.len - 1] else null;
+        e.unlock();
+        releaseSession(last orelse break);
+    }
+    if (options.iroh) if (e.net.ep) |ep| ep.deinit();
     e.sessions.deinit(gpa);
     e.events.deinit(gpa);
     e.allow.deinit();

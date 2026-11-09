@@ -13,6 +13,7 @@ a session, and a `PacketPipe`, wired into the pipeline.
 | [pathsim.zig](pathsim.zig) | Scripted path flaps (direct <-> relay) and connection drops over the sim, for the session tests. |
 | [pathlog.zig](pathlog.zig) | The sessions' path log. |
 | [main.zig](main.zig) | The `moonsec` tool. |
+| [abi.zig](abi.zig) | The public C ABI ([include/moonsec.h](../include/moonsec.h), [spec/c-abi-v1.md](../spec/c-abi-v1.md)) over `HostApp`/`ClientApp`: loopback sessions in virtual time, iroh sessions on `runThreadedWith`. |
 | [pairing.zig](pairing.zig) | Pairing on a device: the state directory, and the pairing exchange and session admission over any reliable stream ([spec/pairing-v0.md](../spec/pairing-v0.md)). |
 | [keystore.zig](keystore.zig) | `KeyStore` interface for the device key; file-backed store (0600) and an in-memory one. |
 | [pair_cmd.zig](pair_cmd.zig) | `moonsec id`, `pair host`, `pair client`, `paired`, `unpair`, `run pair`, and admission for `peer iroh --state-dir`. |
