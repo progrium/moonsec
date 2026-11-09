@@ -175,6 +175,10 @@ admission; a host admits only clients on its allowlist, others get `MOONSEC_ERR_
 and the host a `REFUSED` event, and a client connects only to hosts it paired with. The
 `INSECURE_NO_PAIRING` flags turn this off on either side, for tests and labs only.
 (`REQUIRE_PAIRED`, which used to opt in, is still accepted and now means the default.)
+`moonsec_host_set_permissions(host, peer_id, MOONSEC_PERM_*)` sets what a paired client may
+do besides watching: `INPUT` (its input is applied) and `CLIPBOARD`; new pairings get `ALL`.
+It is saved with the allowlist and applies to the client's live session at once (the
+clipboard: messages are dropped at once, the feature goes from the next channel).
 
 **Loopback** (`MOONSEC_FEATURE_LOOPBACK`). `moonsec_loopback_create` makes an in-process
 simulated network ([transport/sim.zig](../transport/sim.zig)) with a profile (`CLEAN`,

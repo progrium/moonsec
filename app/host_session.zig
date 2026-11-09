@@ -139,6 +139,8 @@ pub const Stats = struct {
     recovery_requests: u64 = 0,
     pings: u64 = 0,
     inputs_applied: u64 = 0,
+    /// Input events dropped because the device lacks the input permission.
+    inputs_denied: u64 = 0,
     hellos: u64 = 0,
     sessions: u64 = 0,
     /// Times a hello changed the codec or format.
@@ -567,7 +569,10 @@ pub const HostSession = struct {
                     s.stats.malformed += 1;
                     return;
                 };
-                for (actions[0..n]) |a| {
+                // A view-only device: acknowledged (so the client stops resending), not applied.
+                const allowed = if (s.cfg.control.perms) |pm| pm.read().input else true;
+                if (!allowed) s.stats.inputs_denied += n;
+                for (actions[0..if (allowed) n else 0]) |a| {
                     const t: Micros = switch (a) {
                         .key => |k| k.time,
                         .button => |b| b.time,
@@ -801,7 +806,7 @@ pub const HostSession = struct {
         var fb: [32]u8 = undefined;
         try w.print("  stream {s} {s}{s}\n", .{ @tagName(s.codec), s.format.name(&fb), if (st.format_changes > 1) " (changed by a hello)" else "" });
         if (s.decision) |d| try w.print("  loss policy: {s}, loss {d:.2}%, FEC overhead {d:.0}%, {d} parity shards, {d} NACKs ignored, {d} mode switches\n", .{ @tagName(d.mode), d.loss * 100, d.overhead * 100, st.parity_shards, st.nacks_ignored, s.policy.switches });
-        try w.print("  NACKs {d} -> retransmits {d}; feedback {d}; frame acks {d} (recovery requests {d}); pings {d}; inputs {d}\n", .{ st.nacks, st.retransmits, st.feedback, st.frame_acks, st.recovery_requests, st.pings, st.inputs_applied });
+        try w.print("  NACKs {d} -> retransmits {d}; feedback {d}; frame acks {d} (recovery requests {d}); pings {d}; inputs {d} (denied {d})\n", .{ st.nacks, st.retransmits, st.feedback, st.frame_acks, st.recovery_requests, st.pings, st.inputs_applied, st.inputs_denied });
         if (st.path_changes + st.reconnects + st.stall_pauses > 0)
             try w.print("  path changes {d}, reconnects {d}; stalls {d} ({d} frames held, longest {d:.0} ms)\n", .{ st.path_changes, st.reconnects, st.stall_pauses, st.stall_frames, ms(st.stall_longest_us) });
         const snap = s.tele.snapshot();

@@ -8,6 +8,9 @@
 //!   relay only, no n0 relays or discovery (a self-hosted relay; browsers pair through one).
 //!   moonsec paired [--state-dir D]
 //!   moonsec unpair ID-PREFIX [--state-dir D]
+//!   moonsec allow ID-PREFIX view|full|input,clipboard [--state-dir D]
+//!   `pair host --allow PERMS` sets what the devices it pairs may do (default full: input
+//!   and clipboard); `allow` changes it for a paired client, from its next connection.
 //!   moonsec run pair [--seconds N]      pairing and admission end to end over iroh on loopback
 //!
 //! `pair host` binds iroh with the device's key, opens a pairing window, and shows a QR
@@ -38,6 +41,8 @@ pub const Args = struct {
     pin_file: []const u8 = "",
     qr_svg: []const u8 = "",
     pairings: u8 = 1,
+    /// `pair host --allow`: what devices paired in this window may do.
+    perms: pair.allowlist.Perms = .full,
     pin_only: bool = false,
     qr_only: bool = false,
 };
@@ -106,7 +111,11 @@ pub fn cmdPaired(c: Ctx, w: *Io.Writer) !bool {
         var l = try st.loadList(which);
         defer l.deinit();
         try w.print("{s} ({d}):\n", .{ if (which == .clients) "clients allowed to connect" else "hosts paired with", l.len() });
-        for (l.entries.items) |e| try w.print("  {s}  {s}\n", .{ &pair.id.toHex(&e.id), e.name });
+        for (l.entries.items) |e| {
+            try w.print("  {s}  {s}", .{ &pair.id.toHex(&e.id), e.name });
+            if (which == .clients) try w.print("  [{f}]", .{e.perms});
+            try w.writeByte('\n');
+        }
     }
     return true;
 }
@@ -130,6 +139,34 @@ pub fn cmdUnpair(c: Ctx, prefix: []const u8, w: *Io.Writer) !bool {
     }
     try w.print("{s}\n", .{if (removed > 0) "removed" else "no paired device matches"});
     return removed > 0;
+}
+
+/// `moonsec allow ID-PREFIX PERMS`: what a paired client may do. A running `peer iroh`
+/// host applies it from the device's next connection.
+pub fn cmdAllow(c: Ctx, prefix: []const u8, perms_text: []const u8, w: *Io.Writer) !bool {
+    const p = pair.allowlist.Perms.parse(perms_text) orelse {
+        std.debug.print("moonsec: permissions are view, full, or a list of input and clipboard (input,clipboard)\n", .{});
+        return false;
+    };
+    var st = try openState(c);
+    defer st.close();
+    var l = try st.loadList(.clients);
+    defer l.deinit();
+    switch (l.setPermsPrefix(prefix, p)) {
+        0 => {
+            try w.print("no paired client matches\n", .{});
+            return false;
+        },
+        1 => {
+            try st.saveList(.clients, &l);
+            try w.print("allowed: {f}\n", .{p});
+            return true;
+        },
+        else => |n| {
+            std.debug.print("moonsec: {s} matches {d} devices; give more digits\n", .{ prefix, n });
+            return false;
+        },
+    }
 }
 
 // --- over iroh ----------------------------------------------------------------------
@@ -401,7 +438,7 @@ const PairServer = struct {
                 defer srv.mu.unlock(c.io);
                 switch (out) {
                     .paired => |p| {
-                        try srv.clients.put(.{ .id = p.peer_id, .paired_unix_s = unixNow(c.io), .name = p.name() });
+                        try srv.clients.put(.{ .id = p.peer_id, .paired_unix_s = unixNow(c.io), .name = p.name(), .perms = c.p.perms });
                         try srv.st.saveList(.clients, srv.clients);
                         srv.paired += 1;
                         try srv.w.print("paired with {s} ({s}) by {s}\n", .{ p.name(), &pair.id.short(&p.peer_id), if (p.method == .pin) "PIN" else "QR ticket" });
@@ -506,20 +543,31 @@ pub fn cmdPairClient(c: Ctx, w: *Io.Writer) !bool {
 
 // --- session admission ------------------------------------------------------------------
 
-/// Host side of admission: true if `conn` asked for a session and its device is on the
-/// allowlist. Bounded by `IrohStream.admit_budget_ms` in all.
-fn admitOne(conn: iroh.Conn, clients: *const pair.Allowlist) !bool {
+/// `IrohLink` tag of an admitted device's permissions (never 0, so 0 means "none yet").
+pub fn permsTag(p: pair.allowlist.Perms) u32 {
+    return 0x100 | @as(u32, @as(u8, @bitCast(p)));
+}
+
+/// The permissions behind an `IrohLink` tag: none (view only) for 0 or a stray tag.
+pub fn tagPerms(tag: u32) pair.allowlist.Perms {
+    if (tag & 0x100 == 0) return .view;
+    return @bitCast(@as(u8, @truncate(tag)));
+}
+
+/// Host side of admission: the device's permissions if `conn` asked for a session and
+/// its device is on the allowlist, else null. Bounded by `IrohStream.admit_budget_ms` in all.
+fn admitOne(conn: iroh.Conn, clients: *const pair.Allowlist) !?pair.allowlist.Perms {
     const peer_id = try remoteId(conn);
     var s: IrohStream = .withBudget(try conn.acceptBi(IrohStream.admit_budget_ms), IrohStream.admit_budget_ms);
     defer s.close();
     var f: ex.Framer = .{};
     var mb: [ex.max_message]u8 = undefined;
-    const first = (try pairing.readMessage(s.stream(), &f, &mb)) orelse return false;
-    const allowed = ex.classify(first) == .admit and clients.contains(&peer_id);
+    const first = (try pairing.readMessage(s.stream(), &f, &mb)) orelse return null;
+    const perms = if (ex.classify(first) == .admit) clients.perms(&peer_id) else null;
     var o: ex.Out = .{};
-    try s.stream().write(ex.admitReply(&o, allowed));
-    if (!allowed) std.debug.print("refused {s}: not on the allowlist\n", .{&pair.id.short(&peer_id)});
-    return allowed;
+    try s.stream().write(ex.admitReply(&o, perms != null));
+    if (perms == null) std.debug.print("refused {s}: not on the allowlist\n", .{&pair.id.short(&peer_id)});
+    return perms;
 }
 
 /// `IrohLink` gates for `peer iroh`: admission on every connection, the first and each
@@ -528,15 +576,26 @@ fn admitOne(conn: iroh.Conn, clients: *const pair.Allowlist) !bool {
 pub const LinkGate = struct {
     list: *const pair.Allowlist,
     role: enum { host, client },
+    /// Host: the state directory, so each admission reads the allowlist afresh and
+    /// `moonsec unpair` and `moonsec allow` apply from a device's next connection. If it
+    /// cannot be read, `list` (loaded at start) decides.
+    state: ?*pairing.State = null,
 
     pub fn gate(self: *LinkGate) iroh_pipe.IrohLink.Gate {
         return .{ .ctx = self, .check = check };
     }
 
-    fn check(ctx: *anyopaque, conn: iroh.Conn) iroh_pipe.IrohLink.Verdict {
+    fn check(ctx: *anyopaque, conn: iroh.Conn, tag: *u32) iroh_pipe.IrohLink.Verdict {
         const self: *LinkGate = @ptrCast(@alignCast(ctx));
         switch (self.role) {
-            .host => return if (admitOne(conn, self.list) catch false) .admit else .refuse,
+            .host => {
+                var fresh: ?pair.Allowlist = if (self.state) |st| st.loadList(.clients) catch null else null;
+                defer if (fresh) |*l| l.deinit();
+                const list = if (fresh) |*l| l else self.list;
+                const perms = (admitOne(conn, list) catch null) orelse return .refuse;
+                tag.* = permsTag(perms);
+                return .admit;
+            },
             // A broken stream is worth another dial; a refusal is final.
             .client => return if (requestSession(conn, self.list)) |ok| (if (ok) .admit else .refuse) else |_| .retry,
         }
@@ -720,6 +779,29 @@ pub fn runPairE2E(c: Ctx, self_exe: []const u8) !bool {
     };
     sess_waited = true;
     step("host streamed to the paired client", true, sess_ok, &ok);
+
+    // View-only: the host stops applying the device's input and syncing its clipboard.
+    {
+        var st = try pairing.State.open(c.gpa, c.io, c1);
+        defer st.close();
+        const id = try st.identity();
+        const hex = pair.id.toHex(&id.id);
+        step("allow the QR client view only", true, try runSelf(c.io, &.{ self_exe, "allow", hex[0..8], "view", "--state-dir", host_dir }), &ok);
+    }
+    Io.Dir.cwd().deleteFile(c.io, sess_ticket) catch {};
+    var view_host = try spawnSelf(c.io, &.{ self_exe, "peer", "iroh", "host", "--state-dir", host_dir, "--ticket-file", sess_ticket, "--seconds", secs_s });
+    var view_waited = false;
+    defer if (!view_waited) {
+        view_host.kill(c.io);
+    };
+    _ = try waitFile(c, sess_ticket, &junk);
+    step("view-only client streams, no clipboard", true, try runSelf(c.io, &.{ self_exe, "peer", "iroh", "client", "--state-dir", c1, "--ticket-file", sess_ticket, "--seconds", secs_s, "--expect-view-only" }), &ok);
+    const view_ok = switch (try view_host.wait(c.io)) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    view_waited = true;
+    step("host applied none of its input or clipboard", true, view_ok, &ok);
     std.debug.print("pairing over iroh: {s}\n\n", .{if (ok) "pass" else "FAIL"});
     return ok;
 }

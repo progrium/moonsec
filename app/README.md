@@ -58,6 +58,7 @@ moonsec pair client --ticket MOONSEC1:...          # QR ticket: pairs with no PI
 moonsec pair client --ticket MOONSEC1:... --pin 123456   # address ticket plus the PIN
 moonsec paired                           # this device's ID and both paired-device lists
 moonsec unpair a1b2c3d4                  # remove a device by ID prefix
+moonsec allow a1b2c3d4 view               # watch only: no input, no clipboard (or input / clipboard / full)
 moonsec peer iroh host ...              # device key; admits only paired clients
 ```
 

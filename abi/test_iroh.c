@@ -172,6 +172,13 @@ int main(void) {
     CHECK(ev.code == 1);
     OK(moonsec_host_pair_end(h));
 
+    /* Permissions: only for paired clients, only known bits. */
+    CHECK(moonsec_host_set_permissions(h, client_id, MOONSEC_PERM_INPUT) == MOONSEC_OK);
+    CHECK(moonsec_host_set_permissions(h, client_id, 0x80) == MOONSEC_ERR_INVALID);
+    CHECK(moonsec_host_set_permissions(h, "not an id", MOONSEC_PERM_ALL) == MOONSEC_ERR_INVALID);
+    CHECK(moonsec_host_set_permissions(h, host_id, MOONSEC_PERM_ALL) == MOONSEC_ERR_REFUSED);
+    CHECK(moonsec_host_set_permissions(h, client_id, MOONSEC_PERM_ALL) == MOONSEC_OK);
+
     /* Paired: connect and stream. */
     OK(moonsec_client_connect(c, ticket, 10000, &cs));
     CHECK(cs != NULL);

@@ -12,8 +12,23 @@ const pipe_mod = @import("pipe");
 const ctl = core.control;
 const ByteStream = pipe_mod.ByteStream;
 
+/// What the device at the other end of the session's current connection may do (host side;
+/// `core.pair.allowlist.Perms`), read when a channel starts and for every input event. A
+/// reconnecting pipe may move to another device, so it is asked again each time.
+pub const PermsSource = struct {
+    ctx: *anyopaque,
+    get: *const fn (ctx: *anyopaque) core.pair.allowlist.Perms,
+
+    pub fn read(p: PermsSource) core.pair.allowlist.Perms {
+        return p.get(p.ctx);
+    }
+};
+
 pub const Config = struct {
     clipboard: ctl.clipboard.Config = .{},
+    /// Host: a channel to a device without the clipboard permission runs without the
+    /// clipboard (not offered, nothing sent, nothing applied). Null: every device has it.
+    perms: ?PermsSource = null,
     /// Feature bits and message types of features built on the channel (5B, 5D, ...).
     features: u64 = 0,
     known: []const ctl.Known = &.{},
@@ -82,16 +97,21 @@ pub const Control = struct {
         try c.restart();
     }
 
+    fn clipboardAllowed(c: *const Control) bool {
+        return if (c.cfg.perms) |p| p.read().clipboard else true;
+    }
+
     fn restart(c: *Control) !void {
         if (c.ch) |*ch| ch.deinit();
         c.ch = null;
         c.peer = null;
+        const clip_ok = c.clipboardAllowed();
         c.ch = try ctl.Channel.init(c.gpa, .{
             .role = c.role,
             .max_message = c.cfg.max_message,
             .features = c.cfg.features,
             .known = c.cfg.known,
-        }, c.clip);
+        }, if (clip_ok) c.clip else null);
         c.stats.channels += 1;
     }
 
@@ -148,6 +168,8 @@ pub const Control = struct {
                 c.stats.ups += 1;
             },
             .clipboard_text => |t| {
+                // Revoked during this channel: drop what the device sends from now on.
+                if (!c.clipboardAllowed()) continue;
                 c.clip_write.clearRetainingCapacity();
                 try c.clip_write.appendSlice(c.gpa, t);
                 c.clip_pending = true;
@@ -181,6 +203,7 @@ pub const Control = struct {
     /// The local system clipboard now holds `text`. Sent if the channel is up (and on the
     /// next channel otherwise); echoes of what `takeClipboard` handed out are dropped.
     pub fn clipboardChanged(c: *Control, text: []const u8) !void {
+        if (!c.clipboardAllowed()) return;
         if (c.ch) |*ch| {
             try ch.clipboardChanged(text);
         } else if (try c.clip.copied(c.gpa, text)) |_| {}
