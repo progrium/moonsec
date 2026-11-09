@@ -1,0 +1,23 @@
+{
+  "name": "moonsec-web",
+  "private": true,
+  "type": "module",
+  "description": "moonsec browser client (TypeScript glue around the Zig core in wasm) and its browser test harness",
+  "scripts": {
+    "wasm": "cd .. && zig build web-wasm",
+    "build": "node e2e/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "e2e": "npm run build && playwright test",
+    "stub": "npm run build && node e2e/stub-host.mjs",
+    "safari": "npm run build && node e2e/safari.mjs",
+    "media": "npm run build && node e2e/media-host.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "22.15.3",
+    "@types/ws": "8.18.1",
+    "esbuild": "0.25.4",
+    "typescript": "5.8.3",
+    "ws": "8.18.2"
+  }
+}

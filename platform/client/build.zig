@@ -248,6 +248,7 @@ pub fn macosClientModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
             .{ .name = "core", .module = core },
             .{ .name = "client_overlay", .module = overlayModule(b, target, optimize, .{ .core = core, .platform = platform }) },
             .{ .name = "macc_c", .module = tc.createModule() },
+            .{ .name = "client_gamepad", .module = if (native) gamepadModule(b, target, optimize, .{ .core = core, .platform = platform }) else gamepadCheckModule(b, target, optimize, .{ .core = core, .platform = platform }) },
         },
     });
     if (native) {
@@ -264,6 +265,23 @@ pub fn macosClientModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
         }) |f| m.linkFramework(f, .{});
     }
     return m;
+}
+
+/// The gamepad module's Zig side only (gc.m is not compiled, nothing is linked), for
+/// type-checking the macOS client from hosts without the SDK.
+fn gamepadCheckModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: Modules) *std.Build.Module {
+    const opts = b.addOptions();
+    opts.addOption(bool, "require_uinput", false);
+    return b.createModule(.{
+        .root_source_file = b.path("platform/client/gamepad/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = m.core },
+            .{ .name = "platform", .module = m.platform },
+            .{ .name = "gamepad_options", .module = opts.createModule() },
+        },
+    });
 }
 
 /// `test-mac-client` runs the macOS client tests (macOS host); they also join `test-mac`.

@@ -7,7 +7,7 @@ learn which OS, GPU API or codec library is underneath.
 | Side | Object | Thread | Windows (Phase 2) | macOS (Phase 4) | Linux (client Phase 4, host Phase 7) |
 | --- | --- | --- | --- | --- | --- |
 | host | `Capture` | capture | Desktop Duplication | ScreenCaptureKit | ScreenCast portal + PipeWire (dma-buf or memfd) |
-| host | `Encoder` | encode | NVENC | VideoToolbox (low latency, LTR) | |
+| host | `Encoder` | encode | NVENC | VideoToolbox (low latency, LTR) | VAAPI (libva, long-term references), libx264 fallback |
 | host | `AudioSource` | audio | WASAPI loopback | ScreenCaptureKit audio | PipeWire, default sink's monitor |
 | host | `InputInjector` | network | SendInput | CGEvent | |
 | client | `Decoder` | decode | D3D11VA | | libavcodec: VAAPI, software fallback |
@@ -17,7 +17,8 @@ learn which OS, GPU API or codec library is underneath.
 
 The macOS host backend is in [host/macos](host/macos/README.md). The Linux client is in
 [client/linux](client/linux/README.md), the Linux host's capture and audio in
-[host/linux](host/linux/README.md).
+[host/linux](host/linux/README.md) and its encoders in
+[host/linux/ENCODERS.md](host/linux/ENCODERS.md).
 Gamepad capture for every client OS is in [client/gamepad](client/gamepad/README.md).
 
 A backend lives in `platform/<name>/` and exports `openHost(...) !HostBackend` and/or
