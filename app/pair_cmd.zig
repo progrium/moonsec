@@ -295,9 +295,11 @@ pub fn cmdPairHost(c: Ctx, w: *Io.Writer) !bool {
         const first = (readFirst(s.stream(), &f, &mb) catch continue) orelse continue;
         var nonce: ex.Nonce = undefined;
         try c.io.randomSecure(&nonce);
+        var seed: ex.Seed = undefined;
+        try c.io.randomSecure(&seed);
         switch (ex.classify(first)) {
             .pair => {
-                var h = ex.Host.init(&window, ident.id, peer_id, nonce, name);
+                var h = ex.Host.init(&window, ident.id, peer_id, nonce, seed, name);
                 const out = pairing.serveHost(s.stream(), &f, &h, first, &monoNow) catch |e| {
                     std.debug.print("pairing with {s}: stream error {t}\n", .{ &pair.id.short(&peer_id), e });
                     continue;
@@ -387,7 +389,9 @@ pub fn cmdPairClient(c: Ctx, w: *Io.Writer) !bool {
     defer s.close();
     var nonce: ex.Nonce = undefined;
     try c.io.randomSecure(&nonce);
-    var cl = ex.Client.init(t.host_id, ident.id, nonce, cred, name);
+    var seed: ex.Seed = undefined;
+    try c.io.randomSecure(&seed);
+    var cl = ex.Client.init(t.host_id, ident.id, nonce, seed, cred, name);
     const out = try pairing.runClient(s.stream(), &cl);
     switch (out) {
         .paired => |p| {

@@ -88,7 +88,7 @@ Checked against the spec, with what we found:
 | MACs compared in constant time | `std.crypto.timing_safe.eql` on both sides | Holds. |
 | Client checks it reached the ticket's host before sending anything | `cmdPairClient` compares `remoteId` with `t.host_id` | Holds. |
 | QR secret is single-use and expires | `pairings_left`, `deadline_us` (monotonic, host side); `expires` in the ticket is advisory for the client | Holds; `expires` and the CRC are not authenticated, which is fine because the host enforces the window. |
-| PIN offline guessing | Client sends its proof before the host proves anything | **Does not hold against a host the client was tricked into dialing** (O2). |
+| PIN offline guessing | CPace for the PIN method | Holds: each run tests one guess, online, whichever side runs it (O2, fixed). |
 | Ticket parsing | `Ticket.decode`: CRC, length checks, version | Holds; now also refuses undefined flag bits (fixed). |
 | Names cannot break the list format | `sanitizeName` on the way in; `cleanField` on addresses | Holds (fuzzed by `pair_text`). |
 | Admission checks the allowlist by authenticated ID | `admitOne`, `LinkGate` | Holds, on every connection including reconnects (O1, fixed). |
@@ -132,6 +132,7 @@ that run under Miri, and the threading contract in `iroh_shim.h`.
 
 | # | Fix |
 | --- | --- |
+| O2 | The PIN method runs CPace (a balanced PAKE over ristretto255, std's `Ristretto255`) inside the same three messages: the challenge carries the host's share, the proof the client's, and the MAC key derives from the shared point. A host the client dials by mistake gets a proof it cannot test any PIN guess against, the right one included (`core/pair/exchange.zig` test "a host without the PIN"). Invalid and identity shares are refused. The QR method is unchanged. Pairing `hello` is now version 1. |
 | O1 | `peer iroh` always enforces pairing (the device key from `--state-dir` or the default state directory); `--insecure-no-pairing` opts out, and only `run iroh` and `tools/netlab` pass it. `IrohLink` takes an admission gate that runs on every connection it accepts or dials, reconnects included, and a newcomer replaces a live session's connection only if it comes from the same device; the paired mode now reconnects too. The C ABI requires pairing by default (`MOONSEC_HOST_INSECURE_NO_PAIRING` and `MOONSEC_CLIENT_INSECURE_NO_PAIRING` opt out; `REQUIRE_PAIRED` is still accepted). Tests: `transport/iroh_test.zig` "link gate", `run pair`, `abi/test_iroh.c`. |
 
 ### Open
@@ -139,7 +140,7 @@ that run under Miri, and the threading contract in `iroh_shim.h`.
 | # | Severity | Finding | Recommendation |
 | --- | --- | --- | --- |
 | ~~O1~~ | **High (release blocker)**, fixed (above) | `moonsec peer iroh host` without `--state-dir` admits any peer that has its address ticket: video, audio, input injection, and the clipboard with `--clipboard`. In that mode `IrohLink` also accepts a replacement connection after a drop without any check, so a stranger who reaches the endpoint can take over a running session. Pairing-enforced mode (`peerPaired`) has no reconnect. | Before any release: make pairing the only mode outside the `run` lab commands (an explicit `--insecure-no-pairing` for labs), and run admission on every connection `IrohLink` accepts, including reconnects. |
-| O2 | Medium | PIN pairing is not a PAKE. The client sends `client_mac = HMAC(K(PIN), transcript)` before the host proves anything, so a host the client dials by mistake (an attacker's address ticket, substituted wherever the user got it) receives a value it can brute-force offline in well under a second (10⁶ HMACs), then pair with the real host as itself inside the same window. The QR method (128-bit secret) is not affected. | Use a balanced PAKE for the PIN method (CPace or SPAKE2 over the same transcript), or show the host's short ID next to the PIN and have the client confirm it before sending its proof. At minimum, say in the spec that an address ticket must come from the host itself. |
+| ~~O2~~ | Medium, fixed (above) | PIN pairing is not a PAKE. The client sends `client_mac = HMAC(K(PIN), transcript)` before the host proves anything, so a host the client dials by mistake (an attacker's address ticket, substituted wherever the user got it) receives a value it can brute-force offline in well under a second (10⁶ HMACs), then pair with the real host as itself inside the same window. The QR method (128-bit secret) is not affected. | Use a balanced PAKE for the PIN method (CPace or SPAKE2 over the same transcript), or show the host's short ID next to the PIN and have the client confirm it before sending its proof. At minimum, say in the spec that an address ticket must come from the host itself. |
 | O3 | Medium | Availability: the host serves pairing and admission one connection at a time, with 10 s timeouts per step, up to about 32 s draining a stream on close, and an accept handshake bound of `max(10 s, accept timeout)` (600 s for `peer iroh --relay`). One unpaired peer that keeps connecting and stalling can stop the user from pairing or starting a session. No compromise. | Serve each connection on its own task with a total deadline (a few seconds for pairing, less for admission), cap concurrent unauthenticated connections, and bound the handshake by `ACCEPT_HANDSHAKE_TIMEOUT` alone. |
 | O4 | Medium | Every paired client gets full control. There are no per-device permissions (view-only, no clipboard) in the allowlist; the multi-user "may control" flag is a host-wide setting, and `app/multi_host.zig` is not wired to iroh admission yet. | Add a permissions field to the allowlist (the spec lists it as a follow-up) before multi-user ships over the network. |
 | O5 | Low | Secrets on the command line: `pair client --ticket <QR ticket>` and `--pin` are visible to other local users on the client (`ps`, `/proc`), who could race the pairing. | Read the ticket or PIN from stdin or a file by default (`--ticket-file` exists) and warn when they are given as arguments. |
@@ -176,8 +177,8 @@ they merge.
 
 ## Questions for the reviewer
 
-1. Is the HMAC exchange sound for the QR method as specified, and which PAKE would you
-   want for the PIN method (O2)?
+1. Is the HMAC exchange sound for the QR method as specified, and is our simplified CPace
+   for the PIN method (spec/pairing-v0.md, "Exchange"; O2) sound as instantiated?
 2. Is binding the client name into the transcript, but not the host name, a problem? (The
    host's name reaches the client only inside the accepted, MAC-verified exchange.)
 3. Does relying on iroh's TLS for endpoint authentication leave anything for us to check

@@ -1410,7 +1410,9 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
             e.unlock();
             var nonce: ex.Nonce = undefined;
             io().random(&nonce);
-            var hs = ex.Host.init(&window, e.identity.id, peer_id, nonce, e.name);
+            var seed: ex.Seed = undefined;
+            io().random(&seed);
+            var hs = ex.Host.init(&window, e.identity.id, peer_id, nonce, seed, e.name);
             const out = pairing.serveHost(s.stream(), &f, &hs, first, &wallNow) catch return;
             e.lock();
             defer e.unlock();
@@ -1654,7 +1656,9 @@ export fn moonsec_client_pair(h: ?*c.moonsec_client, ticket: ?[*:0]const u8, pin
     defer s.close();
     var nonce: ex.Nonce = undefined;
     io().random(&nonce);
-    var cl = ex.Client.init(host_id, e.identity.id, nonce, cred, e.name);
+    var seed: ex.Seed = undefined;
+    io().random(&seed);
+    var cl = ex.Client.init(host_id, e.identity.id, nonce, seed, cred, e.name);
     const result = pairing.runClient(s.stream(), &cl) catch return irohErr("pairing");
     switch (result) {
         .paired => |pd| {
