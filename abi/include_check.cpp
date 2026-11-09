@@ -21,6 +21,7 @@ SIG(moonsec_host_listen, moonsec_status, (moonsec_host*));
 SIG(moonsec_host_ticket, moonsec_status, (moonsec_host*, char*, size_t, size_t*));
 SIG(moonsec_host_pair_begin, moonsec_status, (moonsec_host*, const moonsec_pair_config*, moonsec_pair_info*));
 SIG(moonsec_host_pair_end, moonsec_status, (moonsec_host*));
+SIG(moonsec_host_set_permissions, moonsec_status, (moonsec_host*, const char*, uint32_t));
 SIG(moonsec_host_listen_loopback, moonsec_status, (moonsec_host*, moonsec_loopback*, moonsec_session**));
 SIG(moonsec_host_give_input, moonsec_status, (moonsec_host*, moonsec_session*));
 SIG(moonsec_host_displays, moonsec_status, (moonsec_host*, moonsec_display_info*, size_t, size_t*));

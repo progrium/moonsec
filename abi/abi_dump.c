@@ -235,6 +235,9 @@ static void dump(void) {
     K(MOONSEC_HOST_APP_INPUT);
     K(MOONSEC_HOST_REQUIRE_PAIRED);
     K(MOONSEC_HOST_INSECURE_NO_PAIRING);
+    K(MOONSEC_PERM_INPUT);
+    K(MOONSEC_PERM_CLIPBOARD);
+    K(MOONSEC_PERM_ALL);
     K(MOONSEC_PAIR_QR_AND_PIN);
     K(MOONSEC_PAIR_QR_ONLY);
     K(MOONSEC_PAIR_PIN_ONLY);
@@ -293,6 +296,7 @@ static void dump(void) {
     FN(moonsec_host_ticket);
     FN(moonsec_host_pair_begin);
     FN(moonsec_host_pair_end);
+    FN(moonsec_host_set_permissions);
     FN(moonsec_host_listen_loopback);
     FN(moonsec_host_give_input);
     FN(moonsec_host_displays);

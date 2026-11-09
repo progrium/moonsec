@@ -13,7 +13,8 @@
 import { CoreSession, State } from "../core";
 import { WebSocketTransport, type Transport } from "../transport";
 import { codecString, probeDecoders, type DecoderSupport } from "./codec";
-import type { AudioReport, FromWorker, InputOp, NeedMsg, PcmMsg, StartMsg, ToWorker, VideoReport } from "./protocol";
+import type { AudioReport, FromWorker, InputOp, NeedMsg, PcmMsg, ProbeEvent, StartMsg, ToWorker, VideoReport } from "./protocol";
+import { IrohTransport } from "../../../shim-web/js/transport.js";
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -46,6 +47,9 @@ class Media {
   /** When the first audio frame was rendered, and how much audio has been since (µs). */
   audioStartUs = 0;
   audioPlayedUs = 0;
+  probe: { x: number; y: number } | null;
+  probeLight: boolean | null = null;
+  probeEvents: ProbeEvent[] = [];
 
   constructor(core: CoreSession, transport: Transport, m: StartMsg, support: DecoderSupport) {
     this.core = core;
@@ -56,6 +60,7 @@ class Media {
     this.relayed = m.relayed;
     this.seconds = m.seconds;
     this.audioPort = m.audio;
+    this.probe = m.probe ?? null;
     core.setPath({ rttUs: 0, relayed: m.relayed, pathEpoch: 0, connEpoch: 0, connected: true });
     transport.onDatagram = (dg) => {
       if (!core.push(dg, nowUs())) return;
@@ -164,6 +169,14 @@ class Media {
     frame.close();
     const presentedAt = nowUs();
     this.core.onPresented(id, presentedAt);
+    if (this.probe) {
+      const px = this.ctx.getImageData(this.probe.x, this.probe.y, 1, 1).data;
+      const light = px[0] + px[1] + px[2] > 384;
+      if (light !== this.probeLight) {
+        this.probeLight = light;
+        this.probeEvents.push({ at: presentedAt + performance.timeOrigin * 1000, light, frameId: id });
+      }
+    }
     this.video.drawn++;
     this.video.drawMs.push((presentedAt - decodedAt) / 1000);
     if (!this.video.nonBlank && this.video.drawn % 30 === 0) {
@@ -226,7 +239,10 @@ class Media {
       video: { ...this.video, errors: [...this.video.errors] },
       audio: { ...this.audio },
       relayed: this.relayed,
+      probe: this.probeEvents,
+      transport: transportStats(this.transport),
     };
+    this.probeEvents = [];
     this.video.decodeMs = [];
     this.video.drawMs = [];
     self.postMessage(msg);
@@ -271,6 +287,28 @@ class Media {
 
 let media: Media | null = null;
 
+function transportStats(t: Transport): Record<string, number | boolean> | null {
+  const conn = (t as Partial<IrohTransport>).conn;
+  if (!conn) return null;
+  return Object.fromEntries(Object.entries(conn.stats() as Record<string, unknown>).map(([k, v]) => [k, typeof v === "bigint" ? Number(v) : (v as number | boolean)]));
+}
+
+/** shim-web in this worker: bind a relay-only endpoint and dial the host's ticket. */
+async function dialIroh(o: { ticket: string; relayUrls: string[]; pkgUrl: string }): Promise<Transport> {
+  type IrohModule = typeof import("../../../shim-web/pkg/iroh_web.js");
+  const iroh: IrohModule = await import(/* @vite-ignore */ new URL("iroh_web.js", o.pkgUrl).href);
+  await iroh.default({ module_or_path: new URL("iroh_web_bg.wasm", o.pkgUrl) });
+  const ep = await iroh.Endpoint.bind({ relayUrls: o.relayUrls });
+  await ep.online(15000);
+  const conn = await ep.connect(o.ticket, "moonsec/0", 30000);
+  // No admission yet (spec/pairing-v0.md): the browser host lets in whoever has its ticket.
+  const t = new IrohTransport(conn);
+  // Keep the endpoint reachable: when its wrapper is garbage collected, wasm-bindgen's
+  // finalizer drops the Rust endpoint and the connection closes under the session.
+  (t as IrohTransport & { endpoint?: unknown }).endpoint = ep;
+  return t;
+}
+
 self.onmessage = async (ev: MessageEvent<ToWorker>) => {
   const m = ev.data;
   try {
@@ -284,7 +322,7 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
         if (transport) transport.send(dg.slice());
         else pending.push(dg.slice());
       });
-      transport = await WebSocketTransport.connect(m.wsUrl);
+      transport = m.iroh ? await dialIroh(m.iroh) : await WebSocketTransport.connect(m.wsUrl);
       for (const dg of pending) transport.send(dg);
       media = new Media(core, transport, m, support);
     } else if (m.type === "input") {

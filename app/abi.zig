@@ -690,7 +690,7 @@ const NetLink = if (options.iroh) struct {
 
     /// client: each new connection goes to the same host and through admission, as
     /// `moonsec_client_connect`'s first one did.
-    fn clientGate(ctx: *anyopaque, conn: iroh.Conn) iroh_pipe.IrohLink.Verdict {
+    fn clientGate(ctx: *anyopaque, conn: iroh.Conn, _: *u32) iroh_pipe.IrohLink.Verdict {
         const n: *NetLink = @ptrCast(@alignCast(ctx));
         const rid = pair_cmd.remoteId(conn) catch return .retry;
         if (!std.mem.eql(u8, &rid, &n.peer)) return .refuse;
@@ -725,6 +725,10 @@ const Session = struct {
     runner: ?Io.Future(void) = null,
     /// A multi-user client's view of the host's roster.
     view: core.multi.View = .{},
+    /// Host: the client device (iroh sessions) and what it may do. Read on the session's
+    /// threads; `moonsec_host_set_permissions` changes it under the endpoint's lock.
+    peer: ?pair.Id = null,
+    perms: pair.allowlist.Perms = .full,
 
     // What `check` last reported.
     started: bool = false,
@@ -962,10 +966,15 @@ fn sessionClipboard(s: *Session) SessionError!?clipboard.Clipboard {
 }
 
 /// A host session over `p`. `virtual`: the clock is the loopback's, nothing may block.
-fn newHostSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStream, transport: Transport, virtual: ?*Loopback) SessionError!*Session {
+fn sessionPerms(ctx: *anyopaque) pair.allowlist.Perms {
+    const s: *Session = @ptrCast(@alignCast(ctx));
+    return @atomicLoad(pair.allowlist.Perms, &s.perms, .acquire);
+}
+
+fn newHostSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStream, transport: Transport, virtual: ?*Loopback, peer: ?pair.Id, perms: pair.allowlist.Perms) SessionError!*Session {
     const s = try gpa.create(Session);
     errdefer gpa.destroy(s);
-    s.* = .{ .ep = e, .app = undefined, .transport = transport, .clock = undefined, .clip = .init(gpa) };
+    s.* = .{ .ep = e, .app = undefined, .transport = transport, .clock = undefined, .clip = .init(gpa), .peer = peer, .perms = perms };
     errdefer s.clip.deinit();
     if (virtual) |lb| {
         s.side_clock = .{ .net = lb.net, .side = .a };
@@ -999,7 +1008,9 @@ fn newHostSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStrea
     }
     const codec = pickCodec(be.encoder.caps(), cfg.codec) orelse return error.Unsupported;
     const clip = try sessionClipboard(s);
-    s.app = .{ .host = apps.HostApp.init(gpa, be, hostOptions(cfg, codec, ctl, clip), p) catch |err| return switch (err) {
+    var ho = hostOptions(cfg, codec, ctl, clip);
+    ho.perms = .{ .ctx = s, .get = sessionPerms };
+    s.app = .{ .host = apps.HostApp.init(gpa, be, ho, p) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Unsupported => error.Unsupported,
         else => error.Backend,
@@ -1448,7 +1459,7 @@ export fn moonsec_host_listen_loopback(h: ?*c.moonsec_host, lp: ?*c.moonsec_loop
     if (l.host != null) return fail(c.MOONSEC_ERR_STATE, "a host is already on this loopback", .{});
     if (e.hc.backend == c.MOONSEC_BACKEND_SYSTEM) return fail(c.MOONSEC_ERR_UNSUPPORTED, "the loopback runs in virtual time: system backends need iroh", .{});
     if (e.activeSession()) return fail(c.MOONSEC_ERR_STATE, "the host already has a session", .{});
-    const s = newHostSession(e, l.net.pipeFor(.a), l.net.streamFor(.a), .{ .loopback = l }, l) catch |err| return sessionError(err);
+    const s = newHostSession(e, l.net.pipeFor(.a), l.net.streamFor(.a), .{ .loopback = l }, l, null, .full) catch |err| return sessionError(err);
     e.sessions.append(gpa, s) catch {
         s.deinit();
         return fail(c.MOONSEC_ERR_NO_MEMORY, "out of memory", .{});
@@ -1729,7 +1740,7 @@ fn startIrohSession(e: *Endpoint, conn: iroh.Conn, peer_name: []const u8, peer: 
         return;
     }
     const s = (if (e.role == .host)
-        newHostSession(e, n.link.packetPipe(), n.link.controlStream(), .{ .iroh = n }, null)
+        newHostSession(e, n.link.packetPipe(), n.link.controlStream(), .{ .iroh = n }, null, peer, e.allow.perms(&peer) orelse .full)
     else
         newClientSession(e, n.link.packetPipe(), n.link.controlStream(), .{ .iroh = n }, null)) catch |err| {
         n.destroy();
@@ -1799,12 +1810,16 @@ fn joinMulti(e: *Endpoint, n: *NetLink, name: []const u8) !*Session {
     try e.sessions.ensureUnusedCapacity(gpa, 1);
     const s = try gpa.create(Session);
     errdefer gpa.destroy(s);
-    s.* = .{ .ep = e, .app = undefined, .run = run, .transport = .{ .iroh = n }, .clock = run.app.be.clock, .clip = .init(gpa) };
+    const perms: pair.allowlist.Perms = e.allow.perms(&n.peer) orelse .full;
+    s.* = .{ .ep = e, .app = undefined, .run = run, .transport = .{ .iroh = n }, .clock = run.app.be.clock, .clip = .init(gpa), .peer = n.peer, .perms = perms };
     errdefer s.clip.deinit();
-    if (try sessionClipboard(s)) |cb| s.clip_sync = .{ .cb = cb, .interval_us = 50_000 };
+    // The member's clipboard syncs only with the clipboard permission.
+    if (perms.clipboard) if (try sessionClipboard(s)) |cb| {
+        s.clip_sync = .{ .cb = cb, .interval_us = 50_000 };
+    };
     errdefer if (s.sys_clip) |*y| y.close();
-    // v0: every member may control (a per-device permission is a follow-up).
-    const peer = run.app.m.addPeer(n.link.packetPipe(), n.link.controlStream(), name, true) catch |err| return switch (err) {
+    // A member may take control only with the input permission.
+    const peer = run.app.m.addPeer(n.link.packetPipe(), n.link.controlStream(), name, perms.input) catch |err| return switch (err) {
         error.Full => error.Busy,
         else => err,
     };
@@ -1957,6 +1972,35 @@ export fn moonsec_host_pair_begin(h: ?*c.moonsec_host, config: ?*const c.moonsec
     e.net.paired_in_window = 0;
     _ = writeOut(c.moonsec_pair_info, out, r);
     return ok;
+}
+
+export fn moonsec_host_set_permissions(h: ?*c.moonsec_host, peer_id: ?[*:0]const u8, perms: u32) Status {
+    const e = hostOf(h) orelse return invalid("not a host");
+    const text = peer_id orelse return invalid("peer_id is NULL");
+    const id = pair.id.parseHex(std.mem.span(text)) orelse return invalid("peer_id is not a 64 hex digit endpoint ID");
+    if (perms & ~@as(u32, c.MOONSEC_PERM_ALL) != 0) return invalid("unknown permission bits");
+    const p: pair.allowlist.Perms = .{ .input = perms & c.MOONSEC_PERM_INPUT != 0, .clipboard = perms & c.MOONSEC_PERM_CLIPBOARD != 0 };
+    e.lock();
+    defer e.unlock();
+    for (e.allow.entries.items) |*entry| {
+        if (!std.mem.eql(u8, &entry.id, &id)) continue;
+        entry.perms = p;
+        e.saveAllow();
+        // Its live session follows: input at once, the clipboard from the next channel
+        // (a multi-user member: whether it may take control, at once).
+        for (e.sessions.items) |s| if (s.peer) |sp| if (std.mem.eql(u8, &sp, &id)) {
+            @atomicStore(pair.allowlist.Perms, &s.perms, p, .release);
+            switch (s.app) {
+                .member => |m| if (s.run) |r| if (r.app.m.roster.find(m.id)) |mem| {
+                    mem.may_control = p.input;
+                    if (!p.input) r.app.m.roster.request(m.id, false);
+                },
+                else => {},
+            }
+        };
+        return ok;
+    }
+    return fail(c.MOONSEC_ERR_REFUSED, "{s} is not paired with this host", .{&pair.id.short(&id)});
 }
 
 export fn moonsec_host_pair_end(h: ?*c.moonsec_host) Status {

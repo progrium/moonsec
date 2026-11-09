@@ -194,6 +194,9 @@ const MOONSEC_HOST_NO_AUDIO 32
 const MOONSEC_HOST_APP_INPUT 64
 const MOONSEC_HOST_REQUIRE_PAIRED 128
 const MOONSEC_HOST_INSECURE_NO_PAIRING 256
+const MOONSEC_PERM_INPUT 1
+const MOONSEC_PERM_CLIPBOARD 2
+const MOONSEC_PERM_ALL 3
 const MOONSEC_PAIR_QR_AND_PIN 0
 const MOONSEC_PAIR_QR_ONLY 1
 const MOONSEC_PAIR_PIN_ONLY 2
@@ -251,6 +254,7 @@ fn moonsec_host_listen
 fn moonsec_host_ticket
 fn moonsec_host_pair_begin
 fn moonsec_host_pair_end
+fn moonsec_host_set_permissions
 fn moonsec_host_listen_loopback
 fn moonsec_host_give_input
 fn moonsec_host_displays

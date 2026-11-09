@@ -125,7 +125,7 @@ interface Exports {
 
 /// The module's WASI imports. The core does no I/O: everything but stderr (panic
 /// messages), the clock, randomness and exit answers ENOSYS.
-function wasiImports(getMemory: () => WebAssembly.Memory, module: WebAssembly.Module): Record<string, Function> {
+export function wasiImports(getMemory: () => WebAssembly.Memory, module: WebAssembly.Module): Record<string, Function> {
   const ENOSYS = 52;
   const imports: Record<string, Function> = {};
   for (const imp of WebAssembly.Module.imports(module)) {

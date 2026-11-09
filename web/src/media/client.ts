@@ -21,6 +21,9 @@ export interface ClientOptions {
   input?: HTMLElement | false;
   mouseMode?: MouseMode;
   onError?: (message: string) => void;
+  /** Dial a browser or native host over iroh instead of `wsUrl`. */
+  iroh?: { ticket: string; relayUrls: string[]; pkgUrl: string };
+  probe?: { x: number; y: number };
 }
 
 /**
@@ -112,6 +115,8 @@ export class WebClient {
       audio: audioPort,
       relayed: o.relayed ?? true,
       seconds: o.seconds ?? 0,
+      iroh: o.iroh ?? null,
+      probe: o.probe ?? null,
     };
     worker.postMessage(start, audioPort ? [canvas, audioPort] : [canvas]);
     if (o.input !== false) {
