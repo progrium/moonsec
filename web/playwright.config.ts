@@ -1,6 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
 const port = Number(process.env.PORT ?? 8787);
+const mediaPort = Number(process.env.MEDIA_PORT ?? 8788);
 
 export default defineConfig({
   testDir: "e2e",
@@ -10,12 +11,21 @@ export default defineConfig({
   workers: 1, // one stub host, whose /state is the latest session's
   reporter: [["list"], ["json", { outputFile: "test-results/report.json" }]],
   use: { baseURL: `http://127.0.0.1:${port}`, trace: "off" },
-  webServer: {
-    command: `node e2e/stub-host.mjs --port ${port}`,
-    url: `http://127.0.0.1:${port}/harness.html`,
-    reuseExistingServer: !process.env.CI,
-    stdout: "pipe",
-  },
+  webServer: [
+    {
+      command: `node e2e/stub-host.mjs --port ${port}`,
+      url: `http://127.0.0.1:${port}/harness.html`,
+      reuseExistingServer: !process.env.CI,
+      stdout: "pipe",
+    },
+    {
+      // The media pipeline against a real host (e2e/media-host.mjs; needs `zig build web-host`).
+      command: `node e2e/media-host.mjs --port ${mediaPort}`,
+      url: `http://127.0.0.1:${mediaPort}/client.html`,
+      reuseExistingServer: !process.env.CI,
+      stdout: "pipe",
+    },
+  ],
   projects: [
     {
       name: "chromium",

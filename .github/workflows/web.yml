@@ -7,9 +7,9 @@ name: web
 on:
   push:
     branches: ["**"]
-    paths: ["web/**", "core/**", "build.zig", "build.zig.zon", ".github/workflows/web.yml"]
+    paths: ["web/**", "core/**", "app/**", "codec/**", "platform/**", "transport/**", "build.zig", "build.zig.zon", ".github/workflows/web.yml"]
   pull_request:
-    paths: ["web/**", "core/**", "build.zig", "build.zig.zon", ".github/workflows/web.yml"]
+    paths: ["web/**", "core/**", "app/**", "codec/**", "platform/**", "transport/**", "build.zig", "build.zig.zon", ".github/workflows/web.yml"]
   workflow_dispatch:
 
 permissions:
@@ -39,8 +39,8 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: wasm modules
-        run: zig build web-wasm --summary all
+      - name: wasm modules and the media test host
+        run: zig build web-wasm web-host --summary all
       - run: npm ci
       - name: Typecheck
         run: npx tsc --noEmit
