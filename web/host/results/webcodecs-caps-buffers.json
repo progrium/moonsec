@@ -1,0 +1,69 @@
+{
+  "getAllFrameBuffers": true,
+  "codecs": {
+    "avc1.42E028": {
+      "software": true,
+      "hardware": false,
+      "L1T3": true,
+      "manual": true
+    },
+    "av01.0.08M.08": {
+      "software": true,
+      "hardware": false,
+      "L1T3": true,
+      "manual": true
+    },
+    "vp09.00.10.08": {
+      "software": true,
+      "hardware": false,
+      "L1T3": true,
+      "manual": true
+    },
+    "vp8": {
+      "software": true,
+      "hardware": false,
+      "L1T3": true,
+      "manual": true
+    },
+    "hvc1.1.6.L120.B0": {
+      "software": false,
+      "hardware": false,
+      "L1T3": false,
+      "manual": false
+    }
+  },
+  "opus10ms": true,
+  "mediaStreamTrackProcessor": true,
+  "manualRefs": {
+    "avc1.42E028": {
+      "buffers": 3,
+      "chunks": [
+        "key",
+        "delta",
+        "delta",
+        "delta",
+        "delta",
+        "delta"
+      ]
+    },
+    "av01.0.08M.08": {
+      "buffers": 3,
+      "chunks": [
+        "key",
+        "delta",
+        "delta",
+        "delta",
+        "delta",
+        "delta"
+      ]
+    },
+    "vp09.00.10.08": {
+      "buffers": 0
+    },
+    "vp8": {
+      "buffers": 0
+    },
+    "hvc1.1.6.L120.B0": "Error: page.evaluate: InvalidStateError: Failed to execute 'encode' on 'VideoEncoder': Cannot call 'encode' on a closed codec."
+  },
+  "browser": "chromium 153.0.8010.12 --enable-blink-features=WebCodecsVideoEncoderBuffers"
+}

@@ -103,3 +103,14 @@ export function hidUsageFromKeyCode(keyCode: number): number {
   };
   return legacy[keyCode] ?? 0;
 }
+
+let reverse: Map<number, string> | null = null;
+
+/** The KeyboardEvent.code for a HID usage (the first name in the table), or "" (browser host injection). */
+export function codeForUsage(usage: number): string {
+  if (!reverse) {
+    reverse = new Map();
+    for (const [code, u] of Object.entries(table)) if (!reverse.has(u)) reverse.set(u, code);
+  }
+  return reverse.get(usage) ?? "";
+}

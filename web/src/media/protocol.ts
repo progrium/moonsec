@@ -16,6 +16,17 @@ export interface StartMsg {
   relayed: boolean;
   /** Stop after this long streaming (0: never). */
   seconds: number;
+  /** Dial a host over iroh (shim-web) instead of the WebSocket test transport. */
+  iroh?: { ticket: string; relayUrls: string[]; pkgUrl: string } | null;
+  /** Watch the pixel at (x, y) of each drawn frame and report when it turns light or dark (latency tests). */
+  probe?: { x: number; y: number } | null;
+}
+
+/** A probe pixel change: when the frame showing it was drawn (absolute µs) and its new state. */
+export interface ProbeEvent {
+  at: number;
+  light: boolean;
+  frameId: number;
 }
 
 /**
@@ -70,6 +81,10 @@ export interface StatsMsg {
   video: VideoReport;
   audio: AudioReport;
   relayed: boolean;
+  /** shim-web's connection counters when the transport is iroh. */
+  transport?: Record<string, number | boolean> | null;
+  /** Probe changes since the last report. */
+  probe: ProbeEvent[];
 }
 
 export type FromWorker = StatsMsg | { type: "error"; message: string };

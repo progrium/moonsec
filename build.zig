@@ -410,6 +410,25 @@ pub fn build(b: *std.Build) void {
         web_wasm.wasi_exec_model = .reactor;
         const install_wasm = b.addInstallArtifact(web_wasm, .{ .dest_dir = .{ .override = .{ .custom = "web" } } });
         web_step.dependOn(&install_wasm.step);
+        // The browser host (spike, web/host/README.md): the host session and the host end of
+        // the audio stage, zig-out/web/moonsec-host.wasm.
+        const host_wasm = b.addExecutable(.{ .name = "moonsec-host", .root_module = b.createModule(.{
+            .root_source_file = b.path("app/web_host.zig"),
+            .target = wasm_wasi,
+            .optimize = web_opt,
+            .strip = true,
+            .imports = &.{
+                .{ .name = "core", .module = w_core },
+                .{ .name = "platform", .module = w_platform },
+                .{ .name = "pipe", .module = w_pipe },
+                .{ .name = "audio_stage", .module = w_stage },
+                .{ .name = "opus", .module = w_opus.module },
+            },
+        }) });
+        host_wasm.entry = .disabled;
+        host_wasm.rdynamic = true;
+        host_wasm.wasi_exec_model = .reactor;
+        web_step.dependOn(&b.addInstallArtifact(host_wasm, .{ .dest_dir = .{ .override = .{ .custom = "web" } } }).step);
     }
 
     // `moonsec-linux`: moonsec-sim plus the Linux client backend (platform/client/linux),

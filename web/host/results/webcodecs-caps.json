@@ -1,0 +1,38 @@
+{
+  "getAllFrameBuffers": false,
+  "codecs": {
+    "avc1.42E028": {
+      "software": true,
+      "hardware": false,
+      "L1T3": true,
+      "manual": true
+    },
+    "av01.0.08M.08": {
+      "software": true,
+      "hardware": false,
+      "L1T3": true,
+      "manual": true
+    },
+    "vp09.00.10.08": {
+      "software": true,
+      "hardware": false,
+      "L1T3": true,
+      "manual": true
+    },
+    "vp8": {
+      "software": true,
+      "hardware": false,
+      "L1T3": true,
+      "manual": true
+    },
+    "hvc1.1.6.L120.B0": {
+      "software": false,
+      "hardware": false,
+      "L1T3": false,
+      "manual": false
+    }
+  },
+  "opus10ms": true,
+  "mediaStreamTrackProcessor": true,
+  "browser": "chromium 153.0.8010.12"
+}
