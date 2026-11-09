@@ -30,6 +30,9 @@ pub const ClientSpec = struct {
     multi_user: bool = true,
     join_at_us: Micros = 0,
     leave_at_us: ?Micros = null,
+    /// What the client's decoder takes and its display shows (sent in its hello).
+    decoder_formats: api.Formats = api.Formats.all,
+    display: api.DisplayCaps = .{},
 };
 
 pub const Event = union(enum) {
@@ -66,6 +69,12 @@ pub const Options = struct {
     roster: multi.roster.Config = .{},
     rate: multi.rate.Config = .{},
     intersect_acks: bool = true,
+    /// The host's format preferences and encoder (as in simrun.Options).
+    encoder_formats: api.Formats = api.Formats.all,
+    yuv444: bool = false,
+    ten_bit: bool = false,
+    /// The host's display is in HDR mode with this metadata.
+    hdr_source: ?api.HdrMetadata = null,
 };
 
 pub const ClientResult = struct {
@@ -86,6 +95,11 @@ pub const ClientResult = struct {
     have_input: bool = false,
     members_seen: u8 = 0,
     rosters: u64 = 0,
+    /// The stream's format when the client ended, configs that changed it mid-session,
+    /// and frames whose format was not the one its config named.
+    format: api.VideoFormat = .{},
+    config_changes: u64 = 0,
+    wrong_format: u64 = 0,
     presence: [80]u8 = undefined,
     presence_len: u8 = 0,
 
@@ -110,6 +124,10 @@ pub const Result = struct {
         joins: u64,
         leaves: u64,
         bitrate_bps: u64,
+        format: api.VideoFormat,
+        format_changes: u64,
+        format_refusals: u64,
+        reconfigures: u64,
     },
     clients: [multi.max_members]ClientResult,
     n: usize,
@@ -120,8 +138,9 @@ pub const Result = struct {
 
     pub fn print(r: *const Result, w: *std.Io.Writer) !void {
         const h = r.host;
-        try w.print("{d} s, {d} clients: host sent {d} frames (keyframes {d}, refreshes {d}), bitrate {d} kbit/s; acks held {d}, released {d}; input applied {d}, dropped {d}, releases {d}; keys {d} (wrong {d}); joins {d}, leaves {d}\n", .{ r.seconds, r.n, h.frames, h.keyframes, h.refreshes, h.bitrate_bps / 1000, h.acks_held, h.acks_released, h.inputs_applied, h.inputs_dropped, h.releases, h.keys, h.keys_wrong, h.joins, h.leaves });
-        for (r.clients[0..r.n], 0..) |c, i| try w.print("  client {d}: presented {d}, lost {d}, freezes {d}, longest gap {d:.1} ms, corrupt {d} (missing ref {d}), unreadable {d}, retransmits {d}, parity {d}; {s}; \"{s}\"\n", .{ i, c.presented, c.lost, c.freezes, @as(f64, @floatFromInt(c.longest_gap_us)) / 1000, c.corrupt, c.missing_ref, c.unreadable, c.retransmits, c.parity_shards, c.end, c.presence[0..c.presence_len] });
+        var fb: [32]u8 = undefined;
+        try w.print("{d} s, {d} clients: host sent {d} frames (keyframes {d}, refreshes {d}), bitrate {d} kbit/s, {s} ({d} format changes, {d} refused); acks held {d}, released {d}; input applied {d}, dropped {d}, releases {d}; keys {d} (wrong {d}); joins {d}, leaves {d}\n", .{ r.seconds, r.n, h.frames, h.keyframes, h.refreshes, h.bitrate_bps / 1000, h.format.name(&fb), h.format_changes, h.format_refusals, h.acks_held, h.acks_released, h.inputs_applied, h.inputs_dropped, h.releases, h.keys, h.keys_wrong, h.joins, h.leaves });
+        for (r.clients[0..r.n], 0..) |c, i| try w.print("  client {d}: presented {d}, lost {d}, freezes {d}, longest gap {d:.1} ms, corrupt {d} (missing ref {d}), unreadable {d}, retransmits {d}, parity {d}; {s} ({d} config changes, wrong format {d}); {s}; \"{s}\"\n", .{ i, c.presented, c.lost, c.freezes, @as(f64, @floatFromInt(c.longest_gap_us)) / 1000, c.corrupt, c.missing_ref, c.unreadable, c.retransmits, c.parity_shards, c.format.name(&fb), c.config_changes, c.wrong_format, c.end, c.presence[0..c.presence_len] });
     }
 };
 
@@ -233,7 +252,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
 
     // The host's clock is the host side of the first path (every path's host side reads the
     // same simulated time: all are advanced together and the host has no offset).
-    const sh = try synthetic.openHost(gpa, .{ .clock = slots[0].hclock.clock(), .width = o.width, .height = o.height, .audio = o.audio });
+    const sh = try synthetic.openHost(gpa, .{ .clock = slots[0].hclock.clock(), .width = o.width, .height = o.height, .audio = o.audio, .encoder_formats = o.encoder_formats, .hdr_display = o.hdr_source });
     const hb = sh.backend();
     defer hb.deinit();
     var host = try multi_host.MultiHostApp.init(gpa, hb, .{
@@ -241,6 +260,8 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         .bitrate_bps = o.bitrate_bps,
         .slices = o.slices,
         .audio = o.audio,
+        .yuv444 = o.yuv444,
+        .ten_bit = o.ten_bit,
         .session = .{ .rate_control = o.rate_control, .loss_policy = o.loss_policy },
     }, .{ .roster = o.roster, .rate = o.rate, .intersect_acks = o.intersect_acks });
     defer host.deinit();
@@ -269,7 +290,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         }
         for (slots, 0..) |*s, i| {
             if (s.app == null and t >= s.spec.join_at_us and t < end_us) {
-                const sc = try synthetic.openClient(gpa, .{ .clock = s.cclock.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio });
+                const sc = try synthetic.openClient(gpa, .{ .clock = s.cclock.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio, .decoder_formats = s.spec.decoder_formats, .display = s.spec.display });
                 s.sc = sc;
                 s.app = try apps.ClientApp.init(gpa, sc.backend(), .{
                     .content_ctx = sc,
@@ -337,6 +358,10 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .joins = host.m.stats.joins,
             .leaves = host.m.stats.leaves,
             .bitrate_bps = host.m.bitrate_bps,
+            .format = host.m.format,
+            .format_changes = host.m.stats.format_changes,
+            .format_refusals = host.m.stats.format_refusals,
+            .reconfigures = host.stats.reconfigures,
         },
         .clients = undefined,
         .n = slots.len,
@@ -364,6 +389,9 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
                 .have_input = if (s.snap) |v| v.haveInput() else false,
                 .members_seen = s.most_members,
                 .rosters = s.view.stats.rosters,
+                .format = if (a.s.config) |cf| cf.format else .{},
+                .config_changes = a.s.stats.config_changes,
+                .wrong_format = sc.decoder.stats.wrong_format,
             };
             const v = s.snap orelse s.view;
             const p = v.presence(&c.presence);

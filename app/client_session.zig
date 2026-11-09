@@ -97,6 +97,9 @@ pub const Stats = struct {
     /// Reconnects asked of the pipe, and new connections it made.
     reconnect_requests: u64 = 0,
     reconnects: u64 = 0,
+    /// Configs that changed the stream mid-session (a multi-user host re-picking the
+    /// format as members join and leave).
+    config_changes: u64 = 0,
 };
 
 const Queued = struct {
@@ -121,6 +124,9 @@ pub const ClientSession = struct {
     stats: Stats = .{},
     path: pipe_mod.PathStats = .{},
     config: ?wire.Config = null,
+    /// Bumped by every config that starts the stream anew (the first, and each change of
+    /// codec, format or size): the app configures its decoder and presenter again.
+    config_seq: u32 = 0,
 
     seq: u64 = 0,
     start_us: ?Micros = null,
@@ -410,8 +416,11 @@ pub const ClientSession = struct {
                             return;
                         };
                         if (c.nonce != s.cfg.nonce) return;
-                        if (s.config == null) {
+                        if (s.config) |old| {
+                            if (!sameStream(old, c)) s.restart(c, now);
+                        } else {
                             s.config = c;
+                            s.config_seq +%= 1;
                             s.state = .streaming;
                             s.rec = recovery.Client.init(.{ .frame_interval_us = 1_000_000 / @as(u64, c.fps) });
                         }
@@ -569,6 +578,25 @@ pub const ClientSession = struct {
     // --- decode/present stage --------------------------------------------
 
     /// The next frame to decode, or null. Its data is valid until the next call.
+    /// The decoder takes the same stream under both configs.
+    fn sameStream(a: wire.Config, b: wire.Config) bool {
+        return a.codec == b.codec and a.format.eql(b.format) and a.width == b.width and a.height == b.height;
+    }
+
+    /// The host switched the stream to another codec, format or size mid-session (spec/
+    /// wire-v0.md, "Session"): what is queued is in the old one, and so is everything
+    /// before the IDR the host sends next.
+    fn restart(s: *ClientSession, c: wire.Config, now: Micros) void {
+        s.config = c;
+        s.config_seq +%= 1;
+        s.stats.config_changes += 1;
+        while (s.queue.popFront()) |q| {
+            s.timesFor(q.au.frame_id).valid = false;
+            s.giveBuf(q.buf);
+        }
+        s.rec.restart(@intCast(now));
+    }
+
     pub fn nextAccessUnit(s: *ClientSession) ?api.AccessUnit {
         if (s.current) |q| {
             s.giveBuf(q.buf);
