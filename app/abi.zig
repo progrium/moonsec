@@ -24,6 +24,9 @@ const simrun = @import("simrun.zig");
 const pairing = @import("pairing.zig");
 const keystore = @import("keystore.zig");
 const pair_cmd = @import("pair_cmd.zig");
+const multi_host = @import("multi_host.zig");
+const clipsync = @import("clipsync.zig");
+const HostSession = @import("host_session.zig").HostSession;
 const system = @import("system.zig");
 const iroh = if (options.iroh) @import("iroh") else struct {};
 const iroh_pipe = if (options.iroh) @import("iroh_pipe") else struct {};
@@ -133,7 +136,7 @@ export fn moonsec_version_string() [*:0]const u8 {
 
 export fn moonsec_features() u32 {
     var f: u32 = c.MOONSEC_FEATURE_LOOPBACK;
-    if (options.iroh) f |= c.MOONSEC_FEATURE_IROH;
+    if (options.iroh) f |= c.MOONSEC_FEATURE_IROH | c.MOONSEC_FEATURE_MULTI_USER;
     if (system.available) f |= c.MOONSEC_FEATURE_SYSTEM_BACKEND;
     return f;
 }
@@ -228,8 +231,26 @@ const Endpoint = struct {
     }
 
     fn activeSession(e: *const Endpoint) bool {
-        for (e.sessions.items) |s| if (!s.ended()) return true;
-        return false;
+        return e.activeSessions() > 0;
+    }
+
+    fn activeSessions(e: *const Endpoint) u32 {
+        var n: u32 = 0;
+        for (e.sessions.items) |s| if (!s.ended()) {
+            n += 1;
+        };
+        return n;
+    }
+
+    /// A host that takes more than one client at once.
+    fn multiUser(e: *const Endpoint) bool {
+        return e.role == .host and e.hc.max_clients > 1;
+    }
+
+    /// The host can't take another client now.
+    fn full(e: *const Endpoint) bool {
+        const admitting = if (options.iroh) e.net.admitting else 0;
+        return e.activeSessions() + admitting >= @max(e.hc.max_clients, 1);
     }
 };
 
@@ -243,9 +264,11 @@ const Net = if (options.iroh) struct {
     /// never touches the next.
     window_gen: u64 = 0,
     paired_in_window: u32 = 0,
+    /// A multi-user host's current stream (max_clients > 1).
+    run: ?*MultiRun = null,
     /// Connections being paired or admitted, each on its own task.
     tasks: ?*pair_cmd.ConnTasks = null,
-    /// Admitted connections whose session is being set up (one session at a time).
+    /// Admitted connections whose session is being set up (they count toward `max_clients`).
     admitting: u32 = 0,
 } else struct {};
 
@@ -347,7 +370,8 @@ export fn moonsec_host_create(config: ?*const c.moonsec_host_config, out: ?*?*c.
     const cfg = readIn(c.moonsec_host_config, config) orelse return invalid("config is NULL or struct_size is too small");
     const st = checkCommon(cfg.backend, cfg.clipboard, cfg.relay_mode, cfg.relay_url);
     if (st != ok) return st;
-    if (cfg.max_clients > 1) return fail(c.MOONSEC_ERR_UNSUPPORTED, "more than one client needs MOONSEC_FEATURE_MULTI_USER", .{});
+    if (cfg.max_clients > core.multi.max_members) return invalid("max_clients is more than 32");
+    if (cfg.max_clients > 1 and !options.iroh) return fail(c.MOONSEC_ERR_UNSUPPORTED, "multi-user hosts need iroh (MOONSEC_FEATURE_MULTI_USER)", .{});
     if (cfg.codec != 0 and (cfg.codec > 255 or !api.CodecSet.has(.{ .h264 = true, .hevc = true, .av1 = true, .passthrough = true }, @enumFromInt(@as(u8, @intCast(cfg.codec))))))
         return invalid("unknown codec");
     if (cfg.flags & c.MOONSEC_HOST_REQUIRE_PAIRED != 0 and cfg.flags & c.MOONSEC_HOST_INSECURE_NO_PAIRING != 0)
@@ -405,7 +429,8 @@ fn destroyEndpoint(e: *Endpoint) void {
         e.lock();
         const last: ?*Session = if (e.sessions.items.len > 0) e.sessions.items[e.sessions.items.len - 1] else null;
         e.unlock();
-        releaseSession(last orelse break);
+        const l = last orelse break;
+        if (l.run != null) releaseMember(l) else releaseSession(l);
     }
     if (options.iroh) if (e.net.ep) |ep| ep.deinit();
     e.sessions.deinit(gpa);
@@ -465,10 +490,23 @@ export fn moonsec_client_poll_event(h: ?*c.moonsec_client, ev: ?*c.moonsec_event
     return pollEvent(clientOf(h) orelse return invalid("not a client"), ev, timeout_ms);
 }
 
-export fn moonsec_host_give_input(h: ?*c.moonsec_host, s: ?*c.moonsec_session) Status {
-    _ = hostOf(h) orelse return invalid("not a host");
-    _ = s;
-    return fail(c.MOONSEC_ERR_UNSUPPORTED, "multi-user sessions are not in this build (MOONSEC_FEATURE_MULTI_USER)", .{});
+export fn moonsec_host_give_input(h: ?*c.moonsec_host, p: ?*c.moonsec_session) Status {
+    const e = hostOf(h) orelse return invalid("not a host");
+    if (!options.iroh) return fail(c.MOONSEC_ERR_UNSUPPORTED, "multi-user sessions need iroh (MOONSEC_FEATURE_MULTI_USER)", .{});
+    e.lock();
+    defer e.unlock();
+    const r = e.net.run orelse return fail(c.MOONSEC_ERR_STATE, "no multi-user session is streaming (max_clients > 1)", .{});
+    var to: u16 = core.multi.host_id;
+    if (p != null) {
+        const s = sessionOf(p) orelse return invalid("not a session");
+        if (s.run != r or s.released) return invalid("not a member of this host's current session");
+        to = s.app.member.id;
+    }
+    return switch (r.app.m.hostGive(to)) {
+        .ok => ok,
+        .wrong_policy => fail(c.MOONSEC_ERR_STATE, "the input policy has no owner", .{}),
+        else => fail(c.MOONSEC_ERR_STATE, "that member may not take input, or has left", .{}),
+    };
 }
 
 export fn moonsec_host_displays(h: ?*c.moonsec_host, out: ?[*]c.moonsec_display_info, cap: usize, count: ?*usize) Status {
@@ -499,11 +537,18 @@ const SideClock = struct {
 /// Client input to the host app's event queue (MOONSEC_HOST_APP_INPUT), in place of the
 /// backend's injector.
 const AppInjector = struct {
-    s: *Session,
+    /// A single client's session, or (null) the member of `run` whose action it is.
+    s: ?*Session = null,
+    run: ?*MultiRun = null,
+    clock: api.Clock,
+    ep: *Endpoint,
 
     pub fn inject(self: *AppInjector, a: core.input.Action) api.Error!void {
+        // A member's input names the member's session; releases after a handoff come
+        // from the host's user (no session).
+        const target: ?*Session = self.s orelse if (self.run) |r| r.memberById(r.app.injecting_from) else null;
         var in = std.mem.zeroes(c.moonsec_input);
-        const now = self.s.clock.now();
+        const now = self.clock.now();
         in.time_us = now;
         switch (a) {
             .key => |k| {
@@ -549,10 +594,10 @@ const AppInjector = struct {
         }
         var ev = std.mem.zeroes(c.moonsec_event);
         ev.type = c.MOONSEC_EVENT_INPUT;
-        ev.session = @ptrCast(self.s);
+        ev.session = @ptrCast(target);
         ev.time_us = now;
         ev.input = in;
-        self.s.ep.push(ev);
+        self.ep.push(ev);
     }
 };
 
@@ -595,13 +640,76 @@ const FramePresenter = struct {
 
 const Transport = union(enum) {
     loopback: *Loopback,
-    iroh: if (options.iroh) *iroh_pipe.IrohPipe else void,
+    iroh: if (options.iroh) *NetLink else void,
 };
+
+/// An iroh session's connection: an `IrohLink` that outlives a dropped connection. The
+/// client redials (admission again on each new connection, the link's gate); the host's
+/// accept loop admits the client's new connection and hands it to the session's link
+/// (`offered`), found by the client's endpoint id.
+const NetLink = if (options.iroh) struct {
+    link: iroh_pipe.IrohLink = undefined,
+    ep: *Endpoint,
+    /// The far end's endpoint id: the client on a host, the host on a client.
+    peer: pair.Id,
+    /// client: the address it dials again.
+    addr: ?[:0]u8 = null,
+
+    /// Starts on `conn` (admitted already); owns it from here, also on failure.
+    fn create(e: *Endpoint, conn: iroh.Conn, peer: pair.Id, addr: ?[]const u8) !*NetLink {
+        const n = gpa.create(NetLink) catch |err| {
+            conn.deinit(0);
+            return err;
+        };
+        n.* = .{ .ep = e, .peer = peer };
+        if (addr) |a| n.addr = gpa.dupeZ(u8, a) catch |err| {
+            gpa.destroy(n);
+            conn.deinit(0);
+            return err;
+        };
+        const dial = e.role == .client;
+        n.link.startWith(io(), e.net.ep.?, .{
+            .role = if (dial) .dial else .offered,
+            .ticket = n.addr orelse "",
+            .alpn = pair_cmd.alpn,
+            .gate = if (dial) .{ .ctx = n, .check = clientGate } else null,
+            .refuse_code = pair_cmd.close_not_paired,
+        }, conn) catch |err| {
+            if (n.addr) |a| gpa.free(a);
+            gpa.destroy(n);
+            return err;
+        };
+        return n;
+    }
+
+    fn destroy(n: *NetLink) void {
+        n.link.deinit();
+        if (n.addr) |a| gpa.free(a);
+        gpa.destroy(n);
+    }
+
+    /// client: each new connection goes to the same host and through admission, as
+    /// `moonsec_client_connect`'s first one did.
+    fn clientGate(ctx: *anyopaque, conn: iroh.Conn, _: *u32) iroh_pipe.IrohLink.Verdict {
+        const n: *NetLink = @ptrCast(@alignCast(ctx));
+        const rid = pair_cmd.remoteId(conn) catch return .retry;
+        if (!std.mem.eql(u8, &rid, &n.peer)) return .refuse;
+        var s: pair_cmd.IrohStream = .{ .s = conn.openBi(5_000) catch return .retry };
+        defer s.close();
+        const refused = pairing.requestAdmission(s.stream()) catch return .retry;
+        return if (refused == null) .admit else .refuse;
+    }
+} else struct {};
 
 const Session = struct {
     magic: u32 = magic,
     ep: *Endpoint,
-    app: union(Role) { host: apps.HostApp, client: apps.ClientApp },
+    /// A host's one client (`HostApp`), a client, or one member of a multi-user host
+    /// (its peer in `run`, which owns it).
+    app: union(enum) { host: apps.HostApp, client: apps.ClientApp, member: *multi_host.Peer },
+    run: ?*MultiRun = null,
+    /// The app let go of a member's handle; it is freed with its run.
+    released: bool = false,
     transport: Transport,
     clock: api.Clock,
     side_clock: SideClock = undefined,
@@ -612,7 +720,11 @@ const Session = struct {
     clip: clipboard.Memory,
     clip_seen: u64 = 0,
     sys_clip: ?clipboard.System = null,
+    /// A member's clipboard sync (a single session's is inside its app).
+    clip_sync: ?clipsync.Sync = null,
     runner: ?Io.Future(void) = null,
+    /// A multi-user client's view of the host's roster.
+    view: core.multi.View = .{},
     /// Host: the client device (iroh sessions) and what it may do. Read on the session's
     /// threads; `moonsec_host_set_permissions` changes it under the endpoint's lock.
     peer: ?pair.Id = null,
@@ -624,19 +736,31 @@ const Session = struct {
     last_format: c.moonsec_video_format = std.mem.zeroes(c.moonsec_video_format),
     last_size: [2]u32 = .{ 0, 0 },
     relayed: bool = false,
+    /// Who held input when last reported (a member id; `core.multi.host_id`: the host's user).
+    last_owner: ?u16 = null,
+
+    /// The host side's session: a single client's or a member's.
+    fn hostSession(s: *const Session) ?*HostSession {
+        return switch (s.app) {
+            .host => |*a| @constCast(&a.s),
+            .member => |p| &p.s,
+            .client => null,
+        };
+    }
 
     fn ended(s: *const Session) bool {
         return switch (s.app) {
             .host => |*a| a.done(),
             .client => |*a| a.done(),
+            .member => |p| p.left or p.s.ended(),
         };
     }
 
     fn close(s: *Session) void {
         const now = s.clock.now();
         switch (s.app) {
-            .host => |*a| a.s.close(now),
             .client => |*a| a.s.close(now),
+            else => s.hostSession().?.close(now),
         }
     }
 
@@ -645,20 +769,20 @@ const Session = struct {
         s.close();
         const now = s.clock.now();
         switch (s.app) {
-            .host => |*a| a.s.step(now),
             .client => |*a| a.s.step(now),
+            else => s.hostSession().?.step(now),
         }
     }
 
     fn state(s: *const Session) i32 {
         return switch (s.app) {
-            .host => |*a| switch (a.s.state) {
-                .waiting => c.MOONSEC_STATE_CONNECTING,
+            .client => |*a| switch (a.s.state) {
+                .connecting => c.MOONSEC_STATE_CONNECTING,
                 .streaming => c.MOONSEC_STATE_STREAMING,
                 .ended => c.MOONSEC_STATE_ENDED,
             },
-            .client => |*a| switch (a.s.state) {
-                .connecting => c.MOONSEC_STATE_CONNECTING,
+            else => switch (s.hostSession().?.state) {
+                .waiting => c.MOONSEC_STATE_CONNECTING,
                 .streaming => c.MOONSEC_STATE_STREAMING,
                 .ended => c.MOONSEC_STATE_ENDED,
             },
@@ -667,19 +791,19 @@ const Session = struct {
 
     fn endReason(s: *const Session) i32 {
         return switch (s.app) {
-            .host => |*a| switch (a.s.end) {
-                .none => c.MOONSEC_END_NONE,
-                .closed => c.MOONSEC_END_CLOSED,
-                .client_bye => c.MOONSEC_END_PEER_CLOSED,
-                .peer_timeout => c.MOONSEC_END_TIMEOUT,
-                .pipe_closed => c.MOONSEC_END_TRANSPORT,
-                .failed => c.MOONSEC_END_FAILED,
-            },
             .client => |*a| switch (a.s.end) {
                 .none => c.MOONSEC_END_NONE,
                 .closed => c.MOONSEC_END_CLOSED,
                 .host_bye => c.MOONSEC_END_PEER_CLOSED,
                 .peer_timeout, .connect_timeout => c.MOONSEC_END_TIMEOUT,
+                .pipe_closed => c.MOONSEC_END_TRANSPORT,
+                .failed => c.MOONSEC_END_FAILED,
+            },
+            else => switch (s.hostSession().?.end) {
+                .none => c.MOONSEC_END_NONE,
+                .closed => c.MOONSEC_END_CLOSED,
+                .client_bye => c.MOONSEC_END_PEER_CLOSED,
+                .peer_timeout => c.MOONSEC_END_TIMEOUT,
                 .pipe_closed => c.MOONSEC_END_TRANSPORT,
                 .failed => c.MOONSEC_END_FAILED,
             },
@@ -690,6 +814,10 @@ const Session = struct {
     fn format(s: *const Session) struct { f: c.moonsec_video_format, w: u32, h: u32, fps: u32, bitrate: u64 } {
         switch (s.app) {
             .host => |*a| return .{ .f = vf(a.s.codec, a.s.format), .w = a.size.width, .h = a.size.height, .fps = a.opts.fps, .bitrate = a.s.bitrate_bps },
+            .member => |p| {
+                const r = &s.run.?.app;
+                return .{ .f = vf(p.s.codec, p.s.format), .w = r.size.width, .h = r.size.height, .fps = r.opts.fps, .bitrate = p.s.bitrate_bps };
+            },
             .client => |*a| {
                 const cf = a.s.config orelse return .{ .f = std.mem.zeroes(c.moonsec_video_format), .w = 0, .h = 0, .fps = 0, .bitrate = 0 };
                 return .{ .f = vf(cf.codec, cf.format), .w = cf.width, .h = cf.height, .fps = cf.fps, .bitrate = cf.bitrate_bps };
@@ -699,8 +827,8 @@ const Session = struct {
 
     fn pathStats(s: *const Session) pipe_mod.PathStats {
         return switch (s.app) {
-            .host => |*a| a.s.path,
             .client => |*a| a.s.path,
+            else => s.hostSession().?.path,
         };
     }
 
@@ -708,6 +836,7 @@ const Session = struct {
         switch (s.app) {
             .host => |*a| a.tick(),
             .client => |*a| a.tick(),
+            .member => unreachable, // members run on their run's threads
         }
     }
 
@@ -723,13 +852,11 @@ const Session = struct {
                 a.deinit();
                 be.deinit();
             },
+            // The run freed the peer (`MultiRun.deinit`).
+            .member => {},
         }
         if (options.iroh) switch (s.transport) {
-            .iroh => |p| {
-                p.ctl.drop();
-                p.conn.deinit(0);
-                gpa.destroy(p);
-            },
+            .iroh => |n| n.destroy(),
             else => {},
         };
         s.clip.deinit();
@@ -784,6 +911,23 @@ fn check(s: *Session) void {
         var ce = ev;
         ce.type = c.MOONSEC_EVENT_CLIPBOARD;
         e.push(ce);
+    }
+    if (s.app == .client) {
+        // A multi-user host's roster: who holds input.
+        const ctl = &s.app.client.s.control;
+        while (ctl.takeMessage()) |m| {
+            defer ctl.gpa.free(m.body);
+            if (m.type == core.multi.msg.roster) s.view.onRoster(m.body);
+        }
+        if (s.view.have and (s.last_owner == null or s.last_owner.? != s.view.owner)) {
+            s.last_owner = s.view.owner;
+            var oe = ev;
+            oe.type = c.MOONSEC_EVENT_INPUT_OWNER;
+            // This client's session when it holds input, else NULL.
+            oe.session = if (s.view.owner == s.view.you) @ptrCast(s) else null;
+            oe.code = s.view.owner;
+            e.push(oe);
+        }
     }
     if (!s.ended_sent and st == c.MOONSEC_STATE_ENDED) {
         s.ended_sent = true;
@@ -859,12 +1003,24 @@ fn newHostSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStrea
     }
     errdefer be.deinit();
     if (cfg.flags & c.MOONSEC_HOST_APP_INPUT != 0) {
-        s.injector = .{ .s = s };
+        s.injector = .{ .s = s, .clock = s.clock, .ep = e };
         be.input = api.bind(api.InputInjector, AppInjector, &s.injector);
     }
     const codec = pickCodec(be.encoder.caps(), cfg.codec) orelse return error.Unsupported;
     const clip = try sessionClipboard(s);
-    s.app = .{ .host = apps.HostApp.init(gpa, be, .{
+    var ho = hostOptions(cfg, codec, ctl, clip);
+    ho.perms = .{ .ctx = s, .get = sessionPerms };
+    s.app = .{ .host = apps.HostApp.init(gpa, be, ho, p) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Unsupported => error.Unsupported,
+        else => error.Backend,
+    } };
+    return s;
+}
+
+/// The host config as the apps' options.
+fn hostOptions(cfg: c.moonsec_host_config, codec: api.Codec, ctl: ?pipe_mod.ByteStream, clip: ?clipboard.Clipboard) apps.HostOptions {
+    return .{
         .fps = if (cfg.fps != 0) cfg.fps else 60,
         .bitrate_bps = if (cfg.bitrate_bps != 0) cfg.bitrate_bps else 10_000_000,
         .codec = codec,
@@ -882,13 +1038,7 @@ fn newHostSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStrea
         .control_stream = ctl,
         .clipboard = clip,
         .clipboard_poll_us = 50_000,
-        .perms = .{ .ctx = s, .get = sessionPerms },
-    }, p) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.Unsupported => error.Unsupported,
-        else => error.Backend,
-    } };
-    return s;
+    };
 }
 
 fn newClientSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStream, transport: Transport, virtual: ?*Loopback) SessionError!*Session {
@@ -930,21 +1080,25 @@ fn newClientSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStr
     const clip = try sessionClipboard(s);
     var nonce: [4]u8 = undefined;
     io().random(&nonce);
-    s.app = .{ .client = apps.ClientApp.init(gpa, be, .{
-        .windowed = cfg.flags & c.MOONSEC_CLIENT_FULLSCREEN == 0,
-        .audio = cfg.flags & c.MOONSEC_CLIENT_NO_AUDIO == 0,
-        .session = .{
-            .max_width = cfg.max_width,
-            .max_height = cfg.max_height,
-            .nonce = std.mem.readInt(u32, &nonce, .little) | 1,
+    s.app = .{
+        .client = apps.ClientApp.init(gpa, be, .{
+            .windowed = cfg.flags & c.MOONSEC_CLIENT_FULLSCREEN == 0,
+            .audio = cfg.flags & c.MOONSEC_CLIENT_NO_AUDIO == 0,
+            .session = .{
+                .max_width = cfg.max_width,
+                .max_height = cfg.max_height,
+                .nonce = std.mem.readInt(u32, &nonce, .little) | 1,
+                // Rosters from a multi-user host (spec/multi-user-v0.md).
+                .control = .{ .features = core.multi.feature_bit, .known = &core.multi.known },
+            },
+            .control_stream = ctl,
+            .clipboard = clip,
+            .clipboard_poll_us = 50_000,
+        }, p) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Backend,
         },
-        .control_stream = ctl,
-        .clipboard = clip,
-        .clipboard_poll_us = 50_000,
-    }, p) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.Backend,
-    } };
+    };
     // Offer only the codecs the app allows.
     if (cfg.codecs != 0) {
         const mask: u8 = @truncate(cfg.codecs);
@@ -969,6 +1123,7 @@ fn runSession(s: *Session) void {
     switch (s.app) {
         .host => |*a| a.runThreadedWith(io(), lock, hook) catch {},
         .client => |*a| a.runThreadedWith(io(), lock, hook) catch {},
+        .member => unreachable, // on its run's threads (runMulti)
     }
     s.ep.lock();
     check(s);
@@ -1027,6 +1182,20 @@ fn removeEventAt(q: *std.Deque(c.moonsec_event), idx: usize) void {
     q.* = tmp;
 }
 
+/// Not part of the ABI (not in moonsec.h): tests drop a session's iroh connection as a
+/// network failure would, to exercise reconnecting.
+export fn moonsec__test_drop_connection(p: ?*c.moonsec_session) Status {
+    const s = sessionOf(p) orelse return invalid("not a session");
+    if (!options.iroh) return noIroh();
+    s.ep.lock();
+    defer s.ep.unlock();
+    switch (s.transport) {
+        .iroh => |n| n.link.dropForTest(),
+        else => return fail(c.MOONSEC_ERR_UNSUPPORTED, "not an iroh session", .{}),
+    }
+    return ok;
+}
+
 export fn moonsec_session_state(p: ?*c.moonsec_session) i32 {
     const s = sessionOf(p) orelse return invalid("not a session");
     s.ep.lock();
@@ -1043,7 +1212,7 @@ export fn moonsec_session_close(p: ?*c.moonsec_session) Status {
 }
 
 export fn moonsec_session_release(p: ?*c.moonsec_session) void {
-    if (sessionOf(p)) |s| releaseSession(s);
+    if (sessionOf(p)) |s| if (s.run != null) releaseMember(s) else releaseSession(s);
 }
 
 export fn moonsec_session_send_input(p: ?*c.moonsec_session, in: ?*const c.moonsec_input) Status {
@@ -1053,7 +1222,7 @@ export fn moonsec_session_send_input(p: ?*c.moonsec_session, in: ?*const c.moons
     defer s.ep.unlock();
     const a = switch (s.app) {
         .client => |*a| a,
-        .host => return fail(c.MOONSEC_ERR_STATE, "input is sent from the client's session", .{}),
+        .host, .member => return fail(c.MOONSEC_ERR_STATE, "input is sent from the client's session", .{}),
     };
     if (a.s.state != .streaming) return fail(c.MOONSEC_ERR_STATE, "the session is not streaming", .{});
     const t = if (i.time_us != 0) i.time_us else s.clock.now();
@@ -1082,8 +1251,17 @@ export fn moonsec_session_send_input(p: ?*c.moonsec_session, in: ?*const c.moons
 }
 
 export fn moonsec_session_request_input(p: ?*c.moonsec_session) Status {
-    _ = sessionOf(p) orelse return invalid("not a session");
-    return fail(c.MOONSEC_ERR_UNSUPPORTED, "multi-user sessions are not in this build (MOONSEC_FEATURE_MULTI_USER)", .{});
+    const s = sessionOf(p) orelse return invalid("not a session");
+    s.ep.lock();
+    defer s.ep.unlock();
+    const a = switch (s.app) {
+        .client => |*a| a,
+        else => return fail(c.MOONSEC_ERR_STATE, "input is requested from the client's session", .{}),
+    };
+    if (!s.view.have) return fail(c.MOONSEC_ERR_STATE, "the host is not a multi-user host, or its roster has not come yet", .{});
+    a.s.control.send(.{ .type = core.multi.msg.input_request, .body = &core.multi.msg.encodeRequest(true) }, core.multi.feature_bit) catch
+        return fail(c.MOONSEC_ERR_STATE, "the control channel is not up", .{});
+    return ok;
 }
 
 export fn moonsec_session_clipboard_set(p: ?*c.moonsec_session, text: ?[*]const u8, len: usize) Status {
@@ -1145,8 +1323,9 @@ export fn moonsec_session_telemetry(p: ?*c.moonsec_session, out: ?*c.moonsec_tel
     const now = s.clock.now();
     var snap: core.telemetry.Snapshot = undefined;
     switch (s.app) {
-        .host => |*a| {
-            const st = a.s.stats;
+        .host, .member => {
+            const hs = s.hostSession().?;
+            const st = hs.stats;
             t.rtt_us = path.rtt_us;
             t.frames = st.frames;
             t.keyframes = st.keyframes;
@@ -1156,8 +1335,8 @@ export fn moonsec_session_telemetry(p: ?*c.moonsec_session, out: ?*c.moonsec_tel
             t.input_events = st.inputs_applied;
             t.path_changes = st.path_changes;
             t.reconnects = st.reconnects;
-            if (a.s.offset != null) t.flags |= c.MOONSEC_TELEMETRY_CLOCK_SYNCED;
-            snap = a.s.tele.snapshot();
+            if (hs.offset != null) t.flags |= c.MOONSEC_TELEMETRY_CLOCK_SYNCED;
+            snap = hs.tele.snapshot();
         },
         .client => |*a| {
             const st = a.s.stats;
@@ -1493,9 +1672,16 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
             e.lock();
             const paired = e.allow.contains(&peer_id);
             const need = e.flags & c.MOONSEC_HOST_INSECURE_NO_PAIRING == 0;
-            const busy = e.activeSession() or e.net.admitting > 0;
+            // A client of a live session coming back on a new connection (it dropped):
+            // it keeps its session, so it does not count against max_clients.
+            const back = liveLink(e, &peer_id) != null;
+            const busy = !back and e.full();
+            const name = if (e.allow.get(&peer_id)) |d| d.name else "";
+            var name_buf: [64]u8 = undefined;
+            const nm = name_buf[0..@min(name.len, name_buf.len)];
+            @memcpy(nm, name[0..nm.len]);
             const allowed = (paired or !need) and !busy;
-            if (allowed) e.net.admitting += 1;
+            if (allowed and !back) e.net.admitting += 1;
             e.unlock();
             var o: ex.Out = .{};
             s.stream().write(ex.admitReply(&o, allowed)) catch {};
@@ -1507,13 +1693,21 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
                 e.push(peerEvent(c.MOONSEC_EVENT_REFUSED, &peer_id, "", if (busy) 1 else 0));
                 return;
             }
+            if (back) {
+                e.lock();
+                defer e.unlock();
+                // Its session may have ended meanwhile: then the connection goes unused.
+                if (liveLink(e, &peer_id)) |n| n.link.offer(conn) else conn.deinit(0);
+                return;
+            }
             defer {
                 e.lock();
                 e.net.admitting -= 1;
                 e.unlock();
             }
-            // It owns `conn` from here, also when it fails.
-            startIrohSession(e, conn, peer_id) catch {};
+            // It owns `conn` from here, also when it fails (the backend did not
+            // open): the client's session then ends with the connection.
+            startIrohSession(e, conn, if (nm.len > 0) nm else "client", peer_id, null) catch {};
         },
         .invalid => {
             s.close();
@@ -1523,23 +1717,33 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
 }
 
 /// A session over `conn` on its own threads. Owns `conn` from here (also on failure).
-/// `peer` (host): the admitted client, whose allowlist permissions the session applies.
-fn startIrohSession(e: *Endpoint, conn: iroh.Conn, peer: ?pair.Id) !void {
-    if (!options.iroh) unreachable;
-    const ip = gpa.create(iroh_pipe.IrohPipe) catch |err| {
-        conn.deinit(0);
-        return err;
+/// The link of a session with `peer` that has not ended, if any. Under the endpoint lock.
+fn liveLink(e: *Endpoint, peer: *const pair.Id) ?*NetLink {
+    for (e.sessions.items) |x| switch (x.transport) {
+        .iroh => |n| if (std.mem.eql(u8, &n.peer, peer) and !x.ended()) return n,
+        else => {},
     };
-    ip.* = .init(conn);
+    return null;
+}
+
+/// `peer` is the far end's endpoint id; `addr` (client) is where it dials again after a drop.
+fn startIrohSession(e: *Endpoint, conn: iroh.Conn, peer_name: []const u8, peer: pair.Id, addr: ?[]const u8) !void {
+    if (!options.iroh) unreachable;
+    const n = try NetLink.create(e, conn, peer, addr);
     e.lock();
     defer e.unlock();
+    if (e.role == .host and e.multiUser()) {
+        last_started = joinMulti(e, n, peer_name) catch |err| {
+            n.destroy();
+            return err;
+        };
+        return;
+    }
     const s = (if (e.role == .host)
-        newHostSession(e, ip.packetPipe(), ip.controlStream(false), .{ .iroh = ip }, null, peer, if (peer) |*id| e.allow.perms(id) orelse .full else .full)
+        newHostSession(e, n.link.packetPipe(), n.link.controlStream(), .{ .iroh = n }, null, peer, e.allow.perms(&peer) orelse .full)
     else
-        newClientSession(e, ip.packetPipe(), ip.controlStream(true), .{ .iroh = ip }, null)) catch |err| {
-        ip.ctl.drop();
-        conn.deinit(0);
-        gpa.destroy(ip);
+        newClientSession(e, n.link.packetPipe(), n.link.controlStream(), .{ .iroh = n }, null)) catch |err| {
+        n.destroy();
         return err;
     };
     e.sessions.append(gpa, s) catch |err| {
@@ -1556,6 +1760,174 @@ fn startIrohSession(e: *Endpoint, conn: iroh.Conn, peer: ?pair.Id) !void {
 
 /// The session `startIrohSession` made last (the client's connect returns it).
 threadlocal var last_started: ?*Session = null;
+
+// ---------------------------------------------------------------------------
+// Multi-user hosts (max_clients > 1): one capture and encode for every member
+// (app/multi_host.zig, spec/multi-user-v0.md)
+
+/// A multi-user stream: the backend, the `MultiHostApp` and its threads, and the member
+/// sessions. Starts with its first member; when every member has left the threads stop,
+/// and the next client starts a new one. Freed once the app released every member.
+const MultiRun = struct {
+    ep: *Endpoint,
+    app: multi_host.MultiHostApp,
+    injector: AppInjector = undefined,
+    members: std.ArrayList(*Session) = .empty,
+    runner: ?Io.Future(void) = null,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// The threads returned (every member left, or `stop`).
+    finished: bool = false,
+    /// Who held input when last reported.
+    last_owner: ?u16 = null,
+
+    fn memberById(r: *MultiRun, id: u16) ?*Session {
+        for (r.members.items) |s| if (s.app.member.id == id and !s.released) return s;
+        return null;
+    }
+
+    fn deinit(r: *MultiRun) void {
+        const be = r.app.be;
+        r.app.deinit();
+        be.deinit();
+        for (r.members.items) |s| s.deinit();
+        r.members.deinit(gpa);
+        gpa.destroy(r);
+    }
+};
+
+/// Admit a client into the endpoint's current run, starting one if there is none (lock held).
+fn joinMulti(e: *Endpoint, n: *NetLink, name: []const u8) !*Session {
+    if (!options.iroh) unreachable;
+    var fresh = false;
+    const run = if (e.net.run) |r| r else blk: {
+        const r = try newRun(e);
+        fresh = true;
+        break :blk r;
+    };
+    errdefer if (fresh) run.deinit();
+    // Room first, so nothing fails once the peer is in.
+    try run.members.ensureUnusedCapacity(gpa, 1);
+    try e.sessions.ensureUnusedCapacity(gpa, 1);
+    const s = try gpa.create(Session);
+    errdefer gpa.destroy(s);
+    const perms: pair.allowlist.Perms = e.allow.perms(&n.peer) orelse .full;
+    s.* = .{ .ep = e, .app = undefined, .run = run, .transport = .{ .iroh = n }, .clock = run.app.be.clock, .clip = .init(gpa), .peer = n.peer, .perms = perms };
+    errdefer s.clip.deinit();
+    // The member's clipboard syncs only with the clipboard permission.
+    if (perms.clipboard) if (try sessionClipboard(s)) |cb| {
+        s.clip_sync = .{ .cb = cb, .interval_us = 50_000 };
+    };
+    errdefer if (s.sys_clip) |*y| y.close();
+    // A member may take control only with the input permission.
+    const peer = run.app.m.addPeer(n.link.packetPipe(), n.link.controlStream(), name, perms.input) catch |err| return switch (err) {
+        error.Full => error.Busy,
+        else => err,
+    };
+    s.app = .{ .member = peer };
+    run.members.appendAssumeCapacity(s);
+    e.sessions.appendAssumeCapacity(s);
+    if (fresh) {
+        run.runner = io().concurrent(runMulti, .{run}) catch |err| {
+            _ = e.sessions.pop();
+            _ = run.members.pop();
+            return err;
+        };
+        e.net.run = run;
+    }
+    return s;
+}
+
+fn newRun(e: *Endpoint) !*MultiRun {
+    const cfg = e.hc;
+    var be: api.HostBackend = undefined;
+    if (cfg.backend == c.MOONSEC_BACKEND_SYSTEM) {
+        be = try system.openHost(gpa, .{ .audio = cfg.flags & c.MOONSEC_HOST_NO_AUDIO == 0, .state_dir = e.state_path });
+    } else {
+        const sh = synthetic.openHost(gpa, .{
+            .clock = api.clockFn(wallNow),
+            .sleeper = wallSleep,
+            .width = if (cfg.width != 0) cfg.width else 640,
+            .height = if (cfg.height != 0) cfg.height else 360,
+            .audio = cfg.flags & c.MOONSEC_HOST_NO_AUDIO == 0,
+        }) catch return error.OutOfMemory;
+        be = sh.backend();
+    }
+    errdefer be.deinit();
+    const r = try gpa.create(MultiRun);
+    errdefer gpa.destroy(r);
+    r.* = .{ .ep = e, .app = undefined };
+    if (cfg.flags & c.MOONSEC_HOST_APP_INPUT != 0) {
+        r.injector = .{ .run = r, .clock = be.clock, .ep = e };
+        be.input = api.bind(api.InputInjector, AppInjector, &r.injector);
+    }
+    const codec = pickCodec(be.encoder.caps(), cfg.codec) orelse return error.Unsupported;
+    r.app = multi_host.MultiHostApp.init(gpa, be, hostOptions(cfg, codec, null, null), .{}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Unsupported => error.Unsupported,
+        else => error.Backend,
+    };
+    return r;
+}
+
+/// A run's threads: network here, capture+encode on their own, until every member left.
+fn runMulti(r: *MultiRun) void {
+    const e = r.ep;
+    const lock: apps.Lock = .{ .mu = &e.mu, .io = io() };
+    r.app.runThreadedWith(io(), lock, .{ .ctx = r, .f = multiHook }, &r.stop) catch {};
+    e.lock();
+    defer e.unlock();
+    multiHook(r);
+    r.finished = true;
+    if (options.iroh) if (e.net.run == r) {
+        e.net.run = null;
+    };
+}
+
+/// After every network step (lock held): members' clipboards, events, the input owner.
+fn multiHook(p: *anyopaque) void {
+    const r: *MultiRun = @ptrCast(@alignCast(p));
+    const now = r.app.be.clock.now();
+    for (r.members.items) |s| {
+        const peer = s.app.member;
+        if (s.clip_sync) |*y| if (!peer.left) y.pump(gpa, &peer.s.control, now);
+        if (!s.released) check(s);
+    }
+    const owner = r.app.m.roster.owner;
+    if (r.last_owner == null or r.last_owner.? != owner) {
+        r.last_owner = owner;
+        var ev = std.mem.zeroes(c.moonsec_event);
+        ev.type = c.MOONSEC_EVENT_INPUT_OWNER;
+        ev.session = @ptrCast(r.memberById(owner));
+        ev.code = owner;
+        ev.time_us = now;
+        // Only changes after the first member's arrival are news.
+        if (r.members.items.len > 0 and r.app.m.stats.joins > 0) r.ep.push(ev);
+    }
+}
+
+fn releaseMember(s: *Session) void {
+    const e = s.ep;
+    const r = s.run.?;
+    e.lock();
+    if (!s.ended()) s.closeNow();
+    s.released = true;
+    removeSession(e, s);
+    var all = true;
+    for (r.members.items) |m| if (!m.released) {
+        all = false;
+    };
+    e.unlock();
+    if (!all) return;
+    // The last handle: stop the threads (if they still run) and free the run.
+    r.stop.store(true, .release);
+    if (r.runner) |*f| f.await(io());
+    e.lock();
+    if (options.iroh) if (e.net.run == r) {
+        e.net.run = null;
+    };
+    e.unlock();
+    r.deinit();
+}
 
 export fn moonsec_host_pair_begin(h: ?*c.moonsec_host, config: ?*const c.moonsec_pair_config, info: ?*c.moonsec_pair_info) Status {
     const e = hostOf(h) orelse return invalid("not a host");
@@ -1614,8 +1986,18 @@ export fn moonsec_host_set_permissions(h: ?*c.moonsec_host, peer_id: ?[*:0]const
         if (!std.mem.eql(u8, &entry.id, &id)) continue;
         entry.perms = p;
         e.saveAllow();
-        // Its live session follows: input at once, the clipboard from the next channel.
-        for (e.sessions.items) |s| if (s.peer) |sp| if (std.mem.eql(u8, &sp, &id)) @atomicStore(pair.allowlist.Perms, &s.perms, p, .release);
+        // Its live session follows: input at once, the clipboard from the next channel
+        // (a multi-user member: whether it may take control, at once).
+        for (e.sessions.items) |s| if (s.peer) |sp| if (std.mem.eql(u8, &sp, &id)) {
+            @atomicStore(pair.allowlist.Perms, &s.perms, p, .release);
+            switch (s.app) {
+                .member => |m| if (s.run) |r| if (r.app.m.roster.find(m.id)) |mem| {
+                    mem.may_control = p.input;
+                    if (!p.input) r.app.m.roster.request(m.id, false);
+                },
+                else => {},
+            }
+        };
         return ok;
     }
     return fail(c.MOONSEC_ERR_REFUSED, "{s} is not paired with this host", .{&pair.id.short(&id)});
@@ -1701,7 +2083,7 @@ export fn moonsec_client_connect(h: ?*c.moonsec_client, ticket: ?[*:0]const u8, 
         return fail(c.MOONSEC_ERR_REFUSED, "the host refused the session: {s}", .{pairing.reasonText(why)});
     }
     last_started = null;
-    startIrohSession(e, conn, null) catch |err| return sessionError(switch (err) {
+    startIrohSession(e, conn, "", rid, tg.addr) catch |err| return sessionError(switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Unsupported => error.Unsupported,
         else => error.Backend,

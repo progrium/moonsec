@@ -187,7 +187,7 @@ typedef struct moonsec_host_config {
     uint32_t height;
     uint64_t bitrate_bps; /* start bitrate; 0: 10 Mbit/s */
     uint32_t clipboard;   /* MOONSEC_CLIPBOARD_* */
-    uint32_t max_clients; /* 0: 1. More needs MOONSEC_FEATURE_MULTI_USER */
+    uint32_t max_clients; /* 0: 1; up to 32 at once over iroh (MOONSEC_FEATURE_MULTI_USER) */
     uint32_t relay_mode;  /* MOONSEC_RELAY_* */
     uint32_t reserved0;
     const char *relay_url;    /* MOONSEC_RELAY_CUSTOM */
@@ -418,7 +418,7 @@ typedef struct moonsec_telemetry {
     uint64_t parity_shards; /* host: FEC */
     uint64_t input_events;  /* host: applied; client: sent */
     uint64_t path_changes;
-    uint64_t reconnects;
+    uint64_t reconnects;    /* iroh: new connections under this session (spec: Reconnect) */
     moonsec_stage_stats stages[MOONSEC_STAGE_MAX]; /* by MOONSEC_STAGE_* */
 } moonsec_telemetry;
 
@@ -436,7 +436,7 @@ MOONSEC_API moonsec_status moonsec_session_telemetry(moonsec_session *session, m
 #define MOONSEC_EVENT_PAIRED 7          /* host; peer_id, peer_name */
 #define MOONSEC_EVENT_PAIR_FAILED 8     /* host; peer_id; code: MOONSEC_PAIR_FAIL_* */
 #define MOONSEC_EVENT_PAIR_CLOSED 9     /* host; code: devices paired in the window */
-#define MOONSEC_EVENT_INPUT_OWNER 10    /* multi-user; session that has input, NULL = host's user */
+#define MOONSEC_EVENT_INPUT_OWNER 10    /* multi-user; session holding input (host: that member's; client: its own session, NULL when someone else holds it); code: holder's member id, 0 = host's user */
 #define MOONSEC_EVENT_REFUSED 11        /* host: a client that is not paired was turned away; peer_id */
 
 #define MOONSEC_PAIR_FAIL_BAD_PROOF 1 /* wrong PIN or secret */

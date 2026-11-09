@@ -123,7 +123,7 @@ valid during the call.
 | `PAIR_FAILED` | host | `peer_id`, `code` = `MOONSEC_PAIR_FAIL_*` |
 | `PAIR_CLOSED` | host | `code` = devices paired in the window |
 | `REFUSED` | host | `peer_id`; `code` 1 when refused for being busy |
-| `INPUT_OWNER` | multi-user (reserved) | `session` holding input, NULL for the host's user |
+| `INPUT_OWNER` | both, multi-user | `session` holding input (host: the member's; client: its own, NULL when another member or the host's user holds it); `code` = the holder's member id, 0 for the host's user |
 
 `time_us` is the local monotonic clock (the loopback's virtual clock for loopback
 sessions). Releasing a session drops its queued events.
@@ -212,6 +212,16 @@ side and blocks until it is done. Both ends save the other to their allowlists i
   `CLIPBOARD` event when the peer's text arrives.
 - **Format**: `moonsec_session_format` gives the negotiated codec, chroma, bit depth,
   colour space and size; `FORMAT_CHANGED` reports a change.
+- **Reconnect** (iroh): a session outlives a dropped connection. When the connection
+  closes, or nothing arrives from the host for 2 s, the client dials the host again from
+  the ticket, checks it is the same host and asks for admission again, as on its first
+  connection. The host's accept loop admits the new connection and hands it to the live
+  session of the same client endpoint (it does not count against `max_clients`), a
+  multi-user member included. The session stays `STREAMING` throughout, with no events;
+  `reconnects` in the telemetry counts the new connections. A session ends only after
+  60 s with no connection (`TIMEOUT`), or when the host refuses the client on a redial
+  (the client's session then times out). A close still sends a bye, so the peer ends
+  at once. The timeouts are fixed in this draft.
 
 ## Telemetry
 
@@ -225,16 +235,34 @@ the host's session, client-side ones on the client's; cross-clock stages need th
 offset (`MOONSEC_TELEMETRY_CLOCK_SYNCED`). `stages` has 8 slots so 1.x can add one stage
 without growing the struct; `stage_count` says how many are filled.
 
-## Multi-user and displays
+## Multi-user
 
-Declared now so the 1.0 symbol table includes them; implemented when the Phase 5 work is
-wired through the ABI:
+A host with `max_clients` above 1 (up to 32) streams to that many clients at once over
+iroh ([multi-user-v0.md](multi-user-v0.md), [app/multi_host.zig](../app/multi_host.zig)):
+one capture and one encode, sent to every member, in the best codec and format all of
+them decode. Each member is its own `moonsec_session` on the host, with its own events,
+telemetry and clipboard; a client past the cap is refused as busy (`REFUSED`, `code` 1).
+The stream starts with the first member and stops when the last one leaves; the next
+client starts it again. Loopback sessions are always one client.
 
-- `max_clients` above 1, `moonsec_host_give_input`, `moonsec_session_request_input` and
-  the `INPUT_OWNER` event map to `core/multi` and [multi-user-v0.md](multi-user-v0.md)
-  (`MOONSEC_FEATURE_MULTI_USER`).
-- `moonsec_host_displays` lists displays (`MOONSEC_FEATURE_DISPLAYS`); switching displays
-  mid-session will be a new function in 1.x.
+- Input follows the owner policy: one member holds input at a time (the first member
+  that joins gets it), other members' input is dropped. `moonsec_host_give_input(host,
+  session)` hands it to a member, or back to the host's user with NULL;
+  `moonsec_session_request_input` (client) asks for it, which the roster shows to the
+  owner and the host. `INPUT_OWNER` reports every change on both sides. With
+  `APP_INPUT`, each `INPUT` event names the member it came from (NULL for the key
+  releases the host sends when input changes hands).
+- Every member may take input (a per-device permission in the allowlist is a
+  follow-up), and the policy is always `owner`; `everyone` and `view_only` are not
+  exposed yet.
+- Clients always advertise the multi-user feature, so they get rosters from any
+  multi-user host.
+
+## Displays
+
+`moonsec_host_displays` lists displays (`MOONSEC_FEATURE_DISPLAYS`), declared and
+`UNSUPPORTED` until the multiple-displays work (#37) is wired through; switching displays
+mid-session will be a new function in 1.x.
 
 ## Linking
 
@@ -262,13 +290,13 @@ wired through the ABI:
 | Loopback transport | done |
 | iroh: listen, ticket, connect, admission (pairing required unless `INSECURE_NO_PAIRING`) | done |
 | Pairing (QR and PIN), key store in `state_dir` | done |
-| Reconnect after a dropped connection | not yet: an iroh session runs on one connection, and a drop ends it (the `moonsec` tool's `IrohLink` redials, but admission would have to run on each new connection) |
+| Reconnect after a dropped connection | done over iroh (client redials with admission, the host hands the connection to the live session; one-client and multi-user hosts); `abi/test_reconnect.c` |
 | Events, notify, frame callback | done |
 | Input both ways incl. gamepads | done |
 | Clipboard (app and system) | done |
 | Codec and format preferences | done (per-client negotiation, #36) |
 | Telemetry and per-stage latency | done |
-| Multi-user (#38) | declared, `UNSUPPORTED` |
+| Multi-user (#38) | done over iroh (owner policy, every member may control); `abi/test_multi.c`, and on the OS backends in `test-abi-system -- multi` |
 | Displays (#37) | declared, `UNSUPPORTED` |
 
 ## Freeze
@@ -290,5 +318,6 @@ Open questions for that review:
 4. **Pictures.** The system backend presents in its own window; `on_frame` hands the app
    the picture too. Is a "render into my surface" mode (the app passes a window or
    texture) needed for 1.0, or is it a 1.x addition?
-5. **One session per host** until multi-user is wired: a second client is refused while
-   one is streaming.
+5. **Multi-user policy.** Only the owner policy, and every member may control. Should
+   the config pick the policy (`everyone`, `view_only`) and a per-device "may control"
+   in 1.0, or later?

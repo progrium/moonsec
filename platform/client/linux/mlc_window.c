@@ -51,6 +51,8 @@ void mlc_log(const char *fmt, ...) {
 /* Window state */
 
 struct mlc_window {
+    /* Unique per window in this process (see make_current). */
+    uint64_t gen;
     struct wl_display *display;
     struct wl_registry *registry;
     struct wl_compositor *compositor;
@@ -316,10 +318,17 @@ static GLuint link_program(const char *fs_src) {
     return p;
 }
 
+/* The window whose context this thread made current last. A context handle alone can't
+ * tell: a window made after another was destroyed may get the same handle, while a thread
+ * that drew into the old one (a pooled thread, say) still has the old one current. */
+static atomic_uint_fast64_t window_gens;
+static _Thread_local uint64_t current_gen;
+
 static int make_current(mlc_window *w) {
-    if (eglGetCurrentContext() == w->egl_context) return MLC_OK;
+    if (current_gen == w->gen && eglGetCurrentContext() == w->egl_context) return MLC_OK;
     if (!eglMakeCurrent(w->egl_display, w->egl_surface, w->egl_surface, w->egl_context))
         return mlc_fail(MLC_E_FAIL, "eglMakeCurrent: 0x%x", eglGetError());
+    current_gen = w->gen;
     eglSwapInterval(w->egl_display, w->swap_interval);
     return MLC_OK;
 }
@@ -427,6 +436,7 @@ int mlc_window_create(uint32_t width, uint32_t height, const char *title, mlc_wi
         goto fail;
     }
     static const EGLint ctx_attr[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE};
+    w->gen = atomic_fetch_add(&window_gens, 1) + 1;
     w->egl_context = eglCreateContext(w->egl_display, cfg, EGL_NO_CONTEXT, ctx_attr);
     if (w->egl_context == EGL_NO_CONTEXT) {
         rc = mlc_fail(MLC_E_NODEVICE, "eglCreateContext: 0x%x", eglGetError());

@@ -202,7 +202,8 @@ Support/moonsec` (macOS), `%APPDATA%\moonsec` (Windows).
 
 - LAN discovery (mDNS), so a PIN alone finds the host without an address ticket.
 - Revocation beyond `moonsec unpair` (which applies from the device's next connection).
-- Multi-user over the network: `app/multi_host.zig`'s "may control" should come from the
-  `input` permission when it is wired to iroh admission.
+- Permissions for multi-user members over `peer iroh` (the C ABI's multi-user host already
+  takes "may control" from the `input` permission and syncs a member's clipboard only with
+  `clipboard`).
 - An external security review (Phase 7): threat model in [docs/security.md](../docs/security.md),
   reviewer packet and our findings in [docs/security-review.md](../docs/security-review.md).

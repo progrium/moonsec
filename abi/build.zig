@@ -124,8 +124,17 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     // --- over iroh (shim) ---
     const iroh_test = cProgram(b, target, optimize, "abi-test-iroh", "abi/test_iroh.c", full.static, false);
     const run_iroh = b.addRunArtifact(iroh_test);
-    b.step("test-abi-iroh", "C ABI over iroh on loopback: pairing, admission, a session (builds the shim)").dependOn(&run_iroh.step);
-    if (b.top_level_steps.get("test-shim")) |ts| ts.step.dependOn(&run_iroh.step);
+    const multi_test = cProgram(b, target, optimize, "abi-test-multi", "abi/test_multi.c", full.static, false);
+    const run_multi = b.addRunArtifact(multi_test);
+    run_multi.step.dependOn(&run_iroh.step); // one loopback run at a time
+    const reconnect_test = cProgram(b, target, optimize, "abi-test-reconnect", "abi/test_reconnect.c", full.static, false);
+    const run_reconnect = b.addRunArtifact(reconnect_test);
+    run_reconnect.step.dependOn(&run_multi.step);
+    const iroh_step = b.step("test-abi-iroh", "C ABI over iroh on loopback: pairing, admission, a session, a multi-user host, reconnects (builds the shim)");
+    iroh_step.dependOn(&run_iroh.step);
+    iroh_step.dependOn(&run_multi.step);
+    iroh_step.dependOn(&run_reconnect.step);
+    if (b.top_level_steps.get("test-shim")) |ts| ts.step.dependOn(iroh_step);
 
     // --- the OS backends over iroh ---
     const test_system = b.step("test-abi-system", "C ABI: a host and a client on MOONSEC_BACKEND_SYSTEM over iroh (-Dabi-system; Linux: under platform/host/linux/headless.sh)");
@@ -139,8 +148,11 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             m.addCSourceFile(.{ .file = b.path("platform/host/linux/testwin/testportal.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-fno-sanitize=undefined" } });
             m.linkSystemLibrary("dbus-1", .{});
         }
+        // `-- multi` runs it on a multi-user host. On Linux each mode needs its own
+        // headless.sh: its Weston does not survive a capture after a finished session.
         const run_sys = b.addRunArtifact(sys_test);
         run_sys.has_side_effects = true;
+        if (b.args) |args| run_sys.addArgs(args);
         test_system.dependOn(&run_sys.step);
     } else test_system.dependOn(&b.addFail("test-abi-system needs -Dabi-system=true").step);
 
