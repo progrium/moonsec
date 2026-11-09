@@ -189,9 +189,33 @@ Session setup on datagrams, until the reliable QUIC control streams land. Define
 | kind | name | direction | payload |
 | ---: | --- | --- | --- |
 | 18 | `clock_report` | client → host | `i64 offset_us` (host clock − client clock, from clock sync), `i64 error_bound_us`. 16 bytes. The host uses it to time input injection against capture. |
-| 32 | `hello` | client → host | `u32 nonce`, `u8 codecs` (bit 0 H.264, 1 HEVC, 2 AV1, 3 passthrough), 3 reserved, `u32 max_width`, `u32 max_height` (0 = any). 16 bytes. |
-| 33 | `config` | host → client | `u32 nonce` (echo), `u8 codec` (1 H.264, 2 HEVC, 3 AV1, 250 passthrough), `u8 slices`, `u16 fps`, `u32 width`, `u32 height`, `u64 bitrate_bps`. 24 bytes; `fps`, `slices`, `width`, `height` non-zero. |
+| 32 | `hello` | client → host | `u32 nonce`, `u8 codecs` (bit 0 H.264, 1 HEVC, 2 AV1, 3 passthrough), 3 reserved, `u32 max_width`, `u32 max_height` (0 = any), `u8 formats[4]` (per codec: H.264, HEVC, AV1, passthrough; bits below), `u8 display` (bit 0: the display is in an HDR10 mode), 1 reserved, `u16 peak_nits` (display peak luminance, cd/m², 0 = unknown). 24 bytes. |
+| 33 | `config` | host → client | `u32 nonce` (echo), `u8 codec` (1 H.264, 2 HEVC, 3 AV1, 250 passthrough), `u8 slices`, `u16 fps`, `u32 width`, `u32 height`, `u64 bitrate_bps`, `u8 chroma` (0 4:2:0, 1 4:4:4), `u8 bit_depth` (8 or 10), `u8 color` (0 SDR BT.709, 1 HDR10), `u8 flags` (bit 0: HDR metadata follows), `hdr_metadata` (28 bytes, zero when flag 0 is clear). 56 bytes; `fps`, `slices`, `width`, `height` non-zero. |
 | 34 | `bye` | both | `u8 reason` (0 done, 1 quit, 2 error). |
+
+Format bits, one byte per codec in `hello`'s `formats` (platform/format.zig `Formats`):
+bit 0 8-bit 4:2:0, 1 10-bit 4:2:0, 2 8-bit 4:4:4, 3 10-bit 4:4:4, 4 HDR10 (the decoder
+reads BT.2020/PQ and the presenter shows or tone-maps it, at whichever 10-bit formats it
+has); bits 5–7 reserved, ignored. A codec set in `codecs` with no format bits decodes
+8-bit 4:2:0 only. A client advertises what its decoder decodes **and** its presenter can
+show; `display` says whether showing HDR10 as HDR is possible now.
+
+`hdr_metadata` is SMPTE ST 2086 plus CTA-861.3 in HEVC SEI units: `u16 x, u16 y` for the
+R, G, B primaries then the white point (units of 0.00002), `u32 max_luminance`, `u32
+min_luminance` (0.0001 cd/m²), `u16 max_cll`, `u16 max_fall` (cd/m², 0 unknown).
+
+A `config` is valid only with a known chroma and colour, 8 or 10 bits, HDR10 at 10 bits
+only, and metadata only with HDR10; a client drops any other as malformed. Both messages
+are still accepted at their original lengths (16 and 24 bytes), meaning no format bits
+and 8-bit 4:2:0 SDR.
+
+The host picks the codec and format (`format.negotiate`): among the codecs both sides
+have, in the host's order of preference, the format with HDR10 (only when the captured
+display is in HDR mode, the client's display is too and the user allows it), then 4:4:4
+(when the host prefers it), then 10-bit (when the host prefers it or HDR10 needs it);
+the first feature outranks the later ones and ties go to the codec order. A `hello` with
+a new nonce, or with different capabilities, can change the choice; the host then
+reconfigures its encoder and starts again from an IDR.
 
 The client sends `hello` every 100 ms until a `config` with its nonce arrives. The host
 answers every `hello` with `config`; a `hello` with a nonce it has not seen starts a new
@@ -202,3 +226,6 @@ side that hears nothing from the other for 5 s ends the session.
 
 - v0 (Nov 2026): first draft.
 - v0 (Nov 2026): session messages (`hello`, `config`, `bye`, `clock_report`) for the Phase 2 apps.
+- v0 (Nov 2026): `hello` carries per-codec format bits and the display's HDR mode (24
+  bytes); `config` names chroma, bit depth, colour space and HDR metadata (56 bytes). The
+  16- and 24-byte forms are still accepted.

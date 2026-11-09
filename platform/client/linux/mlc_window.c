@@ -87,7 +87,10 @@ struct mlc_window {
 
     /* GL objects. */
     GLuint prog_yuv, prog_rgb;
-    GLint yuv_tex[3], yuv_layout, yuv_matrix, yuv_offset, yuv_rect;
+    GLint yuv_tex[3], yuv_layout, yuv_matrix, yuv_offset, yuv_rect, yuv_transfer;
+    /* 10-bit planes reduced to 8 for upload (GLES 3.0 has no 16-bit normalized textures). */
+    uint8_t *scratch;
+    size_t scratch_len;
     GLint rgb_tex, rgb_rect, rgb_blend;
     GLuint tex[3];
     GLuint overlay_tex;
@@ -225,22 +228,41 @@ static const char *vs_src =
     "  gl_Position = vec4(mix(rect.xy, rect.zw, c), 0.0, 1.0);\n"
     "}\n";
 
-/* layout 0: NV12 (tex0 Y, tex1 UV); 1: I420 (tex0 Y, tex1 U, tex2 V). */
+/* layout 0: NV12 (tex0 Y, tex1 UV); 1: three planes, I420 or I444 (tex0 Y, tex1 U,
+ * tex2 V; the chroma textures' size sets the subsampling).
+ * transfer 1: the RGB is PQ-encoded BT.2020 (HDR10). This SDR presenter tone-maps it:
+ * ST 2084 to cd/m², SDR reference white at 203 cd/m² (ITU-R BT.2408) as 1.0, BT.2020 to
+ * BT.709 primaries, highlights above 0.8 rolled off towards 1.0 by the brightest channel
+ * (hue kept), then a 2.2 gamma for the display. */
 static const char *fs_yuv_src =
     "#version 300 es\n"
-    "precision mediump float;\n"
+    "precision highp float;\n"
     "uniform sampler2D tex0, tex1, tex2;\n"
     "uniform int layout_;\n"
+    "uniform int transfer_;\n"
     "uniform mat3 matrix;\n"
     "uniform vec3 offset;\n"
     "in vec2 uv;\n"
     "out vec4 color;\n"
+    "const mat3 bt2020_to_709 = mat3(1.6605, -0.1246, -0.0182, -0.5876, 1.1329, -0.1006, -0.0728, -0.0083, 1.1187);\n"
+    "vec3 pq_eotf(vec3 e) {\n" /* 0..1 of 10000 cd/m2 */
+    "  vec3 p = pow(max(e, 0.0), vec3(1.0 / 78.84375));\n"
+    "  return pow(max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), vec3(1.0 / 0.1593017578125));\n"
+    "}\n"
     "void main() {\n"
     "  vec3 yuv;\n"
     "  yuv.x = texture(tex0, uv).r;\n"
     "  if (layout_ == 0) yuv.yz = texture(tex1, uv).rg;\n"
     "  else yuv.yz = vec2(texture(tex1, uv).r, texture(tex2, uv).r);\n"
-    "  color = vec4(clamp(matrix * (yuv - offset), 0.0, 1.0), 1.0);\n"
+    "  vec3 rgb = clamp(matrix * (yuv - offset), 0.0, 1.0);\n"
+    "  if (transfer_ == 1) {\n"
+    "    vec3 lin = max(bt2020_to_709 * (pq_eotf(rgb) * (10000.0 / 203.0)), 0.0);\n"
+    "    float m = max(max(lin.r, lin.g), lin.b);\n"
+    "    const float k = 0.8;\n"
+    "    if (m > k) lin *= (k + (1.0 - k) * (1.0 - exp(-(m - k) / (1.0 - k)))) / m;\n"
+    "    rgb = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.2));\n"
+    "  }\n"
+    "  color = vec4(rgb, 1.0);\n"
     "}\n";
 
 /* BGRA bytes uploaded as RGBA: swizzle back. `blend` keeps alpha (the overlay). */
@@ -309,6 +331,7 @@ static int gl_init(mlc_window *w) {
     static const char *names[3] = {"tex0", "tex1", "tex2"};
     for (int i = 0; i < 3; i++) w->yuv_tex[i] = glGetUniformLocation(w->prog_yuv, names[i]);
     w->yuv_layout = glGetUniformLocation(w->prog_yuv, "layout_");
+    w->yuv_transfer = glGetUniformLocation(w->prog_yuv, "transfer_");
     w->yuv_matrix = glGetUniformLocation(w->prog_yuv, "matrix");
     w->yuv_offset = glGetUniformLocation(w->prog_yuv, "offset");
     w->yuv_rect = glGetUniformLocation(w->prog_yuv, "rect");
@@ -469,6 +492,7 @@ void mlc_window_destroy(mlc_window *w) {
         wl_display_flush(w->display);
         wl_display_disconnect(w->display);
     }
+    free(w->scratch);
     free(w);
 }
 
@@ -552,6 +576,30 @@ static void upload(GLuint tex, GLenum internal, GLenum format, uint32_t w, uint3
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 }
 
+/* Uploads a plane of 16-bit words as 8-bit: `comps` samples per texel, the value in the
+ * low `bits` bits (yuv4xxp10le) or, with `msb`, the top bits (P010). */
+static int upload16(mlc_window *w, GLuint tex, GLenum internal, GLenum format, uint32_t width, uint32_t height, const uint8_t *data, uint32_t stride, uint32_t comps, int msb, uint32_t bits) {
+    size_t row = (size_t)width * comps, need = row * height;
+    if (need > w->scratch_len) {
+        uint8_t *p = realloc(w->scratch, need);
+        if (!p) return MLC_E_NOMEM;
+        w->scratch = p;
+        w->scratch_len = need;
+    }
+    unsigned shift = msb ? 8 : bits - 8;
+    for (uint32_t y = 0; y < height; y++) {
+        const uint16_t *src = (const uint16_t *)(data + (size_t)y * stride);
+        uint8_t *dst = w->scratch + (size_t)y * row;
+        for (size_t x = 0; x < row; x++) {
+            /* Round, and keep 1023 at 255. */
+            unsigned v = (src[x] + (msb ? 0x80u : (1u << (shift - 1)))) >> shift;
+            dst[x] = (uint8_t)(v > 255 ? 255 : v);
+        }
+    }
+    upload(tex, internal, format, width, height, w->scratch, (uint32_t)row, comps);
+    return MLC_OK;
+}
+
 /* Fit the picture inside the window, keeping its aspect; clip-space rect. */
 static void letterbox(const mlc_window *w, uint32_t fw, uint32_t fh, float rect[4]) {
     float ww = (float)w->width, wh = (float)w->height;
@@ -587,7 +635,9 @@ static void yuv_matrix(const mlc_frame *f, float m[9], float off[3]) {
         off[0] = 16.0f / 255.0f;
     }
     off[1] = off[2] = 128.0f / 255.0f;
-    float kr = f->bt709 ? 0.2126f : 0.299f, kb = f->bt709 ? 0.0722f : 0.114f, kg = 1.0f - kr - kb;
+    float kr = f->bt2020 ? 0.2627f : f->bt709 ? 0.2126f : 0.299f;
+    float kb = f->bt2020 ? 0.0593f : f->bt709 ? 0.0722f : 0.114f;
+    float kg = 1.0f - kr - kb;
     /* R = Y + 2(1-kr) V; G = Y - 2 kb (1-kb)/kg U - 2 kr (1-kr)/kg V; B = Y + 2(1-kb) U */
     float rv = 2 * (1 - kr), gu = -2 * kb * (1 - kb) / kg, gv = -2 * kr * (1 - kr) / kg, bu = 2 * (1 - kb);
     /* columns: Y, U, V */
@@ -610,17 +660,30 @@ int mlc_window_draw(mlc_window *w, const mlc_frame *f) {
         float rect[4];
         letterbox(w, f->width, f->height, rect);
         uint32_t cw = (f->width + 1) / 2, ch = (f->height + 1) / 2;
+        if (f->kind == MLC_FRAME_I444) cw = f->width, ch = f->height;
+        int deep = f->bit_depth > 8;
         switch (f->kind) {
         case MLC_FRAME_NV12:
+        case MLC_FRAME_P010:
         case MLC_FRAME_I420:
+        case MLC_FRAME_I444:
         case MLC_FRAME_VAAPI: {
             if (f->kind == MLC_FRAME_NV12) {
                 upload(w->tex[0], GL_R8, GL_RED, f->width, f->height, f->planes[0], f->strides[0], 1);
                 upload(w->tex[1], GL_RG8, GL_RG, cw, ch, f->planes[1], f->strides[1], 2);
-            } else if (f->kind == MLC_FRAME_I420) {
-                upload(w->tex[0], GL_R8, GL_RED, f->width, f->height, f->planes[0], f->strides[0], 1);
-                upload(w->tex[1], GL_R8, GL_RED, cw, ch, f->planes[1], f->strides[1], 1);
-                upload(w->tex[2], GL_R8, GL_RED, cw, ch, f->planes[2], f->strides[2], 1);
+            } else if (f->kind == MLC_FRAME_P010) {
+                if ((rc = upload16(w, w->tex[0], GL_R8, GL_RED, f->width, f->height, f->planes[0], f->strides[0], 1, 1, 10)) ||
+                    (rc = upload16(w, w->tex[1], GL_RG8, GL_RG, cw, ch, f->planes[1], f->strides[1], 2, 1, 10)))
+                    return rc;
+            } else if (f->kind == MLC_FRAME_I420 || f->kind == MLC_FRAME_I444) {
+                for (int i = 0; i < 3; i++) {
+                    uint32_t pw = i ? cw : f->width, ph = i ? ch : f->height;
+                    if (deep) {
+                        if ((rc = upload16(w, w->tex[i], GL_R8, GL_RED, pw, ph, f->planes[i], f->strides[i], 1, 0, f->bit_depth))) return rc;
+                    } else {
+                        upload(w->tex[i], GL_R8, GL_RED, pw, ph, f->planes[i], f->strides[i], 1);
+                    }
+                }
             } else if ((rc = draw_dmabuf(w, f, images)) != MLC_OK) {
                 return rc;
             }
@@ -632,7 +695,8 @@ int mlc_window_draw(mlc_window *w, const mlc_frame *f) {
             }
             float m[9], off[3];
             yuv_matrix(f, m, off);
-            glUniform1i(w->yuv_layout, f->kind == MLC_FRAME_I420 ? 1 : 0);
+            glUniform1i(w->yuv_layout, f->kind == MLC_FRAME_I420 || f->kind == MLC_FRAME_I444 ? 1 : 0);
+            glUniform1i(w->yuv_transfer, f->transfer == MLC_TRANSFER_PQ ? 1 : 0);
             glUniformMatrix3fv(w->yuv_matrix, 1, GL_FALSE, m);
             glUniform3fv(w->yuv_offset, 1, off);
             glUniform4fv(w->yuv_rect, 1, rect);

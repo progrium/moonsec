@@ -102,6 +102,21 @@ test "software H.264 decode: one picture per access unit, right pixels" {
     try testing.expectEqual(n, pictures);
 }
 
+test "D3D11VA format probe: nothing on WARP; what the hardware device has, printed" {
+    const com = try win.ComThread.init();
+    defer com.deinit();
+    const d3d = try warp();
+    defer d3d.destroy();
+    // WARP has no video decoder profiles.
+    for ([_]u32{ c.MSWC_CODEC_H264, c.MSWC_CODEC_HEVC, c.MSWC_CODEC_AV1 }) |codec|
+        try testing.expectEqual(@as(u32, 0), c.mswc_decoder_hw_formats(client.d3dPtr(d3d), codec));
+    // On a GPU (Jeff's box), say what the hardware could decode beyond 8-bit 4:2:0.
+    const hw = client.createDevice(.hardware, 0) catch return;
+    defer hw.destroy();
+    const f = client.probeHardwareFormats(hw);
+    std.debug.print("D3D11VA formats: h264 {any}\nhevc {any}\nav1 {any}\n", .{ f.h264, f.hevc, f.av1 });
+}
+
 test "decoder rejects garbage without wedging" {
     const com = try win.ComThread.init();
     defer com.deinit();

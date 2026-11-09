@@ -34,6 +34,9 @@ const Micros = i64;
 
 pub const Config = struct {
     codecs: api.CodecSet = .{ .passthrough = true },
+    /// Formats per codec the decoder and presenter take, and the display (sent in hello).
+    formats: api.FormatCaps = .{},
+    display: api.DisplayCaps = .{},
     max_width: u32 = 0,
     max_height: u32 = 0,
     nonce: u32 = 1,
@@ -362,7 +365,7 @@ pub const ClientSession = struct {
 
     fn sendHello(s: *ClientSession) void {
         var b: [wire.Hello.len]u8 = undefined;
-        (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height }).encode(&b);
+        (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height, .formats = s.cfg.formats, .display = s.cfg.display }).encode(&b);
         s.sendOther(.control_fast, @intFromEnum(wire.Kind.hello), &b);
     }
 
@@ -634,7 +637,8 @@ pub const ClientSession = struct {
     pub fn report(s: *const ClientSession, w: *std.Io.Writer) !void {
         const st = s.stats;
         try w.print("client: {s}{s}{s}\n", .{ @tagName(s.end), if (s.reason.len > 0) ": " else "", s.reason });
-        if (s.config) |c| try w.print("  stream {s} {d}x{d}@{d} at {d} kbit/s, {d} slices\n", .{ @tagName(c.codec), c.width, c.height, c.fps, c.bitrate_bps / 1000, c.slices });
+        var fb: [32]u8 = undefined;
+        if (s.config) |c| try w.print("  stream {s} {s} {d}x{d}@{d} at {d} kbit/s, {d} slices\n", .{ @tagName(c.codec), c.format.name(&fb), c.width, c.height, c.fps, c.bitrate_bps / 1000, c.slices });
         try w.print("  frames received {d}, presented {d}, lost {d}, stale {d}, dropped while frozen {d}, decode errors {d}, queue overflows {d}\n", .{ st.frames_received, st.frames_presented, st.frames_lost, st.frames_stale, st.frames_dropped, st.decode_errors, st.queue_overflows });
         try w.print("  shards {d} (retransmitted {d}), NACKs {d}, feedback {d}, frame acks {d}, pongs {d}, input events {d}\n", .{ st.shards, s.video_retx, st.nacks, st.feedback, st.frame_acks, st.pongs, st.input_events });
         const r = s.rec.stats;

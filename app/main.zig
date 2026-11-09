@@ -101,6 +101,9 @@ const Args = struct {
     uinput_script: bool = false,
     /// Linux client: no PipeWire stream.
     no_audio: bool = false,
+    /// Host format preferences (platform/format.zig): 4:4:4 and 10-bit when the client has them.
+    yuv444: bool = false,
+    ten_bit: bool = false,
     p: pair_cmd.Args = .{},
 };
 
@@ -134,6 +137,7 @@ fn usage() error{Usage} {
         \\       moonsec run pair [--seconds N]
         \\       (peer iroh also takes --state-dir: device key, and the host admits paired clients only)
         \\opts:  --fps N --bitrate BPS --size WxH --slices N --rate-control
+        \\       --yuv444 --ten-bit (host: prefer 4:4:4 / 10-bit when the client decodes it)
         \\       --loss-policy (sim, soak: NACK/FEC/relay chosen per path)
         \\sim:   --flaps T:D,.. --drops T:D,.. --idle-ms N --repunch-ms N --relay-delay-ms N --no-stall-pause
         \\client: --client synthetic|linux (moonsec-linux: Wayland/EGL, libavcodec, PipeWire, evdev)
@@ -178,6 +182,14 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         }
         if (std.mem.eql(u8, s, "--no-audio")) {
             a.no_audio = true;
+            continue;
+        }
+        if (std.mem.eql(u8, s, "--yuv444")) {
+            a.yuv444 = true;
+            continue;
+        }
+        if (std.mem.eql(u8, s, "--ten-bit")) {
+            a.ten_bit = true;
             continue;
         }
         if (std.mem.eql(u8, s, "--pin-only")) {
@@ -298,6 +310,8 @@ fn simOptions(a: *const Args, seconds: u32, progress: u32) simrun.Options {
         .outage_us = a.outage_ms * 1000,
         .rate_control = a.rate_control,
         .loss_policy = a.loss_policy,
+        .yuv444 = a.yuv444,
+        .ten_bit = a.ten_bit,
     };
 }
 
@@ -343,7 +357,7 @@ fn exitedOk(t: std.process.Child.Term) bool {
 /// The argv tail every peer gets.
 const PeerArgs = struct {
     buf: [6][24]u8 = undefined,
-    list: [16][]const u8 = undefined,
+    list: [20][]const u8 = undefined,
     n: usize = 0,
 
     fn add(p: *PeerArgs, k: []const u8, comptime fmt: []const u8, v: anytype) void {
@@ -373,6 +387,14 @@ const PeerArgs = struct {
         }
         if (a.no_audio) {
             p.list[p.n] = "--no-audio";
+            p.n += 1;
+        }
+        if (a.yuv444) {
+            p.list[p.n] = "--yuv444";
+            p.n += 1;
+        }
+        if (a.ten_bit) {
+            p.list[p.n] = "--ten-bit";
             p.n += 1;
         }
     }
@@ -607,7 +629,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             const sh = try synthetic.openHost(gpa, .{ .clock = clock, .sleeper = wallSleep, .width = a.width, .height = a.height });
             const hb = sh.backend();
             defer hb.deinit();
-            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
+            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .yuv444 = a.yuv444, .ten_bit = a.ten_bit, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
             defer app.deinit();
             try app.runThreaded(io);
             try app.s.report(&w);

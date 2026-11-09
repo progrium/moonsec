@@ -75,7 +75,23 @@ uint32_t mswc_send_key(uint16_t scan_code, int extended, int up);
 enum {
     MSWC_CODEC_H264 = 1,
     MSWC_CODEC_HEVC = 2,
+    /* Probed only (mswc_decoder_hw_formats); the decoder MFT path takes H.264 and HEVC. */
+    MSWC_CODEC_AV1 = 3,
 };
+
+/* Coded formats, as platform/format.zig's Formats bits. */
+enum {
+    MSWC_FMT_420_8 = 0x01,
+    MSWC_FMT_420_10 = 0x02,
+    MSWC_FMT_444_8 = 0x04,
+    MSWC_FMT_444_10 = 0x08,
+    MSWC_FMT_HDR10 = 0x10,
+};
+
+/* What the GPU's D3D11VA decoder has for `codec` (decoder profile plus output format),
+ * as MSWC_FMT_* bits; 0 without a video device (WARP). A probe for the hardware check:
+ * the MFT decode path and the presenter take 8-bit 4:2:0 only (see mswc_formats.c). */
+uint32_t mswc_decoder_hw_formats(msw_d3d *d3d, uint32_t codec);
 
 typedef struct mswc_decoder mswc_decoder;
 

@@ -1,0 +1,60 @@
+name: macos
+
+# macOS host backend (platform/host/macos). The macos-15 runner is a VM with no Screen
+# Recording or Accessibility permission, so the capture, audio and injection tests skip;
+# the VideoToolbox tests run on whatever encoder the VM has, and print which (hardware or
+# software, low-latency and LTR or not) in the log and the job summary.
+# Linux type-checks the same code for aarch64 and x86_64 macOS.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test:
+    name: test (macos-15)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build the macOS host tests
+        run: zig build build-test-mac --summary all
+      # Run the binary directly so every test's report (encoders, timings, skips) is in the log.
+      - name: macOS host backend tests
+        run: ./zig-out/mac-test/mac-host-test 2>&1 | tee test-mac.log; exit ${PIPESTATUS[0]}
+        shell: bash
+      - name: VideoToolbox on this runner
+        if: always()
+        shell: bash
+        run: |
+          touch test-mac.log
+          {
+            echo '### VideoToolbox on the macos-15 runner'
+            echo '```'
+            sed -n '/VTCopyVideoEncoderList/,/^chosen:/p' test-mac.log
+            grep -E '^(h264|hevc): |^LTR |^mean frame|^skip ' test-mac.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  check:
+    name: type-check (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: zig fmt
+        run: zig fmt --check platform/host/macos
+      - name: Type-check for aarch64 and x86_64 macOS
+        run: zig build check-mac --summary all

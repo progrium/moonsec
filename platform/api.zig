@@ -93,8 +93,39 @@ pub const PixelFormat = enum(u8) {
     nv12 = 2,
     /// 10-bit 4:2:0 in 16-bit words.
     p010 = 3,
+    /// 8-bit 4:4:4, three full-size planes Y, U, V.
+    i444 = 4,
+    /// 10-bit 4:4:4, three full-size planes of 16-bit words (value in the low 10 bits).
+    i444_16 = 5,
+    /// Half-float R, G, B, A, linear, BT.709 primaries scaled so 1.0 = 80 cd/m² (scRGB):
+    /// what Desktop Duplication delivers from a display in HDR mode.
+    rgba16f = 6,
+    /// 10-bit R, G, B and 2-bit A packed in a 32-bit word (DXGI_FORMAT_R10G10B10A2_UNORM),
+    /// PQ-encoded BT.2020 when the image is `.hdr10`.
+    rgb10a2 = 7,
     _,
 };
+
+/// Chroma, bit depth, colour space and HDR metadata, and their negotiation (platform/format.zig).
+pub const format = @import("format.zig");
+pub const VideoFormat = format.VideoFormat;
+pub const Formats = format.Formats;
+pub const FormatCaps = format.FormatCaps;
+pub const ColorSpace = format.ColorSpace;
+pub const HdrMetadata = format.HdrMetadata;
+pub const DisplayCaps = format.DisplayCaps;
+
+/// `formats` with every codec in `codecs` that has no bits given its 8-bit 4:2:0 baseline,
+/// and codecs not in `codecs` cleared: what an encoder or decoder really offers.
+pub fn effectiveFormats(codecs: CodecSet, formats: FormatCaps) FormatCaps {
+    var out: FormatCaps = .{};
+    for ([_]Codec{ .h264, .hevc, .av1, .passthrough }) |c| {
+        if (!codecs.has(c)) continue;
+        const f = formats.get(@intFromEnum(c));
+        out.set(@intFromEnum(c), if (f.bits() == 0) Formats.baseline else f);
+    }
+    return out;
+}
 
 /// A picture: on the GPU (`gpu`, a backend-specific handle such as an ID3D11Texture2D*,
 /// IOSurfaceRef or VASurfaceID), in memory (`cpu`), or both. Encoders and presenters say
@@ -103,6 +134,9 @@ pub const Image = struct {
     width: u32,
     height: u32,
     format: PixelFormat = .bgra8,
+    /// The colour space the pixels are in (decoded YUV: the matrix, primaries and transfer
+    /// to convert with; captured RGB: SDR, or HDR10/scRGB from a display in HDR mode).
+    color: ColorSpace = .sdr_bt709,
     gpu: ?*anyopaque = null,
     /// Subresource or array slice of `gpu` (Desktop Duplication and D3D11VA use arrays).
     gpu_index: u32 = 0,
@@ -128,6 +162,9 @@ pub const CaptureConfig = struct {
     /// Preferred size, 0 = the display's own. A backend may ignore it.
     width: u32 = 0,
     height: u32 = 0,
+    /// Capture in HDR when the display is in an HDR mode (rgba16f or rgb10a2 frames tagged
+    /// `.hdr10`); off, or on an SDR display, frames are 8-bit SDR as before.
+    hdr: bool = false,
 };
 
 pub const CapturedFrame = struct {
@@ -195,7 +232,15 @@ pub const Capture = struct {
     }
 };
 
-pub const Size = struct { width: u32, height: u32 };
+pub const Size = struct {
+    width: u32,
+    height: u32,
+    /// From `Capture.start`: the colour mode frames will come in, and the display's HDR
+    /// metadata when it is in HDR mode and reports any. A display switching mode
+    /// mid-capture surfaces as `error.DeviceLost`.
+    color: ColorSpace = .sdr_bt709,
+    hdr: ?HdrMetadata = null,
+};
 
 // ---------------------------------------------------------------------------
 // Host: encode
@@ -212,6 +257,9 @@ pub const EncoderCaps = struct {
     cpu_input: bool = false,
     /// Formats it takes (bgra8 at least, as capture delivers it).
     formats: []const PixelFormat = &.{.bgra8},
+    /// Coded formats per codec (chroma, bit depth, HDR10). A codec in `codecs` with no bits
+    /// here does 8-bit 4:2:0 SDR only (`effectiveFormats`).
+    coded: FormatCaps = .{},
 };
 
 /// Session settings, from the design's "Encoder settings": no B-frames, no lookahead,
@@ -225,6 +273,11 @@ pub const EncoderConfig = struct {
     slices: u8 = 1,
     /// Mark long-term references (only when caps.ltr).
     ltr: bool = false,
+    /// Chroma, bit depth and colour space to encode in; one of `caps.coded`'s. With HDR10
+    /// the encoder writes the colour description (VUI / sequence header) and, when `hdr`
+    /// is set, the mastering display and content light level SEI / metadata OBUs on every
+    /// keyframe. Input frames come as `CaptureConfig.hdr` asked for; the encoder converts.
+    format: VideoFormat = .{},
 };
 
 pub const Force = enum(u8) { none, ltr_refresh, idr };
@@ -377,6 +430,9 @@ pub const DecoderConfig = struct {
     codec: Codec,
     width: u32,
     height: u32,
+    /// What the host's `config` named. The bitstream says the same; a decoder may trust
+    /// either, but a stream that disagrees with this is the host's bug.
+    format: VideoFormat = .{},
 };
 
 pub const DecoderCaps = struct {
@@ -384,6 +440,10 @@ pub const DecoderCaps = struct {
     /// Output it produces; the presenter must take it.
     gpu_output: bool = false,
     cpu_output: bool = false,
+    /// Coded formats per codec it decodes and its presenter can show (a 4:4:4 picture the
+    /// presenter would have to drop chroma from does not count). A codec in `codecs` with
+    /// no bits here is 8-bit 4:2:0 SDR only.
+    coded: FormatCaps = .{},
 };
 
 /// One reassembled frame.
@@ -454,6 +514,9 @@ pub const PresenterConfig = struct {
     mode: PresentMode = .lowest_latency,
     /// Start in a window (false: fullscreen).
     windowed: bool = true,
+    /// The stream's format. With HDR10 on an HDR display the presenter shows PQ as is
+    /// (HDR swapchain / colour-managed surface); on an SDR one it tone-maps.
+    format: VideoFormat = .{},
 };
 
 /// What the latency overlay shows: every stage's rolling stats and the link.
@@ -567,6 +630,8 @@ pub const ClientBackend = struct {
     presenter: Presenter,
     audio: ?AudioSink = null,
     input: ?InputSource = null,
+    /// The display the window opens on: whether it is in an HDR mode now. Sent in `hello`.
+    display: DisplayCaps = .{},
     deinit_ptr: ?*anyopaque = null,
     deinitFn: ?*const fn (ptr: ?*anyopaque) void = null,
 
@@ -678,6 +743,13 @@ test "bind builds vtables from methods" {
     try testing.expect(!f.started);
 }
 
+test "effective formats" {
+    const f = effectiveFormats(.{ .h264 = true, .hevc = true }, .{ .hevc = Formats.all, .av1 = Formats.all });
+    try testing.expectEqual(Formats.baseline, f.h264);
+    try testing.expectEqual(Formats.all, f.hevc);
+    try testing.expectEqual(Formats{}, f.av1);
+}
+
 test "codec sets" {
     const s: CodecSet = .{ .h264 = true, .passthrough = true };
     try testing.expect(s.has(.h264) and s.has(.passthrough) and !s.has(.hevc));
@@ -689,4 +761,5 @@ pub const pattern = @import("pattern.zig");
 
 test {
     _ = pattern;
+    _ = format;
 }

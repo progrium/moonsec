@@ -140,6 +140,7 @@ pub fn windowsClientModule(b: *std.Build, target: std.Build.ResolvedTarget, opti
         "platform/client/windows/mswc_decode.c",
         "platform/client/windows/mswc_present.c",
         "platform/client/windows/mswc_audio.c",
+        "platform/client/windows/mswc_formats.c",
     }, &.{ "d3d11", "dxgi", "ole32", "oleaut32", "uuid", "user32", "mfplat", "mfuuid", "mf", "strmiids", "avrt" });
     return m;
 }
