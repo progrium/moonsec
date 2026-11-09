@@ -685,6 +685,12 @@ pub const HostSession = struct {
                         if (s.state != .streaming) return;
                         // Repeats of a request applied or waiting are copies in flight.
                         if (!display_mod.newer(sel.request, s.request_applied)) return;
+                        if (s.cfg.shared) {
+                            // Members of a multi-user session share one encode, of the
+                            // host's display: refuse, so the client stops asking.
+                            s.stats.selects += 1;
+                            return s.onSelectFailed(sel.request, now);
+                        }
                         if (s.pending_select) |p| if (!display_mod.newer(sel.request, p.request)) return;
                         s.pending_select = sel;
                         s.stats.selects += 1;

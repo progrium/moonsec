@@ -90,6 +90,10 @@ the host cannot apply it (unknown display, capture failed) it keeps streaming as
 still answers with a `stream_config` carrying the `request`, so the client stops repeating;
 the client sees that `display` did not change.
 
+In a multi-user session (spec/multi-user-v0.md) every member gets the same encode, of
+the display the host picked, so the host refuses every `select_display` this way. Who
+may pick the shared display is not decided yet.
+
 ## `stream_config` (host → client)
 
 The datagram `config` message ([wire-v0.md](wire-v0.md)), now 72 bytes:
