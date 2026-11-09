@@ -530,8 +530,9 @@ pub const MultiHost = struct {
 };
 
 /// A `MultiHost` over a host platform backend: capture and encode once, network for every
-/// member, input from the members the policy allows. Single-threaded (`tick`), like the
-/// sim runs; a threaded runner is the same split as `apps.HostApp.runThreaded`.
+/// member, input from the members the policy allows. `tick` runs it on the caller's thread
+/// (the sim runs); `runThreadedWith` splits it as `apps.HostApp.runThreaded` does, the
+/// network on the calling thread and capture+encode on their own.
 pub const MultiHostApp = struct {
     be: api.HostBackend,
     m: MultiHost,
@@ -541,6 +542,8 @@ pub const MultiHostApp = struct {
     ltr: bool,
     last_frame_us: ?Micros = null,
     audio: ?*apps.HostAudio = null,
+    /// The member whose action is being injected (the injector may ask).
+    injecting_from: u16 = multi.host_id,
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0, reconfigures: u64 = 0 } = .{},
 
     pub const Options = struct {
@@ -605,21 +608,37 @@ pub const MultiHostApp = struct {
         a.m.deinit();
     }
 
-    pub fn tick(a: *MultiHostApp) void {
-        const now = a.be.clock.now();
+    /// Network stage: every member's session, audio, input. With the lock held.
+    fn network(a: *MultiHostApp, now: Micros) void {
         a.m.step(now);
         if (a.audio) |au| au.pump(&a.m, now);
         while (a.m.popAction()) |p| {
+            a.injecting_from = p.from;
             if (a.be.input) |inj| inj.inject(p.action) catch {
                 a.stats.inject_errors += 1;
             };
+            a.injecting_from = multi.host_id;
             a.m.onInjected(p.from, p.time, a.be.clock.now());
         }
+    }
+
+    pub fn tick(a: *MultiHostApp) void {
+        a.network(a.be.clock.now());
         if (!a.m.streaming()) return;
-        const f = (a.grab() catch return) orelse return;
+        const f = (a.grab(0) catch return) orelse return;
         defer a.be.capture.release(&f);
-        const change = a.m.takeFormat();
-        const params = a.m.encodeParams();
+        a.encodeOne(&f, null);
+    }
+
+    /// One encode of a captured frame; the lock, if any, is taken around the session calls.
+    fn encodeOne(a: *MultiHostApp, f: *const api.CapturedFrame, lock: ?apps.Lock) void {
+        if (lock) |l| l.lock();
+        const live = a.m.streaming();
+        const change = if (live) a.m.takeFormat() else null;
+        const bitrate = a.m.bitrate_bps;
+        const params = if (live) a.m.encodeParams() else api.EncodeParams{};
+        if (lock) |l| l.unlock();
+        if (!live) return;
         if (change) |c| {
             a.be.encoder.configure(.{
                 .codec = c.codec,
@@ -627,12 +646,14 @@ pub const MultiHostApp = struct {
                 .width = f.image.width,
                 .height = f.image.height,
                 .fps = a.opts.fps,
-                .bitrate_bps = a.m.bitrate_bps,
+                .bitrate_bps = bitrate,
                 .slices = a.slices,
                 .ltr = a.ltr,
             }) catch {
                 // Negotiation only picks what the encoder's caps offer; a refusal is the
                 // backend's bug, and every member would get frames its config does not name.
+                if (lock) |l| l.lock();
+                defer if (lock) |l| l.unlock();
                 a.stats.encode_errors += 1;
                 a.m.onEncodeDropped();
                 a.m.abort("the encoder rejected the members' common codec or format");
@@ -640,10 +661,12 @@ pub const MultiHostApp = struct {
             };
             a.stats.reconfigures += 1;
         }
-        const r = a.be.encoder.encode(&f, params);
+        const r = a.be.encoder.encode(f, params);
+        if (lock) |l| l.lock();
+        defer if (lock) |l| l.unlock();
         if (r) |ef_| {
             if (ef_) |ef| {
-                a.m.onEncoded(ef, &f, a.be.clock.now());
+                a.m.onEncoded(ef, f, a.be.clock.now());
                 a.last_frame_us = f.captured_us;
             } else a.m.onEncodeDropped();
         } else |_| {
@@ -652,8 +675,48 @@ pub const MultiHostApp = struct {
         }
     }
 
-    fn grab(a: *MultiHostApp) api.Error!?api.CapturedFrame {
-        if (try a.be.capture.acquire(0)) |f| return f;
+    /// Network on this thread, capture+encode on their own, until `stop` is set or every
+    /// member has left (members may still join meanwhile: `addPeer` under the lock).
+    /// `hook` runs under the lock after every network step.
+    pub fn runThreadedWith(a: *MultiHostApp, io: std.Io, lock: apps.Lock, hook: ?apps.Hook, stop: *std.atomic.Value(bool)) !void {
+        var media_stop: std.atomic.Value(bool) = .init(false);
+        var media = try io.concurrent(mediaLoop, .{ a, lock, &media_stop });
+        defer {
+            media_stop.store(true, .release);
+            media.await(io);
+        }
+        while (true) {
+            lock.lock();
+            a.network(a.be.clock.now());
+            if (hook) |h| h.f(h.ctx);
+            const finished = a.m.ended() or stop.load(.acquire);
+            lock.unlock();
+            if (finished) return;
+            io.sleep(.fromMicroseconds(1000), .awake) catch {};
+        }
+    }
+
+    fn mediaLoop(a: *MultiHostApp, lock: apps.Lock, stop: *std.atomic.Value(bool)) void {
+        const interval = @divTrunc(1_000_000, @as(Micros, a.opts.fps));
+        while (!stop.load(.acquire)) {
+            lock.lock();
+            const live = a.m.streaming();
+            lock.unlock();
+            if (!live) {
+                lock.io.sleep(.fromMilliseconds(2), .awake) catch {};
+                continue;
+            }
+            const f = (a.grab(interval) catch {
+                lock.io.sleep(.fromMilliseconds(2), .awake) catch {};
+                continue;
+            }) orelse continue;
+            a.encodeOne(&f, lock);
+            a.be.capture.release(&f);
+        }
+    }
+
+    fn grab(a: *MultiHostApp, timeout_us: Micros) api.Error!?api.CapturedFrame {
+        if (try a.be.capture.acquire(timeout_us)) |f| return f;
         a.stats.capture_timeouts += 1;
         const last = a.last_frame_us orelse return null;
         if (a.be.clock.now() - last < a.opts.repeat_after_us) return null;
