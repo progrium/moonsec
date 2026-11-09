@@ -1,4 +1,4 @@
-//! Zig binding for the moonsec iroh shim (shim/include/iroh_shim.h, ABI v0.2).
+//! Zig binding for the moonsec iroh shim (shim/include/iroh_shim.h, ABI v0.2.1).
 //! Thin, allocation-free wrapper: Zig owns every buffer passed to the shim.
 //! Tests: transport/iroh_test.zig (loopback) and transport/iroh_netns_test.zig (Linux netns).
 const std = @import("std");
@@ -297,6 +297,14 @@ pub const Stream = struct {
 
     pub fn writeAll(self: Stream, data: []const u8, timeout_ms: u32) Error!void {
         try check(c.iroh_stream_write(self.handle, data.ptr, data.len, timeout_ms));
+    }
+
+    /// Writes what the stream takes now and returns how many bytes (`timeout_ms == 0` polls:
+    /// error.WouldBlock when flow control has no room). Safe to call non-blocking.
+    pub fn writeSome(self: Stream, data: []const u8, timeout_ms: u32) Error!usize {
+        var n: usize = 0;
+        try check(c.iroh_stream_write_some(self.handle, data.ptr, data.len, timeout_ms, &n));
+        return n;
     }
 
     /// Reads into `buf`; an empty slice means the peer finished the stream.

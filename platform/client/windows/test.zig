@@ -102,6 +102,21 @@ test "software H.264 decode: one picture per access unit, right pixels" {
     try testing.expectEqual(n, pictures);
 }
 
+test "D3D11VA format probe: nothing on WARP; what the hardware device has, printed" {
+    const com = try win.ComThread.init();
+    defer com.deinit();
+    const d3d = try warp();
+    defer d3d.destroy();
+    // WARP has no video decoder profiles.
+    for ([_]u32{ c.MSWC_CODEC_H264, c.MSWC_CODEC_HEVC, c.MSWC_CODEC_AV1 }) |codec|
+        try testing.expectEqual(@as(u32, 0), c.mswc_decoder_hw_formats(client.d3dPtr(d3d), codec));
+    // On a GPU (Jeff's box), say what the hardware could decode beyond 8-bit 4:2:0.
+    const hw = client.createDevice(.hardware, 0) catch return;
+    defer hw.destroy();
+    const f = client.probeHardwareFormats(hw);
+    std.debug.print("D3D11VA formats: h264 {any}\nhevc {any}\nav1 {any}\n", .{ f.h264, f.hevc, f.av1 });
+}
+
 test "decoder rejects garbage without wedging" {
     const com = try win.ComThread.init();
     defer com.deinit();
@@ -170,8 +185,12 @@ fn swapchainTest(flags: u32) !void {
 
     var overlay_px: [8 * 4]u32 = @splat(0xFF00FF00);
     for (aus[0..n], 0..) |au, i| {
+        // A busy runner (or an occluded window) can leave the waitable unsignalled past
+        // the timeout; the backend presents anyway in that case, so the test does too.
         const wr = c.mswc_presenter_wait(pr, 1000);
-        try testing.expect(wr >= 0);
+        if (wr == win.hrCode(c.MSW_DXGI_ERROR_WAIT_TIMEOUT)) {
+            std.debug.print("frame latency waitable timed out at frame {d}; presenting anyway\n", .{i});
+        } else try checkHr("mswc_presenter_wait", wr);
         var f: c.mswc_frame = undefined;
         var got: c_int = 0;
         try win.check(c.mswc_decoder_decode(dec, au.ptr, au.len, @intCast(i), &f, &got));

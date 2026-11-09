@@ -294,12 +294,40 @@ pub const PacedHook = struct {
     func: *const fn (ctx: ?*anyopaque, data: []const u8, local_us: i64) void,
 };
 
+/// One direction of the reliable byte stream next to the datagrams (the control channel's
+/// transport). It models QUIC's stream after recovery: bytes arrive in order, one link
+/// delay after they are written, and loss, queueing and capacity do not touch them (control
+/// traffic is small next to media). It adds no events to the network, so scenario digests
+/// do not change.
+const StreamDir = struct {
+    const Chunk = struct { at: i64, data: []u8 };
+    chunks: std.ArrayList(Chunk) = .empty,
+    head: usize = 0,
+    /// Read offset into chunks[head].
+    off: usize = 0,
+    bytes: usize = 0,
+    last_at: i64 = std.math.minInt(i64),
+    /// The writer finished: end of stream after the queued bytes (at this time).
+    fin_at: ?i64 = null,
+
+    fn deinit(d: *StreamDir, gpa: std.mem.Allocator) void {
+        for (d.chunks.items[d.head..]) |c| gpa.free(c.data);
+        d.chunks.deinit(gpa);
+        d.* = .{};
+    }
+};
+
+/// Bytes the stream holds in one direction before `write` returns 0 (flow control).
+pub const stream_window: usize = 4 << 20;
+
 /// One endpoint's handle; `Net.pipeFor(side)` wraps it in a `PacketPipe`.
 pub const End = struct {
     net: *Net,
     side: Side,
     cfg: EndpointConfig,
     on_paced: ?PacedHook = null,
+    /// Set by `Net.resetStream`: the next stream call reports `error.Reset` once.
+    stream_reset: bool = false,
 
     fn out(self: *End) *Link {
         return &self.net.links[@intFromEnum(self.side)];
@@ -357,6 +385,66 @@ pub const End = struct {
         return self.cfg.max_datagram;
     }
 
+    fn streamWrite(ptr: *anyopaque, data: []const u8) pipe.StreamError!usize {
+        const self: *End = @ptrCast(@alignCast(ptr));
+        if (self.stream_reset) {
+            self.stream_reset = false;
+            return error.Reset;
+        }
+        const d = &self.net.streams[@intFromEnum(self.side)];
+        if (d.fin_at != null) return error.Closed;
+        const n = @min(data.len, stream_window -| d.bytes);
+        if (n == 0) return 0;
+        const at = @max(d.last_at, self.net.t + self.out().cfg.delay_us);
+        const copy = self.net.gpa.dupe(u8, data[0..n]) catch return 0;
+        d.chunks.append(self.net.gpa, .{ .at = at, .data = copy }) catch {
+            self.net.gpa.free(copy);
+            return 0;
+        };
+        d.last_at = at;
+        d.bytes += n;
+        return n;
+    }
+
+    fn streamRead(ptr: *anyopaque, buf: []u8) pipe.StreamError!?usize {
+        const self: *End = @ptrCast(@alignCast(ptr));
+        if (self.stream_reset) {
+            self.stream_reset = false;
+            return error.Reset;
+        }
+        const d = &self.net.streams[@intFromEnum(self.side.other())];
+        var got: usize = 0;
+        while (got < buf.len and d.head < d.chunks.items.len) {
+            const c = d.chunks.items[d.head];
+            if (c.at > self.net.t) break;
+            const n = @min(buf.len - got, c.data.len - d.off);
+            @memcpy(buf[got..][0..n], c.data[d.off..][0..n]);
+            got += n;
+            d.off += n;
+            d.bytes -= n;
+            if (d.off == c.data.len) {
+                self.net.gpa.free(c.data);
+                d.head += 1;
+                d.off = 0;
+            }
+        }
+        if (d.head == d.chunks.items.len and d.head > 0) {
+            d.chunks.clearRetainingCapacity();
+            d.head = 0;
+        }
+        if (got > 0) return got;
+        if (d.fin_at) |f| if (f <= self.net.t and d.head == d.chunks.items.len) return 0;
+        return null;
+    }
+
+    fn streamFinish(ptr: *anyopaque) void {
+        const self: *End = @ptrCast(@alignCast(ptr));
+        const d = &self.net.streams[@intFromEnum(self.side)];
+        if (d.fin_at == null) d.fin_at = @max(d.last_at, self.net.t + self.out().cfg.delay_us);
+    }
+
+    const stream_vtable = pipe.ByteStream.VTable{ .write = streamWrite, .read = streamRead, .finish = streamFinish };
+
     const vtable = pipe.PacketPipe.VTable{
         .send = send,
         .recv = recv,
@@ -380,6 +468,8 @@ pub const Net = struct {
     pkts: std.ArrayList(Packet) = .empty,
     free_list: std.ArrayList(u32) = .empty,
     hasher: std.hash.Wyhash,
+    /// The reliable stream, by writing side.
+    streams: [2]StreamDir = .{ .{}, .{} },
 
     /// `Net` holds pointers to itself; create it in place and don't move it.
     pub fn init(self: *Net, gpa: std.mem.Allocator, cfg: Config) !void {
@@ -403,6 +493,7 @@ pub const Net = struct {
         self.pkts.deinit(self.gpa);
         self.free_list.deinit(self.gpa);
         self.q.deinit(self.gpa);
+        for (&self.streams) |*d| d.deinit(self.gpa);
         for (&self.links) |*l| {
             l.send_fifo.deinit(self.gpa);
             l.queue.deinit(self.gpa);
@@ -441,6 +532,18 @@ pub const Net = struct {
     /// The endpoint's `PacketPipe`.
     pub fn pipeFor(self: *Net, side: Side) pipe.PacketPipe {
         return .{ .ptr = &self.ends[@intFromEnum(side)], .vtable = &End.vtable };
+    }
+
+    /// The endpoint's reliable byte stream (see `StreamDir`).
+    pub fn streamFor(self: *Net, side: Side) pipe.ByteStream {
+        return .{ .ptr = &self.ends[@intFromEnum(side)], .vtable = &End.stream_vtable };
+    }
+
+    /// Replaces the stream, as a reconnect does: bytes in flight are lost and each side's
+    /// next stream call reports `error.Reset`.
+    pub fn resetStream(self: *Net) void {
+        for (&self.streams) |*d| d.deinit(self.gpa);
+        for (&self.ends) |*e| e.stream_reset = true;
     }
 
     /// Observe datagrams leaving `side`'s pacer (see `PacedHook`); null clears it.
@@ -1157,4 +1260,34 @@ test "fades pick capacities inside the range" {
         last = c;
     }
     try testing.expect(changes >= 12 and changes <= 30);
+}
+
+test "the stream delivers bytes in order one link delay later, then end of stream" {
+    var net: Net = undefined;
+    try net.init(std.testing.allocator, .{ .a_to_b = .{ .delay_us = 5 * MS, .loss = 0.5 } });
+    defer net.deinit();
+    const a = net.streamFor(.a);
+    const b = net.streamFor(.b);
+    try std.testing.expectEqual(@as(usize, 5), try a.write("hello"));
+    try net.runUntil(1 * MS);
+    try std.testing.expectEqual(@as(usize, 6), try a.write(" world"));
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, null), try b.read(&buf));
+    try net.runUntil(5 * MS);
+    try std.testing.expectEqual(@as(?usize, 4), try b.read(&buf));
+    try std.testing.expectEqualStrings("hell", &buf);
+    try std.testing.expectEqual(@as(?usize, 1), try b.read(&buf));
+    try std.testing.expectEqual(@as(?usize, null), try b.read(&buf));
+    a.finish();
+    try net.runUntil(20 * MS);
+    var big: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, 6), try b.read(&big));
+    try std.testing.expectEqualStrings(" world", big[0..6]);
+    try std.testing.expectEqual(@as(?usize, 0), try b.read(&big));
+    try std.testing.expectError(error.Closed, a.write("x"));
+    net.resetStream();
+    try std.testing.expectError(error.Reset, b.read(&big));
+    try std.testing.expectEqual(@as(?usize, null), try b.read(&big));
+    try std.testing.expectError(error.Reset, a.write("x"));
+    try std.testing.expectEqual(@as(usize, 1), try a.write("x"));
 }

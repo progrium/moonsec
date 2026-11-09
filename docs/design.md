@@ -139,6 +139,7 @@ The pipeline never buffers: every frame is encoded, sent, decoded and presented 
 - No periodic keyframes; long-term references for recovery. No intra-refresh as a baseline: VideoToolbox has none that works (S8), and the Windows encoders are untested.
 - Per-frame bitrate reconfiguration without forcing a keyframe (VideoToolbox settles within 0–11 frames).
 - Codecs: H.264 and HEVC first, AV1 where the encoder supports it; 4:4:4 and HDR later.
+- Formats (Phase 5, [platform/format.zig](../platform/format.zig)): the client's hello lists, per codec, which of 8/10-bit 4:2:0 and 4:4:4 and HDR10 its decoder and presenter take, and whether its display is in HDR mode; the host picks codec and format from that, its encoder's caps and its preferences (HDR10 when both displays are HDR, then 4:4:4, then 10-bit) and names them with the ST 2086/CTA-861.3 metadata in config. Built and simulated for every combination; the Linux client decodes AV1 (dav1d), HEVC Main 4:4:4 and Main10/HDR10 in software and tone-maps PQ to SDR. NVENC (AV1, 4:4:4, 10-bit, HDR10 SEI/OBUs) is written against #15, compile-checked; VideoToolbox, D3D11VA output and HDR presentation are listed in [platform/README.md](../platform/README.md#formats). Hardware-untested.
 
 **Loss recovery**
 
@@ -434,7 +435,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 ### Phase 4: macOS host and more clients (about 5 weeks)
 
 - Host: ScreenCaptureKit, VideoToolbox, CGEvent input.
-- Clients: macOS (VideoToolbox, Metal) and Linux (VAAPI, Wayland/EGL).
+- Clients: macOS (VideoToolbox, Metal) and Linux (VAAPI, Wayland/EGL). Linux client built in [platform/client/linux](../platform/client/linux/README.md): libavcodec with VAAPI and a software fallback, Wayland/EGL (GLES 3, dma-buf import of VAAPI surfaces), PipeWire, evdev. CI runs it end to end against the synthetic host in headless Weston on llvmpipe; VAAPI decode and dma-buf import are untested without a GPU.
 - Gamepads on all clients; virtual gamepad on Windows host (driver path decided in Phase 3). (Client capture built: `platform/client/gamepad`, XInput on Windows, GameController on macOS, evdev on Linux, one `core.input.Gamepad.Button` layout; the Linux source is tested against a uinput virtual pad in CI. The Windows client polls it from `InputSource.poll`; the macOS and Linux client backends call theirs the same way once they land.)
 
 **Gate:** every host/client pair in the target table streams with the Phase 2 latency bar.
@@ -456,7 +457,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 ### Phase 7: Linux host and hardening (about 5 weeks)
 
-- Linux host: PipeWire capture, VAAPI/NVENC, uinput.
+- Linux host: PipeWire capture, VAAPI/NVENC, uinput. Capture and audio built in [platform/host/linux](../platform/host/linux/README.md): the ScreenCast portal with restore tokens (approve once, then unattended), a PipeWire stream with dma-buf or memfd buffers and cursor metadata, and the default sink's monitor for audio. Tested headless against Weston's PipeWire output behind the real portal frontend; dma-buf is untested without a GPU.
 - Fuzzing of every parser; external security review of pairing and the shim boundary.
 - Packaging, code signing, driver signing, notices; public C ABI frozen as 1.0.
 
