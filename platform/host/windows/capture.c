@@ -153,3 +153,115 @@ msw_hr msw_dup_pointer_shape(msw_dup *p, void *buf, uint32_t len, uint32_t *need
     memcpy(buf, p->shape, p->shape_len);
     return S_OK;
 }
+
+/* ---- Display list ---------------------------------------------------------- */
+
+/* The monitor's friendly name and the mode's exact refresh rate, from the display
+ * configuration path whose source is GDI device `gdi`. */
+static void display_config(const WCHAR *gdi, msw_display_info *out) {
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || np == 0) return;
+    DISPLAYCONFIG_PATH_INFO *paths = (DISPLAYCONFIG_PATH_INFO *)calloc(np, sizeof *paths);
+    DISPLAYCONFIG_MODE_INFO *modes = (DISPLAYCONFIG_MODE_INFO *)calloc(nm ? nm : 1, sizeof *modes);
+    if (!paths || !modes || QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) != ERROR_SUCCESS)
+        goto done;
+    for (UINT32 i = 0; i < np; i++) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME src;
+        memset(&src, 0, sizeof src);
+        src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        src.header.size = sizeof src;
+        src.header.adapterId = paths[i].sourceInfo.adapterId;
+        src.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS || wcscmp(src.viewGdiDeviceName, gdi) != 0) continue;
+        const DISPLAYCONFIG_RATIONAL r = paths[i].targetInfo.refreshRate;
+        if (r.Denominator != 0 && r.Numerator != 0)
+            out->refresh_mhz = (uint32_t)(((uint64_t)r.Numerator * 1000 + r.Denominator / 2) / r.Denominator);
+        DISPLAYCONFIG_TARGET_DEVICE_NAME tgt;
+        memset(&tgt, 0, sizeof tgt);
+        tgt.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        tgt.header.size = sizeof tgt;
+        tgt.header.adapterId = paths[i].targetInfo.adapterId;
+        tgt.header.id = paths[i].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&tgt.header) == ERROR_SUCCESS) {
+            msw_utf8(tgt.monitorFriendlyDeviceName, out->name, sizeof out->name);
+            const DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY t = tgt.outputTechnology;
+            if (!out->name[0] && (t == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL ||
+                                  t == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED ||
+                                  t == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED))
+                strcpy(out->name, "Built-in Display");
+        }
+        break; /* a cloned source has several paths; the first names it */
+    }
+done:
+    free(paths);
+    free(modes);
+}
+
+static void display_fill(uint32_t index, const DXGI_OUTPUT_DESC *od, msw_display_info *out) {
+    memset(out, 0, sizeof *out);
+    out->index = index;
+    out->x = od->DesktopCoordinates.left;
+    out->y = od->DesktopCoordinates.top;
+    out->width = (uint32_t)(od->DesktopCoordinates.right - od->DesktopCoordinates.left);
+    out->height = (uint32_t)(od->DesktopCoordinates.bottom - od->DesktopCoordinates.top);
+    /* The mode's own size in pixels (the desktop rectangle is scaled for a process that
+     * is not DPI aware), and its rate in whole hertz until the display config gives the
+     * exact one. */
+    DEVMODEW dm;
+    memset(&dm, 0, sizeof dm);
+    dm.dmSize = sizeof dm;
+    if (EnumDisplaySettingsW(od->DeviceName, ENUM_CURRENT_SETTINGS, &dm)) {
+        if (dm.dmPelsWidth && dm.dmPelsHeight) {
+            out->width = dm.dmPelsWidth;
+            out->height = dm.dmPelsHeight;
+        }
+        if (dm.dmDisplayFrequency > 1) out->refresh_mhz = dm.dmDisplayFrequency * 1000;
+    }
+    MONITORINFO mi;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    if (od->Monitor && GetMonitorInfoW(od->Monitor, &mi)) out->primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    else out->primary = out->x == 0 && out->y == 0;
+    display_config(od->DeviceName, out);
+    if (!out->name[0]) {
+        const WCHAR *n = od->DeviceName;
+        if (wcsncmp(n, L"\\\\.\\", 4) == 0) n += 4;
+        msw_utf8(n, out->name, sizeof out->name);
+    }
+}
+
+msw_hr msw_displays(msw_d3d *d, uint32_t adapter_index, msw_display_info *out, uint32_t cap, uint32_t *count) {
+    *count = 0;
+    HRESULT hr = S_OK;
+    IDXGIFactory1 *f = NULL;
+    IDXGIAdapter1 *a = NULL;
+    if (d && d->adapter) {
+        a = d->adapter;
+        IDXGIAdapter1_AddRef(a);
+    } else {
+        MSW_TRY(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f), done);
+        MSW_TRY(IDXGIFactory1_EnumAdapters1(f, adapter_index, &a), done);
+    }
+    uint32_t n = 0;
+    for (UINT i = 0;; i++) {
+        IDXGIOutput *o = NULL;
+        hr = IDXGIAdapter1_EnumOutputs(a, i, &o);
+        if (hr == DXGI_ERROR_NOT_FOUND) {
+            hr = S_OK;
+            break;
+        }
+        if (FAILED(hr)) goto done;
+        DXGI_OUTPUT_DESC od;
+        hr = IDXGIOutput_GetDesc(o, &od);
+        MSW_RELEASE(o);
+        if (FAILED(hr)) goto done;
+        if (!od.AttachedToDesktop) continue;
+        if (n < cap) display_fill(i, &od, &out[n]);
+        n++;
+    }
+    *count = n;
+done:
+    MSW_RELEASE(a);
+    MSW_RELEASE(f);
+    return hr;
+}

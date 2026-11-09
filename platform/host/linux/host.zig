@@ -83,7 +83,8 @@ pub const Options = struct {
     /// encoder that maps linear buffers, `&.{c.MLH_MOD_LINEAR}`.
     modifiers: []const u64 = &.{},
     /// Let the user pick several monitors in the portal dialog (one stream each);
-    /// `CaptureConfig.display` then indexes them. Off: one monitor.
+    /// `CaptureConfig.display` then indexes them and `displays` lists them. Off: one
+    /// monitor.
     multiple: bool = false,
     /// How long `start` waits for the user to answer the portal's dialog.
     dialog_timeout_ms: u32 = 5 * 60 * 1000,
@@ -102,6 +103,13 @@ pub const Capture = struct {
     out: ?c.mlh_frame = null,
     /// Polls the portal's bus for a closed session about every second.
     next_poll_us: api.Micros = 0,
+    /// The cursor setting the portal session was opened with (a new one needs a new session).
+    portal_cursor: bool = false,
+    /// Each stream's size in pixels once it has been captured (the portal gives logical
+    /// sizes, which differ under scaling), for `displays`. Cleared with the session.
+    pixels: [max_streams]api.Size = @splat(.{ .width = 0, .height = 0 }),
+
+    pub const max_streams = 16;
 
     pub fn init(opts: Options) Capture {
         return .{ .opts = opts };
@@ -111,9 +119,48 @@ pub const Capture = struct {
         self.stop();
     }
 
+    /// Starts capturing stream `cfg.display` of the portal session. A session that is
+    /// still open is kept (another of the monitors the user picked, or a new size or
+    /// rate, needs no dialog); `stop` ends it, and the next start opens a new one.
     pub fn start(self: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
-        self.stop();
+        self.stopStream();
         errdefer self.stop();
+        if (self.portal) |p| {
+            if (self.portal_cursor != cfg.cursor or c.mlh_portal_poll(p) < 0) self.closePortal();
+        }
+        if (self.portal == null) try self.openPortal(cfg);
+        const p = self.portal.?;
+        const n = c.mlh_portal_stream_count(p);
+        // One stream per chosen monitor; `display` indexes them (`displays`), and
+        // anything past the end is the first.
+        const idx: u32 = if (cfg.display < n) cfg.display else 0;
+        if (idx != cfg.display) log.warn("no portal stream {d} (the user picked {d}); capturing the first", .{ cfg.display, n });
+        _ = c.mlh_portal_stream(p, idx, &self.stream);
+        var fd: c_int = -1;
+        try check("OpenPipeWireRemote", c.mlh_portal_pipewire_fd(p, &fd));
+        const cc: c.mlh_capture_config = .{
+            .fd = fd,
+            .node_id = self.stream.node_id,
+            .fps = cfg.fps,
+            .modifiers = if (self.opts.modifiers.len > 0) self.opts.modifiers.ptr else null,
+            .n_modifiers = @intCast(self.opts.modifiers.len),
+            .cursor_meta = @intFromBool(c.mlh_portal_cursor_mode(p) == c.MLH_CURSOR_METADATA),
+            .timeout_ms = self.opts.format_timeout_ms,
+        };
+        var h: ?*c.mlh_capture = null;
+        try check("PipeWire capture", c.mlh_capture_start(&cc, &h));
+        self.cap = h;
+        var w: u32 = 0;
+        var ht: u32 = 0;
+        c.mlh_capture_size(h, &w, &ht);
+        self.cfg = cfg;
+        self.size = .{ .width = w, .height = ht };
+        if (idx < max_streams) self.pixels[idx] = self.size;
+        self.next_poll_us = nowUs() + std.time.us_per_s;
+        return self.size;
+    }
+
+    fn openPortal(self: *Capture, cfg: api.CaptureConfig) api.Error!void {
         var token_buf: [512]u8 = undefined;
         var token: ?[*:0]const u8 = null;
         if (self.opts.token_path) |p| {
@@ -136,32 +183,8 @@ pub const Capture = struct {
                 log.info("the portal gave no restore token (ScreenCast v{d}); the next start will ask again", .{c.mlh_portal_version(p)});
             }
         }
-        const n = c.mlh_portal_stream_count(p);
-        // One stream per chosen monitor; until Capture.displays (#37) maps ids, `display`
-        // is an index and anything past the end is the first.
-        const idx: u32 = if (cfg.display < n) cfg.display else 0;
-        _ = c.mlh_portal_stream(p, idx, &self.stream);
-        var fd: c_int = -1;
-        try check("OpenPipeWireRemote", c.mlh_portal_pipewire_fd(p, &fd));
-        const cc: c.mlh_capture_config = .{
-            .fd = fd,
-            .node_id = self.stream.node_id,
-            .fps = cfg.fps,
-            .modifiers = if (self.opts.modifiers.len > 0) self.opts.modifiers.ptr else null,
-            .n_modifiers = @intCast(self.opts.modifiers.len),
-            .cursor_meta = @intFromBool(c.mlh_portal_cursor_mode(p) == c.MLH_CURSOR_METADATA),
-            .timeout_ms = self.opts.format_timeout_ms,
-        };
-        var h: ?*c.mlh_capture = null;
-        try check("PipeWire capture", c.mlh_capture_start(&cc, &h));
-        self.cap = h;
-        var w: u32 = 0;
-        var ht: u32 = 0;
-        c.mlh_capture_size(h, &w, &ht);
-        self.cfg = cfg;
-        self.size = .{ .width = w, .height = ht };
-        self.next_poll_us = nowUs() + std.time.us_per_s;
-        return self.size;
+        self.portal_cursor = cfg.cursor;
+        self.pixels = @splat(.{ .width = 0, .height = 0 });
     }
 
     fn toFrame(self: *Capture, f: *const c.mlh_frame, start_us: api.Micros) api.CapturedFrame {
@@ -243,12 +266,43 @@ pub const Capture = struct {
         self.out = null;
     }
 
+    /// Stops the stream and ends the portal session.
     pub fn stop(self: *Capture) void {
+        self.stopStream();
+        self.closePortal();
+    }
+
+    fn stopStream(self: *Capture) void {
         self.release(undefined);
         if (self.cap) |h| c.mlh_capture_destroy(h);
         self.cap = null;
+    }
+
+    fn closePortal(self: *Capture) void {
         if (self.portal) |p| c.mlh_portal_close(p);
         self.portal = null;
+    }
+
+    /// The monitors the user shared through the portal (one stream each; `multiple`
+    /// lets them pick several), as displays whose ids are stream indexes. Wayland gives
+    /// an app no other view of the outputs, so there is no list before the first `start`
+    /// (`error.Unsupported`). Sizes are in pixels for streams captured so far and in the
+    /// compositor's logical units for the rest; positions are logical.
+    pub fn displays(self: *Capture, out: []api.DisplayInfo) api.Error!usize {
+        const p = self.portal orelse return error.Unsupported;
+        var k: usize = 0;
+        const n = c.mlh_portal_stream_count(p);
+        var i: u32 = 0;
+        while (i < n and k < out.len) : (i += 1) {
+            var si: c.mlh_stream_info = undefined;
+            if (c.mlh_portal_stream(p, i, &si) < 0) continue;
+            const px: api.Size = if (i < max_streams) self.pixels[i] else .{ .width = 0, .height = 0 };
+            if (streamDisplay(i, &si, px)) |d| {
+                out[k] = d;
+                k += 1;
+            }
+        }
+        return k;
     }
 
     pub fn stats(self: *Capture) c.mlh_capture_stats {
@@ -274,6 +328,30 @@ pub const Capture = struct {
         return api.bind(api.Capture, Capture, self);
     }
 };
+
+/// Portal stream `index` as a display: `pixels` when known (it has been captured), else
+/// the portal's logical size; null when neither is there. The first stream is primary.
+pub fn streamDisplay(index: u32, si: *const c.mlh_stream_info, pixels: api.Size) ?api.DisplayInfo {
+    const known = pixels.width > 0 and pixels.height > 0;
+    if (!known and (si.width <= 0 or si.height <= 0)) return null;
+    var d: api.DisplayInfo = .{
+        .id = index,
+        .width = if (known) pixels.width else @intCast(si.width),
+        .height = if (known) pixels.height else @intCast(si.height),
+        // "-1" when the portal gave no position.
+        .x = @max(si.x, 0),
+        .y = @max(si.y, 0),
+        .primary = index == 0,
+    };
+    var buf: [api.DisplayInfo.name_max]u8 = undefined;
+    const kind = switch (si.source_type) {
+        2 => "Window",
+        4 => "Virtual display",
+        else => "Monitor",
+    };
+    d.setName(std.fmt.bufPrint(&buf, "{s} {d}", .{ kind, index + 1 }) catch kind);
+    return d;
+}
 
 // ---------------------------------------------------------------------------
 // Audio

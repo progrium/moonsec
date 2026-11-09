@@ -14,6 +14,17 @@ returns a `platform.HostBackend` (see [../../api.zig](../../api.zig)).
 C code follows [../../windows/README.md](../../windows/README.md): COM in C against Zig's
 bundled mingw-w64 headers, and Zig sees only [host_win.h](host_win.h).
 
+## Displays
+
+`Capture.displays` (and `listDisplays`, which needs no device) lists the outputs of the
+device's adapter that are attached to the desktop. Ids are output indexes, what
+`CaptureConfig.display` and `msw_dup_create` take, so index 0 is not always the primary
+(`primary` says which is). Sizes and refresh rates are the current mode's
+(`EnumDisplaySettingsW`, then the display configuration's exact rate), positions are on
+the virtual desktop, and names are the monitor's EDID name from `DisplayConfigGetDeviceInfo`
+("Built-in Display" for a laptop panel). Outputs on another adapter, such as the other GPU
+of a hybrid laptop, are not listed: this device cannot duplicate them.
+
 ## Encoders
 
 - **NVENC** (`.nvenc`): P1 preset with ultra-low-latency tuning, CBR with a one-frame VBV,

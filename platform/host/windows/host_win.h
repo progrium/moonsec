@@ -38,6 +38,25 @@ void msw_dup_destroy(msw_dup *dup);
 void msw_dup_size(const msw_dup *dup, uint32_t *w, uint32_t *h);
 /* The output's rectangle in virtual-desktop pixels. */
 void msw_dup_desktop_rect(const msw_dup *dup, int32_t *left, int32_t *top, int32_t *width, int32_t *height);
+/* One output of an adapter, for the host's display list. */
+typedef struct msw_display_info {
+    /* The output's index on its adapter: msw_dup_create's output_index. */
+    uint32_t index;
+    /* The current mode in pixels and its refresh rate in millihertz (0 = unknown). */
+    uint32_t width, height;
+    uint32_t refresh_mhz;
+    /* Top-left corner on the virtual desktop. */
+    int32_t x, y;
+    uint32_t primary;
+    /* The monitor's name (EDID), UTF-8; "Built-in Display" for a laptop panel, the GDI
+     * device name ("DISPLAY2") when Windows has none. */
+    char name[64];
+} msw_display_info;
+
+/* The outputs of the device's adapter that are attached to the desktop, in output index
+ * order; with `d` NULL, those of adapter `adapter_index` (no device is created). Fills up
+ * to `cap` entries; *count is how many there are. A WARP device has none. */
+msw_hr msw_displays(msw_d3d *d, uint32_t adapter_index, msw_display_info *out, uint32_t cap, uint32_t *count);
 /* Waits up to timeout_ms for a desktop update. MSW_DXGI_ERROR_WAIT_TIMEOUT when nothing
  * changed. On S_OK `out` is filled; out->present_ns == 0 means only the pointer changed
  * and out->texture holds the previous image. MSW_DXGI_ERROR_ACCESS_LOST (mode change,

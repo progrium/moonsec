@@ -25,6 +25,8 @@ const nowUs = () => performance.now() * 1000;
 const maxInDecoder = 2;
 /** How far audio rendering may run ahead of the worker's clock. */
 const audioLeadUs = 40_000;
+/** How often the page gets a stats message while the session runs. */
+const reportEveryUs = 250_000;
 
 class Media {
   core: CoreSession;
@@ -41,6 +43,8 @@ class Media {
   stepScheduled = false;
   ended = false;
   streamingSince = 0;
+  /** When the last stats message went to the page (µs). */
+  reportedAt = 0;
   seconds: number;
   video: VideoReport = { codec: null, hardware: "", configured: 0, submitted: 0, decoded: 0, drawn: 0, failed: 0, errors: [], decodeMs: [], drawMs: [], nonBlank: false };
   audio: AudioReport = { rendered: 0, paced: 0, played: 0, loud: 0, underruns: 0, queued: 0, sampleRate: 0 };
@@ -68,7 +72,11 @@ class Media {
       this.schedule();
     };
     if (this.audioPort) this.audioPort.onmessage = (ev: MessageEvent<NeedMsg>) => this.onNeed(ev.data);
-    setInterval(() => this.report(), 250);
+    // Stats go out from step() while it runs (below), and from this interval while it
+    // doesn't: WebKit starves a worker's interval while the step timer keeps being re-armed
+    // (Playwright's WebKit never fired it during a stream), so the interval alone left the
+    // page without stats until the session ended.
+    setInterval(() => this.reportIfDue(), reportEveryUs / 1000);
     this.step();
   }
 
@@ -86,6 +94,7 @@ class Media {
     if (this.ended) return;
     const now = nowUs();
     this.core.step(now);
+    this.reportIfDue(now);
     const state = this.core.state;
     if (state === State.streaming) {
       if (this.streamingSince === 0) this.streamingSince = now;
@@ -228,7 +237,12 @@ class Media {
 
   // --- reports -------------------------------------------------------------
 
+  reportIfDue(now = nowUs()) {
+    if (!this.ended && now - this.reportedAt >= reportEveryUs) this.report();
+  }
+
   report() {
+    this.reportedAt = nowUs();
     const st = this.core.state;
     const msg: FromWorker = {
       type: "stats",

@@ -142,7 +142,41 @@ pub const Capture = struct {
         self.dup = null;
         self.have_last = false;
     }
+
+    /// The outputs of the device's adapter (`CaptureConfig.display` is the output index).
+    pub fn displays(self: *Capture, out: []api.DisplayInfo) api.Error!usize {
+        return listDisplays(dev(self.d3d), 0, out);
+    }
 };
+
+/// The displays Desktop Duplication can capture: the outputs of the device's adapter
+/// attached to the desktop, or with `d` null, those of adapter `adapter` (no device is
+/// created, for listing before a host opens). Ids are output indexes; an output on
+/// another adapter (the other GPU of a hybrid laptop) is not listed, since this device
+/// cannot duplicate it.
+pub fn listDisplays(d: ?*c.msw_d3d, adapter: u32, out: []api.DisplayInfo) api.Error!usize {
+    var buf: [core.display.DisplayList.max_displays]c.msw_display_info = undefined;
+    var total: u32 = 0;
+    const hr = c.msw_displays(d, adapter, &buf, buf.len, &total);
+    if (!ok(hr)) return hrError("list displays", hr);
+    const n = @min(total, buf.len, out.len);
+    for (buf[0..n], out[0..n]) |*w, *o| o.* = displayInfo(w);
+    return n;
+}
+
+pub fn displayInfo(w: *const c.msw_display_info) api.DisplayInfo {
+    var d: api.DisplayInfo = .{
+        .id = w.index,
+        .width = w.width,
+        .height = w.height,
+        .refresh_mhz = w.refresh_mhz,
+        .x = w.x,
+        .y = w.y,
+        .primary = w.primary != 0,
+    };
+    d.setName(std.mem.sliceTo(&w.name, 0));
+    return d;
+}
 
 // ---------------------------------------------------------------------------
 // Encoder
