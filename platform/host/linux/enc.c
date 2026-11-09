@@ -7,31 +7,12 @@
 
 #include "enc_internal.h"
 
-static _Thread_local char last_error[512];
-
-const char *mlh_last_error(void) { return last_error; }
-
-int mlh_fail(int code, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(last_error, sizeof last_error, fmt, ap);
-    va_end(ap);
-    fprintf(stderr, "host-linux: %s\n", last_error);
-    return code;
-}
-
-void mlh_log(const char *fmt, ...) {
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    fprintf(stderr, "host-linux: %s\n", buf);
-}
+/* mlh_last_error, mlh_fail and mlh_log: enc_errors.c, or mlh_common.c when the encoders
+ * are linked into the host backend with the capture side. */
 
 int mlh_enc_create(uint32_t kind, const char *device, mlh_enc **out) {
     *out = NULL;
-    last_error[0] = 0;
+    mlh_clear_error();
     switch (kind) {
     case MLH_ENC_VAAPI: return mlh_enc_vaapi_create(device, out);
     case MLH_ENC_SOFTWARE: return mlh_enc_sw_create(out);

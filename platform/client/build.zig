@@ -12,6 +12,9 @@ pub const Modules = struct {
     platform: *std.Build.Module,
     /// platform/linux/uinput.zig: event codes, key table, uinput devices (Linux only).
     linux_uinput: ?*std.Build.Module = null,
+    /// platform/windows (msw.c): pass the one the host backend links too, so it is
+    /// compiled once.
+    win: ?*std.Build.Module = null,
 };
 
 fn overlayModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: Modules) *std.Build.Module {
@@ -169,6 +172,14 @@ pub fn windowsClientModule(b: *std.Build, target: std.Build.ResolvedTarget, opti
         .optimize = optimize,
         .imports = &.{.{ .name = "core", .module = core }},
     });
+    return windowsClientModuleWith(b, target, optimize, .{ .core = core, .platform = platform });
+}
+
+/// `windowsClientModule` on the caller's core and platform modules (an app's, so the
+/// bundle's types are the app's).
+pub fn windowsClientModuleWith(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, mods: Modules) *std.Build.Module {
+    const core = mods.core;
+    const platform = mods.platform;
     const tc = b.addTranslateC(.{ .root_source_file = b.path("platform/client/windows/mswc.h"), .target = target, .optimize = optimize });
     tc.addIncludePath(b.path("platform/windows"));
     const m = b.createModule(.{
@@ -178,7 +189,7 @@ pub fn windowsClientModule(b: *std.Build, target: std.Build.ResolvedTarget, opti
         .imports = &.{
             .{ .name = "platform", .module = platform },
             .{ .name = "core", .module = core },
-            .{ .name = "win", .module = root.windowsModule(b, target, optimize) },
+            .{ .name = "win", .module = mods.win orelse root.windowsModule(b, target, optimize) },
             .{ .name = "client_overlay", .module = overlayModule(b, target, optimize, .{ .core = core, .platform = platform }) },
             .{ .name = "client_gamepad", .module = gamepadModule(b, target, optimize, .{ .core = core, .platform = platform }) },
             .{ .name = "mswc_c", .module = tc.createModule() },
@@ -241,6 +252,13 @@ pub fn macosClientModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
         .optimize = optimize,
         .imports = &.{.{ .name = "core", .module = core }},
     });
+    return macosClientModuleWith(b, target, optimize, native, .{ .core = core, .platform = platform });
+}
+
+/// `macosClientModule` on the caller's core and platform modules.
+pub fn macosClientModuleWith(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, native: bool, mods: Modules) *std.Build.Module {
+    const core = mods.core;
+    const platform = mods.platform;
     const tc = b.addTranslateC(.{ .root_source_file = b.path("platform/client/macos/macc.h"), .target = target, .optimize = optimize });
     const m = b.createModule(.{
         .root_source_file = b.path("platform/client/macos/backend.zig"),

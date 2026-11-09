@@ -15,6 +15,10 @@ const char *mlh_last_error(void) {
     return last_error;
 }
 
+void mlh_clear_error(void) {
+    last_error[0] = 0;
+}
+
 int mlh_fail(int code, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

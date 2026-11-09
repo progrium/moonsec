@@ -134,7 +134,19 @@ sessions). Releasing a session drops its queued events.
 
 - **Backend**: `MOONSEC_BACKEND_SYNTHETIC` (test pattern, passthrough codec; what tests
   and examples use) or `MOONSEC_BACKEND_SYSTEM` (the OS's capture, encoder, decoder and
-  presenter; `MOONSEC_FEATURE_SYSTEM_BACKEND`).
+  presenter; `MOONSEC_FEATURE_SYSTEM_BACKEND`). System sessions run in real time, so
+  they need iroh: the loopback refuses them with `MOONSEC_ERR_UNSUPPORTED`. What each OS
+  opens is in [app/system.zig](../app/system.zig):
+
+  | OS | Host | Client |
+  | --- | --- | --- |
+  | Linux | ScreenCast portal + PipeWire capture, VAAPI then libx264 (NVENC when the Linux NVENC backend joins the picker), PipeWire audio, uinput | libavcodec (VAAPI, software), a Wayland + EGL window, PipeWire, evdev |
+  | Windows | Desktop Duplication, NVENC then Media Foundation, WASAPI loopback, SendInput | Media Foundation / D3D11VA, a flip-model swapchain, WASAPI, Raw Input and XInput |
+  | macOS | ScreenCaptureKit, VideoToolbox, CGEvent | VideoToolbox, a Metal window (made on the main thread, which must run its run loop), CoreAudio, GameController |
+
+  A Linux host with a state directory keeps the portal's restore token there
+  (`screencast.token`), so the user approves screen sharing once. Audio is left out when
+  the OS has no audio service rather than failing the session.
 - **Identity and key store**: `state_dir` holds the device key (`identity.key`, 0600)
   and the paired-device lists, as `moonsec --state-dir` does
   ([pairing-v0.md](pairing-v0.md), "Key storage"). NULL is the per-user default
@@ -227,6 +239,12 @@ wired through the ABI:
   libraries (see `linkShim` in [build.zig](../build.zig)).
 - `zig build abi-sim` builds `libmoonsec-sim` without iroh (loopback only), which needs no
   Rust; the ABI tests link it.
+- `-Dabi-system=true|false` puts the OS backends into both libraries. On by default for
+  Windows targets and on macOS hosts; on Linux it needs the libraries listed in
+  [platform/client/build.zig](../platform/client/build.zig) and
+  [platform/host/linux/build.zig](../platform/host/linux/build.zig), so it is off by
+  default there. A library built with them links the OS's media libraries (Linux:
+  libavcodec, libva, Wayland, EGL, GLES, PipeWire, D-Bus).
 - On Windows, define `MOONSEC_SHARED` before including the header when linking the DLL.
 
 ## Implemented in this draft
@@ -235,7 +253,7 @@ wired through the ABI:
 | --- | --- |
 | Version, features, errors, strings, struct_size | done |
 | Host and client on the synthetic backend | done |
-| System backends (`MOONSEC_BACKEND_SYSTEM`) | `UNSUPPORTED`: the Windows, macOS and Linux backends need one opener per OS in the library build |
+| System backends (`MOONSEC_BACKEND_SYSTEM`) | done: built in with `-Dabi-system` (default on for Windows and macOS). Linux runs end to end in `zig build test-abi-system` under a headless Weston (portal capture, libx264, software decode, EGL window); Windows cross-compiles; macOS is untested here (no SDK) |
 | Loopback transport | done |
 | iroh: listen, ticket, connect, admission, `REQUIRE_PAIRED` | done |
 | Pairing (QR and PIN), key store in `state_dir` | done |

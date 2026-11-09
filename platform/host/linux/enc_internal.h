@@ -5,6 +5,7 @@
 #include "mlh_enc.h"
 
 /* Records (and prints to stderr) the last error on this thread; returns `code`. */
+void mlh_clear_error(void);
 int mlh_fail(int code, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void mlh_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
