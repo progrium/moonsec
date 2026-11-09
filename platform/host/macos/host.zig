@@ -90,6 +90,9 @@ pub const Capture = struct {
     last: ?api.CapturedFrame = null,
     /// Restarts after the stream stopped under us.
     restarts: u32 = 0,
+    /// The bundle's injector, pointed at each display capture starts on so absolute
+    /// moves land on the streamed display.
+    input: ?*c.mh_input = null,
 
     pub fn create(format: api.PixelFormat) api.Error!Capture {
         _ = try fmtToC(format);
@@ -123,7 +126,13 @@ pub const Capture = struct {
         self.cfg = cfg;
         self.started = true;
         self.size = .{ .width = w, .height = h };
+        if (self.input) |in| c.mh_input_set_display(in, cfg.display);
         return self.size;
+    }
+
+    /// The active displays (`CaptureConfig.display` is the index in this list, 0 = main).
+    pub fn displays(_: *Capture, out: []api.DisplayInfo) api.Error!usize {
+        return listDisplays(out);
     }
 
     pub fn acquire(self: *Capture, timeout_us: api.Micros) api.Error!?api.CapturedFrame {
@@ -192,6 +201,31 @@ pub const Capture = struct {
         return s;
     }
 };
+
+/// The displays ScreenCaptureKit can capture, main display first. Ids are indexes in
+/// CGGetActiveDisplayList order (what `CaptureConfig.display` takes); positions are in
+/// points on the global display space. Needs no permission and no open bundle.
+pub fn listDisplays(out: []api.DisplayInfo) api.Error!usize {
+    var buf: [core.display.DisplayList.max_displays]c.mh_display_info = undefined;
+    const total = c.mh_displays(&buf, buf.len);
+    const n = @min(total, buf.len, out.len);
+    for (buf[0..n], out[0..n]) |*m, *o| o.* = displayInfo(m);
+    return n;
+}
+
+pub fn displayInfo(m: *const c.mh_display_info) api.DisplayInfo {
+    var d: api.DisplayInfo = .{
+        .id = m.index,
+        .width = m.width,
+        .height = m.height,
+        .refresh_mhz = m.refresh_mhz,
+        .x = m.x,
+        .y = m.y,
+        .primary = m.primary != 0,
+    };
+    d.setName(std.mem.sliceTo(&m.name, 0));
+    return d;
+}
 
 // ---------------------------------------------------------------------------
 // Encoder
@@ -422,7 +456,8 @@ pub const Injector = struct {
 // Bundle
 
 pub const Options = struct {
-    /// Display for audio and absolute pointer moves; capture takes CaptureConfig.display.
+    /// Display for audio, and for absolute pointer moves until capture starts (they then
+    /// follow the captured display); capture takes CaptureConfig.display.
     display: u32 = 0,
     /// What capture delivers. NV12 is VideoToolbox's native input (no conversion).
     pixel_format: api.PixelFormat = .nv12,
@@ -484,6 +519,7 @@ pub fn openHost(allocator: std.mem.Allocator, opts: Options) api.Error!api.HostB
     self.* = .{ .allocator = allocator, .capture = capture, .encoder = encoder };
     if (opts.audio) self.audio = Audio.create(opts.display) catch null;
     if (opts.input) self.injector = Injector.create(opts.display) catch null;
+    if (self.injector) |*i| self.capture.input = i.in;
     if (opts.input and !postEventAllowed()) log.warn("no Accessibility permission: injected input will be dropped", .{});
     return .{
         .clock = clock,

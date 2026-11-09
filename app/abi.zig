@@ -516,7 +516,7 @@ export fn moonsec_host_displays(h: ?*c.moonsec_host, out: ?[*]c.moonsec_display_
     if (cap > 0 and out == null) return invalid("out is NULL");
     var list: [core.display.DisplayList.max_displays]api.DisplayInfo = undefined;
     const n = hostDisplays(e, &list) catch |err| return switch (err) {
-        error.Unsupported => fail(c.MOONSEC_ERR_UNSUPPORTED, "this host's capture backend does not list displays", .{}),
+        error.Unsupported => fail(c.MOONSEC_ERR_UNSUPPORTED, "no display list until a session streams (this build has no system backend, or on Linux the portal has not picked the monitors yet)", .{}),
         error.OutOfMemory => fail(c.MOONSEC_ERR_NO_MEMORY, "out of memory", .{}),
         else => fail(c.MOONSEC_ERR_BACKEND, "listing displays failed", .{}),
     };
@@ -535,9 +535,9 @@ export fn moonsec_host_displays(h: ?*c.moonsec_host, out: ?[*]c.moonsec_display_
 }
 
 /// The host's displays: the list a streaming session last got from its capture (it
-/// polls about once a second), or with none streaming, a fresh synthetic backend's.
-/// The OS capture backends do not list displays yet, and opening one only to ask would
-/// open its encoder and input device: `Unsupported` until a session streams.
+/// polls about once a second), or with none streaming, the OS's list (system backend;
+/// Windows and macOS list without opening a bundle, Linux only once a session's portal
+/// dialog has picked the monitors) or a fresh synthetic backend's.
 fn hostDisplays(e: *Endpoint, out: []api.DisplayInfo) !usize {
     {
         e.lock();
@@ -551,7 +551,10 @@ fn hostDisplays(e: *Endpoint, out: []api.DisplayInfo) !usize {
             else => {},
         };
     }
-    if (e.hc.backend == c.MOONSEC_BACKEND_SYSTEM) return error.Unsupported;
+    if (e.hc.backend == c.MOONSEC_BACKEND_SYSTEM) return system.hostDisplays(out) catch |err| switch (err) {
+        error.Backend => error.BackendFailed,
+        else => |x| x,
+    };
     const sh = try synthetic.openHost(gpa, .{
         .clock = api.clockFn(wallNow),
         .width = if (e.hc.width != 0) e.hc.width else 640,

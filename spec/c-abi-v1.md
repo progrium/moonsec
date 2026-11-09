@@ -267,8 +267,13 @@ client starts it again. Loopback sessions are always one client.
 - While a session streams, the list is the one its capture last reported (polled about
   once a second, so a plugged-in display shows up).
 - With none streaming, the synthetic backend lists its display at the configured size.
-  The OS capture backends do not list displays yet (`UNSUPPORTED`): opening one only to
-  ask would open its encoder and input device.
+  The system backend lists the OS's displays without opening capture, the encoder or
+  input: on Windows the outputs of the first adapter (DXGI), on macOS the active
+  displays (main first). Linux returns `UNSUPPORTED` until a session streams, because
+  Wayland shows the monitors only through the ScreenCast portal's dialog; the list is
+  then the monitors the user shared there.
+- Ids are indexes into the backend's list (0 is the first listed, which on Windows is
+  not always the primary; `primary` says which is).
 - `MOONSEC_FEATURE_DISPLAYS` is set in every build.
 
 Not exposed yet (open questions on naming and events): the client's view of the host's

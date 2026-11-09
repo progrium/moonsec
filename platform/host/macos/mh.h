@@ -49,6 +49,20 @@ uint32_t mh_display_id(uint32_t index);
 int mh_display_bounds(uint32_t index, double *x, double *y, double *w, double *h);
 int mh_display_pixels(uint32_t index, uint32_t *w, uint32_t *h);
 
+/* One active display, for the host's display list. */
+typedef struct {
+    uint32_t index;       /* as mh_display_id: what mh_capture_config.display takes */
+    uint32_t id;          /* its CGDirectDisplayID */
+    uint32_t width, height; /* the mode's size in pixels */
+    uint32_t refresh_mhz; /* 0 = unknown */
+    int32_t x, y;         /* top-left in global display coordinates (points) */
+    uint32_t primary;     /* the main display */
+    char name[64];        /* NSScreen's localized name, UTF-8 */
+} mh_display_info;
+/* The active displays in mh_display_id order. Fills up to `cap` entries and returns how
+ * many there are. Needs no Screen Recording permission. */
+uint32_t mh_displays(mh_display_info *out, uint32_t cap);
+
 /* CVPixelBuffer helpers (tests and the encoder's own scaling). Formats: */
 enum { MH_FMT_BGRA = 1, MH_FMT_NV12 = 2 };
 /* An IOSurface-backed CVPixelBuffer; release with mh_cf_release. */

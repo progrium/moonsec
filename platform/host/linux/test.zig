@@ -581,3 +581,74 @@ test "input: open without uinput the host streams without input, or fails when i
     be.deinit();
     try std.testing.expectError(error.NoInput, host.backend.open(std.testing.allocator, .{ .opener = opener, .require_input = true }));
 }
+
+test "displays: portal streams, in pixels once captured" {
+    var si = std.mem.zeroes(c.mlh_stream_info);
+    si.source_type = 1;
+    si.x = 1280;
+    si.y = 0;
+    si.width = 1280;
+    si.height = 720;
+    // Not captured yet: the portal's logical size.
+    const a = host.streamDisplay(1, &si, .{ .width = 0, .height = 0 }).?;
+    try testing.expectEqual(@as(u32, 1), a.id);
+    try testing.expectEqual(@as(u32, 1280), a.width);
+    try testing.expectEqual(@as(i32, 1280), a.x);
+    try testing.expect(!a.primary);
+    try testing.expectEqualStrings("Monitor 2", a.name());
+    // Captured at 1.5x scale: its pixels.
+    const b = host.streamDisplay(0, &si, .{ .width = 1920, .height = 1080 }).?;
+    try testing.expectEqual(@as(u32, 1920), b.width);
+    try testing.expectEqual(@as(u32, 1080), b.height);
+    try testing.expect(b.primary);
+    // No size from the portal and never captured: not listed. No position: 0,0.
+    si.width = 0;
+    si.x = -1;
+    si.y = -1;
+    try testing.expect(host.streamDisplay(2, &si, .{ .width = 0, .height = 0 }) == null);
+    const d = host.streamDisplay(2, &si, .{ .width = 800, .height = 600 }).?;
+    try testing.expectEqual(@as(i32, 0), d.x);
+    si.source_type = 4;
+    try testing.expectEqualStrings("Virtual display 3", host.streamDisplay(2, &si, .{ .width = 800, .height = 600 }).?.name());
+}
+
+test "displays: none before the portal session opens" {
+    var cap = host.Capture.init(.{});
+    defer cap.deinit();
+    var out: [4]api.DisplayInfo = undefined;
+    try testing.expectError(error.Unsupported, cap.iface().displays(&out));
+}
+
+test "displays: the shared monitors, and switching between them keeps the portal session" {
+    if (!haveDisplay()) return skip("portal", "no Wayland display");
+    var cap = host.Capture.init(.{ .multiple = true });
+    defer cap.deinit();
+    const size = try startCapture(&cap, .{});
+    var out: [4]api.DisplayInfo = undefined;
+    const n = try cap.iface().displays(&out);
+    std.debug.print("displays: {d}; first {s} {d}x{d} at {d},{d}\n", .{ n, out[0].name(), out[0].width, out[0].height, out[0].x, out[0].y });
+    try testing.expect(n >= 1);
+    try testing.expectEqual(@as(u32, 0), out[0].id);
+    try testing.expect(out[0].primary);
+    try testing.expectEqual(size.width, out[0].width);
+    try testing.expectEqual(size.height, out[0].height);
+    if (!usingTestPortal()) return;
+    // A start while the session is open (a display select, a ladder step) asks the
+    // portal nothing; one after `stop` opens a new session.
+    var starts: u32 = 0;
+    var restored: u32 = 0;
+    var cursor: u32 = 0;
+    var persist: u32 = 0;
+    tw.mlh_testportal_counts(&starts, &restored, &cursor, &persist);
+    _ = try cap.start(.{ .display = 0, .fps = 30 });
+    var after: u32 = 0;
+    tw.mlh_testportal_counts(&after, &restored, &cursor, &persist);
+    try testing.expectEqual(starts, after);
+    const f = (try cap.acquire(1_000_000)) orelse (try cap.repeatLast()) orelse return error.NoFrame;
+    cap.release(&f);
+    cap.stop();
+    try testing.expectError(error.Unsupported, cap.iface().displays(&out));
+    _ = try cap.start(.{});
+    tw.mlh_testportal_counts(&after, &restored, &cursor, &persist);
+    try testing.expectEqual(starts + 1, after);
+}
