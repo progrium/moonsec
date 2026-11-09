@@ -139,6 +139,7 @@ The pipeline never buffers: every frame is encoded, sent, decoded and presented 
 - No periodic keyframes; long-term references for recovery. No intra-refresh as a baseline: VideoToolbox has none that works (S8), and the Windows encoders are untested.
 - Per-frame bitrate reconfiguration without forcing a keyframe (VideoToolbox settles within 0–11 frames).
 - Codecs: H.264 and HEVC first, AV1 where the encoder supports it; 4:4:4 and HDR later.
+- Formats (Phase 5, [platform/format.zig](../platform/format.zig)): the client's hello lists, per codec, which of 8/10-bit 4:2:0 and 4:4:4 and HDR10 its decoder and presenter take, and whether its display is in HDR mode; the host picks codec and format from that, its encoder's caps and its preferences (HDR10 when both displays are HDR, then 4:4:4, then 10-bit) and names them with the ST 2086/CTA-861.3 metadata in config. Built and simulated for every combination; the Linux client decodes AV1 (dav1d), HEVC Main 4:4:4 and Main10/HDR10 in software and tone-maps PQ to SDR. NVENC (AV1, 4:4:4, 10-bit, HDR10 SEI/OBUs) is written against #15, compile-checked; VideoToolbox, D3D11VA output and HDR presentation are listed in [platform/README.md](../platform/README.md#formats). Hardware-untested.
 
 **Loss recovery**
 

@@ -49,7 +49,14 @@ const PacketPipe = pipe_mod.PacketPipe;
 const Micros = i64;
 
 pub const Config = struct {
+    /// The codec and format to stream, and the encoder is configured with. With
+    /// `negotiate`, only the start: each hello picks them anew.
     codec: api.Codec = .passthrough,
+    format: api.VideoFormat = .{},
+    /// Pick codec and format per client from the encoder's caps, the hello and the host's
+    /// preferences (platform/format.zig). Null: `codec` and `format` are fixed, and a
+    /// client that cannot decode them is turned away.
+    negotiate: ?Negotiate = null,
     width: u32,
     height: u32,
     fps: u32 = 60,
@@ -89,6 +96,15 @@ pub const Config = struct {
     bye_interval_us: Micros = 20_000,
 };
 
+pub const Negotiate = struct {
+    /// What the encoder offers (`api.effectiveFormats` of its caps).
+    encoder: api.FormatCaps,
+    preference: api.format.Preference,
+};
+
+/// A codec and format for the app to configure the encoder with (`takeFormat`).
+pub const FormatChange = struct { codec: api.Codec, format: api.VideoFormat };
+
 pub const State = enum { waiting, streaming, ended };
 
 pub const End = enum { none, client_bye, peer_timeout, pipe_closed, closed, failed };
@@ -113,6 +129,8 @@ pub const Stats = struct {
     inputs_applied: u64 = 0,
     hellos: u64 = 0,
     sessions: u64 = 0,
+    /// Times a hello changed the codec or format.
+    format_changes: u64 = 0,
     /// The pipe's selected path changed / its connection was replaced.
     path_changes: u64 = 0,
     reconnects: u64 = 0,
@@ -169,6 +187,11 @@ pub const HostSession = struct {
     bitrate_bps: u64,
     pending_bitrate: u64 = 0,
     pending_reconfigure: ?rate.ladder.Rung = null,
+    /// The codec and format being streamed (and named in config), and a change the
+    /// encoder has not been configured with yet.
+    codec: api.Codec,
+    format: api.VideoFormat,
+    pending_format: bool = false,
     rec: *recovery.Host,
     input_rx: core.input.Receiver = .{},
     actions: std.Deque(Pending) = .empty,
@@ -198,6 +221,8 @@ pub const HostSession = struct {
             .ctl = ctl,
             .ladder = ladder,
             .bitrate_bps = cfg.bitrate_bps,
+            .codec = cfg.codec,
+            .format = cfg.format,
             .rec = rec,
             .tele = tele,
             .parity_buf = pb,
@@ -228,6 +253,11 @@ pub const HostSession = struct {
         s.state = .ended;
         s.end = e;
         s.reason = why;
+    }
+
+    /// End the session at once, failed (the app could not go on: the encoder refused).
+    pub fn abort(s: *HostSession, why: []const u8) void {
+        s.finish(.failed, why);
     }
 
     /// Leave: send byes, then end.
@@ -261,7 +291,8 @@ pub const HostSession = struct {
         var b: [wire.Config.len]u8 = undefined;
         (wire.Config{
             .nonce = s.nonce.?,
-            .codec = s.cfg.codec,
+            .codec = s.codec,
+            .format = s.format,
             .slices = s.cfg.slices,
             .fps = @intCast(s.cfg.fps),
             .width = s.cfg.width,
@@ -422,6 +453,15 @@ pub const HostSession = struct {
     }
 
     /// A resolution or frame-rate step the ladder wants, once: the app applies it with
+    /// The codec and format a hello changed to, once: the app reconfigures the encoder
+    /// before the next frame (the next frame is an IDR either way: a new client, or
+    /// `onHello` asked recovery for one).
+    pub fn takeFormat(s: *HostSession) ?FormatChange {
+        if (!s.pending_format) return null;
+        s.pending_format = false;
+        return .{ .codec = s.codec, .format = s.format };
+    }
+
     /// `Encoder.configure` (expect a keyframe). Only with `rate_control`.
     pub fn takeReconfigure(s: *HostSession) ?rate.ladder.Rung {
         defer s.pending_reconfigure = null;
@@ -500,13 +540,32 @@ pub const HostSession = struct {
 
     fn onHello(s: *HostSession, h: wire.Hello, now: Micros) void {
         s.stats.hellos += 1;
-        if (!h.codecs.has(s.cfg.codec)) return s.finish(.failed, "client cannot decode the host's codec");
+        const decodable = h.decodable();
+        var codec = s.codec;
+        var fmt = s.format;
+        if (s.cfg.negotiate) |n| {
+            const c = api.format.negotiate(n.preference, n.encoder, decodable, h.display) orelse
+                return s.finish(.failed, "no codec both the encoder and the client's decoder have");
+            codec = @enumFromInt(c.codec);
+            fmt = c.format;
+        } else if (!decodable.get(@intFromEnum(s.cfg.codec)).supports(s.cfg.format)) {
+            return s.finish(.failed, "client cannot decode the host's codec");
+        }
+        const changed = codec != s.codec or !fmt.eql(s.format);
+        if (changed) {
+            s.codec = codec;
+            s.format = fmt;
+            s.pending_format = true;
+            s.stats.format_changes += 1;
+        }
         if (s.nonce == null or s.nonce.? != h.nonce) {
             // A new session (or a restarted client): start from a keyframe.
             const first = s.nonce == null;
             s.nonce = h.nonce;
             s.stats.sessions += 1;
             if (!first) s.rec.onRecoveryRequest(.{ .first_missing = s.next_frame_id, .want_idr = true });
+        } else if (changed) {
+            s.rec.onRecoveryRequest(.{ .first_missing = s.next_frame_id, .want_idr = true });
         }
         s.state = .streaming;
         s.sendConfig(now);
@@ -645,6 +704,8 @@ pub const HostSession = struct {
         const st = s.stats;
         try w.print("host: {s}{s}{s}\n", .{ @tagName(s.end), if (s.reason.len > 0) ": " else "", s.reason });
         try w.print("  frames {d} (keyframes {d}, refreshes {d}, repeats {d}, encoder drops {d}), {d} MB in {d} shards\n", .{ st.frames, st.keyframes, st.refreshes, st.repeats, st.encode_drops, st.bytes / 1_000_000, st.shards });
+        var fb: [32]u8 = undefined;
+        try w.print("  stream {s} {s}{s}\n", .{ @tagName(s.codec), s.format.name(&fb), if (st.format_changes > 1) " (changed by a hello)" else "" });
         if (s.decision) |d| try w.print("  loss policy: {s}, loss {d:.2}%, FEC overhead {d:.0}%, {d} parity shards, {d} NACKs ignored, {d} mode switches\n", .{ @tagName(d.mode), d.loss * 100, d.overhead * 100, st.parity_shards, st.nacks_ignored, s.policy.switches });
         try w.print("  NACKs {d} -> retransmits {d}; feedback {d}; frame acks {d} (recovery requests {d}); pings {d}; inputs {d}\n", .{ st.nacks, st.retransmits, st.feedback, st.frame_acks, st.recovery_requests, st.pings, st.inputs_applied });
         if (st.path_changes + st.reconnects + st.stall_pauses > 0)
@@ -673,4 +734,122 @@ pub fn printStage(w: *std.Io.Writer, name: []const u8, st: telemetry.StageStats)
 
 fn ms(us: Micros) f64 {
     return @as(f64, @floatFromInt(us)) / 1000.0;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+
+const testing = std.testing;
+
+/// A pipe the test writes the client's datagrams into and reads the host's back from.
+const TestPipe = struct {
+    in: [8][Recv.cap]u8 = undefined,
+    in_len: [8]usize = undefined,
+    n_in: usize = 0,
+    configs: [8]wire.Config = undefined,
+    n_configs: usize = 0,
+
+    const Recv = struct {
+        const cap = 256;
+    };
+
+    fn push(t: *TestPipe, kind: wire.Kind, payload: []const u8) void {
+        const m = wire.message(&t.in[t.n_in], .control_fast, @intFromEnum(kind), 0, payload);
+        t.in_len[t.n_in] = m.len;
+        t.n_in += 1;
+    }
+    fn hello(t: *TestPipe, h: wire.Hello) void {
+        var b: [wire.Hello.len]u8 = undefined;
+        h.encode(&b);
+        t.push(.hello, &b);
+    }
+
+    fn send(p: *anyopaque, d: []const u8) pipe_mod.SendError!void {
+        const t: *TestPipe = @ptrCast(@alignCast(p));
+        var dec = proto.wire.Decoder.init(d);
+        const env = proto.Envelope.decode(&dec) catch return;
+        if (env.stream == .control_fast and env.kind == @intFromEnum(wire.Kind.config)) {
+            t.configs[t.n_configs % 8] = wire.Config.decode(dec.rest()).?;
+            t.n_configs += 1;
+        }
+    }
+    fn recv(p: *anyopaque, b: []u8) pipe_mod.RecvError!?pipe_mod.Received {
+        const t: *TestPipe = @ptrCast(@alignCast(p));
+        if (t.n_in == 0) return null;
+        const n = t.in_len[0];
+        @memcpy(b[0..n], t.in[0][0..n]);
+        for (1..t.n_in) |i| {
+            t.in[i - 1] = t.in[i];
+            t.in_len[i - 1] = t.in_len[i];
+        }
+        t.n_in -= 1;
+        return .{ .len = n, .recv_us = 0 };
+    }
+    fn setRate(_: *anyopaque, _: u64) void {}
+    fn stats(_: *anyopaque) pipe_mod.PathStats {
+        return .{};
+    }
+    fn max(_: *anyopaque) usize {
+        return 1200;
+    }
+    const vt = PacketPipe.VTable{ .send = send, .recv = recv, .setPacingRate = setRate, .stats = stats, .maxDatagramSize = max };
+};
+
+test "each hello negotiates the codec and format; a change waits for the app and forces an IDR" {
+    var tp: TestPipe = .{};
+    const enc = api.effectiveFormats(.{ .h264 = true, .hevc = true, .av1 = true }, .{
+        .h264 = .{ .yuv420_8 = true, .yuv444_8 = true },
+        .hevc = api.Formats.all,
+        .av1 = .{ .yuv420_8 = true, .yuv420_10 = true, .hdr10 = true },
+    });
+    var s = try HostSession.init(testing.allocator, .{
+        .codec = .hevc,
+        .width = 1920,
+        .height = 1080,
+        .negotiate = .{ .encoder = enc, .preference = .{ .codecs = .of(&.{ 2, 1, 3 }), .yuv444 = true, .source_is_hdr = true } },
+    }, .{ .ptr = &tp, .vtable = &TestPipe.vt });
+    defer s.deinit();
+
+    // An HEVC 4:4:4 client with an SDR display: HEVC 4:4:4 8-bit.
+    tp.hello(.{ .nonce = 1, .codecs = .{ .h264 = true, .hevc = true }, .formats = .{ .hevc = .{ .yuv420_8 = true, .yuv444_8 = true } } });
+    s.step(1000);
+    try testing.expect(s.streaming());
+    try testing.expectEqual(@as(usize, 1), tp.n_configs);
+    try testing.expectEqual(api.Codec.hevc, tp.configs[0].codec);
+    try testing.expectEqual(api.format.Chroma.yuv444, tp.configs[0].format.chroma);
+    const fc = s.takeFormat().?;
+    try testing.expectEqual(api.format.Chroma.yuv444, fc.format.chroma);
+    try testing.expectEqual(@as(?FormatChange, null), s.takeFormat());
+    // The same hello again: the same config, nothing for the app.
+    tp.hello(.{ .nonce = 1, .codecs = .{ .h264 = true, .hevc = true }, .formats = .{ .hevc = .{ .yuv420_8 = true, .yuv444_8 = true } } });
+    s.step(2000);
+    try testing.expectEqual(@as(?FormatChange, null), s.takeFormat());
+    try testing.expectEqual(@as(usize, 2), tp.n_configs);
+
+    // A new client: AV1 only, HDR display. AV1 10-bit HDR10, and an IDR.
+    tp.hello(.{ .nonce = 2, .codecs = .{ .av1 = true }, .formats = .{ .av1 = .{ .yuv420_8 = true, .yuv420_10 = true, .hdr10 = true } }, .display = .{ .hdr10 = true } });
+    s.step(3000);
+    const c = tp.configs[2];
+    try testing.expectEqual(api.Codec.av1, c.codec);
+    try testing.expectEqual(api.ColorSpace.hdr10, c.format.color);
+    try testing.expectEqual(@as(u8, 10), c.format.bit_depth);
+    try testing.expectEqual(api.HdrMetadata.default_hdr10, c.format.hdr.?);
+    try testing.expectEqual(api.Codec.av1, s.takeFormat().?.codec);
+    try testing.expectEqual(api.Force.idr, s.encodeParams().force);
+    s.onEncodeDropped();
+    try testing.expectEqual(@as(u64, 2), s.stats.format_changes);
+
+    // An old client (16-byte hello, H.264 only): H.264 8-bit 4:2:0 SDR.
+    var old: [wire.Hello.len]u8 = undefined;
+    (wire.Hello{ .nonce = 3, .codecs = .{ .h264 = true } }).encode(&old);
+    tp.push(.hello, old[0..wire.Hello.base_len]);
+    s.step(4000);
+    try testing.expectEqual(api.Codec.h264, tp.configs[3].codec);
+    try testing.expect(tp.configs[3].format.eql(.{}));
+
+    // A client with nothing in common is turned away.
+    tp.hello(.{ .nonce = 4, .codecs = .{ .passthrough = true } });
+    s.step(5000);
+    try testing.expect(s.ended());
+    try testing.expectEqual(End.failed, s.end);
 }
