@@ -140,6 +140,8 @@ pub const Status = struct {
     relayed: bool = false,
     freezes: u32 = 0,
     clock_synced: bool = false,
+    /// Multi-user presence line (`core.multi.View.presence`), empty for one client.
+    presence: []const u8 = "",
 
     pub fn from(o: *const api.Overlay, fps: ?f32) Status {
         return .{
@@ -150,6 +152,7 @@ pub const Status = struct {
             .relayed = o.relayed,
             .freezes = o.freezes,
             .clock_synced = o.clock_synced,
+            .presence = o.presence,
         };
     }
 };
@@ -236,6 +239,7 @@ pub fn lines(snap: *const telemetry.Snapshot, status: Status) Lines {
         });
     }
     l.add("DROP {d}  FRAMES {d}", .{ snap.counters.frames_not_presented, snap.counters.frames });
+    if (status.presence.len > 0) l.add("{s}", .{status.presence});
     return l;
 }
 
@@ -290,7 +294,7 @@ test "every printable overlay character has a glyph" {
     var snap: telemetry.Snapshot = .{};
     snap.stages[0] = .{ .count = 1, .p50 = 1234, .p99 = -5678 };
     for ([_]bool{ false, true }) |synced| {
-        const l = lines(&snap, .{ .fps = 59.9, .bitrate_bps = 24_150_000, .relayed = true, .loss = 0.0042, .rtt_us = 12_345, .clock_synced = synced });
+        const l = lines(&snap, .{ .fps = 59.9, .bitrate_bps = 24_150_000, .relayed = true, .loss = 0.0042, .rtt_us = 12_345, .clock_synced = synced, .presence = "3 here  input: Host (you)" });
         for (0..l.n) |i| for (l.get(i)) |ch| {
             if (ch == ' ') continue;
             try testing.expect(glyph(ch) != null);
@@ -319,6 +323,9 @@ test "lines: header, stage rows and unknowns" {
     try testing.expectEqualStrings("TOT        -     -     -", l.get(8));
     try testing.expectEqualStrings("DROP 0  FRAMES 1", l.get(10));
     try testing.expectEqual(@as(usize, 11), l.n);
+    // A multi-user session adds the presence line.
+    l = lines(&snap, .{ .presence = "2 here  input: Alice (you)" });
+    try testing.expectEqualStrings("2 here  input: Alice (you)", l.get(11));
 }
 
 test "render draws inside its rectangle and clips to the canvas" {

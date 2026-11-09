@@ -16,10 +16,90 @@ const pipe = @import("pipe");
 
 const Io = std.Io;
 
+/// The control channel's stream (spec/control-v0.md) on an iroh connection, as a
+/// non-blocking `pipe.ByteStream`. The dialing side opens it, the accepting side accepts the
+/// first stream the peer opens after anything accepted before (pairing, admission). When a
+/// reconnecting link installs a new connection, the old stream goes with the old connection
+/// and the next call reports `error.Reset` (if the old one carried any bytes), so the
+/// channel starts over with `hello` on a stream of the new connection.
+pub const ControlStream = struct {
+    /// Open the stream (client) or accept it (host).
+    opener: bool,
+    s: ?iroh.Stream = null,
+    /// Generation of the connection the stream belongs to.
+    gen: u64 = 0,
+    /// Bytes went either way on this generation's stream.
+    used: bool = false,
+    /// The stream (or its connection) failed; wait for a new connection, if one can come.
+    dead: bool = false,
+
+    /// Frees the stream; call before freeing its connection.
+    pub fn drop(cs: *ControlStream) void {
+        if (cs.s) |st| st.deinit(0);
+        cs.s = null;
+    }
+
+    fn prepare(cs: *ControlStream, conn: ?iroh.Conn, gen: u64, reconnects: bool) pipe.StreamError!?iroh.Stream {
+        if (gen != cs.gen) {
+            cs.drop();
+            const was_used = cs.used;
+            cs.gen = gen;
+            cs.used = false;
+            cs.dead = false;
+            if (was_used) return error.Reset;
+        }
+        if (cs.dead) return if (reconnects) null else error.Closed;
+        if (cs.s) |st| return st;
+        const c = conn orelse return null;
+        cs.s = (if (cs.opener) c.openBi(0) else c.acceptBi(0)) catch |e| switch (e) {
+            error.Closed => return cs.failed(reconnects),
+            else => return null, // not yet (accept: the peer has not written; open: no credit)
+        };
+        return cs.s;
+    }
+
+    fn failed(cs: *ControlStream, reconnects: bool) pipe.StreamError!?iroh.Stream {
+        cs.dead = true;
+        cs.drop();
+        return if (reconnects) null else error.Closed;
+    }
+
+    fn write(cs: *ControlStream, conn: ?iroh.Conn, gen: u64, reconnects: bool, data: []const u8) pipe.StreamError!usize {
+        const st = try cs.prepare(conn, gen, reconnects) orelse return 0;
+        const n = st.writeSome(data, 0) catch |e| switch (e) {
+            error.WouldBlock, error.Timeout => return 0,
+            else => {
+                _ = try cs.failed(reconnects);
+                return 0;
+            },
+        };
+        if (n > 0) cs.used = true;
+        return n;
+    }
+
+    fn read(cs: *ControlStream, conn: ?iroh.Conn, gen: u64, reconnects: bool, buf: []u8) pipe.StreamError!?usize {
+        const st = try cs.prepare(conn, gen, reconnects) orelse return null;
+        const got = st.read(buf, 0) catch |e| switch (e) {
+            error.WouldBlock, error.Timeout => return null,
+            else => {
+                _ = try cs.failed(reconnects);
+                return null;
+            },
+        };
+        if (got.len > 0) cs.used = true;
+        return got.len;
+    }
+
+    fn finish(cs: *ControlStream) void {
+        if (cs.s) |st| st.finish() catch {};
+    }
+};
+
 pub const IrohPipe = struct {
     conn: iroh.Conn,
     pacing_bps: u64 = 0,
     closed: bool = false,
+    ctl: ControlStream = .{ .opener = true },
 
     pub fn init(conn: iroh.Conn) IrohPipe {
         return .{ .conn = conn };
@@ -94,6 +174,27 @@ pub const IrohPipe = struct {
     pub fn maxDatagramSize(self: *IrohPipe) usize {
         return self.conn.maxDatagramSize();
     }
+
+    /// The control stream on this connection: `opener` for the client, not for the host.
+    /// Free it with `ctl.drop()` before the connection.
+    pub fn controlStream(self: *IrohPipe, opener: bool) pipe.ByteStream {
+        self.ctl.opener = opener;
+        return .{ .ptr = self, .vtable = &pipe_stream_vtable };
+    }
+
+    fn sWrite(ptr: *anyopaque, data: []const u8) pipe.StreamError!usize {
+        const self: *IrohPipe = @ptrCast(@alignCast(ptr));
+        return self.ctl.write(self.conn, 0, false, data);
+    }
+    fn sRead(ptr: *anyopaque, buf: []u8) pipe.StreamError!?usize {
+        const self: *IrohPipe = @ptrCast(@alignCast(ptr));
+        return self.ctl.read(self.conn, 0, false, buf);
+    }
+    fn sFinish(ptr: *anyopaque) void {
+        const self: *IrohPipe = @ptrCast(@alignCast(ptr));
+        self.ctl.finish();
+    }
+    const pipe_stream_vtable = pipe.ByteStream.VTable{ .write = sWrite, .read = sRead, .finish = sFinish };
 
     fn vSend(ptr: *anyopaque, data: []const u8) pipe.SendError!void {
         const self: *IrohPipe = @ptrCast(@alignCast(ptr));
@@ -178,6 +279,7 @@ pub const IrohLink = struct {
     installed: u64 = 0,
     conn_epoch: u32 = 0,
     pacing_bps: u64 = 0,
+    ctl: ControlStream = .{ .opener = true },
     /// dial: a reconnect is under way.
     redialing: bool = false,
     /// dial: the current connection delivered after the reconnect request.
@@ -208,6 +310,7 @@ pub const IrohLink = struct {
         self.stop.store(true, .release);
         if (self.worker) |*w| w.await(self.io);
         self.worker = null;
+        self.ctl.drop();
         if (self.ready) |c| c.deinit(0);
         if (self.cand) |c| c.deinit(0);
         if (self.cur) |p| p.conn.deinit(0);
@@ -298,6 +401,7 @@ pub const IrohLink = struct {
         self.base.send_drops += s.send_drops + s.send_queue_bytes / 1200;
         self.base.recv_drops += s.recv_drops;
         self.path_epoch_base +%= s.path_epoch +% 1;
+        self.ctl.drop();
         p.conn.deinit(0);
         self.cur = null;
     }
@@ -456,6 +560,32 @@ pub const IrohLink = struct {
         const self: *IrohLink = @ptrCast(@alignCast(ptr));
         self.requestDial();
     }
+
+    /// The control stream, following the link to each new connection (see `ControlStream`).
+    pub fn controlStream(self: *IrohLink) pipe.ByteStream {
+        self.ctl.opener = self.opts.role == .dial;
+        return .{ .ptr = self, .vtable = &link_stream_vtable };
+    }
+
+    fn ctlConn(self: *IrohLink) ?iroh.Conn {
+        self.adopt();
+        return if (self.curOpen()) self.cur.?.conn else null;
+    }
+    fn sWrite(ptr: *anyopaque, data: []const u8) pipe.StreamError!usize {
+        const self: *IrohLink = @ptrCast(@alignCast(ptr));
+        const c = self.ctlConn();
+        return self.ctl.write(c, self.installed, true, data);
+    }
+    fn sRead(ptr: *anyopaque, buf: []u8) pipe.StreamError!?usize {
+        const self: *IrohLink = @ptrCast(@alignCast(ptr));
+        const c = self.ctlConn();
+        return self.ctl.read(c, self.installed, true, buf);
+    }
+    fn sFinish(ptr: *anyopaque) void {
+        const self: *IrohLink = @ptrCast(@alignCast(ptr));
+        self.ctl.finish();
+    }
+    const link_stream_vtable = pipe.ByteStream.VTable{ .write = sWrite, .read = sRead, .finish = sFinish };
 
     const link_vtable = pipe.PacketPipe.VTable{
         .send = send,

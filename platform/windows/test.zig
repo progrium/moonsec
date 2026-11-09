@@ -12,11 +12,25 @@ test "HRESULT messages" {
 }
 
 test "QPC clock is monotonic and in nanoseconds" {
+    // A Windows wait can end up to a timer tick before the time asked for, so one 2 ms
+    // sleep does not promise 1 ms on the clock (this flaked on windows-2022). Sleep in
+    // 1 ms steps until qpcNs has moved 2 ms instead. std's awake clock also reads QPC,
+    // with its own conversion, so the qpcNs interval, read inside the std one, can be no
+    // longer: that pins the units (a fast conversion fails here, a slow one hits the cap).
+    const io = std.testing.io;
+    const t0 = std.Io.Timestamp.now(io, .awake);
     const a = win.qpcNs();
-    try std.testing.io.sleep(.fromMilliseconds(2), .awake);
-    const b = win.qpcNs();
-    try std.testing.expect(b > a);
-    try std.testing.expect(b - a >= 1 * std.time.ns_per_ms);
+    var b = a;
+    var i: u32 = 0;
+    while (b - a < 2 * std.time.ns_per_ms) : (i += 1) {
+        try std.testing.expect(i < 2000); // about 2 s of 1 ms sleeps
+        try io.sleep(.fromMilliseconds(1), .awake);
+        const now = win.qpcNs();
+        try std.testing.expect(now >= b);
+        b = now;
+    }
+    const std_ns: u64 = @intCast(t0.untilNow(io, .awake).toNanoseconds());
+    try std.testing.expect(b - a <= std_ns);
     try std.testing.expect(b - a < 2 * std.time.ns_per_s);
 }
 

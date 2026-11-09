@@ -10,6 +10,11 @@
 //!                                             relays off (or only URL); write the ticket to TICKET_FILE, then
 //!                                             count datagrams and report counts every 20 ms
 //!                                             (peer for transport/iroh_netns_test.zig)
+//!   shim-echo serve TICKET_FILE [--relay-url URL] [--relay-ca PEM_FILE]
+//!                                             relay only (n0's without URL); write the ticket, then
+//!                                             serve every connection: echo datagrams and
+//!                                             bidirectional streams, plus the blast/sink
+//!                                             commands below (peer for shim-web/test)
 //!
 //! Exit status 0 means every datagram came back intact.
 const std = @import("std");
@@ -67,6 +72,8 @@ pub fn main(init: std.process.Init) !void {
         const conn = ep.connect(t, alpn, 30_000) catch |e| return die("connect", e);
         defer conn.deinit(0);
         try pingLoop(init.io, conn, count);
+    } else if (std.mem.eql(u8, cmd, "serve")) {
+        try serve(init.io, ticket orelse return usage(), relay_url, relay_ca);
     } else if (std.mem.eql(u8, cmd, "sink")) {
         try sink(init.io, ticket orelse return usage(), extra orelse return usage(), relay_url, relay_ca);
     } else return usage();
@@ -126,7 +133,7 @@ fn onShimThread(_: ?*anyopaque) callconv(.c) void {
 }
 
 fn usage() error{Usage} {
-    std.debug.print("usage: shim-echo selftest [--relay | --relay-url URL [--relay-ca PEM_FILE]] [-n COUNT] | listen | dial TICKET [-n COUNT] | sink BIND_ADDR TICKET_FILE [--relay-url URL] [--relay-ca PEM_FILE]\n", .{});
+    std.debug.print("usage: shim-echo selftest [--relay | --relay-url URL [--relay-ca PEM_FILE]] [-n COUNT] | listen | dial TICKET [-n COUNT] | sink BIND_ADDR TICKET_FILE [--relay-url URL] [--relay-ca PEM_FILE] | serve TICKET_FILE [--relay-url URL] [--relay-ca PEM_FILE]\n", .{});
     return error.Usage;
 }
 
@@ -272,5 +279,142 @@ fn recvSeq(conn: iroh.Conn, buf: []u8, seq: u32) ![]u8 {
     while (true) {
         const d = try conn.recvDatagram(buf, 1_000);
         if (d.len >= 4 and std.mem.readInt(u32, d[0..4], .little) == seq) return d;
+    }
+}
+
+// --- serve: the native peer for the browser transport tests (shim-web/test) ---------------
+//
+// Datagrams are echoed, except those starting with a 4-byte command:
+//   "SINK" ...                        counted (count, bytes), not echoed: browser -> native rate
+//   "STAT"                            answered with "STAT" count:u64 bytes:u64 (LE), then reset
+//   "BLST" kbps:u32 ms:u32 size:u32   send `size`-byte datagrams at `kbps` for `ms`, each
+//                                     "BDAT" seq:u32 t_us:u64 ..., then "BEND" sent:u32
+//                                     (native -> browser rate)
+// Every bidirectional stream is echoed until the peer finishes it, then finished.
+
+fn serve(io: std.Io, ticket_file: []const u8, relay_url: ?[:0]const u8, relay_ca: ?[:0]const u8) !void {
+    const ep = try bindOrDie(.{
+        .alpn = alpn,
+        .relay_mode = if (relay_url != null) .custom_only else .default,
+        .relay_urls = if (relay_url) |u| u.ptr else null,
+        .relay_ca_pem = if (relay_ca) |p| p.ptr else null,
+        .bind_addr = "127.0.0.1:0",
+    });
+    defer ep.deinit();
+    ep.online(15_000) catch |e| return die("online", e);
+    var tbuf: [4096]u8 = undefined;
+    const t = try ep.ticket(&tbuf);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ticket_file, .data = t });
+    std.debug.print("serve ticket: {s}\n", .{t});
+    while (true) {
+        const conn = ep.accept(3_600_000) catch |e| switch (e) {
+            error.Timeout => continue,
+            else => return die("accept", e),
+        };
+        var idbuf: [128]u8 = undefined;
+        std.debug.print("serve: connection from {s}\n", .{conn.remoteId(&idbuf) catch "?"});
+        const shared = try std.heap.page_allocator.create(Served);
+        shared.* = .{ .conn = conn };
+        const st = try std.Thread.spawn(.{}, serveStreams, .{shared});
+        st.detach();
+        const dt = try std.Thread.spawn(.{}, serveDatagrams, .{ io, shared });
+        dt.detach();
+    }
+}
+
+/// One served connection, shared by its stream and datagram threads; the last one out frees it.
+const Served = struct {
+    conn: iroh.Conn,
+    refs: std.atomic.Value(u32) = .init(2),
+
+    fn release(s: *Served) void {
+        if (s.refs.fetchSub(1, .acq_rel) == 1) {
+            s.conn.deinit(0);
+            std.heap.page_allocator.destroy(s);
+        }
+    }
+};
+
+fn serveStreams(sv: *Served) void {
+    defer sv.release();
+    const conn = sv.conn;
+    while (true) {
+        const s = conn.acceptBi(3_600_000) catch return;
+        defer s.deinit(0);
+        var buf: [65536]u8 = undefined;
+        while (true) {
+            const d = s.read(&buf, 30_000) catch break;
+            if (d.len == 0) {
+                s.finish() catch {};
+                break;
+            }
+            s.writeAll(d, 30_000) catch break;
+        }
+    }
+}
+
+fn serveDatagrams(io: std.Io, sv: *Served) void {
+    defer sv.release();
+    const conn = sv.conn;
+    var buf: [65536]u8 = undefined;
+    var count: u64 = 0;
+    var bytes: u64 = 0;
+    while (true) {
+        const d = conn.recvDatagram(&buf, 3_600_000) catch |e| switch (e) {
+            error.Timeout => continue,
+            else => return,
+        };
+        const cmd = if (d.len >= 4) d[0..4] else "";
+        if (std.mem.eql(u8, cmd, "SINK")) {
+            count += 1;
+            bytes += d.len;
+        } else if (std.mem.eql(u8, cmd, "STAT")) {
+            var r: [20]u8 = undefined;
+            @memcpy(r[0..4], "STAT");
+            std.mem.writeInt(u64, r[4..12], count, .little);
+            std.mem.writeInt(u64, r[12..20], bytes, .little);
+            conn.sendDatagram(&r) catch return;
+            count = 0;
+            bytes = 0;
+        } else if (std.mem.eql(u8, cmd, "BLST") and d.len >= 16) {
+            const kbps = std.mem.readInt(u32, d[4..8], .little);
+            const ms = std.mem.readInt(u32, d[8..12], .little);
+            const size = @min(@max(std.mem.readInt(u32, d[12..16], .little), 16), @as(u32, @intCast(@min(conn.maxDatagramSize(), 65536))));
+            blast(io, conn, kbps, ms, size) catch return;
+        } else {
+            conn.sendDatagram(d) catch return;
+        }
+    }
+}
+
+fn blast(io: std.Io, conn: iroh.Conn, kbps: u32, ms: u32, size: u32) !void {
+    var out: [65536]u8 = undefined;
+    @memset(out[0..size], 0x5a);
+    @memcpy(out[0..4], "BDAT");
+    const start = iroh.nowUs();
+    const end = start + @as(u64, ms) * 1000;
+    const interval_us: u64 = @max(1, @as(u64, size) * 8 * 1000 / @max(kbps, 1));
+    var seq: u32 = 0;
+    var next = start;
+    while (true) {
+        const now = iroh.nowUs();
+        if (now >= end) break;
+        if (now < next) {
+            if (next - now > 1500) io.sleep(.fromMicroseconds(@intCast(next - now - 1000)), .awake) catch {};
+            continue;
+        }
+        std.mem.writeInt(u32, out[4..8], seq, .little);
+        std.mem.writeInt(u64, out[8..16], now, .little);
+        try conn.sendDatagram(out[0..size]);
+        seq += 1;
+        next += interval_us;
+    }
+    var r: [8]u8 = undefined;
+    @memcpy(r[0..4], "BEND");
+    std.mem.writeInt(u32, r[4..8], seq, .little);
+    // The end marker may be lost like any datagram; send it a few times.
+    for (0..3) |_| {
+        try conn.sendDatagram(&r);
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
     }
 }
