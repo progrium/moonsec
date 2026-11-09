@@ -72,6 +72,24 @@ pub fn build(b: *std.Build) void {
     }) });
     wasm_step.dependOn(&wasm_tests.step);
 
+    // Browser pairing (shim-web/pair/pair.zig): core/pair as a small wasm module that the
+    // browser transport (shim-web/) drives. `zig build web-pair` -> zig-out/web/moonsec-pair.wasm.
+    const wasm_free = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const web_pair = b.addExecutable(.{
+        .name = "moonsec-pair",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("shim-web/pair/pair.zig"),
+            .target = wasm_free,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "core", .module = b.createModule(.{ .root_source_file = b.path("core/root.zig"), .target = wasm_free, .optimize = .ReleaseSmall }) }},
+        }),
+    });
+    web_pair.entry = .disabled;
+    web_pair.rdynamic = true;
+    const install_web_pair = b.addInstallArtifact(web_pair, .{ .dest_dir = .{ .override = .{ .custom = "web" } } });
+    b.step("web-pair", "Build core/pair for the browser: zig-out/web/moonsec-pair.wasm").dependOn(&install_web_pair.step);
+    wasm_step.dependOn(&web_pair.step);
+
     // libopus from source (codec/opus/libopus.zig) and its Zig binding, for every target.
     const opus = addOpus(b, target, optimize);
     const opus_tests = b.addTest(.{ .name = "opus-test", .root_module = opus.module });
