@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
 
     // Client platform backends (platform/client/build.zig).
     @import("platform/client/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
+    @import("platform/client/build.zig").addLinuxTests(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod });
 
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
@@ -289,6 +290,7 @@ pub fn build(b: *std.Build) void {
     for ([_]bool{ false, true }) |with_iroh| {
         const opts = b.addOptions();
         opts.addOption(bool, "iroh", with_iroh);
+        opts.addOption(bool, "linux_client", false);
         const m = b.createModule(.{ .root_source_file = b.path("app/main.zig"), .target = target, .optimize = optimize, .imports = &app_imports });
         m.addOptions("app_options", opts);
         if (with_iroh) {
@@ -323,6 +325,22 @@ pub fn build(b: *std.Build) void {
             soak.addArgs(if (b.args) |a| a else &.{ "soak", "--seconds", "3600" });
             b.step("soak", "One hour of streaming over the simulated LAN in virtual time (args override)").dependOn(&soak.step);
         }
+    }
+
+    // `moonsec-linux`: moonsec-sim plus the Linux client backend (platform/client/linux),
+    // `--client linux` on the client peer. Needs the libraries in platform/client/build.zig.
+    {
+        const step = b.step("moonsec-linux", "Install zig-out/bin/moonsec-linux: moonsec-sim with the Linux client backend (Linux host)");
+        if (target.result.os.tag == .linux) {
+            const opts = b.addOptions();
+            opts.addOption(bool, "iroh", false);
+            opts.addOption(bool, "linux_client", true);
+            const m = b.createModule(.{ .root_source_file = b.path("app/main.zig"), .target = target, .optimize = optimize, .imports = &app_imports });
+            m.addOptions("app_options", opts);
+            m.addImport("client_linux", @import("platform/client/build.zig").linuxClientModule(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod }));
+            const exe = b.addExecutable(.{ .name = "moonsec-linux", .root_module = m });
+            step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        } else step.dependOn(&b.addFail("moonsec-linux needs a Linux host").step);
     }
 
     // Fuzz harnesses for every parser (fuzz/, docs/fuzzing.md): `zig build fuzz --fuzz`.
