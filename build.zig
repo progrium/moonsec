@@ -307,6 +307,9 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // Fuzz harnesses for every parser (fuzz/, docs/fuzzing.md): `zig build fuzz --fuzz`.
+    @import("fuzz/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod }, fuzzOpus, test_step, wasm_step);
+
     // core/rate driving the simulated network with S11's metrics (sim/rate.zig).
     const sim_rate = b.addExecutable(.{ .name = "sim-rate", .root_module = b.createModule(.{ .root_source_file = b.path("sim/rate.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod } } }) });
     b.installArtifact(sim_rate);
@@ -602,6 +605,13 @@ const Opus = struct {
     /// The Zig binding (codec/opus/opus.zig), linked against `lib`. Import it as "opus".
     module: *std.Build.Module,
 };
+
+/// libopus, its binding and the audio stage over a given core module, for fuzz/build.zig.
+fn fuzzOpus(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module) @import("fuzz/build.zig").Opus {
+    const opus = addOpus(b, target, optimize);
+    const stage = b.createModule(.{ .root_source_file = b.path("codec/opus/stage.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "opus", .module = opus.module } } });
+    return .{ .opus = opus.module, .audio_stage = stage };
+}
 
 fn addOpus(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Opus {
     const src = b.dependency("opus", .{});
