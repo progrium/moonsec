@@ -92,7 +92,7 @@ the client sees that `display` did not change.
 
 ## `stream_config` (host → client)
 
-The datagram `config` message ([wire-v0.md](wire-v0.md)), now 40 bytes:
+The datagram `config` message ([wire-v0.md](wire-v0.md)), now 72 bytes:
 
 | Offset | Size | Field | Meaning |
 | ---: | ---: | --- | --- |
@@ -103,12 +103,13 @@ The datagram `config` message ([wire-v0.md](wire-v0.md)), now 40 bytes:
 | 8 | 4 | `width` | ≥ 1. |
 | 12 | 4 | `height` | ≥ 1. |
 | 16 | 8 | `bitrate_bps` | The encoder's bitrate when this config was sent (informational). |
-| 24 | 4 | `epoch` | 0 for the session's first config, then +1 per change (wraps). |
-| 28 | 4 | `first_frame` | Video `frame_id` of the first frame encoded with this config. |
-| 32 | 4 | `display` | `id` of the display streamed. |
-| 36 | 4 | `request` | Newest `select_display.request` the host applied or refused; 0 none. |
+| 24 | 32 | format | Chroma, bit depth, colour space, flags and HDR metadata (wire-v0). |
+| 56 | 4 | `epoch` | 0 for the session's first config, then +1 per change (wraps). |
+| 60 | 4 | `first_frame` | Video `frame_id` of the first frame encoded with this config. |
+| 64 | 4 | `display` | `id` of the display streamed. |
+| 68 | 4 | `request` | Newest `select_display.request` the host applied or refused; 0 none. |
 
-The 24-byte Phase 2 form (no `epoch` onward) is still accepted, read as epoch 0.
+The 24- and 56-byte forms (no `epoch` onward) are still accepted, read as epoch 0.
 
 **Host.** A change takes effect at the next frame: the host reconfigures capture and
 encoder, bumps `epoch`, sets `first_frame` to the next `frame_id`, and encodes that frame

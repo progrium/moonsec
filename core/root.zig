@@ -36,6 +36,9 @@ pub const control = @import("control/root.zig");
 
 /// Display list, display selection and mid-stream config scheduling.
 pub const display = @import("display/root.zig");
+/// Multi-user sessions: roster and input policy, LTR acks across clients, shared rate
+/// (spec/multi-user-v0.md).
+pub const multi = @import("multi/root.zig");
 
 /// Per-frame stage timing and rolling stats for the latency overlay.
 pub const telemetry = @import("telemetry/root.zig");

@@ -42,6 +42,9 @@ const Micros = i64;
 
 pub const Config = struct {
     codecs: api.CodecSet = .{ .passthrough = true },
+    /// Formats per codec the decoder and presenter take, and the display (sent in hello).
+    formats: api.FormatCaps = .{},
+    display: api.DisplayCaps = .{},
     max_width: u32 = 0,
     max_height: u32 = 0,
     nonce: u32 = 1,
@@ -101,7 +104,9 @@ pub const Stats = struct {
     malformed: u64 = 0,
     unknown: u64 = 0,
     path_changes: u64 = 0,
-    /// Mid-stream configs heard of, and the ones that needed the decoder configured again.
+    /// Mid-stream configs heard of (a display or mode change, a rate ladder step, a
+    /// multi-user host re-picking the format), and the ones that needed the decoder
+    /// configured again.
     config_changes: u64 = 0,
     decoder_reconfigures: u64 = 0,
     display_lists: u64 = 0,
@@ -149,6 +154,9 @@ pub const ClientSession = struct {
     /// A `new_config` frame came before its config: later frames are dropped (recovery
     /// repairs them) until one whose config is known and starts there or later.
     awaiting_config: ?u32 = null,
+    /// Bumped by every config that starts the stream anew (the first, and each change of
+    /// codec, format or size): the app configures its decoder and presenter again.
+    config_seq: u32 = 0,
 
     seq: u64 = 0,
     start_us: ?Micros = null,
@@ -435,7 +443,7 @@ pub const ClientSession = struct {
 
     fn sendHello(s: *ClientSession) void {
         var b: [wire.Hello.len]u8 = undefined;
-        (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height }).encode(&b);
+        (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height, .formats = s.cfg.formats, .display = s.cfg.display }).encode(&b);
         s.sendOther(.control_fast, @intFromEnum(wire.Kind.hello), &b);
     }
 
@@ -483,8 +491,13 @@ pub const ClientSession = struct {
                         if (c.nonce != s.cfg.nonce) return;
                         if (s.config == null) {
                             s.config = c;
+                            s.config_seq +%= 1;
                             s.state = .streaming;
                             s.rec = recovery.Client.init(.{ .frame_interval_us = 1_000_000 / @as(u64, c.fps) });
+                        } else if (s.schedule.find(c.epoch)) |known| {
+                            // The same epoch with another stream: the host restarted it in
+                            // place (a multi-user host re-picking the format, or a new hello).
+                            if (!sameStream(known.value, c)) s.restart(c, now);
                         }
                         if (s.schedule.offer(.{ .epoch = c.epoch, .first_frame = c.first_frame, .value = c }) and s.schedule.current.?.epoch != c.epoch)
                             s.stats.config_changes += 1;
@@ -674,6 +687,27 @@ pub const ClientSession = struct {
     // --- decode/present stage --------------------------------------------
 
     /// The next frame to decode, or null. Its data is valid until the next call.
+    /// The decoder takes the same stream under both configs.
+    fn sameStream(a: wire.Config, b: wire.Config) bool {
+        return a.codec == b.codec and a.format.eql(b.format) and a.width == b.width and a.height == b.height;
+    }
+
+    /// The host switched the stream to another codec, format or size mid-session (spec/
+    /// wire-v0.md, "Session"): what is queued is in the old one, and so is everything
+    /// before the IDR the host sends next.
+    fn restart(s: *ClientSession, c: wire.Config, now: Micros) void {
+        s.config = c;
+        s.config_seq +%= 1;
+        s.stats.config_changes += 1;
+        s.schedule = .{};
+        s.awaiting_config = null;
+        while (s.queue.popFront()) |q| {
+            s.timesFor(q.au.frame_id).valid = false;
+            s.giveBuf(q.buf);
+        }
+        s.rec.restart(@intCast(now));
+    }
+
     pub fn nextAccessUnit(s: *ClientSession) ?api.AccessUnit {
         if (s.current) |q| {
             s.giveBuf(q.buf);
@@ -745,7 +779,8 @@ pub const ClientSession = struct {
     pub fn report(s: *const ClientSession, w: *std.Io.Writer) !void {
         const st = s.stats;
         try w.print("client: {s}{s}{s}\n", .{ @tagName(s.end), if (s.reason.len > 0) ": " else "", s.reason });
-        if (s.config) |c| try w.print("  stream {s} {d}x{d}@{d} at {d} kbit/s, {d} slices\n", .{ @tagName(c.codec), c.width, c.height, c.fps, c.bitrate_bps / 1000, c.slices });
+        var fb: [32]u8 = undefined;
+        if (s.config) |c| try w.print("  stream {s} {s} {d}x{d}@{d} at {d} kbit/s, {d} slices\n", .{ @tagName(c.codec), c.format.name(&fb), c.width, c.height, c.fps, c.bitrate_bps / 1000, c.slices });
         try w.print("  frames received {d}, presented {d}, lost {d}, stale {d}, dropped while frozen {d}, decode errors {d}, queue overflows {d}\n", .{ st.frames_received, st.frames_presented, st.frames_lost, st.frames_stale, st.frames_dropped, st.decode_errors, st.queue_overflows });
         try w.print("  shards {d} (retransmitted {d}), NACKs {d}, feedback {d}, frame acks {d}, pongs {d}, input events {d}\n", .{ st.shards, s.video_retx, st.nacks, st.feedback, st.frame_acks, st.pongs, st.input_events });
         const r = s.rec.stats;

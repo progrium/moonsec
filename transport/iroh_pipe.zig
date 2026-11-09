@@ -236,13 +236,39 @@ pub const IrohPipe = struct {
 /// The accepting side (the host) accepts in the background. A new connection replaces a
 /// closed one at once; while the current one is open, the newcomer waits until it delivers
 /// a datagram (the client sends on a new connection right away) and then replaces it. So
-/// a stray dial never steals a working session. (Pairing will decide who may connect.)
+/// a stray dial never steals a working session.
+///
+/// `Options.gate` decides who may connect: it runs on every connection the link accepts or
+/// dials, the first and every reconnect, before the link hands it over (the apps run
+/// session admission there, spec/pairing-v0.md). While the current connection is open, a
+/// newcomer replaces it only if it comes from the same remote endpoint, so one admitted
+/// device cannot take over another's live session.
 ///
 /// Every call is non-blocking: dialing and accepting run on a worker task, which hands
 /// connections over to the caller's thread. Connections are freed on the caller's thread.
 /// `PathStats.conn_epoch` counts replacements, and the pacing rate carries over.
 pub const IrohLink = struct {
-    pub const Role = enum { dial, accept };
+    /// `offered`: like `accept`, but the caller accepts (and admits) connections itself and
+    /// hands this link the ones for its session with `offer`, as a host with several
+    /// sessions on one endpoint does; the link runs no worker.
+    pub const Role = enum { dial, accept, offered };
+
+    pub const Verdict = enum {
+        /// Hand the connection over.
+        admit,
+        /// Close it; a dialing link dials again after its backoff.
+        retry,
+        /// Close it; a dialing link stops dialing (`refused` turns true). For an accepting
+        /// link the same as `retry`.
+        refuse,
+    };
+
+    /// Runs on the worker task, before a connection is handed over. It may block (bounded
+    /// by its own timeouts) and must not free the connection.
+    pub const Gate = struct {
+        ctx: *anyopaque,
+        check: *const fn (ctx: *anyopaque, conn: iroh.Conn) Verdict,
+    };
 
     pub const Options = struct {
         role: Role,
@@ -253,6 +279,14 @@ pub const IrohLink = struct {
         /// Backoff between failed dials: doubles from min to max.
         retry_min_ms: u32 = 250,
         retry_max_ms: u32 = 4_000,
+        /// Admission for every connection; null admits every one (lab runs only).
+        gate: ?Gate = null,
+        /// The application error code a connection the gate turned away is closed with.
+        refuse_code: u32 = 0,
+        /// accept: gates running at once, each on its own task, so a peer that stalls its
+        /// admission holds up no one else. Connections past it are closed (`busy_code`).
+        max_gates: u32 = 16,
+        busy_code: u32 = 0,
     };
 
     pub const Stats = struct {
@@ -265,6 +299,8 @@ pub const IrohLink = struct {
         discarded: u64 = 0,
         /// Datagrams dropped while there was no connection.
         offline_drops: u64 = 0,
+        /// Connections the gate turned away.
+        refused: u64 = 0,
     };
 
     io: Io,
@@ -297,11 +333,45 @@ pub const IrohLink = struct {
     w_dials: std.atomic.Value(u64) = .init(0),
     w_failures: std.atomic.Value(u64) = .init(0),
     w_accepts: std.atomic.Value(u64) = .init(0),
+    w_refused: std.atomic.Value(u64) = .init(0),
+    /// dial: the gate refused the host; no more dials.
+    w_gave_up: std.atomic.Value(bool) = .init(false),
+    /// accept: gate tasks.
+    gates: Io.Group = .init,
+    drop_requested: std.atomic.Value(bool) = .init(false),
+    gates_running: std.atomic.Value(u32) = .init(0),
 
     /// Starts the worker; a dialing link dials at once. `self` must not move afterwards.
     pub fn start(self: *IrohLink, io: Io, ep: iroh.Endpoint, opts: Options) !void {
         self.* = .{ .io = io, .ep = ep, .opts = opts, .want_dial = opts.role == .dial };
-        self.worker = try io.concurrent(work, .{self});
+        if (opts.role != .offered) self.worker = try io.concurrent(work, .{self});
+    }
+
+    /// Starts on a connection the caller already has (dialed and admitted, or accepted and
+    /// admitted): the link owns it from here, also on failure. A dialing link dials again
+    /// only when it drops. `self` must not move afterwards.
+    pub fn startWith(self: *IrohLink, io: Io, ep: iroh.Endpoint, opts: Options, first: iroh.Conn) !void {
+        self.* = .{ .io = io, .ep = ep, .opts = opts };
+        self.install(first);
+        if (opts.role != .offered) self.worker = io.concurrent(work, .{self}) catch |e| {
+            self.deinit();
+            return e;
+        };
+    }
+
+    /// offered: a new connection from the same remote endpoint, admitted by the caller.
+    /// The link owns it from here. It replaces the current connection as an accepted one
+    /// would. Safe from any thread.
+    pub fn offer(self: *IrohLink, c: iroh.Conn) void {
+        _ = self.w_accepts.fetchAdd(1, .monotonic);
+        self.handOver(c);
+    }
+
+    /// Tests: drop the current connection as a network failure would (a dialing link then
+    /// dials again). Takes effect on the caller's thread at the link's next call. Safe
+    /// from any thread.
+    pub fn dropForTest(self: *IrohLink) void {
+        self.drop_requested.store(true, .release);
     }
 
     /// Stops the worker (waits for a dial or accept in progress) and frees every connection.
@@ -310,6 +380,7 @@ pub const IrohLink = struct {
         self.stop.store(true, .release);
         if (self.worker) |*w| w.await(self.io);
         self.worker = null;
+        self.gates.await(self.io) catch {};
         self.ctl.drop();
         if (self.ready) |c| c.deinit(0);
         if (self.cand) |c| c.deinit(0);
@@ -328,7 +399,14 @@ pub const IrohLink = struct {
         s.dials = self.w_dials.load(.monotonic);
         s.dial_failures = self.w_failures.load(.monotonic);
         s.accepts = self.w_accepts.load(.monotonic);
+        s.refused = self.w_refused.load(.monotonic);
         return s;
+    }
+
+    /// dial: the gate refused the far end (for example, the host does not admit this
+    /// device), so the link stopped dialing.
+    pub fn refused(self: *const IrohLink) bool {
+        return self.w_gave_up.load(.acquire);
     }
 
     /// The current connection, if any (for tests and diagnostics).
@@ -381,15 +459,67 @@ pub const IrohLink = struct {
                     backoff = @min(backoff * 2, self.opts.retry_max_ms);
                     continue;
                 };
+                switch (self.gateCheck(c)) {
+                    .admit => {},
+                    .retry => {
+                        _ = self.w_failures.fetchAdd(1, .monotonic);
+                        self.sleepMs(backoff);
+                        backoff = @min(backoff * 2, self.opts.retry_max_ms);
+                        continue;
+                    },
+                    .refuse => {
+                        self.lock();
+                        self.want_dial = false;
+                        self.unlock();
+                        self.w_gave_up.store(true, .release);
+                        continue;
+                    },
+                }
                 backoff = self.opts.retry_min_ms;
                 self.handOver(c);
             },
+            .offered => return, // no worker
             .accept => {
                 const c = self.ep.accept(200) catch continue;
                 _ = self.w_accepts.fetchAdd(1, .monotonic);
-                self.handOver(c);
+                if (self.opts.gate == null) {
+                    self.handOver(c);
+                    continue;
+                }
+                if (self.gates_running.fetchAdd(1, .acq_rel) >= self.opts.max_gates) {
+                    _ = self.gates_running.fetchSub(1, .acq_rel);
+                    _ = self.w_refused.fetchAdd(1, .monotonic);
+                    c.deinit(self.opts.busy_code);
+                    continue;
+                }
+                self.gates.concurrent(self.io, gateTask, .{ self, c }) catch {
+                    _ = self.gates_running.fetchSub(1, .acq_rel);
+                    // No task to run it on: gate it here.
+                    if (self.gateCheck(c) == .admit) self.handOver(c);
+                };
             },
         };
+    }
+
+    fn gateTask(self: *IrohLink, c: iroh.Conn) void {
+        defer _ = self.gates_running.fetchSub(1, .acq_rel);
+        if (self.gateCheck(c) != .admit) return;
+        if (self.stop.load(.acquire)) {
+            c.deinit(0);
+            return;
+        }
+        self.handOver(c);
+    }
+
+    /// Runs the gate on `c`; anything but `admit` closes and frees it.
+    fn gateCheck(self: *IrohLink, c: iroh.Conn) Verdict {
+        const g = self.opts.gate orelse return .admit;
+        const v = g.check(g.ctx, c);
+        if (v != .admit) {
+            _ = self.w_refused.fetchAdd(1, .monotonic);
+            c.deinit(self.opts.refuse_code);
+        }
+        return v;
     }
 
     /// Fold the current connection's counters into `base` and free it.
@@ -425,6 +555,10 @@ pub const IrohLink = struct {
 
     /// Take a connection from the worker, if it has one.
     fn adopt(self: *IrohLink) void {
+        if (self.drop_requested.swap(false, .acq_rel) and self.cur != null) {
+            self.retire();
+            self.onClosed();
+        }
         self.lock();
         const got = self.ready;
         self.ready = null;
@@ -441,8 +575,14 @@ pub const IrohLink = struct {
                 }
                 self.install(c);
             },
-            .accept => {
+            .accept, .offered => {
                 if (!self.curOpen()) return self.install(c);
+                if (!sameRemote(self.cur.?.conn, c)) {
+                    // Another device: it waits until this session's connection closes.
+                    c.deinit(self.opts.refuse_code);
+                    self.stats_.discarded += 1;
+                    return;
+                }
                 if (self.cand) |old| {
                     old.deinit(0);
                     self.stats_.discarded += 1;
@@ -452,8 +592,16 @@ pub const IrohLink = struct {
         }
     }
 
+    fn sameRemote(a: iroh.Conn, b: iroh.Conn) bool {
+        var ba: [128]u8 = undefined;
+        var bb: [128]u8 = undefined;
+        const ia = a.remoteId(&ba) catch return false;
+        const ib = b.remoteId(&bb) catch return false;
+        return std.mem.eql(u8, ia, ib);
+    }
+
     fn requestDial(self: *IrohLink) void {
-        if (self.opts.role != .dial or self.redialing) return;
+        if (self.opts.role != .dial or self.redialing or self.refused()) return;
         self.redialing = true;
         self.heard_since_request = false;
         self.lock();

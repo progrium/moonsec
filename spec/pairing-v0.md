@@ -36,7 +36,7 @@ it. The text uses only QR alphanumeric characters. Decoders ignore case and whit
 | Size | Field | Meaning |
 | ---: | --- | --- |
 | 1 | `version` | `1`. Anything else: unsupported. |
-| 1 | `flags` | bit 0: a secret follows. Other bits 0. |
+| 1 | `flags` | bit 0: a secret follows. Other bits 0; decoders refuse a ticket with others set. |
 | 32 | `host_id` | the host's endpoint ID |
 | 16 | `secret` | only when flag bit 0 is set |
 | 8 | `expires` | unix seconds after which the host refuses the secret; 0 = none (u64 LE) |
@@ -82,26 +82,56 @@ confirm                             ->    host adds the client to its allowlist
 
 | Kind | Name | Direction | Body |
 | ---: | --- | --- | --- |
-| 1 | `hello` | C→H | `version` (0), `method`, `client_nonce[16]`, `name_len`, `name` (≤ 64 bytes UTF-8) |
-| 2 | `challenge` | H→C | `host_nonce[16]`, `attempts_left` |
-| 3 | `proof` | C→H | `client_mac[32]` |
+| 1 | `hello` | C→H | `version` (1), `method`, `client_nonce[16]`, `name_len`, `name` (≤ 64 bytes UTF-8) |
+| 2 | `challenge` | H→C | `host_nonce[16]`, `attempts_left`; PIN method: then `host_share[32]` |
+| 3 | `proof` | C→H | PIN method: `client_share[32]`, then `client_mac[32]`; QR method: `client_mac[32]` |
 | 4 | `accept` | H→C | `host_mac[32]`, `name_len`, `name` |
 | 5 | `reject` | either | `reason`, `attempts_left` |
 | 6 | `confirm` | C→H | (empty) |
-| 7 | `admit` | C→H | `version` (0); see Admission |
+| 7 | `admit` | C→H | admission `version` (0); see Admission |
 | 8 | `admitted` | H→C | (empty) |
 
 Methods: `1` QR ticket secret, `2` PIN. Nonces are fresh random bytes per connection.
+Version 0 used a PIN-keyed HMAC for the PIN method too (no shares); a version 1 host refuses a
+version 0 `hello` with `unsupported_version`. `admit` keeps its own version byte (0).
 
 Keys and MACs (HMAC-SHA256, `label` = ASCII `moonsec-pair-v0`):
 
 ```
-K          = HMAC(key = label, method || secret)        secret = 16 ticket bytes, or the 6 PIN digits as ASCII
 transcript = label || method || host_id || client_id || client_nonce || host_nonce || name_len || name
 client_mac = HMAC(K, "client" || transcript)
 host_mac   = HMAC(K, "host"   || transcript)
 ```
 
+The key `K` depends on the method.
+
+**QR method** (a 128-bit secret, so a plain HMAC key):
+
+```
+K = HMAC(key = label, method || secret)        secret = the 16 ticket bytes
+```
+
+**PIN method**: CPace ([draft-irtf-cfrg-cpace](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/),
+simplified) over ristretto255, so that neither side can test PIN guesses offline. `lv(x)` is
+one length byte then `x`; `H` is SHA-512.
+
+```
+g           = ristretto255.from_uniform(H(lv("moonsec-pair-v1-cpace") || lv(PIN digits as ASCII) ||
+                lv(host_id) || lv(client_id) || lv(name) || lv(client_nonce) || lv(host_nonce)))
+y           = reduce64(H(seed))                    seed = 32 fresh secret random bytes per connection
+host_share  = g * y_host                           client_share = g * y_client
+K           = H(lv("moonsec-pair-v1-cpace-isk") || lv(client_nonce) || lv(host_nonce) ||
+                lv(peer_share * y_own) || lv(client_share) || lv(host_share))[0..32]
+```
+
+The host sends its share in the challenge, the client its share in the proof. Each side
+refuses a share that does not decode to a ristretto255 point or decodes to the identity
+(host: a wrong proof, costing an attempt; client: `reject(protocol)`). Why: with a MAC keyed
+by the PIN alone, a host the client dials by mistake (an attacker's address ticket) receives
+a proof it can check all 10⁶ PINs against in under a second, then pair with the real host
+inside the window. With CPace the proof depends on `g * (y_client * y_host)`, which a host
+that used another PIN for `g` cannot compute for any PIN guess without solving a discrete
+logarithm, so each run tests exactly one guess, online.
 `host_id` and `client_id` are the IDs the connection authenticated. Binding both means a
 proof cannot be replayed on another connection, relayed to another host, or made for
 another client. `name` is the client's name after sanitizing (below), so a host that
@@ -139,15 +169,17 @@ Text, one device per line; `#` lines and blank lines are ignored:
 Names are sanitized on the way in: control characters and tabs become `?`, invalid UTF-8
 bytes become `?`, and names are cut to 64 bytes at a character boundary. Addresses contain
 no whitespace. The host keeps `paired-clients` (its allowlist); the client keeps
-`paired-hosts` (with each host's address).
+`paired-hosts` (with each host's address). Both are written like key files: 0600 on POSIX,
+through a temporary file and a rename.
 
 ## Key storage
 
 `KeyStore` loads, stores and removes named 32-byte keys. The device key is `identity`.
 
 - `FileKeyStore`: `<state dir>/<name>.key`, holding the line `moonsec secret key v0`, then 64
-  hex digits. On POSIX it is created 0600 in a 0700 directory, and loading refuses a key file
-  that group or others can read. Writes go through a temporary file and a rename.
+  hex digits. On POSIX it is created 0600 in a 0700 directory, loading refuses a key file
+  that group or others can read, and opening refuses a state directory that group or others
+  can write (whoever can write it can replace the allowlist). Writes go through a temporary file and a rename.
 - On Windows the file inherits the state directory's ACL (under `%APPDATA%`, the user's).
   A DPAPI store (Windows) and a Keychain store (macOS) come later behind the same interface.
 
@@ -159,4 +191,5 @@ Support/moonsec` (macOS), `%APPDATA%\moonsec` (Windows).
 
 - LAN discovery (mDNS), so a PIN alone finds the host without an address ticket.
 - Revocation beyond `moonsec unpair`, and per-client permissions.
-- An external security review (Phase 7).
+- An external security review (Phase 7): threat model in [docs/security.md](../docs/security.md),
+  reviewer packet and our findings in [docs/security-review.md](../docs/security-review.md).

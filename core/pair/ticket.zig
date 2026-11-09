@@ -86,6 +86,8 @@ pub const Ticket = struct {
         if (std.hash.Crc32.hash(body) != std.mem.readInt(u32, bin[bin.len - 4 ..][0..4], .little)) return error.BadChecksum;
         if (body[0] != version) return error.UnsupportedVersion;
         const flags = body[1];
+        // Only bit 0 is defined; a ticket with others set is from a newer format.
+        if (flags & ~flag_secret != 0) return error.UnsupportedVersion;
         var t: Ticket = .{ .host_id = body[2..34].*, .addr = &.{} };
         var n: usize = 34;
         if (flags & flag_secret != 0) {
@@ -246,4 +248,26 @@ test "ticket decode rejects typos, truncation, bad prefix and versions" {
     try testing.expectError(error.AddrTooLong, too_long.encode(&big));
     var small: [10]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, t.encode(&small));
+}
+
+test "ticket decode refuses undefined flag bits" {
+    var bin: [fixed_len + 4]u8 = undefined;
+    bin[0] = version;
+    bin[1] = 0x02; // bit 1: not defined in v1
+    @memcpy(bin[2..34], &testId(3));
+    std.mem.writeInt(u64, bin[34..42], 0, .little);
+    std.mem.writeInt(u16, bin[42..44], 4, .little);
+    @memcpy(bin[44..48], "abcd");
+    std.mem.writeInt(u32, bin[48..52], std.hash.Crc32.hash(bin[0..48]), .little);
+    var text: [max_text]u8 = undefined;
+    @memcpy(text[0..prefix.len], prefix);
+    const n = base32Encode(&bin, text[prefix.len..]);
+    var scratch: [max_binary]u8 = undefined;
+    try testing.expectError(error.UnsupportedVersion, Ticket.decode(text[0 .. prefix.len + n], &scratch));
+    // The same ticket with flags 0 decodes.
+    bin[1] = 0;
+    std.mem.writeInt(u32, bin[48..52], std.hash.Crc32.hash(bin[0..48]), .little);
+    const m = base32Encode(&bin, text[prefix.len..]);
+    const t = try Ticket.decode(text[0 .. prefix.len + m], &scratch);
+    try testing.expectEqualStrings("abcd", t.addr);
 }

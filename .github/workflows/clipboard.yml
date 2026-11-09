@@ -3,12 +3,8 @@ name: clipboard
 # The system clipboard backends (platform/clipboard) on real clipboards: X11 under Xvfb and
 # Wayland data-control under headless sway on Linux, NSPasteboard on macOS, Win32 on Windows.
 
+# Automatic triggers are off (turned off on request); run it from the Actions tab.
 on:
-  push:
-    branches: ["**"]
-    paths: ["platform/clipboard/**", "build.zig", ".github/workflows/clipboard.yml"]
-  pull_request:
-    paths: ["platform/clipboard/**", "build.zig", ".github/workflows/clipboard.yml"]
   workflow_dispatch:
 
 permissions:
@@ -29,7 +25,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwayland-dev libx11-dev libxfixes-dev sway xvfb wl-clipboard xclip
-      - name: Build (no display: the test skips)
+      - name: Build without a display (the test skips)
         run: zig build test-clipboard -Dlinux-clipboard --summary all
       - name: X11 (Xvfb)
         run: |

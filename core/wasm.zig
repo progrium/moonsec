@@ -4,6 +4,11 @@
 const core = @import("root.zig");
 const proto = core.proto;
 
+comptime {
+    // Input sender ABI for the web client (web/src/input).
+    _ = @import("input/wasm.zig");
+}
+
 /// Parses one datagram; returns its stream ID, or 0 if it does not parse.
 export fn moonsec_proto_stream(ptr: [*]const u8, len: usize) u8 {
     const m = proto.decode(ptr[0..len]) catch return 0;
@@ -60,4 +65,13 @@ export fn moonsec_control_events(ptr: [*]const u8, len: usize) u32 {
 export fn moonsec_display_list_decode(ptr: [*]const u8, len: usize, out: [*]core.display.DisplayInfo, cap: usize) i32 {
     const d = core.display.DisplayList.decode(ptr[0..len], out[0..cap]) orelse return -1;
     return @intCast(d.n);
+}
+
+/// Parses a multi-user roster message body; returns 1 if it gives this client input, 0 if
+/// not, -1 if it does not parse.
+export fn moonsec_multi_roster_have_input(ptr: [*]const u8, len: usize) i32 {
+    var v: core.multi.View = .{};
+    v.onRoster(ptr[0..len]);
+    if (!v.have) return -1;
+    return @intFromBool(v.haveInput());
 }

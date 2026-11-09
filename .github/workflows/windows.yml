@@ -5,10 +5,8 @@ name: windows
 # Basic Render Driver and Media Foundation's software codecs, and skip hardware paths.
 # Linux cross-compiles the same tests for x86_64 and aarch64 Windows.
 
+# Automatic triggers are off (turned off on request); run it from the Actions tab.
 on:
-  push:
-    branches: ["**"]
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -27,6 +25,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Windows platform tests
+        # Fail instead of skipping for what this runner has: Media Foundation's software
+        # H.264 encoder and an interactive desktop for SendInput. Desktop Duplication,
+        # NVENC and loopback audio need hardware the runner lacks and skip.
+        env:
+          MOONSEC_REQUIRE: mf,input
         run: zig build test-win --summary all
 
   cross:
@@ -41,3 +44,5 @@ jobs:
         run: zig fmt --check platform
       - name: Cross-compile for x86_64 and aarch64 Windows
         run: zig build check-win --summary all
+      - name: Shared NVENC core (fake NVENC) and Linux NVENC (compile, not-found path)
+        run: zig build test-nvenc-core check-nvenc-linux test-nvenc-linux --summary all

@@ -258,6 +258,13 @@ pub fn Schedule(comptime T: type) type {
             return true;
         }
 
+        /// The entry for `epoch`, current or pending.
+        pub fn find(s: *const Self, epoch: u32) ?Entry {
+            if (s.current) |c| if (c.epoch == epoch) return c;
+            for (s.pending) |p| if (p) |x| if (x.epoch == epoch) return x;
+            return null;
+        }
+
         /// The config frame `id` uses; null before any config. Pending configs whose first
         /// frame is at or before `id` take effect (the newest of them wins).
         pub fn forFrame(s: *Self, id: u32) ?Entry {

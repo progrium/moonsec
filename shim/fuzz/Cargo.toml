@@ -1,0 +1,23 @@
+[package]
+name = "moonsec-iroh-shim-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+moonsec-iroh-shim = { path = ".." }
+
+[[bin]]
+name = "c_abi"
+path = "fuzz_targets/c_abi.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the shim's own workspace.
+[workspace]

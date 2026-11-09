@@ -15,7 +15,7 @@ and a test in `transport/iroh_test.zig` (loopback, `zig build test-shim`) or
 | `iroh_shim_init(hook, ctx)` | optional, before anything else; hook runs on the shim runtime thread (pin it, raise priority) |
 | `iroh_shim_version`, `iroh_shim_now_us`, `iroh_last_error` | `now_us` is the clock event timestamps use |
 | `iroh_endpoint_bind(opts, &ep)` | key, ALPN, relay mode (n0 / disabled / custom / custom-only), bind address, and the per-connection transport settings below |
-| `iroh_endpoint_online`, `_id`, `_ticket`, `_connect`, `_accept`, `_free` | blocking calls take a timeout; `accept`'s bounds the wait for a connection, not its handshake (10 s) |
+| `iroh_endpoint_online`, `_id`, `_ticket`, `_connect`, `_accept`, `_free` | blocking calls take a timeout; `accept`'s bounds the wait for a connection; handshakes run in the background, 16 at once, 10 s each |
 | `iroh_endpoint_network_change` | the local network changed: iroh re-runs its net report and tries new paths now |
 | `iroh_conn_send_datagram` | never blocks; a full send buffer evicts the oldest datagrams, counted exactly |
 | `iroh_conn_recv_datagram` | `ms = 0` is non-blocking (`IROH_ERR_AGAIN`) |
