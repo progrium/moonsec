@@ -150,9 +150,23 @@ static void test_basics(void) {
     OK(moonsec_host_create(&hc, &h));
     if (!(moonsec_features() & MOONSEC_FEATURE_IROH)) CHECK(moonsec_host_listen(h) == MOONSEC_ERR_UNSUPPORTED);
     CHECK(moonsec_host_give_input(h, NULL) == MOONSEC_ERR_UNSUPPORTED);
+    moonsec_host_destroy(h);
+
+    /* Displays: the synthetic backend's one display, at the configured size; the count
+     * alone with cap 0. */
+    CHECK(moonsec_features() & MOONSEC_FEATURE_DISPLAYS);
+    hc.width = 320;
+    hc.height = 180;
+    OK(moonsec_host_create(&hc, &h));
     size_t nd = 99;
-    CHECK(moonsec_host_displays(h, NULL, 0, &nd) == MOONSEC_ERR_UNSUPPORTED);
-    CHECK(nd == 0);
+    OK(moonsec_host_displays(h, NULL, 0, &nd));
+    CHECK(nd == 1);
+    moonsec_display_info di[4];
+    memset(di, 0xff, sizeof di);
+    OK(moonsec_host_displays(h, di, 4, &nd));
+    CHECK(nd == 1 && di[0].index == 0 && di[0].width == 320 && di[0].height == 180);
+    CHECK(di[0].primary == 1 && di[0].refresh_mhz == 60000 && di[0].hdr == 0 && strcmp(di[0].name, "Synthetic 1") == 0);
+    CHECK(moonsec_host_displays(h, NULL, 4, &nd) == MOONSEC_ERR_INVALID);
     moonsec_host_destroy(h);
 }
 
@@ -211,6 +225,13 @@ static void test_stream(uint32_t profile) {
     CHECK(moonsec_loopback_now(lb) == 2000000);
     CHECK(moonsec_session_state(hs) == MOONSEC_STATE_STREAMING);
     CHECK(moonsec_session_state(cs) == MOONSEC_STATE_STREAMING);
+    {
+        /* While streaming, the list the session got from its capture. */
+        moonsec_display_info d;
+        size_t nd = 0;
+        OK(moonsec_host_displays(h, &d, 1, &nd));
+        CHECK(nd == 1 && d.width == 320 && d.primary == 1);
+    }
     CHECK(notified > 0);
 
     moonsec_event hev[256], cev[256];

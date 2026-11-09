@@ -260,9 +260,20 @@ client starts it again. Loopback sessions are always one client.
 
 ## Displays
 
-`moonsec_host_displays` lists displays (`MOONSEC_FEATURE_DISPLAYS`), declared and
-`UNSUPPORTED` until the multiple-displays work (#37) is wired through; switching displays
-mid-session will be a new function in 1.x.
+`moonsec_host_displays` lists the host's displays ([display-v0.md](display-v0.md)).
+`index` is the backend's display id, the value `moonsec_host_config.display` takes;
+`hdr` is 0 until backends report it, and `name` is at most 24 bytes from the backend.
+
+- While a session streams, the list is the one its capture last reported (polled about
+  once a second, so a plugged-in display shows up).
+- With none streaming, the synthetic backend lists its display at the configured size.
+  The OS capture backends do not list displays yet (`UNSUPPORTED`): opening one only to
+  ask would open its encoder and input device.
+- `MOONSEC_FEATURE_DISPLAYS` is set in every build.
+
+Not exposed yet (open questions on naming and events): the client's view of the host's
+list and its display select, and an event when the list changes. Multi-user hosts refuse
+selects.
 
 ## Linking
 
@@ -297,7 +308,7 @@ mid-session will be a new function in 1.x.
 | Codec and format preferences | done (per-client negotiation, #36) |
 | Telemetry and per-stage latency | done |
 | Multi-user (#38) | done over iroh (owner policy, every member may control); `abi/test_multi.c`, and on the OS backends in `test-abi-system -- multi` |
-| Displays (#37) | declared, `UNSUPPORTED` |
+| Displays (#37) | listing: `moonsec_host_displays` (synthetic backend, and any backend that lists while streaming); selecting from the client is not exposed |
 
 ## Freeze
 

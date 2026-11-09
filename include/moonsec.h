@@ -182,7 +182,7 @@ typedef struct moonsec_host_config {
     uint32_t flags;   /* MOONSEC_HOST_* */
     uint32_t codec;   /* preferred MOONSEC_CODEC_*; 0: the backend's best */
     uint32_t fps;     /* 0: 60 */
-    uint32_t display; /* display index, 0 = primary */
+    uint32_t display; /* display: an index from moonsec_host_displays (0 = primary) */
     uint32_t width;   /* capture size hint; 0: the display's own */
     uint32_t height;
     uint64_t bitrate_bps; /* start bitrate; 0: 10 Mbit/s */
@@ -261,7 +261,7 @@ MOONSEC_API moonsec_status moonsec_host_give_input(moonsec_host *host, moonsec_s
 
 /* Displays (MOONSEC_FEATURE_DISPLAYS). Frozen layout. */
 typedef struct moonsec_display_info {
-    uint32_t index;
+    uint32_t index;       /* the backend's display id: the value moonsec_host_config.display takes */
     uint32_t width;
     uint32_t height;
     uint32_t refresh_mhz; /* refresh rate in millihertz; 0 unknown */
@@ -269,7 +269,9 @@ typedef struct moonsec_display_info {
     uint32_t hdr;         /* 1 when in an HDR mode now */
     char name[64];
 } moonsec_display_info;
-/* Fills up to `cap` entries; `*count` is the number of displays. */
+/* Fills up to `cap` entries; `*count` is the number of displays. While a session
+ * streams: its capture's list; otherwise the backend's, if it can list without
+ * streaming (MOONSEC_ERR_UNSUPPORTED if not). */
 MOONSEC_API moonsec_status moonsec_host_displays(moonsec_host *host, moonsec_display_info *out, size_t cap, size_t *count);
 
 /* ------------------------------------------------------------------------- */
