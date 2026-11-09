@@ -2,10 +2,8 @@ name: core
 
 # Core unit tests on every host OS, plus the wasm32 compile check. No Rust needed.
 
+# Automatic triggers are off (turned off on request); run it from the Actions tab.
 on:
-  push:
-    branches: ["**"]
-  pull_request:
   workflow_dispatch:
 
 permissions:
