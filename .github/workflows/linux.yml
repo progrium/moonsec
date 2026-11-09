@@ -30,7 +30,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            libavcodec-dev libavutil-dev libva-dev libwayland-dev libegl-dev libgles-dev libpipewire-0.3-dev \
+            libavcodec-dev libavutil-dev libva-dev libwayland-dev libegl-dev libgles-dev libpipewire-0.3-dev libdbus-1-dev \
             weston libgl1-mesa-dri libegl-mesa0 libglx-mesa0 mesa-va-drivers \
             pipewire pipewire-bin wireplumber dbus-daemon pkg-config
       - name: uinput for the runner user

@@ -5,9 +5,8 @@ name: sim
 # deterministic by seed and platform-independent. (The unit tests run as part of
 # `zig build test` in core.yml.)
 
+# Automatic triggers are off (turned off on request); run it from the Actions tab.
 on:
-  push:
-    branches: ["**"]
   workflow_dispatch:
 
 permissions:

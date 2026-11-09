@@ -25,7 +25,7 @@ const api = @import("platform");
 const core = @import("core");
 const ui = @import("linux_uinput");
 
-const log = std.log.scoped(.linux_host);
+const log = std.log.scoped(.host_linux);
 const Gamepad = core.input.Gamepad;
 
 /// Bits of `Gamepad.buttons`: `core.input.Gamepad.Button` (XInput order plus guide).
