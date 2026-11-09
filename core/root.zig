@@ -34,6 +34,8 @@ pub const pair = @import("pair/root.zig");
 /// Reliable control channel: framing, type registry, hello, clipboard (spec/control-v0.md).
 pub const control = @import("control/root.zig");
 
+/// Display list, display selection and mid-stream config scheduling.
+pub const display = @import("display/root.zig");
 /// Multi-user sessions: roster and input policy, LTR acks across clients, shared rate
 /// (spec/multi-user-v0.md).
 pub const multi = @import("multi/root.zig");

@@ -61,6 +61,12 @@ export fn moonsec_control_events(ptr: [*]const u8, len: usize) u32 {
     return n;
 }
 
+/// Parses a display list into `out` (up to `cap` entries); returns the count, or -1.
+export fn moonsec_display_list_decode(ptr: [*]const u8, len: usize, out: [*]core.display.DisplayInfo, cap: usize) i32 {
+    const d = core.display.DisplayList.decode(ptr[0..len], out[0..cap]) orelse return -1;
+    return @intCast(d.n);
+}
+
 /// Parses a multi-user roster message body; returns 1 if it gives this client input, 0 if
 /// not, -1 if it does not parse.
 export fn moonsec_multi_roster_have_input(ptr: [*]const u8, len: usize) i32 {

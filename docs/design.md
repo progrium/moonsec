@@ -425,7 +425,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 ### Phase 3: Internet-grade (about 6 weeks)
 
-- Delay-gradient rate controller with the bitrate, resolution, frame-rate ladder. (Built: `core/rate`, ladder in `core/rate/ladder.zig`, behind `rate_control` in the host session. Applying a resize also needs the client to take a mid-stream config.)
+- Delay-gradient rate controller with the bitrate, resolution, frame-rate ladder. (Built: `core/rate`, ladder in `core/rate/ladder.zig`, behind `rate_control` in the host session. Resolution and frame-rate steps apply end to end through mid-stream configs since Phase 5B.)
 - Adaptive Reed-Solomon FEC and path-based choice between NACK and FEC.
 - Capacity estimate driving the shim's pacing rate; relay mode; reconnect and path-change handling.
 - Pairing with tickets and PIN/QR, host allowlist, self-hosted relay deployment. The relay is packaged in [relay/](../relay/README.md) (iroh-relay 1.4.1 config, container, systemd unit; the netns tests run through it in CI); deploying it to a public host is still to do.
@@ -444,7 +444,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 - Long-term reference recovery with client acks per encoder backend; AV1 where available.
 - 4:4:4 and HDR; AMF and oneVPL encoders.
-- Virtual displays (IddCx on Windows, CGVirtualDisplay on macOS); multi-monitor; clipboard; multi-user sessions.
+- Virtual displays (IddCx on Windows, CGVirtualDisplay on macOS); multi-monitor; clipboard; multi-user sessions. (Multi-monitor and mid-stream changes built: `core/display`, [spec/display-v0.md](../spec/display-v0.md); the host lists displays, the client selects one or caps size and frame rate, and size, frame-rate or display changes, including the rate ladder's resolution steps and host mode changes, apply mid-stream from an IDR. Desktop Duplication and ScreenCaptureKit output selection come with #15 and #27.)
 
 **Gate:** loss recovery without keyframe spikes on NVENC and VideoToolbox; headless host works.
 

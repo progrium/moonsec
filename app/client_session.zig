@@ -10,6 +10,13 @@
 //! frame is presented, with the clock offset from ping/pong; the freeze detector sees
 //! every present.
 //!
+//! Mid-stream configs (Phase 5): the host can change the stream's size, frame rate or
+//! display at any frame. Each config has an epoch and the frame it starts at; frames are
+//! tagged with the config they belong to as they come out of reassembly, and
+//! `takeDecoderConfig` tells the decode stage to configure the decoder and presenter
+//! again before the first frame of a new size. The client acks every config and display
+//! list (`config_ack`), and `selectDisplay` asks the host for another display or size.
+//!
 //! Drops (Phase 3): with a pipe that can reconnect, the client asks it for a new connection
 //! after `reconnect_after_us` without a datagram from the host, and again every
 //! `reconnect_after_us` while the silence lasts; the session ends only after
@@ -29,6 +36,7 @@ const media = core.media;
 const recovery = core.recovery;
 const telemetry = core.telemetry;
 const clock = core.clock;
+const display = core.display;
 const PacketPipe = pipe_mod.PacketPipe;
 const Micros = i64;
 
@@ -80,6 +88,8 @@ pub const Stats = struct {
     frames_lost: u64 = 0,
     frames_dropped: u64 = 0,
     frames_stale: u64 = 0,
+    /// Frames not decoded because their config had not arrived yet.
+    frames_await_config: u64 = 0,
     frames_decoded: u64 = 0,
     decode_errors: u64 = 0,
     frames_presented: u64 = 0,
@@ -94,16 +104,21 @@ pub const Stats = struct {
     malformed: u64 = 0,
     unknown: u64 = 0,
     path_changes: u64 = 0,
+    /// Mid-stream configs heard of (a display or mode change, a rate ladder step, a
+    /// multi-user host re-picking the format), and the ones that needed the decoder
+    /// configured again.
+    config_changes: u64 = 0,
+    decoder_reconfigures: u64 = 0,
+    display_lists: u64 = 0,
+    selects_sent: u64 = 0,
     /// Reconnects asked of the pipe, and new connections it made.
     reconnect_requests: u64 = 0,
     reconnects: u64 = 0,
-    /// Configs that changed the stream mid-session (a multi-user host re-picking the
-    /// format as members join and leave).
-    config_changes: u64 = 0,
 };
 
 const Queued = struct {
     au: api.AccessUnit,
+    config: wire.Config,
     meta: recovery.FrameMeta,
     buf: []u8,
 };
@@ -123,7 +138,22 @@ pub const ClientSession = struct {
     reason: []const u8 = "",
     stats: Stats = .{},
     path: pipe_mod.PathStats = .{},
+    /// The config of the newest frame out of reassembly (the session's first until then).
     config: ?wire.Config = null,
+    schedule: display.Schedule(wire.Config) = .{},
+    /// The config the decoder was last configured for (`decoderConfigured`).
+    decoder_config: ?wire.Config = null,
+    reconfig: ?wire.Config = null,
+    displays: [display.DisplayList.max_displays]display.DisplayInfo = undefined,
+    n_displays: usize = 0,
+    display_gen: ?u32 = null,
+    /// A display select not yet answered by a config, and when to repeat it.
+    select: ?display.SelectDisplay = null,
+    select_request: u32 = 0,
+    next_select: Micros = 0,
+    /// A `new_config` frame came before its config: later frames are dropped (recovery
+    /// repairs them) until one whose config is known and starts there or later.
+    awaiting_config: ?u32 = null,
     /// Bumped by every config that starts the stream anew (the first, and each change of
     /// codec, format or size): the app configures its decoder and presenter again.
     config_seq: u32 = 0,
@@ -338,6 +368,13 @@ pub const ClientSession = struct {
                     s.sendHello();
                     s.next_hello = now + s.cfg.hello_interval_us;
                 }
+                if (s.select) |sel| if (now >= s.next_select) {
+                    var b: [display.SelectDisplay.len]u8 = undefined;
+                    sel.encode(&b);
+                    s.sendOther(.control_fast, @intFromEnum(wire.Kind.select_display), &b);
+                    s.stats.selects_sent += 1;
+                    s.next_select = now + s.cfg.hello_interval_us;
+                };
                 s.pollFrames(now);
             },
             .ended => return,
@@ -369,6 +406,41 @@ pub const ClientSession = struct {
         }
     }
 
+    fn sendConfigAck(s: *ClientSession) void {
+        var b: [display.ConfigAck.len]u8 = undefined;
+        (display.ConfigAck{ .nonce = s.cfg.nonce, .epoch = s.schedule.newestEpoch() orelse 0, .display_gen = s.display_gen orelse 0 }).encode(&b);
+        s.sendOther(.control_fast, @intFromEnum(wire.Kind.config_ack), &b);
+    }
+
+    /// The host's displays, as last listed (empty until the host sends a list).
+    pub fn hostDisplays(s: *const ClientSession) []const display.DisplayInfo {
+        return s.displays[0..s.n_displays];
+    }
+
+    /// Ask the host to stream display `id` (`display.keep_display`: the current one), at
+    /// most `max_width`×`max_height` and `max_fps` (0 = no cap). Repeated until the host's
+    /// config answers it; a newer call replaces an unanswered one.
+    pub fn selectDisplay(s: *ClientSession, id: u32, max_width: u32, max_height: u32, max_fps: u16, now: Micros) void {
+        s.select_request +%= 1;
+        if (s.select_request == 0) s.select_request = 1;
+        s.select = .{ .request = s.select_request, .display = id, .max_width = max_width, .max_height = max_height, .max_fps = max_fps };
+        s.next_select = now;
+    }
+
+    /// For the decode stage, right after `nextAccessUnit`: a config to configure the
+    /// decoder and presenter with before decoding that unit (its size, codec or frame rate
+    /// differs from the last one configured), once. Then call `decoderConfigured`.
+    pub fn takeDecoderConfig(s: *ClientSession) ?wire.Config {
+        defer s.reconfig = null;
+        return s.reconfig;
+    }
+
+    /// The decode stage configured the decoder and presenter for `c`.
+    pub fn decoderConfigured(s: *ClientSession, c: wire.Config) void {
+        if (s.decoder_config != null) s.stats.decoder_reconfigures += 1;
+        s.decoder_config = c;
+    }
+
     fn sendHello(s: *ClientSession) void {
         var b: [wire.Hello.len]u8 = undefined;
         (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height, .formats = s.cfg.formats, .display = s.cfg.display }).encode(&b);
@@ -378,6 +450,7 @@ pub const ClientSession = struct {
     pub fn nextWake(s: *ClientSession, now: Micros) Micros {
         var t = @min(now + 5_000, s.next_feedback, s.next_ping);
         if (s.state == .connecting or s.resync) t = @min(t, s.next_hello);
+        if (s.select != null) t = @min(t, s.next_select);
         if (s.byes_left > 0) t = @min(t, s.next_bye);
         if (s.sender.nextSendTime(now)) |x| t = @min(t, x);
         if (s.receiver.deadline(s.rttUs())) |d| t = @min(t, @as(Micros, @intCast(d)));
@@ -416,14 +489,32 @@ pub const ClientSession = struct {
                             return;
                         };
                         if (c.nonce != s.cfg.nonce) return;
-                        if (s.config) |old| {
-                            if (!sameStream(old, c)) s.restart(c, now);
-                        } else {
+                        if (s.config == null) {
                             s.config = c;
                             s.config_seq +%= 1;
                             s.state = .streaming;
                             s.rec = recovery.Client.init(.{ .frame_interval_us = 1_000_000 / @as(u64, c.fps) });
+                        } else if (s.schedule.find(c.epoch)) |known| {
+                            // The same epoch with another stream: the host restarted it in
+                            // place (a multi-user host re-picking the format, or a new hello).
+                            if (!sameStream(known.value, c)) s.restart(c, now);
                         }
+                        if (s.schedule.offer(.{ .epoch = c.epoch, .first_frame = c.first_frame, .value = c }) and s.schedule.current.?.epoch != c.epoch)
+                            s.stats.config_changes += 1;
+                        if (s.select) |sel| if (!display.newer(sel.request, c.request)) {
+                            s.select = null;
+                        };
+                        s.sendConfigAck();
+                    },
+                    .display_list => {
+                        const d = display.DisplayList.decode(o.payload, &s.displays) orelse {
+                            s.stats.malformed += 1;
+                            return;
+                        };
+                        if (s.display_gen == null or s.display_gen.? != d.gen) s.stats.display_lists += 1;
+                        s.n_displays = d.n;
+                        s.display_gen = d.gen;
+                        if (s.config != null) s.sendConfigAck();
                     },
                     .bye => if (s.state == .streaming) s.finish(.host_bye, "host left"),
                     else => if (o.envelope.kind == @intFromEnum(clock.Kind.clock_pong)) {
@@ -471,7 +562,6 @@ pub const ClientSession = struct {
     }
 
     fn pollFrames(s: *ClientSession, now: Micros) void {
-        const c = s.config.?;
         const unow: u64 = @intCast(now);
         while (s.receiver.poll(unow)) |ev| switch (ev) {
             .frame => |f| {
@@ -484,6 +574,18 @@ pub const ClientSession = struct {
                         continue;
                     }
                 };
+                if (f.meta.flags.new_config) {
+                    const e = s.schedule.forFrame(f.id);
+                    if (e == null or e.?.first_frame != f.id) s.awaiting_config = f.id;
+                }
+                if (s.awaiting_config) |w| {
+                    const e = s.schedule.forFrame(f.id);
+                    if (e != null and !display.newer(w, e.?.first_frame)) s.awaiting_config = null else {
+                        s.stats.frames_await_config += 1;
+                        s.rec.onFrameLost(f.id, unow);
+                        continue;
+                    }
+                }
                 const meta: recovery.FrameMeta = .{
                     .frame_id = f.id,
                     .keyframe = f.meta.flags.keyframe,
@@ -505,7 +607,14 @@ pub const ClientSession = struct {
                     continue;
                 };
                 const data = f.copyTo(buf);
+                // The config this frame was encoded with (the newest that starts at or before it).
+                const c = if (s.schedule.forFrame(f.id)) |e| e.value else s.config.?;
+                if (s.config.?.epoch != c.epoch) {
+                    s.config = c;
+                    s.rec.cfg.frame_interval_us = 1_000_000 / @as(u64, c.fps);
+                }
                 s.queue.pushBack(s.gpa, .{
+                    .config = c,
                     .au = .{
                         .codec = c.codec,
                         .frame_id = f.id,
@@ -590,6 +699,8 @@ pub const ClientSession = struct {
         s.config = c;
         s.config_seq +%= 1;
         s.stats.config_changes += 1;
+        s.schedule = .{};
+        s.awaiting_config = null;
         while (s.queue.popFront()) |q| {
             s.timesFor(q.au.frame_id).valid = false;
             s.giveBuf(q.buf);
@@ -604,6 +715,9 @@ pub const ClientSession = struct {
         }
         const q = s.queue.popFront() orelse return null;
         s.current = q;
+        if (s.decoder_config) |d| {
+            if (!d.sameStream(q.config)) s.reconfig = q.config;
+        } else s.reconfig = q.config;
         return q.au;
     }
 
@@ -683,6 +797,8 @@ pub const ClientSession = struct {
         });
         const snap = s.tele.snapshot();
         inline for (.{ "network", "decode", "present", "total" }) |n| try host_session.printStage(w, n, snap.stage(@field(telemetry.Stage, n)));
+        if (st.config_changes + st.display_lists > 0)
+            try w.print("  configs: {d} mid-stream, decoder configured again {d}, frames waiting for a config {d}, display lists {d} ({d} displays), selects sent {d}\n", .{ st.config_changes, st.decoder_reconfigures, st.frames_await_config, st.display_lists, s.n_displays, st.selects_sent });
         if (st.path_changes + st.reconnects + st.reconnect_requests > 0)
             try w.print("  path changes {d}, reconnects {d} (asked {d})\n", .{ st.path_changes, st.reconnects, st.reconnect_requests });
         try s.log.print(w, "client");

@@ -80,7 +80,7 @@ document (or its own spec, linked here) and claims its block below.
 | `0x0000` | invalid | |
 | `0x0001`–`0x00ff` | channel: `hello`, `close` | this document |
 | `0x0100`–`0x01ff` | clipboard | this document |
-| `0x0200`–`0x02ff` | displays: list, select, mode changes (Phase 5B) | reserved |
+| `0x0200`–`0x02ff` | displays: list, select, mid-stream configs (Phase 5B) | [display-v0.md](display-v0.md) |
 | `0x0300`–`0x03ff` | multi-user sessions: roster, input request and handoff (Phase 5D) | [multi-user-v0.md](multi-user-v0.md) |
 | `0x0400`–`0x04ff` | codec, chroma and colour negotiation (Phase 5F) | reserved |
 | `0x0500`–`0x05ff` | file transfer | reserved |

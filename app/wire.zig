@@ -16,6 +16,12 @@ pub const Kind = enum(u8) {
     hello = 32,
     config = 33,
     bye = 34,
+    /// Host to client: `core.display.DisplayList`.
+    display_list = 35,
+    /// Client to host: `core.display.SelectDisplay`.
+    select_display = 36,
+    /// Client to host: `core.display.ConfigAck`.
+    config_ack = 37,
     _,
 };
 
@@ -67,6 +73,9 @@ pub const Hello = struct {
     }
 };
 
+/// The stream's settings. The host sends one per session and a new one (next `epoch`)
+/// whenever the size, frame rate, codec or display changes mid-stream; it takes effect at
+/// `first_frame`, which the host encodes as an IDR.
 pub const Config = struct {
     nonce: u32,
     codec: api.Codec,
@@ -76,11 +85,21 @@ pub const Config = struct {
     height: u32,
     bitrate_bps: u64,
     format: api.VideoFormat = .{},
+    /// Increments per mid-stream change (wraps). 0 for the session's first config.
+    epoch: u32 = 0,
+    /// The first frame (video `frame_id`) encoded with these settings.
+    first_frame: u32 = 0,
+    /// The display being streamed (`DisplayInfo.id`).
+    display: u32 = 0,
+    /// The newest `select_display.request` applied (0: none yet).
+    request: u32 = 0,
 
-    /// The original config: 8-bit 4:2:0 SDR.
+    /// The original config: 8-bit 4:2:0 SDR, no epoch, first frame, display or request.
     pub const base_len = 24;
     /// Plus chroma, bit depth, colour space, flags and the HDR metadata block.
-    pub const len = base_len + 4 + api.HdrMetadata.len;
+    pub const format_len = base_len + 4 + api.HdrMetadata.len;
+    /// Plus epoch, first frame, display and request (Phase 5B).
+    pub const len = format_len + 16;
 
     const flag_hdr_metadata: u8 = 1;
 
@@ -100,12 +119,17 @@ pub const Config = struct {
             out[27] = flag_hdr_metadata;
             m.encode(out[28..][0..api.HdrMetadata.len]);
         }
+        const t = out[format_len..len];
+        std.mem.writeInt(u32, t[0..4], c.epoch, .little);
+        std.mem.writeInt(u32, t[4..8], c.first_frame, .little);
+        std.mem.writeInt(u32, t[8..12], c.display, .little);
+        std.mem.writeInt(u32, t[12..16], c.request, .little);
     }
 
     /// Takes the 24-byte config of older hosts too. Rejects a format that is not
     /// `VideoFormat.valid` (unknown chroma or colour space, 8-bit HDR10, ...).
     pub fn decode(b: []const u8) ?Config {
-        if (b.len != base_len and b.len != len) return null;
+        if (b.len != base_len and b.len != format_len and b.len != len) return null;
         var c: Config = .{
             .nonce = std.mem.readInt(u32, b[0..4], .little),
             .codec = @enumFromInt(b[4]),
@@ -115,13 +139,25 @@ pub const Config = struct {
             .height = std.mem.readInt(u32, b[12..16], .little),
             .bitrate_bps = std.mem.readInt(u64, b[16..24], .little),
         };
-        if (c.fps == 0 or c.slices == 0 or c.width == 0 or c.height == 0) return null;
         if (b.len == len) {
+            const t = b[format_len..len];
+            c.epoch = std.mem.readInt(u32, t[0..4], .little);
+            c.first_frame = std.mem.readInt(u32, t[4..8], .little);
+            c.display = std.mem.readInt(u32, t[8..12], .little);
+            c.request = std.mem.readInt(u32, t[12..16], .little);
+        }
+        if (c.fps == 0 or c.slices == 0 or c.width == 0 or c.height == 0) return null;
+        if (b.len >= format_len) {
             c.format = .{ .chroma = @enumFromInt(b[24]), .bit_depth = b[25], .color = @enumFromInt(b[26]) };
             if (b[27] & flag_hdr_metadata != 0) c.format.hdr = api.HdrMetadata.decode(b[28..][0..api.HdrMetadata.len]);
             if (!c.format.valid()) return null;
         }
         return c;
+    }
+
+    /// Whether the decoder and presenter need configuring again between `a` and `b`.
+    pub fn sameStream(a: Config, b: Config) bool {
+        return a.codec == b.codec and a.width == b.width and a.height == b.height and a.fps == b.fps and a.format.eql(b.format);
     }
 };
 
@@ -193,9 +229,18 @@ test "session messages round trip" {
     try std.testing.expectEqual(@as(?Hello, null), Hello.decode(hb[1..]));
 
     var cb: [Config.len]u8 = undefined;
-    const c: Config = .{ .nonce = 9, .codec = .passthrough, .slices = 4, .fps = 60, .width = 640, .height = 360, .bitrate_bps = 8_000_000 };
+    const c: Config = .{ .nonce = 9, .codec = .passthrough, .slices = 4, .fps = 60, .width = 640, .height = 360, .bitrate_bps = 8_000_000, .epoch = 3, .first_frame = 1234, .display = 2, .request = 1 };
     c.encode(&cb);
     try std.testing.expectEqual(@as(?Config, c), Config.decode(&cb));
+    // The 24- and 56-byte forms still parse, as epoch 0.
+    var v0 = c;
+    v0.epoch = 0;
+    v0.first_frame = 0;
+    v0.display = 0;
+    v0.request = 0;
+    try std.testing.expectEqual(@as(?Config, v0), Config.decode(cb[0..Config.base_len]));
+    try std.testing.expectEqual(@as(?Config, v0), Config.decode(cb[0..Config.format_len]));
+    try std.testing.expectEqual(@as(?Config, null), Config.decode(cb[0..30]));
     cb[6] = 0;
     cb[7] = 0;
     try std.testing.expectEqual(@as(?Config, null), Config.decode(&cb));

@@ -69,6 +69,14 @@ pub const Options = struct {
     path: ?pathsim.Config = null,
     /// Host and client session settings that differ from the defaults.
     pause_on_stall: bool = true,
+    /// The synthetic host's displays (empty: one, `width`×`height`).
+    displays: []const api.Size = &.{},
+    /// Scripted display events (Phase 5), in time order.
+    display_events: []const DisplayEvent = &.{},
+    /// Host-to-client capacity schedule instead of the profile's (for the rate ladder).
+    downlink_steps: ?[]const simnet.Step = null,
+    /// Its bottleneck queue, bytes (0: the sim's default).
+    downlink_queue_bytes: u64 = 0,
     /// Coded formats the synthetic encoder and decoder offer, the host's preferences, the
     /// host display's HDR mode and the client display (format negotiation, platform/format.zig).
     encoder_formats: api.Formats = api.Formats.all,
@@ -81,6 +89,19 @@ pub const Options = struct {
     /// Run the control channel with in-memory clipboards and this script of copies; the
     /// outcome is written back into it.
     clipboard: ?*ClipScript = null,
+};
+
+pub const DisplayEvent = struct {
+    at_us: Micros,
+    what: union(enum) {
+        /// The client asks for a display (`core.display.keep_display`: the current one)
+        /// with these caps (0 = none).
+        select: struct { display: u32, max_width: u32 = 0, max_height: u32 = 0, max_fps: u16 = 0 },
+        /// A host display changes mode.
+        mode: struct { display: u32, width: u32, height: u32 },
+        /// A display is plugged into the host.
+        hotplug: api.Size,
+    },
 };
 
 /// Copies made on either side during a run, and what each clipboard held at the end.
@@ -131,6 +152,15 @@ pub const Result = struct {
         reconnects: u64 = 0,
         stall_pauses: u64 = 0,
         stall_frames: u64 = 0,
+        reconfigures: u64 = 0,
+        display_switches: u64 = 0,
+        mode_changes: u64 = 0,
+        config_resends: u64 = 0,
+        /// The stream at the end.
+        width: u32 = 0,
+        height: u32 = 0,
+        fps: u32 = 0,
+        display: u32 = 0,
         /// What the hello negotiated.
         format: api.VideoFormat = .{},
         end: []const u8,
@@ -151,6 +181,12 @@ pub const Result = struct {
         path_changes: u64 = 0,
         reconnects: u64 = 0,
         reconnect_requests: u64 = 0,
+        config_changes: u64 = 0,
+        decoder_reconfigures: u64 = 0,
+        /// Displays the client last heard of, and the size of the last presented picture.
+        displays: usize = 0,
+        width: u32 = 0,
+        height: u32 = 0,
         /// The format in the config the client got, and frames presented in another colour space.
         format: api.VideoFormat = .{},
         wrong_color: u64 = 0,
@@ -249,6 +285,8 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     const net = try gpa.create(simnet.Net);
     defer gpa.destroy(net);
     var cfg: simnet.Config = .{ .seed = o.seed, .a_to_b = o.profile.link(), .b_to_a = o.profile.link() };
+    if (o.downlink_steps) |st| cfg.a_to_b.steps = st;
+    if (o.downlink_queue_bytes > 0) cfg.a_to_b.queue_limit_bytes = o.downlink_queue_bytes;
     cfg.b.clock_offset_us = o.clock_offset_us;
     const loss = cfg.a_to_b.loss;
     cfg.a_to_b.loss = 0;
@@ -258,7 +296,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
 
     var hc: SideClock = .{ .net = net, .side = .a };
     var cc: SideClock = .{ .net = net, .side = .b };
-    const sh = try synthetic.openHost(gpa, .{ .clock = hc.clock(), .width = o.width, .height = o.height, .audio = o.audio, .encoder_formats = o.encoder_formats, .hdr_display = o.hdr_source });
+    const sh = try synthetic.openHost(gpa, .{ .clock = hc.clock(), .width = o.width, .height = o.height, .displays = o.displays, .audio = o.audio, .encoder_formats = o.encoder_formats, .hdr_display = o.hdr_source });
     const hb = sh.backend();
     defer hb.deinit();
     const sc = try synthetic.openClient(gpa, .{ .clock = cc.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio, .decoder_formats = o.decoder_formats, .display = o.client_display });
@@ -306,7 +344,13 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     var loss_on = false;
     var next_progress: Micros = @as(Micros, o.progress_every_s) * simnet.SEC;
     var closing = false;
+    var next_event: usize = 0;
     while (!(host.done() and client.done())) : (t += o.step_us) {
+        while (next_event < o.display_events.len and t >= o.display_events[next_event].at_us) : (next_event += 1) switch (o.display_events[next_event].what) {
+            .select => |q| client.s.selectDisplay(q.display, q.max_width, q.max_height, q.max_fps, net.localTime(.b)),
+            .mode => |m| sh.capture.setMode(m.display, m.width, m.height),
+            .hotplug => |sz| _ = sh.capture.addDisplay(sz),
+        };
         if (!loss_on and t >= o.warmup_us) {
             if (o.path != null) {
                 model.setLoss(loss);
@@ -334,7 +378,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         client.tick();
         if (log) |w| if (o.progress_every_s > 0 and t >= next_progress) {
             const fz = client.s.freeze.stats;
-            try w.print("  t={d} s: presented {d}, freezes {d}, longest gap {d:.1} ms\n", .{ @divTrunc(t, simnet.SEC), client.s.stats.frames_presented, fz.freezes, @as(f64, @floatFromInt(fz.longest_gap_us)) / 1000 });
+            try w.print("  t={d} s: presented {d}, freezes {d}, longest gap {d:.1} ms; host encoder {d} kbit/s, pacing {d} kbit/s, stream {d}x{d}@{d}\n", .{ @divTrunc(t, simnet.SEC), client.s.stats.frames_presented, fz.freezes, @as(f64, @floatFromInt(fz.longest_gap_us)) / 1000, host.s.bitrate_bps / 1000, host.s.last_pacing / 1000, host.s.cfg.width, host.s.cfg.height, host.s.cfg.fps });
             try w.flush();
             next_progress += @as(Micros, o.progress_every_s) * simnet.SEC;
         };
@@ -383,6 +427,14 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .reconnects = host.s.stats.reconnects,
             .stall_pauses = host.s.stats.stall_pauses,
             .stall_frames = host.s.stats.stall_frames,
+            .reconfigures = host.s.stats.reconfigures,
+            .display_switches = host.s.stats.display_switches,
+            .mode_changes = host.s.stats.mode_changes,
+            .config_resends = host.s.stats.config_resends,
+            .width = host.s.cfg.width,
+            .height = host.s.cfg.height,
+            .fps = host.s.cfg.fps,
+            .display = host.s.cfg.display,
             .format = host.s.format,
             .end = @tagName(host.s.end),
         },
@@ -402,6 +454,11 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .path_changes = client.s.stats.path_changes,
             .reconnects = client.s.stats.reconnects,
             .reconnect_requests = client.s.stats.reconnect_requests,
+            .config_changes = client.s.stats.config_changes,
+            .decoder_reconfigures = client.s.stats.decoder_reconfigures,
+            .displays = client.s.n_displays,
+            .width = if (sc.presenter.last_size) |z| z.width else 0,
+            .height = if (sc.presenter.last_size) |z| z.height else 0,
             .format = if (client.s.config) |c| c.format else .{},
             .wrong_color = sc.presenter.stats.wrong_color,
             .end = @tagName(client.s.end),

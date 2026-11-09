@@ -2,7 +2,10 @@
 //! client apps run end to end on any machine (CI, the sim, Linux over iroh).
 //!
 //!   Capture        renders the test pattern (platform/pattern.zig) stamped with the
-//!                  capture clock and frame number, at the configured rate.
+//!                  capture clock and frame number, at the configured rate. It has N
+//!                  fake displays of different sizes (`Options.displays`) to pick from,
+//!                  and `setMode`/`addDisplay` change them mid-stream like a real
+//!                  mode change or hotplug.
 //!   Encoder        the passthrough codec: each access unit carries the pattern's stamp,
 //!                  a CRC-32 of the pixels, reference bookkeeping (IDR, P, LTR, LTR
 //!                  refresh), the coded format (chroma, bit depth, colour space, HDR
@@ -135,20 +138,77 @@ pub const Capture = struct {
     next_due: ?Micros = null,
     last: ?api.CapturedFrame = null,
     out: bool = false,
-    default_size: api.Size,
+    /// The fake displays; ids are indexes.
+    display_list: [max_displays]api.DisplayInfo = undefined,
+    n_displays: usize = 0,
+    /// The display being captured, and whether the size follows its mode (no size asked).
+    display: u32 = 0,
+    native: bool = true,
+    stats: struct { starts: u64 = 0, mode_follows: u64 = 0 } = .{},
     /// The "display" is in HDR mode: with `CaptureConfig.hdr`, frames are tagged HDR10 and
     /// `start` reports this metadata (the pixels stay the 8-bit pattern).
     hdr_display: ?api.HdrMetadata = null,
     color: api.ColorSpace = .sdr_bt709,
 
-    pub fn start(c: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
-        c.width = if (cfg.width != 0) cfg.width else c.default_size.width;
-        c.height = if (cfg.height != 0) cfg.height else c.default_size.height;
+    pub const max_displays = 8;
+
+    pub fn initDisplays(c: *Capture, sizes: []const api.Size) void {
+        c.n_displays = 0;
+        var x: i32 = 0;
+        for (sizes[0..@min(sizes.len, max_displays)]) |sz| {
+            var d: api.DisplayInfo = .{ .id = @intCast(c.n_displays), .width = sz.width, .height = sz.height, .refresh_mhz = 60_000, .x = x, .primary = c.n_displays == 0 };
+            var nb: [24]u8 = undefined;
+            d.setName(std.fmt.bufPrint(&nb, "Synthetic {d}", .{c.n_displays + 1}) catch "Synthetic");
+            c.display_list[c.n_displays] = d;
+            c.n_displays += 1;
+            x += @intCast(sz.width);
+        }
+    }
+
+    pub fn displays(c: *Capture, out: []api.DisplayInfo) api.Error!usize {
+        const n = @min(out.len, c.n_displays);
+        @memcpy(out[0..n], c.display_list[0..n]);
+        return n;
+    }
+
+    /// The display's mode changes (as if the user changed its resolution). A capture of
+    /// it at its own size follows from the next frame.
+    pub fn setMode(c: *Capture, id: u32, width: u32, height: u32) void {
+        if (id >= c.n_displays) return;
+        c.display_list[id].width = width;
+        c.display_list[id].height = height;
+    }
+
+    /// A display is plugged in; returns its id.
+    pub fn addDisplay(c: *Capture, size: api.Size) ?u32 {
+        if (c.n_displays == max_displays) return null;
+        const last = c.display_list[c.n_displays - 1];
+        var d: api.DisplayInfo = .{ .id = @intCast(c.n_displays), .width = size.width, .height = size.height, .refresh_mhz = 60_000, .x = last.x + @as(i32, @intCast(last.width)) };
+        d.setName("Synthetic hotplug");
+        c.display_list[c.n_displays] = d;
+        c.n_displays += 1;
+        return d.id;
+    }
+
+    fn alloc(c: *Capture) api.Error!void {
         if (c.width < pattern.min_width or c.height < pattern.min_height) return error.Unsupported;
-        c.interval_us = @divTrunc(1_000_000, @as(Micros, @max(cfg.fps, 1)));
         if (c.buf.len > 0) c.gpa.free(c.buf);
+        c.buf = &.{};
         c.buf = c.gpa.alloc(u8, c.width * c.height * 4) catch return error.OutOfMemory;
+    }
+
+    pub fn start(c: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
+        if (cfg.display >= c.n_displays) return error.Unsupported;
+        const d = c.display_list[cfg.display];
+        c.display = cfg.display;
+        c.native = cfg.width == 0 or cfg.height == 0;
+        c.width = if (c.native) d.width else cfg.width;
+        c.height = if (c.native) d.height else cfg.height;
+        try c.alloc();
+        c.interval_us = @divTrunc(1_000_000, @as(Micros, @max(cfg.fps, 1)));
         c.next_due = null;
+        c.last = null;
+        c.stats.starts += 1;
         if (cfg.hdr) if (c.hdr_display) |m| {
             c.color = .hdr10;
             return .{ .width = c.width, .height = c.height, .color = .hdr10, .hdr = m };
@@ -160,6 +220,16 @@ pub const Capture = struct {
     pub fn acquire(c: *Capture, timeout_us: Micros) api.Error!?api.CapturedFrame {
         std.debug.assert(!c.out);
         if (c.buf.len == 0) return error.Closed;
+        if (c.native) {
+            const d = c.display_list[c.display];
+            if (d.width != c.width or d.height != c.height) {
+                c.width = d.width;
+                c.height = d.height;
+                try c.alloc();
+                c.last = null;
+                c.stats.mode_follows += 1;
+            }
+        }
         var now = c.clock.now();
         const due = c.next_due orelse now;
         if (now < due) {
@@ -492,8 +562,9 @@ pub const Decoder = struct {
 pub const Presenter = struct {
     clock: api.Clock,
     cfg: ?api.PresenterConfig = null,
-    /// Stamp read back from the last presented picture.
+    /// Stamp read back from the last presented picture, and its size.
     last_stamp: ?pattern.Stamp = null,
+    last_size: ?api.Size = null,
     stats: struct { presents: u64 = 0, unreadable: u64 = 0, overlays: u64 = 0, wrong_color: u64 = 0 } = .{},
 
     pub fn configure(p: *Presenter, cfg: api.PresenterConfig) api.Error!void {
@@ -512,6 +583,7 @@ pub const Presenter = struct {
         if (o != null) p.stats.overlays += 1;
         if (f.image.color != p.cfg.?.format.color) p.stats.wrong_color += 1;
         p.stats.presents += 1;
+        p.last_size = .{ .width = f.image.width, .height = f.image.height };
         return .{ .presented_us = p.clock.now() };
     }
 
@@ -717,6 +789,8 @@ pub const Options = struct {
     sleep_ctx: ?*anyopaque = null,
     width: u32 = 640,
     height: u32 = 360,
+    /// Host: the fake displays (display 0 is primary). Empty: one, `width`×`height`.
+    displays: []const api.Size = &.{},
     /// Client: a scripted key event this often (0: none).
     input_interval_us: Micros = 25_000,
     input_limit: u64 = 0,
@@ -797,11 +871,12 @@ pub fn openHost(gpa: std.mem.Allocator, o: Options) !*Host {
     h.* = .{
         .gpa = gpa,
         .clock = o.clock,
-        .capture = .{ .gpa = gpa, .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx, .default_size = .{ .width = o.width, .height = o.height }, .hdr_display = o.hdr_display },
+        .capture = .{ .gpa = gpa, .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx, .hdr_display = o.hdr_display },
         .encoder = .{ .gpa = gpa, .clock = o.clock, .formats = o.encoder_formats },
         .audio = .{ .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx },
         .with_audio = o.audio,
     };
+    h.capture.initDisplays(if (o.displays.len > 0) o.displays else &.{.{ .width = o.width, .height = o.height }});
     return h;
 }
 
@@ -968,6 +1043,40 @@ test "capture keeps cadence and repeats" {
     const b = (try hb.capture.acquire(0)).?;
     try testing.expectEqual(@as(u64, 1), b.seq);
     hb.capture.release(&b);
+}
+
+test "displays: list, select, mode change mid-capture" {
+    const gpa = testing.allocator;
+    const clock = api.clockFn(testClock);
+    const h = try openHost(gpa, .{ .clock = clock, .displays = &.{ .{ .width = 320, .height = 180 }, .{ .width = 256, .height = 192 } } });
+    const hb = h.backend();
+    defer hb.deinit();
+    var ds: [4]api.DisplayInfo = undefined;
+    try testing.expectEqual(@as(usize, 2), try hb.capture.displays(&ds));
+    try testing.expect(ds[0].primary and !ds[1].primary);
+    try testing.expectEqualStrings("Synthetic 2", ds[1].name());
+    try testing.expectEqual(@as(i32, 320), ds[1].x);
+    try testing.expectError(error.Unsupported, hb.capture.start(.{ .display = 2 }));
+    const sz = try hb.capture.start(.{ .display = 1 });
+    try testing.expectEqual(@as(u32, 256), sz.width);
+    const a = (try hb.capture.acquire(0)).?;
+    try testing.expectEqual(@as(u32, 192), a.image.height);
+    hb.capture.release(&a);
+    h.capture.setMode(1, 160, 120);
+    test_now += 20_000;
+    const b = (try hb.capture.acquire(0)).?;
+    try testing.expectEqual(@as(u32, 160), b.image.width);
+    try testing.expect(api.pattern.read(b.image.cpu.?.data, 160, 120, 160 * 4) != null);
+    hb.capture.release(&b);
+    // A scaled capture keeps its size.
+    _ = try hb.capture.start(.{ .display = 0, .width = 160, .height = 90 });
+    h.capture.setMode(0, 640, 360);
+    test_now += 20_000;
+    const c = (try hb.capture.acquire(0)).?;
+    try testing.expectEqual(@as(u32, 160), c.image.width);
+    hb.capture.release(&c);
+    try testing.expectEqual(@as(?u32, 2), h.capture.addDisplay(.{ .width = 200, .height = 100 }));
+    try testing.expectEqual(@as(usize, 3), try hb.capture.displays(&ds));
 }
 
 test "scripted input reaches the injector in order" {
