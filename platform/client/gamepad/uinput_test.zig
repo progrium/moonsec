@@ -227,3 +227,30 @@ test "uinput: a pad already plugged in is found at open, and the state it has" {
     }.f) catch return skipOrFail("the virtual pad's event node never became readable");
     try testing.expectEqual(B.start, e.what.pad.state.?.buttons);
 }
+
+test "uinput: the Linux host's virtual pad is skipped unless asked for" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // Named the way platform/host/linux/input.zig names its pads, plus our pid so the
+    // filter below sees only this one.
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "moonsec pad {d} (Xbox 360 layout)", .{linux.getpid()});
+    try testing.expect(evdev.isHostPad(name));
+    const pad = VirtualPad.create(name, 0x045e) catch |e| return skipOrFail(@errorName(e));
+    defer pad.destroy();
+
+    // Opt out of the skip first, so we know the node is readable before trusting a zero.
+    var seen = try evdev.Source.open(.{ .nowFn = monoNow }, .{ .name_filter = name, .skip_host_pads = false });
+    defer seen.close();
+    _ = waitFor(&seen, {}, struct {
+        fn f(_: void, e: api.InputEvent) bool {
+            return e.what.pad.state != null;
+        }
+    }.f) catch return skipOrFail("the virtual pad's event node never became readable");
+    try testing.expectEqual(@as(usize, 1), seen.deviceCount());
+
+    var src = try evdev.Source.open(.{ .nowFn = monoNow }, .{ .name_filter = name });
+    defer src.close();
+    var out: [8]api.InputEvent = undefined;
+    try testing.expectEqual(@as(usize, 0), try src.poll(&out));
+    try testing.expectEqual(@as(usize, 0), src.deviceCount());
+}

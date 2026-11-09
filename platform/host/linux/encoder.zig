@@ -3,8 +3,9 @@
 //!
 //!   vaapi     libva loaded at run time; H.264 and HEVC; long-term references when the
 //!             driver takes packed headers (we write them: h26x.c), else IDR recovery.
-//!   nvenc     reserved: the Linux NVENC backend builds on the shared NVENC core from the
-//!             Windows host and is wired in here once both have landed.
+//!   nvenc     libcuda and libnvidia-encode loaded at run time (enc_nv.c over enc_nvenc.c,
+//!             on the NVENC core shared with the Windows host); H.264 and HEVC; long-term
+//!             references. `device` is a CUDA ordinal for it. Compile-only so far.
 //!   software  libavcodec's libx264 (or OpenH264) with zerolatency settings; IDR recovery.
 //!   auto      the first of vaapi, nvenc, software that opens.
 //!

@@ -1,4 +1,4 @@
-/* Shared by the Linux encoder backends (enc.c, enc_vaapi.c, enc_sw.c, testenc.c). */
+/* Shared by the Linux encoder backends (enc.c, enc_vaapi.c, enc_nv.c, enc_sw.c, testenc.c). */
 #ifndef MLH_ENC_INTERNAL_H
 #define MLH_ENC_INTERNAL_H
 
@@ -30,6 +30,8 @@ int mlh_enc_append(mlh_enc *e, const void *data, size_t len);
 
 int mlh_enc_vaapi_create(const char *device, mlh_enc **out);
 int mlh_enc_sw_create(mlh_enc **out);
+/* `device`: a CUDA ordinal ("0", "1", ...); anything else means device 0. */
+int mlh_enc_nvenc_create(const char *device, mlh_enc **out);
 
 /* Maps a linear dma-buf for reading (dmabuf.c): BGRA or contiguous NV12. */
 int mlh_dmabuf_map(const mlh_dmabuf *d, const uint8_t **data, uint32_t *stride, uint32_t *format, void **cookie);

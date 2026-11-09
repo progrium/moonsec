@@ -259,7 +259,19 @@ pub const Options = struct {
     /// Only take devices whose name contains this (tests use it to see only
     /// their virtual pad).
     name_filter: ?[]const u8 = null,
+    /// Skip the Linux host's virtual pads (uinput, named "moonsec pad N ...", see
+    /// platform/host/linux/input.zig). With host and client on one machine, reading them
+    /// would send the host's own output back to it as a second controller.
+    skip_host_pads: bool = true,
 };
+
+/// Name prefix of the Linux host's uinput gamepads (platform/host/linux/input.zig).
+pub const host_pad_prefix = "moonsec pad";
+
+/// Whether a device named `name` is one of the Linux host's virtual pads.
+pub fn isHostPad(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, host_pad_prefix);
+}
 
 pub const max_devices = 8;
 
@@ -403,7 +415,7 @@ const LinuxSource = struct {
         const rc = linux.openat(dfd, &z, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
         if (linux.errno(rc) != .SUCCESS) return;
         const fd: i32 = @intCast(rc);
-        const mapper = probe(fd, s.opts.name_filter) orelse {
+        const mapper = probe(fd, s.opts) orelse {
             _ = linux.close(fd);
             return;
         };
@@ -414,9 +426,10 @@ const LinuxSource = struct {
         s.slots.update(d.id, d.mapper.snapshot(), s.clock.now());
     }
 
-    /// Checks that `fd` is a gamepad (and passes the name filter), switches it
-    /// to monotonic timestamps and reads its current state.
-    fn probe(fd: i32, name_filter: ?[]const u8) ?Mapper {
+    /// Checks that `fd` is a gamepad (passing the name filter, and not the host's
+    /// virtual pad unless asked), switches it to monotonic timestamps and reads its
+    /// current state.
+    fn probe(fd: i32, opts: Options) ?Mapper {
         var ev_bits: [4]u8 = .{0} ** 4;
         if (linux.errno(linux.ioctl(fd, EVIOCGBIT(0, ev_bits.len), @intFromPtr(&ev_bits))) != .SUCCESS) return null;
         if (!bitSet(&ev_bits, EV_KEY) or !bitSet(&ev_bits, EV_ABS)) return null;
@@ -426,11 +439,12 @@ const LinuxSource = struct {
         var abs_bytes: [(ABS_MAX + 1) / 8]u8 = .{0} ** ((ABS_MAX + 1) / 8);
         if (linux.errno(linux.ioctl(fd, EVIOCGBIT(EV_ABS, abs_bytes.len), @intFromPtr(&abs_bytes))) != .SUCCESS) return null;
 
-        if (name_filter) |f| {
-            var name: [256]u8 = .{0} ** 256;
-            const rc = linux.ioctl(fd, EVIOCGNAME(name.len), @intFromPtr(&name));
-            if (linux.errno(rc) != .SUCCESS) return null;
-            if (std.mem.indexOf(u8, std.mem.sliceTo(&name, 0), f) == null) return null;
+        if (opts.name_filter != null or opts.skip_host_pads) {
+            var name_buf: [256]u8 = .{0} ** 256;
+            const rc = linux.ioctl(fd, EVIOCGNAME(name_buf.len - 1), @intFromPtr(&name_buf));
+            const name: []const u8 = if (linux.errno(rc) == .SUCCESS) std.mem.sliceTo(&name_buf, 0) else "";
+            if (opts.name_filter) |f| if (std.mem.indexOf(u8, name, f) == null) return null;
+            if (opts.skip_host_pads and isHostPad(name)) return null;
         }
 
         var id: InputId = .{};
@@ -611,6 +625,14 @@ test "evdev: trigger axes fall back to BRAKE/GAS" {
     m.axis(ABS_GAS, 255);
     try testing.expectEqual(@as(u16, 65535), m.snapshot().rt);
     m.axis(0x3f + 1, 7); // out of range: ignored
+}
+
+test "evdev: the Linux host's virtual pads are recognised by name" {
+    try testing.expect(isHostPad("moonsec pad 1 (Xbox 360 layout)"));
+    try testing.expect(isHostPad("moonsec pad 4 (Xbox 360 layout)"));
+    try testing.expect(!isHostPad("moonsec test pad 123-45e"));
+    try testing.expect(!isHostPad("Microsoft X-Box 360 pad"));
+    try testing.expect(!isHostPad(""));
 }
 
 test "evdev: ioctl numbers match linux/input.h" {
