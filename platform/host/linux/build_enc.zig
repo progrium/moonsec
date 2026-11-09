@@ -18,8 +18,17 @@ pub const c_flags: []const []const u8 = &.{ "-std=gnu11", "-Wall", "-Wextra", "-
 
 pub const c_files: []const []const u8 = &.{ "enc.c", "enc_sw.c", "enc_vaapi.c", "enc_nv.c", "enc_nvenc.c", "dmabuf.c", "h26x.c", "testenc.c" };
 
-/// The encoder module ("host_linux_enc", encoder.zig) with its C files and libraries.
+/// The encoder module ("host_linux_enc", encoder.zig) with its C files and libraries, and
+/// its own error functions (enc_errors.c).
 pub fn encoderModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, platform: *std.Build.Module) *std.Build.Module {
+    const mod = encoderModuleShared(b, target, optimize, platform);
+    mod.addCSourceFiles(.{ .root = b.path("platform/host/linux"), .files = &.{"enc_errors.c"}, .flags = c_flags });
+    return mod;
+}
+
+/// The encoder module without the error functions, for linking next to the capture side
+/// (host.zig's mlh_common.c defines them): what the host backend imports.
+pub fn encoderModuleShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, platform: *std.Build.Module) *std.Build.Module {
     const tc = b.addTranslateC(.{ .root_source_file = b.path("platform/host/linux/mlh_enc.h"), .target = target, .optimize = optimize });
     const mod = b.createModule(.{
         .root_source_file = b.path("platform/host/linux/encoder.zig"),

@@ -10,7 +10,19 @@
 //!                             on loopback (builds the shim; part of test-shim)
 //!   zig build examples        examples/host.c and examples/client.c against libmoonsec
 //!   zig build abi-dump -- --write abi/abi-v1.txt     regenerate the ABI dump
+//!   zig build test-abi-system  a host and a client on MOONSEC_BACKEND_SYSTEM over iroh
+//!                             (Linux: run under platform/host/linux/headless.sh)
+//!
+//! `-Dabi-system=true|false` puts the OS backends (MOONSEC_BACKEND_SYSTEM) into the
+//! libraries: the screen capture, encoders, audio and input injection of the host, and the
+//! decoder, window, audio and input of the client. On by default for Windows targets and
+//! on macOS hosts; off by default on Linux, where it needs the libraries listed in
+//! platform/client/build.zig and platform/host/linux/build.zig.
 const std = @import("std");
+const root = @import("../build.zig");
+const client_build = @import("../platform/client/build.zig");
+const host_linux_build = @import("../platform/host/linux/build.zig");
+const host_macos_build = @import("../platform/host/macos/build.zig");
 
 pub const Deps = struct {
     app_imports: []const std.Build.Module.Import,
@@ -18,14 +30,57 @@ pub const Deps = struct {
     iroh_pipe: *std.Build.Module,
     /// The shim's static library, installed next to libmoonsec.a (static consumers link both).
     shim_archive: ?std.Build.LazyPath,
+    /// platform/linux/uinput.zig (the Linux backends share it).
+    linux_uinput: *std.Build.Module,
 };
+
+fn appModule(deps: Deps, name: []const u8) *std.Build.Module {
+    for (deps.app_imports) |i| if (std.mem.eql(u8, i.name, name)) return i.module;
+    @panic(name);
+}
+
+/// Whether the libraries get the OS backends (see the top of this file).
+fn systemDefault(b: *std.Build, target: std.Build.ResolvedTarget) bool {
+    return switch (target.result.os.tag) {
+        .windows => true,
+        .macos => b.graph.host.result.os.tag == .macos,
+        else => false,
+    };
+}
+
+/// Adds the OS backends for `target` to the library module `m` as "system_host" and
+/// "system_client" (app/system.zig picks them up).
+fn addSystem(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, deps: Deps, m: *std.Build.Module) void {
+    const core = appModule(deps, "core");
+    const platform = appModule(deps, "platform");
+    const synthetic = appModule(deps, "synthetic");
+    switch (target.result.os.tag) {
+        .linux => {
+            const lm: client_build.LinuxModules = .{ .core = core, .platform = platform, .synthetic = synthetic, .linux_uinput = deps.linux_uinput };
+            m.addImport("system_host", host_linux_build.linuxHostModule(b, target, optimize, .{ .core = core, .platform = platform, .synthetic = synthetic, .linux_uinput = deps.linux_uinput }));
+            m.addImport("system_client", client_build.linuxClientModule(b, target, optimize, lm));
+        },
+        .windows => {
+            const win = root.windowsModule(b, target, optimize);
+            m.addImport("system_host", root.windowsHostModule(b, target, optimize, win));
+            m.addImport("system_client", client_build.windowsClientModuleWith(b, target, optimize, .{ .core = core, .platform = platform, .win = win }));
+        },
+        .macos => {
+            const native = b.graph.host.result.os.tag == .macos;
+            m.addImport("system_host", host_macos_build.macosHostModule(b, target, optimize, .{ .core = core, .platform = platform }, native));
+            m.addImport("system_client", client_build.macosClientModuleWith(b, target, optimize, native, .{ .core = core, .platform = platform }));
+        },
+        else => @panic("-Dabi-system: no OS backends for this target"),
+    }
+}
 
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, deps: Deps, test_step: *std.Build.Step) void {
     const header = b.addTranslateC(.{ .root_source_file = b.path("include/moonsec.h"), .target = target, .optimize = optimize });
     const header_mod = header.createModule();
 
-    const sim = libraries(b, target, optimize, deps, header_mod, false);
-    const full = libraries(b, target, optimize, deps, header_mod, true);
+    const system = b.option(bool, "abi-system", "Put the OS backends (MOONSEC_BACKEND_SYSTEM) into libmoonsec (default: on for Windows and macOS)") orelse systemDefault(b, target);
+    const sim = libraries(b, target, optimize, deps, header_mod, false, system);
+    const full = libraries(b, target, optimize, deps, header_mod, true, system);
 
     const install_header = b.addInstallHeaderFile(b.path("include/moonsec.h"), "moonsec.h");
     const abi_sim = b.step("abi-sim", "Install the C ABI without iroh: zig-out/lib/libmoonsec-sim.{a,so} and zig-out/include/moonsec.h");
@@ -72,6 +127,23 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     b.step("test-abi-iroh", "C ABI over iroh on loopback: pairing, admission, a session (builds the shim)").dependOn(&run_iroh.step);
     if (b.top_level_steps.get("test-shim")) |ts| ts.step.dependOn(&run_iroh.step);
 
+    // --- the OS backends over iroh ---
+    const test_system = b.step("test-abi-system", "C ABI: a host and a client on MOONSEC_BACKEND_SYSTEM over iroh (-Dabi-system; Linux: under platform/host/linux/headless.sh)");
+    if (system) {
+        const sys_test = cProgram(b, target, optimize, "abi-test-system", "abi/test_system.c", full.static, false);
+        if (target.result.os.tag == .linux) {
+            // The host tests' ScreenCast portal backend, served when MOONSEC_TEST_PORTAL is set.
+            const m = sys_test.root_module;
+            m.addCMacro("MOONSEC_TEST_PORTAL_BACKEND", "1");
+            m.addIncludePath(b.path("platform/host/linux/testwin"));
+            m.addCSourceFile(.{ .file = b.path("platform/host/linux/testwin/testportal.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-fno-sanitize=undefined" } });
+            m.linkSystemLibrary("dbus-1", .{});
+        }
+        const run_sys = b.addRunArtifact(sys_test);
+        run_sys.has_side_effects = true;
+        test_system.dependOn(&run_sys.step);
+    } else test_system.dependOn(&b.addFail("test-abi-system needs -Dabi-system=true").step);
+
     // --- examples ---
     const examples = b.step("examples", "Build examples/host.c and examples/client.c against libmoonsec (builds the shim)");
     inline for (.{ "host", "client" }) |name| {
@@ -83,7 +155,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
 
 const Libs = struct { static: *std.Build.Step.Compile, shared: *std.Build.Step.Compile };
 
-fn libraries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, deps: Deps, header_mod: *std.Build.Module, with_iroh: bool) Libs {
+fn libraries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, deps: Deps, header_mod: *std.Build.Module, with_iroh: bool, system: bool) Libs {
     const name = if (with_iroh) "moonsec" else "moonsec-sim";
     var out: Libs = undefined;
     inline for (.{ .static, .dynamic }) |linkage| {
@@ -91,6 +163,7 @@ fn libraries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         opts.addOption(bool, "iroh", with_iroh);
         opts.addOption(bool, "linux_client", false);
         opts.addOption(bool, "linux_host", false);
+        opts.addOption(bool, "system_backend", system);
         const m = b.createModule(.{
             .root_source_file = b.path("app/abi.zig"),
             .target = target,
@@ -106,6 +179,7 @@ fn libraries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
             m.addImport("iroh", deps.iroh);
             m.addImport("iroh_pipe", deps.iroh_pipe);
         }
+        if (system) addSystem(b, target, optimize, deps, m);
         if (target.result.os.tag == .windows) m.linkSystemLibrary("winmm", .{});
         const lib = b.addLibrary(.{ .name = name, .linkage = linkage, .root_module = m });
         if (linkage == .static) out.static = lib else out.shared = lib;

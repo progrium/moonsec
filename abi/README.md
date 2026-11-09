@@ -9,6 +9,7 @@ The ABI itself: [include/moonsec.h](../include/moonsec.h) (header),
 | [build.zig](build.zig) | The libraries, tests and examples (`@import`ed by the root build.zig). |
 | [test_loopback.c](test_loopback.c) | Host and client through the ABI over the in-process sim, in virtual time, on the clean, LAN and WAN profiles: events, frames through the frame callback, input (keys, buttons, scroll, motion, gamepads), clipboard both ways, telemetry, `struct_size` handling for an older caller, error codes, close and destroy from either side, no common codec. |
 | [test_iroh.c](test_iroh.c) | Over iroh on loopback with the library's threads: an unpaired client refused, pairing by wrong PIN (fails) and QR ticket, a session with input and clipboard, persistence of keys and allowlists in the state directories, a client that requires pairing refusing an unknown host. |
+| [test_system.c](test_system.c) | `MOONSEC_BACKEND_SYSTEM` over iroh: the host captures the screen and encodes with the OS's encoder, the client decodes and shows it in a window; the frame callback sees every picture, input reaches the host app, the loopback refuses system sessions. On Linux it serves the host tests' ScreenCast portal backend under `platform/host/linux/headless.sh`. |
 | [include_check.cpp](include_check.cpp) | The header compiles as C++17, every function has its frozen signature (`static_assert` on its type), and the library links and runs from C++. |
 | [abi_dump.c](abi_dump.c) | Every struct's size and field offsets, every constant's value and every function (by address, so the library must export it). `--check abi-v1.txt` compares with the frozen dump. |
 | [abi-v1.txt](abi-v1.txt) | The frozen dump, for 64-bit targets. |
@@ -19,6 +20,7 @@ The ABI itself: [include/moonsec.h](../include/moonsec.h) (header),
 ```sh
 zig build test-abi        # C test over the sim, C++ check, ABI dump (no Rust; part of `zig build test`)
 zig build test-abi-iroh   # the iroh test (builds the shim; part of `zig build test-shim`)
+platform/host/linux/headless.sh zig build test-abi-system -Dabi-system=true   # OS backends (Linux)
 zig build abi             # zig-out/include/moonsec.h, zig-out/lib/libmoonsec.{a,so} + libiroh_shim.a
 zig build abi-sim         # libmoonsec-sim.{a,so}: loopback only, no Rust
 zig build examples        # zig-out/bin/moonsec-example-{host,client} on the shared library
@@ -33,7 +35,8 @@ zig-out/bin/moonsec-example-client pair MOONSEC1:... --state-dir /tmp/c
 zig-out/bin/moonsec-example-client connect MOONSEC1:... --state-dir /tmp/c
 ```
 
-Across two machines add `--relay` to both.
+Across two machines add `--relay` to both, and `--system` to both to stream the host's
+screen into a window on the client (a library built with `-Dabi-system`).
 
 ## Changing the ABI
 
