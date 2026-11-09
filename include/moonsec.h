@@ -182,7 +182,7 @@ typedef struct moonsec_host_config {
     uint32_t flags;   /* MOONSEC_HOST_* */
     uint32_t codec;   /* preferred MOONSEC_CODEC_*; 0: the backend's best */
     uint32_t fps;     /* 0: 60 */
-    uint32_t display; /* display: an index from moonsec_host_displays (0 = primary) */
+    uint32_t display; /* display: an index from moonsec_host_displays (0: the first listed) */
     uint32_t width;   /* capture size hint; 0: the display's own */
     uint32_t height;
     uint64_t bitrate_bps; /* start bitrate; 0: 10 Mbit/s */

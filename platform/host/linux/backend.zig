@@ -64,6 +64,9 @@ pub const Options = struct {
     /// Portal capture: where the restore token lives (host.tokenPath), so an unattended
     /// host asks the user once.
     token_path: ?[:0]const u8 = null,
+    /// Portal capture: let the user share several monitors in the portal's dialog, which
+    /// the host then lists as its displays and the client can switch between.
+    multiple_displays: bool = true,
     /// DRM render node for VAAPI (null: the first that opens).
     va_device: ?[:0]const u8 = null,
 };
@@ -109,6 +112,9 @@ pub const Host = struct {
         }
         pub fn stop(c: *OutputCapture) void {
             c.inner.stop();
+        }
+        pub fn displays(c: *OutputCapture, out: []api.DisplayInfo) api.Error!usize {
+            return c.inner.displays(out);
         }
     };
 
@@ -180,7 +186,7 @@ pub fn open(gpa: std.mem.Allocator, o: Options) OpenError!*Host {
     errdefer if (encoder_kind != .synthetic) h.enc.deinit();
     if (o.capture == .portal) {
         if (o.token_path) |t| h.token_path = try gpa.dupeZ(u8, t);
-        h.portal = host.Capture.init(.{ .token_path = h.token_path });
+        h.portal = host.Capture.init(.{ .token_path = h.token_path, .multiple = o.multiple_displays });
         h.pw_audio = host.AudioSource.init(.{});
         // The app fails to start when its audio source does: check PipeWire now and
         // stream without audio when it is not there.

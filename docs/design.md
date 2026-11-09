@@ -444,7 +444,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 - Long-term reference recovery with client acks per encoder backend; AV1 where available.
 - 4:4:4 and HDR; AMF and oneVPL encoders.
-- Virtual displays (IddCx on Windows, CGVirtualDisplay on macOS); multi-monitor; clipboard; multi-user sessions. (Multi-monitor and mid-stream changes built: `core/display`, [spec/display-v0.md](../spec/display-v0.md); the host lists displays, the client selects one or caps size and frame rate, and size, frame-rate or display changes, including the rate ladder's resolution steps and host mode changes, apply mid-stream from an IDR. Desktop Duplication and ScreenCaptureKit output selection come with #15 and #27.)
+- Virtual displays (IddCx on Windows, CGVirtualDisplay on macOS); multi-monitor; clipboard; multi-user sessions. (Multi-monitor and mid-stream changes built: `core/display`, [spec/display-v0.md](../spec/display-v0.md); the host lists displays, the client selects one or caps size and frame rate, and size, frame-rate or display changes, including the rate ladder's resolution steps and host mode changes, apply mid-stream from an IDR. The Windows, macOS and Linux capture backends list their real displays: DXGI outputs, the active CoreGraphics displays, and the monitors shared through the ScreenCast portal.)
 
 **Gate:** loss recovery without keyframe spikes on NVENC and VideoToolbox; headless host works.
 

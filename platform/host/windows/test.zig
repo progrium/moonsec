@@ -257,3 +257,34 @@ test "openHost on WARP: the bundle encodes through the platform interface" {
     try testing.expect(out2.keyframe and !out2.ltr_refresh);
     if (b.input) |inj| try inj.inject(.{ .pad = .{ .index = 0, .connected = true, .state = .{} } });
 }
+
+test "display list: the adapter's outputs, without a device" {
+    var out: [16]api.DisplayInfo = undefined;
+    const n = host.listDisplays(null, 0, &out) catch |e| return skip("dup", @errorName(e), 0);
+    if (n == 0) return skip("dup", "no output attached to the desktop", 0);
+    var primaries: usize = 0;
+    for (out[0..n]) |d| {
+        std.debug.print("display {d}: {s} {d}x{d} @ {d} mHz at {d},{d}{s}\n", .{ d.id, d.name(), d.width, d.height, d.refresh_mhz, d.x, d.y, if (d.primary) " (primary)" else "" });
+        try testing.expect(d.width > 0 and d.height > 0);
+        try testing.expect(d.name().len > 0);
+        if (d.primary) primaries += 1;
+    }
+    try testing.expect(primaries <= 1);
+}
+
+test "display info: names are cut to fit and ids are output indexes" {
+    var w = std.mem.zeroes(c.msw_display_info);
+    w.index = 3;
+    w.width = 2560;
+    w.height = 1440;
+    w.refresh_mhz = 143_973;
+    w.x = -2560;
+    w.primary = 1;
+    const long = "A monitor with a very long EDID name";
+    @memcpy(w.name[0..long.len], long);
+    const d = host.displayInfo(&w);
+    try testing.expectEqual(@as(u32, 3), d.id);
+    try testing.expectEqual(@as(i32, -2560), d.x);
+    try testing.expect(d.primary);
+    try testing.expectEqualStrings(long[0..api.DisplayInfo.name_max], d.name());
+}

@@ -83,7 +83,16 @@ Keys are posted by virtual key code (layout-independent, like HID usages); modif
 go out as `kCGEventFlagsChanged` and every event carries the held modifiers. Held buttons
 turn motion into drags; repeated clicks in place within the double-click interval count up.
 Relative motion sets the delta fields games read and moves the cursor, clamped to the
-displays. Absolute positions map 0..65535 onto the display given in `Options.display`.
+displays. Absolute positions map 0..65535 onto the captured display (`Options.display`
+until capture starts).
+
+## Displays
+
+`Capture.displays` (and `listDisplays`, which needs no bundle or permission) lists the
+active displays in `CGGetActiveDisplayList` order, main display first: ids are indexes in
+that order, what `CaptureConfig.display` takes. Sizes are the mode's pixels, positions
+are points in the global display space, names are NSScreen's `localizedName`, and the
+refresh rate is the mode's (NSScreen's maximum for built-in panels, whose mode says 0).
 Gamepads are dropped for now.
 
 ## Permissions

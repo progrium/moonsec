@@ -1,5 +1,6 @@
 // Clock, errors, permissions, displays and pixel buffers for the macOS host backend.
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreVideo/CoreVideo.h>
 #include <mach/mach_time.h>
@@ -7,6 +8,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "mh_internal.h"
 
 static mach_timebase_info_data_t g_tb;
@@ -75,6 +77,61 @@ int mh_display_pixels(uint32_t index, uint32_t *w, uint32_t *h) {
         *h = (uint32_t)CGDisplayPixelsHigh(id);
     }
     return (*w && *h) ? MH_OK : mh_fail(MH_ERR, "display %u has no size", index);
+}
+
+static void display_name(CGDirectDisplayID id, char *out, size_t len, double *max_fps) {
+    out[0] = 0;
+    *max_fps = 0;
+    @autoreleasepool {
+        for (NSScreen *s in [NSScreen screens]) {
+            NSNumber *n = s.deviceDescription[@"NSScreenNumber"];
+            if (!n || n.unsignedIntValue != id) continue;
+            if (@available(macOS 10.15, *)) {
+                NSString *name = s.localizedName;
+                if (name.length) snprintf(out, len, "%s", name.UTF8String);
+            }
+            if (@available(macOS 12.0, *)) *max_fps = (double)s.maximumFramesPerSecond;
+            break;
+        }
+    }
+    if (!out[0]) {
+        if (CGDisplayIsBuiltin(id)) snprintf(out, len, "Built-in Display");
+        else snprintf(out, len, "Display %u", id);
+    }
+}
+
+uint32_t mh_displays(mh_display_info *out, uint32_t cap) {
+    CGDirectDisplayID ids[32];
+    uint32_t n = 0;
+    if (CGGetActiveDisplayList(32, ids, &n) != kCGErrorSuccess) return 0;
+    for (uint32_t i = 0; i < n && i < cap; i++) {
+        mh_display_info *d = &out[i];
+        memset(d, 0, sizeof *d);
+        d->index = i;
+        d->id = ids[i];
+        CGRect r = CGDisplayBounds(ids[i]);
+        d->x = (int32_t)r.origin.x;
+        d->y = (int32_t)r.origin.y;
+        d->primary = CGDisplayIsMain(ids[i]) ? 1 : 0;
+        double hz = 0;
+        CGDisplayModeRef m = CGDisplayCopyDisplayMode(ids[i]);
+        if (m) {
+            d->width = (uint32_t)CGDisplayModeGetPixelWidth(m);
+            d->height = (uint32_t)CGDisplayModeGetPixelHeight(m);
+            hz = CGDisplayModeGetRefreshRate(m);
+            CGDisplayModeRelease(m);
+        }
+        if (!d->width || !d->height) {
+            d->width = (uint32_t)CGDisplayPixelsWide(ids[i]);
+            d->height = (uint32_t)CGDisplayPixelsHigh(ids[i]);
+        }
+        double max_fps = 0;
+        display_name(ids[i], d->name, sizeof d->name, &max_fps);
+        /* Built-in panels report a mode rate of 0; NSScreen knows theirs. */
+        if (hz <= 0) hz = max_fps;
+        d->refresh_mhz = hz > 0 ? (uint32_t)(hz * 1000.0 + 0.5) : 0;
+    }
+    return n;
 }
 
 uint32_t mh_fmt_to_cv(uint32_t fmt) {

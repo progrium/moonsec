@@ -70,6 +70,19 @@ pub fn openHost(gpa: std.mem.Allocator, cfg: HostConfig) Error!api.HostBackend {
     }
 }
 
+/// The host's displays without opening a bundle (no encoder, audio or input device):
+/// what `openHost`'s capture would list, with the same ids. Linux has no list before the
+/// ScreenCast portal session starts (the user picks the monitors there): `Unsupported`.
+pub fn hostDisplays(out: []api.DisplayInfo) Error!usize {
+    if (!available) return error.Unsupported;
+    const r: api.Error!usize = switch (builtin.os.tag) {
+        .windows => host_mod.listDisplays(null, 0, out),
+        .macos => host_mod.listDisplays(out),
+        else => error.Unsupported,
+    };
+    return r catch |e| mapErr(e);
+}
+
 pub fn openClient(gpa: std.mem.Allocator, cfg: ClientConfig) Error!api.ClientBackend {
     if (!available) return error.Unsupported;
     switch (builtin.os.tag) {

@@ -48,9 +48,13 @@ captured output's size, so absolute positions land on the captured pixels.
   field in api.zig) carries it. Buffers with an empty chunk are cursor-only updates: they
   wake `acquire`, which returns a repeat of the last picture with the new cursor.
 - **Displays.** The portal returns one stream per monitor the user chose
-  (`Options.multiple` lets them choose several); `CaptureConfig.display` indexes them
-  and anything past the end is the first. `Capture.displays` arrives with #37 and maps
-  onto the same list.
+  (`Options.multiple` lets them choose several; the system backend turns it on);
+  `CaptureConfig.display` indexes them and anything past the end is the first.
+  `Capture.displays` lists the same streams ("Monitor 1", ...; the first is primary),
+  sized in pixels once captured and in the compositor's logical units before. Wayland
+  shows an app no outputs outside the portal, so there is no list before the first
+  `start`. A `start` while the portal session is open reuses it, so switching between
+  the chosen monitors shows no dialog; `stop` ends the session.
 - **Errors.** No session bus, no portal or no PipeWire: `error.Unsupported`. The user
   cancelled: `error.Unsupported` (logged as cancelled). The session closed or the stream
   ended (monitor unplugged, sharing revoked): `error.DeviceLost`, and `start` again

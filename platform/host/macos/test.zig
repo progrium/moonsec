@@ -483,3 +483,21 @@ test "CGEvent: absolute and relative pointer moves" {
     try testing.expectEqual(@as(u32, 1), inj.unmapped);
     try testing.expectEqual(@as(u32, 0), inj.failed);
 }
+
+test "display list: the active displays, main first" {
+    var out: [16]api.DisplayInfo = undefined;
+    const n = try host.listDisplays(&out);
+    if (n == 0) return skip("capture", "no active display");
+    for (out[0..n], 0..) |d, i| {
+        std.debug.print("display {d}: {s} {d}x{d} @ {d} mHz at {d},{d}{s}\n", .{ d.id, d.name(), d.width, d.height, d.refresh_mhz, d.x, d.y, if (d.primary) " (main)" else "" });
+        try testing.expectEqual(@as(u32, @intCast(i)), d.id);
+        try testing.expect(d.width > 0 and d.height > 0);
+        try testing.expect(d.name().len > 0);
+    }
+    try testing.expect(out[0].primary);
+    var w: u32 = 0;
+    var h: u32 = 0;
+    try ok(c.mh_display_pixels(0, &w, &h));
+    try testing.expectEqual(w, out[0].width);
+    try testing.expectEqual(h, out[0].height);
+}
