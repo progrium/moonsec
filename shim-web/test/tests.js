@@ -139,7 +139,12 @@ export async function rate(iroh, _pair, o) {
       dv.setUint32(12, size, true);
       conn.sendDatagram(cmd);
       let got = 0, bytes = 0, sent = -1, first = 0, last = 0;
-      const deadline = now() + ms + 3000;
+      // A browser that receives slower than the offered rate (Firefox tops out near
+      // 18 Mbit/s here) is still working through the backlog when the blast ends: keep
+      // reading while datagrams arrive, so BEND is seen, the row is a rate rather than
+      // "sent -1", and no backlog is left to swallow the up measurement's STAT replies.
+      const hardDeadline = now() + ms + 20000;
+      let deadline = now() + ms + 3000;
       while (now() < deadline) {
         let d;
         try { d = await conn.recvDatagram(Math.max(1, Math.ceil(deadline - now()))); } catch (e) { if (e.code === "timeout") break; throw e; }
@@ -147,6 +152,7 @@ export async function rate(iroh, _pair, o) {
         if (tag === "BDAT") {
           if (got === 0) first = now();
           last = now();
+          deadline = Math.min(hardDeadline, Math.max(deadline, last + 1000));
           got++;
           bytes += d.length;
         } else if (tag === "BEND") {
