@@ -263,8 +263,18 @@ pub const ClientApp = struct {
     overlay: api.Overlay = .{ .telemetry = .{} },
     next_overlay: Micros = 0,
     audio: ?*ClientAudio = null,
+    /// Multi-user presence line for the overlay (`setPresence`).
+    presence_buf: [80]u8 = undefined,
+    presence_len: u8 = 0,
     clip: ?clipsync.Sync = null,
     stats: struct { decode_errors: u64 = 0, present_errors: u64 = 0 } = .{},
+
+    /// The overlay's multi-user line (`core.multi.View.presence`); empty for none.
+    pub fn setPresence(a: *ClientApp, text: []const u8) void {
+        const n = @min(text.len, a.presence_buf.len);
+        @memcpy(a.presence_buf[0..n], text[0..n]);
+        a.presence_len = @intCast(n);
+    }
 
     pub fn init(gpa: std.mem.Allocator, be: api.ClientBackend, o: ClientOptions, p: pipe_mod.PacketPipe) !ClientApp {
         var cfg = o.session;
@@ -331,6 +341,7 @@ pub const ClientApp = struct {
         const now = a.be.clock.now();
         if (now >= a.next_overlay) {
             a.overlay = a.s.overlay(now);
+            a.overlay.presence = a.presence_buf[0..a.presence_len];
             a.next_overlay = now + a.opts.overlay_interval_us;
         }
         const ov = a.overlay;
@@ -407,7 +418,7 @@ pub const HostAudio = struct {
 
     pub const frame_samples = 480;
 
-    fn init(gpa: std.mem.Allocator, src: api.AudioSource) !*HostAudio {
+    pub fn init(gpa: std.mem.Allocator, src: api.AudioSource) !*HostAudio {
         const fmt = try src.start(.{});
         errdefer src.stop();
         if (fmt.rate != api.audio_rate or fmt.channels == 0 or fmt.channels > 2) return error.Unsupported;
@@ -417,7 +428,7 @@ pub const HostAudio = struct {
         return h;
     }
 
-    fn deinit(h: *HostAudio) void {
+    pub fn deinit(h: *HostAudio) void {
         h.src.stop();
         h.stage.deinit(h.gpa);
         h.gpa.destroy(h);
@@ -429,7 +440,8 @@ pub const HostAudio = struct {
     }
 
     /// Read what the source has, encode every complete frame, send it while streaming.
-    fn pump(h: *HostAudio, s: *HostSession, now: Micros) void {
+    /// `s` is a `HostSession` or a `MultiHost` (which sends to every streaming client).
+    pub fn pump(h: *HostAudio, s: anytype, now: Micros) void {
         const want = @as(usize, frame_samples) * h.channels;
         while (true) {
             const c = h.src.read(h.pcm[h.fill..want], 0) catch {

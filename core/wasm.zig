@@ -55,3 +55,12 @@ export fn moonsec_control_events(ptr: [*]const u8, len: usize) u32 {
     while (ch.poll() catch return n) |_| n += 1;
     return n;
 }
+
+/// Parses a multi-user roster message body; returns 1 if it gives this client input, 0 if
+/// not, -1 if it does not parse.
+export fn moonsec_multi_roster_have_input(ptr: [*]const u8, len: usize) i32 {
+    var v: core.multi.View = .{};
+    v.onRoster(ptr[0..len]);
+    if (!v.have) return -1;
+    return @intFromBool(v.haveInput());
+}

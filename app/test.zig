@@ -7,6 +7,7 @@ test {
     _ = @import("host_session.zig");
     _ = @import("keystore.zig");
     _ = @import("pairing.zig");
+    _ = @import("multi_test.zig");
 }
 
 fn expectPass(o: simrun.Options) !simrun.Result {
