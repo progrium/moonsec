@@ -80,9 +80,37 @@ pub fn build(b: *std.Build) void {
     }) });
     wasm_step.dependOn(&wasm_tests.step);
 
+    // Loadable browser modules (web/): the core's wasm ABI for the web client, and the
+    // input receiver the browser test harness's stub host decodes with (web/e2e).
+    const wasm_free = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const web_step = b.step("web-wasm", "Build the browser wasm modules into zig-out/web");
+    const web_core = b.addExecutable(.{
+        .name = "moonsec-core",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("core/wasm.zig"),
+            .target = wasm_free,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    web_core.entry = .disabled;
+    web_core.rdynamic = true;
+    web_step.dependOn(&b.addInstallArtifact(web_core, .{ .dest_dir = .{ .override = .{ .custom = "web" } } }).step);
+    const web_host_stub = b.addExecutable(.{
+        .name = "moonsec-host-stub",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("web/e2e/host_stub.zig"),
+            .target = wasm_free,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "core", .module = b.createModule(.{ .root_source_file = b.path("core/root.zig"), .target = wasm_free, .optimize = .ReleaseSmall }) }},
+        }),
+    });
+    web_host_stub.entry = .disabled;
+    web_host_stub.rdynamic = true;
+    web_step.dependOn(&b.addInstallArtifact(web_host_stub, .{ .dest_dir = .{ .override = .{ .custom = "web" } } }).step);
+    wasm_step.dependOn(web_step);
+
     // Browser pairing (shim-web/pair/pair.zig): core/pair as a small wasm module that the
     // browser transport (shim-web/) drives. `zig build web-pair` -> zig-out/web/moonsec-pair.wasm.
-    const wasm_free = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const web_pair = b.addExecutable(.{
         .name = "moonsec-pair",
         .root_module = b.createModule(.{

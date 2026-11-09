@@ -1,0 +1,95 @@
+name: web
+
+# Browser harness (web/e2e): the web client's input path, WebCodecs decode and AudioWorklet
+# playback against the stub host, on Playwright's Chromium, Firefox and WebKit (Linux), and
+# on real Safari through safaridriver (macOS). Per-browser timings are uploaded as artifacts.
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["web/**", "core/**", "build.zig", "build.zig.zon", ".github/workflows/web.yml"]
+  pull_request:
+    paths: ["web/**", "core/**", "build.zig", "build.zig.zon", ".github/workflows/web.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  playwright:
+    name: playwright (${{ matrix.browser }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: wasm modules
+        run: zig build web-wasm --summary all
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Install ${{ matrix.browser }}
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+      # The runner has no sound card or sound server. Chromium and WebKit fall back to a fake
+      # output on their own (and Chromium stops rendering when it finds this PulseAudio);
+      # Firefox only plays through PulseAudio, so it gets a null sink.
+      - name: Audio sink for Firefox (PulseAudio null sink)
+        if: matrix.browser == 'firefox'
+        run: |
+          sudo apt-get install -y --no-install-recommends pulseaudio pulseaudio-utils
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=harness
+          pactl set-default-sink harness
+      - name: Harness
+        run: npm run e2e -- --project=${{ matrix.browser }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: web-harness-${{ matrix.browser }}
+          path: web/test-results/
+          if-no-files-found: ignore
+
+  safari:
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: wasm modules
+        run: zig build web-wasm --summary all
+      - run: npm ci
+      - name: Enable safaridriver
+        run: sudo safaridriver --enable
+      - name: Safari harness
+        run: npm run safari
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: web-harness-safari
+          path: web/test-results/
+          if-no-files-found: ignore

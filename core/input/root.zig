@@ -690,4 +690,5 @@ pub const Receiver = struct {
 
 test {
     _ = @import("test.zig");
+    _ = @import("wasm.zig");
 }
