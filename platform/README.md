@@ -13,12 +13,13 @@ learn which OS, GPU API or codec library is underneath.
 | client | `Decoder` | decode | D3D11VA | | libavcodec: VAAPI, software fallback |
 | client | `Presenter` | present | flip-model swapchain | | Wayland + EGL/GLES 3 |
 | client | `AudioSink` | audio | WASAPI | | PipeWire |
-| client | `InputSource` | input/network | Raw Input | | evdev |
+| client | `InputSource` | input/network | Raw Input; XInput pads | GameController pads | evdev; evdev pads |
 
 The macOS host backend is in [host/macos](host/macos/README.md). The Linux client is in
 [client/linux](client/linux/README.md), the Linux host's capture and audio in
 [host/linux](host/linux/README.md) and its encoders in
 [host/linux/ENCODERS.md](host/linux/ENCODERS.md).
+Gamepad capture for every client OS is in [client/gamepad](client/gamepad/README.md).
 
 A backend lives in `platform/<name>/` and exports `openHost(...) !HostBackend` and/or
 `openClient(...) !ClientBackend`. Write plain methods on your own types and turn them
