@@ -206,6 +206,11 @@ pub const HostSession = struct {
     codec: api.Codec,
     format: api.VideoFormat,
     pending_format: bool = false,
+    /// With `cfg.shared`: what the client's last hello said it decodes and shows, and that
+    /// hello, held until the multi host has picked the format every member can take
+    /// (`setFormat`, then `answerHello`).
+    client: ?api.format.Member = null,
+    hello: ?wire.Hello = null,
     rec: *recovery.Host,
     input_rx: core.input.Receiver = .{},
     actions: std.Deque(Pending) = .empty,
@@ -582,6 +587,12 @@ pub const HostSession = struct {
     fn onHello(s: *HostSession, h: wire.Hello, now: Micros) void {
         s.stats.hellos += 1;
         const decodable = h.decodable();
+        if (s.cfg.shared) {
+            // One encode for every member: the multi host picks the format.
+            s.client = .{ .dec = decodable, .display = h.display };
+            s.hello = h;
+            return;
+        }
         var codec = s.codec;
         var fmt = s.format;
         if (s.cfg.negotiate) |n| {
@@ -599,6 +610,11 @@ pub const HostSession = struct {
             s.pending_format = true;
             s.stats.format_changes += 1;
         }
+        s.startStream(h, changed, now);
+    }
+
+    /// Answer a hello: start (or restart) the stream and send the config.
+    fn startStream(s: *HostSession, h: wire.Hello, changed: bool, now: Micros) void {
         if (s.nonce == null or s.nonce.? != h.nonce) {
             // A new session (or a restarted client): start from a keyframe.
             const first = s.nonce == null;
@@ -611,6 +627,28 @@ pub const HostSession = struct {
         }
         s.state = .streaming;
         s.sendConfig(now);
+    }
+
+    /// With `cfg.shared`: the codec and format the multi host's encoder now streams. A
+    /// member already streaming gets a new config (the multi host asks for the IDR, once
+    /// for everyone). Returns whether it changed.
+    pub fn setFormat(s: *HostSession, codec: api.Codec, fmt: api.VideoFormat, now: Micros) bool {
+        std.debug.assert(s.cfg.shared);
+        if (codec == s.codec and fmt.eql(s.format)) return false;
+        s.codec = codec;
+        s.format = fmt;
+        s.stats.format_changes += 1;
+        if (s.state == .streaming and s.nonce != null and s.byes_left == 0) s.sendConfig(now);
+        return true;
+    }
+
+    /// With `cfg.shared`: answer the hello held for the multi host (after `setFormat`).
+    pub fn answerHello(s: *HostSession, now: Micros) void {
+        std.debug.assert(s.cfg.shared);
+        const h = s.hello orelse return;
+        s.hello = null;
+        if (s.state == .ended) return;
+        s.startStream(h, false, now);
     }
 
     // --- encode stage ---------------------------------------------------

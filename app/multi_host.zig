@@ -15,6 +15,12 @@
 //!   policy allows reaches the injector; the rest is acked (so the clients stop resending
 //!   it) and dropped. When input changes hands, keys and buttons the previous holder left
 //!   down are released.
+//! - The codec and format: one encode has one, so it is the best one every member decodes
+//!   (`api.format.negotiateCommon` over the members' hellos, with `session.negotiate`).
+//!   Each hello is held until the choice is made; a join, a leave or a member's new
+//!   capabilities can change it, and then every member gets a new config, the app
+//!   reconfigures the encoder (`takeFormat`) and the next frame is an IDR. A member whose
+//!   decoder has nothing in common with the others is turned away; the others keep theirs.
 //! - One control channel per peer (`core.control.Channel`, host role): the roster goes to
 //!   every member that advertised the multi-user feature, on every change, and
 //!   `input_request` / `input_give` come back. The app moves the channel's bytes (iroh
@@ -60,6 +66,10 @@ pub const Stats = struct {
     rosters_sent: u64 = 0,
     control_malformed: u64 = 0,
     gives_refused: u64 = 0,
+    /// Times the members' common format changed (the first pick counts when it is not the
+    /// configured start), and members turned away for having none in common.
+    format_changes: u64 = 0,
+    format_refusals: u64 = 0,
 };
 
 pub const Peer = struct {
@@ -116,6 +126,12 @@ pub const MultiHost = struct {
     pending_reconfigure: ?rate.ladder.Rung = null,
     next_frame_id: u32 = 0,
     in_encoder: bool = false,
+    /// The encoder's codec and format, and a change the app has not applied yet.
+    codec: api.Codec,
+    format: api.VideoFormat,
+    pending_format: bool = false,
+    /// A member left: the common format may be better now.
+    renegotiate: bool = false,
     /// Members whose actions were applied last, and what they hold down.
     holder: u16 = multi.host_id,
     held: Held = .{},
@@ -141,6 +157,8 @@ pub const MultiHost = struct {
             .roster = .init(cfg.roster),
             .ladder = .init(.{ .width = cfg.session.width, .height = cfg.session.height, .fps = cfg.session.fps }),
             .bitrate_bps = cfg.session.bitrate_bps,
+            .codec = cfg.session.codec,
+            .format = cfg.session.format,
         };
     }
 
@@ -174,6 +192,8 @@ pub const MultiHost = struct {
         if (!m.cfg.intersect_acks) peer.s.join = null;
         peer.s.next_frame_id = m.next_frame_id;
         peer.s.bitrate_bps = m.bitrate_bps;
+        peer.s.codec = m.codec;
+        peer.s.format = m.format;
         if (control_stream) |cs| try peer.s.control.attach(cs);
         try m.peers.append(m.gpa, peer);
         m.stats.joins += 1;
@@ -202,6 +222,11 @@ pub const MultiHost = struct {
         return true;
     }
 
+    /// End every member's session at once, failed (the encoder refused).
+    pub fn abort(m: *MultiHost, why: []const u8) void {
+        for (m.peers.items) |p| if (!p.left) p.s.abort(why);
+    }
+
     pub fn close(m: *MultiHost, now: Micros) void {
         for (m.peers.items) |p| if (!p.left) p.s.close(now);
     }
@@ -218,6 +243,7 @@ pub const MultiHost = struct {
             m.roster.setRelayed(p.id, p.s.path.relayed);
             m.takeInput(p);
         }
+        m.negotiate(now);
         if (m.cfg.session.rate_control) m.updateRate(now);
         m.sendRosters();
         if (m.roster.owner != m.holder and m.cfg.roster.policy == .owner) m.handoff();
@@ -229,6 +255,73 @@ pub const MultiHost = struct {
         m.roster.leave(p.id);
         p.s.control.close();
         m.stats.leaves += 1;
+        m.renegotiate = true;
+    }
+
+    // --- codec and format -----------------------------------------------
+
+    /// Re-pick the codec and format when a hello came in or a member left, then answer the
+    /// held hellos. Members already streaming count first; a newcomer (or a member whose
+    /// new hello says it lost a format) with nothing in common with them is turned away.
+    fn negotiate(m: *MultiHost, now: Micros) void {
+        var hellos = false;
+        for (m.peers.items) |p| if (!p.left and p.s.hello != null) {
+            hellos = true;
+        };
+        if (!hellos and !m.renegotiate) return;
+        m.renegotiate = false;
+
+        var members: [multi.max_members]api.format.Member = undefined;
+        var n: usize = 0;
+        var choice: ?api.format.Choice = null;
+        for ([_]bool{ false, true }) |newcomers| for (m.peers.items) |p| {
+            if (p.left) continue;
+            const c = p.s.client orelse continue;
+            const is_new = p.s.hello != null and !p.s.streaming();
+            if (is_new != newcomers) continue;
+            members[n] = c;
+            if (m.choose(members[0 .. n + 1])) |ch| {
+                choice = ch;
+                n += 1;
+            } else {
+                m.stats.format_refusals += 1;
+                p.s.abort("no codec and format common with the other members");
+                m.onLeft(p);
+                m.renegotiate = false;
+            }
+        };
+        if (choice) |ch| m.setFormat(@enumFromInt(ch.codec), ch.format, now);
+        for (m.peers.items) |p| if (!p.left) p.s.answerHello(now);
+    }
+
+    /// The best codec and format for these members, or the fixed one if every member
+    /// decodes it (`session.negotiate` null). Null: none.
+    fn choose(m: *const MultiHost, members: []const api.format.Member) ?api.format.Choice {
+        if (m.cfg.session.negotiate) |ng| return api.format.negotiateCommon(ng.preference, ng.encoder, members);
+        const fixed: api.format.Choice = .{ .codec = @intFromEnum(m.cfg.session.codec), .format = m.cfg.session.format };
+        for (members) |c| if (!c.dec.get(fixed.codec).supports(fixed.format)) return null;
+        return fixed;
+    }
+
+    fn setFormat(m: *MultiHost, codec: api.Codec, fmt: api.VideoFormat, now: Micros) void {
+        if (codec == m.codec and fmt.eql(m.format)) return;
+        m.codec = codec;
+        m.format = fmt;
+        m.pending_format = true;
+        m.stats.format_changes += 1;
+        for (m.peers.items) |p| if (!p.left) {
+            _ = p.s.setFormat(codec, fmt, now);
+        };
+        // A new sequence: everyone starts again from an IDR.
+        if (m.next_frame_id > 0) m.rec.onRecoveryRequest(.{ .first_missing = m.next_frame_id, .want_idr = true });
+    }
+
+    /// The codec and format the members' hellos changed to, once: the app reconfigures the
+    /// encoder before the next frame (which is an IDR).
+    pub fn takeFormat(m: *MultiHost) ?host_session.FormatChange {
+        if (!m.pending_format) return null;
+        m.pending_format = false;
+        return .{ .codec = m.codec, .format = m.format };
     }
 
     // --- control channel ------------------------------------------------
@@ -444,9 +537,11 @@ pub const MultiHostApp = struct {
     m: MultiHost,
     opts: apps.HostOptions,
     size: api.Size,
+    slices: u8,
+    ltr: bool,
     last_frame_us: ?Micros = null,
     audio: ?*apps.HostAudio = null,
-    stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0 } = .{},
+    stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0, reconfigures: u64 = 0 } = .{},
 
     pub const Options = struct {
         roster: multi.roster.Config = .{},
@@ -455,14 +550,30 @@ pub const MultiHostApp = struct {
     };
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: apps.HostOptions, mo: Options) !MultiHostApp {
-        const size = try be.capture.start(.{ .display = o.display, .fps = o.fps, .width = o.width, .height = o.height });
+        const size = try be.capture.start(.{ .display = o.display, .fps = o.fps, .width = o.width, .height = o.height, .hdr = o.hdr });
         errdefer be.capture.stop();
         const caps = be.encoder.caps();
         if (!caps.codecs.has(o.codec)) return error.Unsupported;
         const slices = @min(o.slices, caps.max_slices);
         try be.encoder.configure(.{ .codec = o.codec, .width = size.width, .height = size.height, .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = slices, .ltr = caps.ltr });
+        // As `apps.HostApp`: the host's codec first, then HEVC, H.264, AV1.
+        var order: api.format.Order = .{};
+        for ([_]api.Codec{ o.codec, .hevc, .h264, .av1, .passthrough }) |c| {
+            if (caps.codecs.has(c)) order.add(@intFromEnum(c));
+        }
         var m = try MultiHost.init(gpa, .{
             .session = .{
+                .negotiate = .{
+                    .encoder = api.effectiveFormats(caps.codecs, caps.coded),
+                    .preference = .{
+                        .codecs = order,
+                        .yuv444 = o.yuv444,
+                        .ten_bit = o.ten_bit,
+                        .hdr = o.hdr,
+                        .source_is_hdr = size.color == .hdr10,
+                        .source_hdr = size.hdr,
+                    },
+                },
                 .codec = o.codec,
                 .width = size.width,
                 .height = size.height,
@@ -481,7 +592,7 @@ pub const MultiHostApp = struct {
             .intersect_acks = mo.intersect_acks,
         });
         errdefer m.deinit();
-        var app: MultiHostApp = .{ .be = be, .m = m, .opts = o, .size = size };
+        var app: MultiHostApp = .{ .be = be, .m = m, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr };
         if (o.audio) if (be.audio) |src| {
             app.audio = try apps.HostAudio.init(gpa, src);
         };
@@ -507,7 +618,28 @@ pub const MultiHostApp = struct {
         if (!a.m.streaming()) return;
         const f = (a.grab() catch return) orelse return;
         defer a.be.capture.release(&f);
+        const change = a.m.takeFormat();
         const params = a.m.encodeParams();
+        if (change) |c| {
+            a.be.encoder.configure(.{
+                .codec = c.codec,
+                .format = c.format,
+                .width = f.image.width,
+                .height = f.image.height,
+                .fps = a.opts.fps,
+                .bitrate_bps = a.m.bitrate_bps,
+                .slices = a.slices,
+                .ltr = a.ltr,
+            }) catch {
+                // Negotiation only picks what the encoder's caps offer; a refusal is the
+                // backend's bug, and every member would get frames its config does not name.
+                a.stats.encode_errors += 1;
+                a.m.onEncodeDropped();
+                a.m.abort("the encoder rejected the members' common codec or format");
+                return;
+            };
+            a.stats.reconfigures += 1;
+        }
         const r = a.be.encoder.encode(&f, params);
         if (r) |ef_| {
             if (ef_) |ef| {

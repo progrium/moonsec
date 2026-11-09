@@ -217,6 +217,12 @@ the first feature outranks the later ones and ties go to the codec order. A `hel
 a new nonce, or with different capabilities, can change the choice; the host then
 reconfigures its encoder and starts again from an IDR.
 
+A host streaming one encode to several clients (spec/multi-user-v0.md) picks the best
+format every client takes, and can send a client a new `config` with a different codec,
+format or size mid-session, when another client joins or leaves. The client then
+reconfigures its decoder and drops frames until the next IDR, which the host sends right
+after; if none arrives within its recovery retry timeout, it asks for one.
+
 The client sends `hello` every 100 ms until a `config` with its nonce arrives. The host
 answers every `hello` with `config`; a `hello` with a nonce it has not seen starts a new
 session from a keyframe. Either side leaves by sending `bye` three times, 20 ms apart; a
@@ -229,3 +235,4 @@ side that hears nothing from the other for 5 s ends the session.
 - v0 (Nov 2026): `hello` carries per-codec format bits and the display's HDR mode (24
   bytes); `config` names chroma, bit depth, colour space and HDR metadata (56 bytes). The
   16- and 24-byte forms are still accepted.
+- v0 (Nov 2026): a `config` can change the stream mid-session (multi-user hosts).

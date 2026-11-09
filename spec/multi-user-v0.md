@@ -144,6 +144,17 @@ shared is what the encoder decides:
   then relies on its pacer, FEC and recovery. One ladder applies it, bounded by the
   strictest member's loss-policy caps (relay mode) and the largest FEC share.
 
+- **Codec and format.** One encode has one codec and format (chroma, bit depth, HDR10):
+  the best one every member's decoder and display take (`format.negotiateCommon`: the
+  members' hello capabilities intersected, then the usual `format.negotiate` ranking). The
+  host holds each `hello` until it has picked, so a joiner's first `config` already names
+  the common format. When a join, a leave or a member's new `hello` changes the pick,
+  every member gets a new `config`, the encoder is reconfigured and the next frame is an
+  IDR for everyone; members keep decoding the old stream until their new `config`, then
+  drop frames until that IDR (spec/wire-v0.md, "Session"). Members already streaming
+  count first: a joiner whose decoder has no codec and format in common with them (and the
+  encoder) is turned away, and the others keep their format.
+
 ## Presence
 
 Clients show the roster in the overlay as one line: how many are here and who has input,
@@ -158,6 +169,8 @@ for example `3 here  input: Alice (you)`, `3 here  input: host`, `3 here  view o
   every member pays for each. With the loss policy on (FEC for that path) it does not
   happen; a per-member IDR budget is a follow-up.
 - Per-device "may control" in the allowlist, and host UI for the roster and handoff.
+- The common format is only as good as the weakest member's decoder: a phone without
+  4:4:4 joining a desktop session drops everyone to 4:2:0 until it leaves.
 - Sending each member a different encode (simulcast, or a second encoder for a slow
   member) is out of scope for v0.
 
@@ -165,3 +178,4 @@ for example `3 here  input: Alice (you)`, `3 here  input: host`, `3 here  view o
 
 - v0 (Nov 2026): first draft: membership, input policies and handoff, roster,
   `input_request`, `input_give`, ack intersection, shared rate.
+- v0 (Nov 2026): one codec and format for every member, re-picked on joins and leaves.
