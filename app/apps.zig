@@ -21,6 +21,8 @@ const ClientSession = @import("client_session.zig").ClientSession;
 const host_session = @import("host_session.zig");
 const client_session = @import("client_session.zig");
 const audio_stage = @import("audio_stage");
+const clipboard = @import("clipboard");
+const clipsync = @import("clipsync.zig");
 
 const proto = core.proto;
 
@@ -31,7 +33,14 @@ pub const HostOptions = struct {
     fps: u32 = 60,
     bitrate_bps: u64 = 10_000_000,
     slices: u8 = 4,
+    /// The codec the host prefers. A client without it gets the next one both ends have
+    /// (HEVC, H.264, AV1, in that order), as `negotiate` picks.
     codec: api.Codec = .passthrough,
+    /// Prefer 4:4:4 (sharp coloured text) and 10-bit when the client decodes them; send
+    /// HDR10 when the display is in HDR mode and the client's display is too.
+    yuv444: bool = false,
+    ten_bit: bool = false,
+    hdr: bool = true,
     display: u32 = 0,
     width: u32 = 0,
     height: u32 = 0,
@@ -43,6 +52,12 @@ pub const HostOptions = struct {
     session: struct { peer_timeout_us: Micros = 5_000_000, pace: bool = true, rate_control: bool = false, loss_policy: bool = false } = .{},
     /// Hold video while the path is stalled (host_session.Config.pause_on_stall).
     pause_on_stall: bool = true,
+    /// The reliable control stream next to the pipe (spec/control-v0.md). Null: no
+    /// control channel, so no clipboard sync.
+    control_stream: ?pipe_mod.ByteStream = null,
+    /// The system clipboard to sync over the control channel (platform/clipboard).
+    clipboard: ?clipboard.Clipboard = null,
+    clipboard_poll_us: Micros = 250_000,
 };
 
 pub const HostApp = struct {
@@ -50,18 +65,37 @@ pub const HostApp = struct {
     s: HostSession,
     opts: HostOptions,
     size: api.Size,
+    slices: u8,
+    ltr: bool,
     last_frame_us: ?Micros = null,
     audio: ?*HostAudio = null,
+    clip: ?clipsync.Sync = null,
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: HostOptions, p: pipe_mod.PacketPipe) !HostApp {
-        const size = try be.capture.start(.{ .display = o.display, .fps = o.fps, .width = o.width, .height = o.height });
+        const size = try be.capture.start(.{ .display = o.display, .fps = o.fps, .width = o.width, .height = o.height, .hdr = o.hdr });
         errdefer be.capture.stop();
         const caps = be.encoder.caps();
         if (!caps.codecs.has(o.codec)) return error.Unsupported;
         const slices = @min(o.slices, caps.max_slices);
         try be.encoder.configure(.{ .codec = o.codec, .width = size.width, .height = size.height, .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = slices, .ltr = caps.ltr });
+        var order: api.format.Order = .{};
+        for ([_]api.Codec{ o.codec, .hevc, .h264, .av1, .passthrough }) |c| {
+            if (caps.codecs.has(c)) order.add(@intFromEnum(c));
+        }
+        var app: HostApp = .{ .be = be, .s = undefined, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr };
         const s = try HostSession.init(gpa, .{
+            .negotiate = .{
+                .encoder = api.effectiveFormats(caps.codecs, caps.coded),
+                .preference = .{
+                    .codecs = order,
+                    .yuv444 = o.yuv444,
+                    .ten_bit = o.ten_bit,
+                    .hdr = o.hdr,
+                    .source_is_hdr = size.color == .hdr10,
+                    .source_hdr = size.hdr,
+                },
+            },
             .codec = o.codec,
             .width = size.width,
             .height = size.height,
@@ -75,8 +109,10 @@ pub const HostApp = struct {
             .loss_policy = o.session.loss_policy,
             .pause_on_stall = o.pause_on_stall,
         }, p);
-        var app: HostApp = .{ .be = be, .s = s, .opts = o, .size = size };
+        app.s = s;
         errdefer app.s.deinit();
+        if (o.control_stream) |cs| try app.s.control.attach(cs);
+        if (o.clipboard) |cb| app.clip = .{ .cb = cb, .interval_us = o.clipboard_poll_us };
         if (o.audio) if (be.audio) |src| {
             app.audio = try HostAudio.init(gpa, src);
         };
@@ -92,6 +128,7 @@ pub const HostApp = struct {
     /// Network stage: pipe, timers, input injection. Call with the session lock held.
     fn network(a: *HostApp, now: Micros) void {
         a.s.step(now);
+        if (a.clip) |*y| y.pump(a.s.gpa, &a.s.control, now);
         if (a.audio) |au| au.pump(&a.s, now);
         while (a.s.popAction()) |p| {
             if (a.be.input) |inj| inj.inject(p.action) catch {
@@ -113,9 +150,28 @@ pub const HostApp = struct {
     fn encodeOne(a: *HostApp, f: *const api.CapturedFrame, lock: ?Lock) void {
         if (lock) |l| l.lock();
         const live = a.s.streaming();
+        const change = if (live) a.s.takeFormat() else null;
+        const bitrate = a.s.bitrate_bps;
         const params = if (live) a.s.encodeParams() else api.EncodeParams{};
         if (lock) |l| l.unlock();
         if (!live) return;
+        if (change) |c| a.be.encoder.configure(.{
+            .codec = c.codec,
+            .format = c.format,
+            .width = f.image.width,
+            .height = f.image.height,
+            .fps = a.opts.fps,
+            .bitrate_bps = bitrate,
+            .slices = a.slices,
+            .ltr = a.ltr,
+        }) catch {
+            if (lock) |l| l.lock();
+            defer if (lock) |l| l.unlock();
+            a.stats.encode_errors += 1;
+            a.s.onEncodeDropped();
+            a.s.abort("the encoder rejected the negotiated codec or format");
+            return;
+        };
         const r = a.be.encoder.encode(f, params);
         if (lock) |l| l.lock();
         defer if (lock) |l| l.unlock();
@@ -150,14 +206,19 @@ pub const HostApp = struct {
     /// Network thread here, capture+encode on its own thread, until the session ends.
     pub fn runThreaded(a: *HostApp, io: Io) !void {
         var mu: Io.Mutex = .init;
-        const lock: Lock = .{ .mu = &mu, .io = io };
+        return a.runThreadedWith(io, .{ .mu = &mu, .io = io }, null);
+    }
+
+    /// `runThreaded` under the caller's lock, which the caller also takes around its own
+    /// calls into the session, with `hook` run under it after every network step.
+    pub fn runThreadedWith(a: *HostApp, io: Io, lock: Lock, hook: ?Hook) !void {
         var stop: std.atomic.Value(bool) = .init(false);
         var media = try io.concurrent(hostMedia, .{ a, lock, &stop });
         defer {
             stop.store(true, .release);
             media.await(io);
         }
-        netLoop(HostApp, a, io, lock);
+        netLoop(HostApp, a, io, lock, hook);
     }
 
     fn hostMedia(a: *HostApp, lock: Lock, stop: *std.atomic.Value(bool)) void {
@@ -190,6 +251,12 @@ pub const ClientOptions = struct {
     overlay_interval_us: Micros = 100_000,
     /// Play the audio stream into the backend's sink, if it has one.
     audio: bool = true,
+    /// The reliable control stream next to the pipe (spec/control-v0.md). Null: no
+    /// control channel, so no clipboard sync.
+    control_stream: ?pipe_mod.ByteStream = null,
+    /// The system clipboard to sync over the control channel (platform/clipboard).
+    clipboard: ?clipboard.Clipboard = null,
+    clipboard_poll_us: Micros = 250_000,
 };
 
 pub const ClientApp = struct {
@@ -197,15 +264,30 @@ pub const ClientApp = struct {
     s: ClientSession,
     opts: ClientOptions,
     configured: bool = false,
+    configured_seq: u32 = 0,
     quit: bool = false,
     overlay: api.Overlay = .{ .telemetry = .{} },
     next_overlay: Micros = 0,
     audio: ?*ClientAudio = null,
+    /// Multi-user presence line for the overlay (`setPresence`).
+    presence_buf: [80]u8 = undefined,
+    presence_len: u8 = 0,
+    clip: ?clipsync.Sync = null,
     stats: struct { decode_errors: u64 = 0, present_errors: u64 = 0 } = .{},
+
+    /// The overlay's multi-user line (`core.multi.View.presence`); empty for none.
+    pub fn setPresence(a: *ClientApp, text: []const u8) void {
+        const n = @min(text.len, a.presence_buf.len);
+        @memcpy(a.presence_buf[0..n], text[0..n]);
+        a.presence_len = @intCast(n);
+    }
 
     pub fn init(gpa: std.mem.Allocator, be: api.ClientBackend, o: ClientOptions, p: pipe_mod.PacketPipe) !ClientApp {
         var cfg = o.session;
-        cfg.codecs = be.decoder.caps().codecs;
+        const caps = be.decoder.caps();
+        cfg.codecs = caps.codecs;
+        cfg.formats = api.effectiveFormats(caps.codecs, caps.coded);
+        cfg.display = be.display;
         var au: ?*ClientAudio = null;
         if (o.audio) if (be.audio) |sink| {
             au = try ClientAudio.init(gpa, sink);
@@ -213,7 +295,11 @@ pub const ClientApp = struct {
             cfg.onAudio = ClientAudio.onAudio;
         };
         errdefer if (au) |x| x.deinit();
-        return .{ .be = be, .s = try ClientSession.init(gpa, cfg, p), .opts = o, .audio = au };
+        var app: ClientApp = .{ .be = be, .s = try ClientSession.init(gpa, cfg, p), .opts = o, .audio = au };
+        errdefer app.s.deinit();
+        if (o.control_stream) |cs| try app.s.control.attach(cs);
+        if (o.clipboard) |cb| app.clip = .{ .cb = cb, .interval_us = o.clipboard_poll_us };
+        return app;
     }
 
     pub fn deinit(a: *ClientApp) void {
@@ -233,22 +319,25 @@ pub const ClientApp = struct {
         };
         if (a.quit) a.s.close(now);
         a.s.step(now);
+        if (a.clip) |*y| y.pump(a.s.gpa, &a.s.control, now);
         if (a.audio) |au| if (a.s.state == .streaming) au.render(a.be.clock.now());
     }
 
-    /// Configure the decoder and presenter once the host's config is in.
+    /// Configure the decoder and presenter once the host's config is in, and again when
+    /// it changes the stream (a multi-user host re-picking the format).
     fn configure(a: *ClientApp) bool {
-        if (a.configured) return true;
+        if (a.configured and a.configured_seq == a.s.config_seq) return true;
         const c = a.s.config orelse return false;
-        a.be.decoder.configure(.{ .codec = c.codec, .width = c.width, .height = c.height }) catch {
+        a.be.decoder.configure(.{ .codec = c.codec, .width = c.width, .height = c.height, .format = c.format }) catch {
             a.s.close(a.be.clock.now());
             return false;
         };
-        a.be.presenter.configure(.{ .width = c.width, .height = c.height, .mode = a.opts.mode, .windowed = a.opts.windowed }) catch {
+        a.be.presenter.configure(.{ .width = c.width, .height = c.height, .mode = a.opts.mode, .windowed = a.opts.windowed, .format = c.format }) catch {
             a.s.close(a.be.clock.now());
             return false;
         };
         a.configured = true;
+        a.configured_seq = a.s.config_seq;
         return true;
     }
 
@@ -260,6 +349,7 @@ pub const ClientApp = struct {
         const now = a.be.clock.now();
         if (now >= a.next_overlay) {
             a.overlay = a.s.overlay(now);
+            a.overlay.presence = a.presence_buf[0..a.presence_len];
             a.next_overlay = now + a.opts.overlay_interval_us;
         }
         const ov = a.overlay;
@@ -301,14 +391,18 @@ pub const ClientApp = struct {
 
     pub fn runThreaded(a: *ClientApp, io: Io) !void {
         var mu: Io.Mutex = .init;
-        const lock: Lock = .{ .mu = &mu, .io = io };
+        return a.runThreadedWith(io, .{ .mu = &mu, .io = io }, null);
+    }
+
+    /// As `HostApp.runThreadedWith`.
+    pub fn runThreadedWith(a: *ClientApp, io: Io, lock: Lock, hook: ?Hook) !void {
         var stop: std.atomic.Value(bool) = .init(false);
         var media = try io.concurrent(clientMedia, .{ a, lock, &stop });
         defer {
             stop.store(true, .release);
             media.await(io);
         }
-        netLoop(ClientApp, a, io, lock);
+        netLoop(ClientApp, a, io, lock, hook);
     }
 
     fn clientMedia(a: *ClientApp, lock: Lock, stop: *std.atomic.Value(bool)) void {
@@ -336,7 +430,7 @@ pub const HostAudio = struct {
 
     pub const frame_samples = 480;
 
-    fn init(gpa: std.mem.Allocator, src: api.AudioSource) !*HostAudio {
+    pub fn init(gpa: std.mem.Allocator, src: api.AudioSource) !*HostAudio {
         const fmt = try src.start(.{});
         errdefer src.stop();
         if (fmt.rate != api.audio_rate or fmt.channels == 0 or fmt.channels > 2) return error.Unsupported;
@@ -346,7 +440,7 @@ pub const HostAudio = struct {
         return h;
     }
 
-    fn deinit(h: *HostAudio) void {
+    pub fn deinit(h: *HostAudio) void {
         h.src.stop();
         h.stage.deinit(h.gpa);
         h.gpa.destroy(h);
@@ -358,7 +452,8 @@ pub const HostAudio = struct {
     }
 
     /// Read what the source has, encode every complete frame, send it while streaming.
-    fn pump(h: *HostAudio, s: *HostSession, now: Micros) void {
+    /// `s` is a `HostSession` or a `MultiHost` (which sends to every streaming client).
+    pub fn pump(h: *HostAudio, s: anytype, now: Micros) void {
         const want = @as(usize, frame_samples) * h.channels;
         while (true) {
             const c = h.src.read(h.pcm[h.fill..want], 0) catch {
@@ -395,7 +490,7 @@ pub const ClientAudio = struct {
     stage: audio_stage.ClientAudio,
     channels: u8,
     /// One rendered frame (up to 60 ms stereo), and how much of it the sink has taken.
-    buf: [2880 * 2]f32 = undefined,
+    buf: [audio_stage.ClientAudio.max_frame_samples * 2]f32 = undefined,
     pending: []const f32 = &.{},
     stats: struct { rendered: u64 = 0, errors: u64 = 0 } = .{},
 
@@ -449,6 +544,12 @@ pub const ClientAudio = struct {
     }
 };
 
+/// Called under the session lock after each network step (the C ABI's event checks).
+pub const Hook = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque) void,
+};
+
 pub const Lock = struct {
     mu: *Io.Mutex,
     io: Io,
@@ -463,10 +564,11 @@ pub const Lock = struct {
 
 /// The network thread: step the session, sleep until it next has work (at most 1 ms, since
 /// datagrams can arrive any time and the pipes have no wakeup handle yet).
-fn netLoop(comptime App: type, a: *App, io: Io, lock: Lock) void {
+fn netLoop(comptime App: type, a: *App, io: Io, lock: Lock, hook: ?Hook) void {
     while (true) {
         lock.lock();
         a.network(a.be.clock.now());
+        if (hook) |h| h.f(h.ctx);
         const done = a.s.ended();
         const now = a.be.clock.now();
         const wait = a.s.nextWake(now) - now;

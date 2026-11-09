@@ -1,7 +1,13 @@
 /* moonsec iroh shim C ABI (v0.2).
  * Status codes: 0 = ok, negative = error; iroh_last_error() has the message (thread-local).
  * The caller owns all buffers. Handles are opaque and freed with their *_free call.
- * See shim/README.md for the design behind each call. */
+ * See shim/README.md for the design behind each call.
+ *
+ * Threading (docs/security-review.md): every call may come from any thread, and calls on one
+ * handle may overlap, but a handle must not be freed while another thread is still inside a
+ * call on it, nor used after its *_free. Blocking calls must not be made from the
+ * IrohThreadStartFn hook (it runs on the shim's own thread, which they wait on). The
+ * iroh_last_error() pointer is valid until the calling thread's next shim call. */
 #ifndef MOONSEC_IROH_SHIM_H
 #define MOONSEC_IROH_SHIM_H
 
@@ -141,6 +147,9 @@ int32_t iroh_endpoint_id(const IrohEndpoint *ep, char *buf, size_t cap);
 int32_t iroh_endpoint_ticket(const IrohEndpoint *ep, char *buf, size_t cap, size_t *out_len);
 int32_t iroh_endpoint_connect(const IrohEndpoint *ep, const char *ticket, const uint8_t *alpn,
                               size_t alpn_len, uint32_t timeout_ms, IrohConn **out);
+/* Waits up to timeout_ms for a connection whose handshake completed. From the first call
+ * on, the endpoint accepts in the background: up to 16 handshakes at once, each bounded by
+ * 10 s (a newcomer past 16 aborts the oldest), and up to 8 completed connections queued. */
 int32_t iroh_endpoint_accept(const IrohEndpoint *ep, uint32_t timeout_ms, IrohConn **out);
 /* The local network changed: re-run iroh's net report and try new paths now. */
 int32_t iroh_endpoint_network_change(const IrohEndpoint *ep);
@@ -179,6 +188,10 @@ int32_t iroh_conn_path_stats(const IrohConn *c, IrohPathStats *out, size_t cap, 
 int32_t iroh_conn_open_bi(const IrohConn *c, uint32_t timeout_ms, IrohStream **out);
 int32_t iroh_conn_accept_bi(const IrohConn *c, uint32_t timeout_ms, IrohStream **out);
 int32_t iroh_stream_write(const IrohStream *s, const uint8_t *buf, size_t len, uint32_t timeout_ms);
+/* Writes what fits now (*out_written bytes); timeout_ms == 0 polls once (IROH_ERR_AGAIN when
+ * flow control has no room). Never loses bytes on a timeout. Since 0.2.1. */
+int32_t iroh_stream_write_some(const IrohStream *s, const uint8_t *buf, size_t len, uint32_t timeout_ms,
+                               size_t *out_written);
 int32_t iroh_stream_read(const IrohStream *s, uint8_t *buf, size_t cap, uint32_t timeout_ms,
                          size_t *out_len);
 int32_t iroh_stream_finish(const IrohStream *s);

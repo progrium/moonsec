@@ -1,0 +1,66 @@
+name: linux
+
+# Linux client and host backends (platform/client/linux, platform/host/linux). Client: unit tests, then the client end to end
+# against the synthetic host, in a headless Weston (GL renderer on Mesa llvmpipe) with
+# PipeWire on a null sink and a uinput keyboard typing the host's key script through
+# evdev. The runners have no GPU: VAAPI is built and its fallback to software decode is
+# tested, but hardware decode and the dma-buf import path are compile-only here.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  client:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Packages (libraries, Weston, Mesa, PipeWire)
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            libavcodec-dev libavutil-dev libva-dev libwayland-dev libegl-dev libgles-dev libpipewire-0.3-dev libdbus-1-dev \
+            weston libgl1-mesa-dri libegl-mesa0 libglx-mesa0 mesa-va-drivers \
+            pipewire pipewire-bin wireplumber dbus-daemon pkg-config
+      - name: uinput for the runner user
+        run: |
+          echo 'KERNEL=="uinput", MODE="0666"' | sudo tee /etc/udev/rules.d/99-moonsec-ci.rules
+          echo 'SUBSYSTEM=="input", KERNEL=="event*", MODE="0666"' | sudo tee -a /etc/udev/rules.d/99-moonsec-ci.rules
+          sudo udevadm control --reload-rules
+          sudo modprobe uinput
+          sudo udevadm trigger --subsystem-match=misc --subsystem-match=input
+          sudo udevadm settle
+          ls -l /dev/uinput
+      - name: zig fmt
+        run: zig fmt --check platform/client platform/host/linux platform/linux app build.zig
+      - name: Build (VAAPI path included; compile-only without a GPU)
+        run: zig build moonsec-linux -Doptimize=ReleaseSafe --summary all
+      - name: Client backend tests (Wayland, PipeWire and uinput required)
+        env:
+          MOONSEC_REQUIRE: wayland,pipewire,uinput
+        run: platform/client/linux/headless.sh zig build test-linux --summary all
+      - name: Host encoder tests (software end to end; VAAPI and NVENC not-available paths)
+        run: zig build test-linux-enc --summary all
+      - name: End to end against the synthetic host (sim LAN)
+        run: platform/client/linux/headless.sh zig-out/bin/moonsec-linux run sim --client linux --uinput-script --seconds 10
+      - name: End to end against the synthetic host (sim WAN)
+        run: platform/client/linux/headless.sh zig-out/bin/moonsec-linux run sim --client linux --uinput-script --profile wan --seconds 10
+      - name: Linux host injector tests (uinput required)
+        env:
+          MOONSEC_REQUIRE: uinput
+        run: zig build test-linux-host --summary all
+      - name: Linux host end to end, injected keys read back from evdev (sim LAN)
+        run: zig-out/bin/moonsec-linux run sim --host linux --verify-input --seconds 10
+      - name: Linux host to Linux client (sim LAN)
+        run: platform/client/linux/headless.sh zig-out/bin/moonsec-linux run sim --host linux --client linux --uinput-script --seconds 10

@@ -20,6 +20,7 @@ const core = @import("core");
 const api = @import("platform");
 const pipe_mod = @import("pipe");
 const wire = @import("wire.zig");
+const control = @import("control.zig");
 const host_session = @import("host_session.zig");
 const pathlog = @import("pathlog.zig");
 
@@ -33,6 +34,9 @@ const Micros = i64;
 
 pub const Config = struct {
     codecs: api.CodecSet = .{ .passthrough = true },
+    /// Formats per codec the decoder and presenter take, and the display (sent in hello).
+    formats: api.FormatCaps = .{},
+    display: api.DisplayCaps = .{},
     max_width: u32 = 0,
     max_height: u32 = 0,
     nonce: u32 = 1,
@@ -63,6 +67,9 @@ pub const Config = struct {
     /// Every audio datagram (stream 2), for the audio stage: envelope, payload, arrival.
     audio_ctx: ?*anyopaque = null,
     onAudio: ?*const fn (ctx: ?*anyopaque, env: proto.Envelope, payload: []const u8, recv_us: Micros) void = null,
+    /// The reliable control channel (spec/control-v0.md): clipboard and the features built
+    /// on it. It runs once the app attaches a stream (`control.attach`).
+    control: control.Config = .{},
 };
 
 pub const State = enum { connecting, streaming, ended };
@@ -90,6 +97,9 @@ pub const Stats = struct {
     /// Reconnects asked of the pipe, and new connections it made.
     reconnect_requests: u64 = 0,
     reconnects: u64 = 0,
+    /// Configs that changed the stream mid-session (a multi-user host re-picking the
+    /// format as members join and leave).
+    config_changes: u64 = 0,
 };
 
 const Queued = struct {
@@ -104,6 +114,8 @@ const times_cap = 128;
 
 pub const ClientSession = struct {
     gpa: std.mem.Allocator,
+    /// The control channel; the app attaches its stream and feeds the clipboard.
+    control: control.Control,
     cfg: Config,
     pipe: PacketPipe,
     state: State = .connecting,
@@ -112,6 +124,9 @@ pub const ClientSession = struct {
     stats: Stats = .{},
     path: pipe_mod.PathStats = .{},
     config: ?wire.Config = null,
+    /// Bumped by every config that starts the stream anew (the first, and each change of
+    /// codec, format or size): the app configures its decoder and presenter again.
+    config_seq: u32 = 0,
 
     seq: u64 = 0,
     start_us: ?Micros = null,
@@ -165,8 +180,11 @@ pub const ClientSession = struct {
         tele.* = .init();
         const times = try gpa.alloc(Times, times_cap);
         @memset(times, .{});
+        var control_ = try control.Control.init(gpa, .client, cfg.control);
+        errdefer control_.deinit();
         return .{
             .gpa = gpa,
+            .control = control_,
             .cfg = cfg,
             .pipe = p,
             .receiver = receiver,
@@ -180,6 +198,7 @@ pub const ClientSession = struct {
     }
 
     pub fn deinit(s: *ClientSession) void {
+        s.control.deinit();
         s.receiver.deinit();
         s.gpa.destroy(s.est);
         s.gpa.destroy(s.tele);
@@ -199,6 +218,7 @@ pub const ClientSession = struct {
     fn finish(s: *ClientSession, e: End, why: []const u8) void {
         if (s.state == .ended) return;
         s.state = .ended;
+        s.control.close();
         s.end = e;
         s.reason = why;
     }
@@ -239,6 +259,7 @@ pub const ClientSession = struct {
     }
 
     pub fn step(s: *ClientSession, now: Micros) void {
+        s.control.step();
         if (s.state == .ended) return;
         const start = s.start_us orelse blk: {
             s.start_us = now;
@@ -350,7 +371,7 @@ pub const ClientSession = struct {
 
     fn sendHello(s: *ClientSession) void {
         var b: [wire.Hello.len]u8 = undefined;
-        (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height }).encode(&b);
+        (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height, .formats = s.cfg.formats, .display = s.cfg.display }).encode(&b);
         s.sendOther(.control_fast, @intFromEnum(wire.Kind.hello), &b);
     }
 
@@ -395,8 +416,11 @@ pub const ClientSession = struct {
                             return;
                         };
                         if (c.nonce != s.cfg.nonce) return;
-                        if (s.config == null) {
+                        if (s.config) |old| {
+                            if (!sameStream(old, c)) s.restart(c, now);
+                        } else {
                             s.config = c;
+                            s.config_seq +%= 1;
                             s.state = .streaming;
                             s.rec = recovery.Client.init(.{ .frame_interval_us = 1_000_000 / @as(u64, c.fps) });
                         }
@@ -554,6 +578,25 @@ pub const ClientSession = struct {
     // --- decode/present stage --------------------------------------------
 
     /// The next frame to decode, or null. Its data is valid until the next call.
+    /// The decoder takes the same stream under both configs.
+    fn sameStream(a: wire.Config, b: wire.Config) bool {
+        return a.codec == b.codec and a.format.eql(b.format) and a.width == b.width and a.height == b.height;
+    }
+
+    /// The host switched the stream to another codec, format or size mid-session (spec/
+    /// wire-v0.md, "Session"): what is queued is in the old one, and so is everything
+    /// before the IDR the host sends next.
+    fn restart(s: *ClientSession, c: wire.Config, now: Micros) void {
+        s.config = c;
+        s.config_seq +%= 1;
+        s.stats.config_changes += 1;
+        while (s.queue.popFront()) |q| {
+            s.timesFor(q.au.frame_id).valid = false;
+            s.giveBuf(q.buf);
+        }
+        s.rec.restart(@intCast(now));
+    }
+
     pub fn nextAccessUnit(s: *ClientSession) ?api.AccessUnit {
         if (s.current) |q| {
             s.giveBuf(q.buf);
@@ -622,7 +665,8 @@ pub const ClientSession = struct {
     pub fn report(s: *const ClientSession, w: *std.Io.Writer) !void {
         const st = s.stats;
         try w.print("client: {s}{s}{s}\n", .{ @tagName(s.end), if (s.reason.len > 0) ": " else "", s.reason });
-        if (s.config) |c| try w.print("  stream {s} {d}x{d}@{d} at {d} kbit/s, {d} slices\n", .{ @tagName(c.codec), c.width, c.height, c.fps, c.bitrate_bps / 1000, c.slices });
+        var fb: [32]u8 = undefined;
+        if (s.config) |c| try w.print("  stream {s} {s} {d}x{d}@{d} at {d} kbit/s, {d} slices\n", .{ @tagName(c.codec), c.format.name(&fb), c.width, c.height, c.fps, c.bitrate_bps / 1000, c.slices });
         try w.print("  frames received {d}, presented {d}, lost {d}, stale {d}, dropped while frozen {d}, decode errors {d}, queue overflows {d}\n", .{ st.frames_received, st.frames_presented, st.frames_lost, st.frames_stale, st.frames_dropped, st.decode_errors, st.queue_overflows });
         try w.print("  shards {d} (retransmitted {d}), NACKs {d}, feedback {d}, frame acks {d}, pongs {d}, input events {d}\n", .{ st.shards, s.video_retx, st.nacks, st.feedback, st.frame_acks, st.pongs, st.input_events });
         const r = s.rec.stats;

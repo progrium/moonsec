@@ -102,6 +102,21 @@ test "software H.264 decode: one picture per access unit, right pixels" {
     try testing.expectEqual(n, pictures);
 }
 
+test "D3D11VA format probe: nothing on WARP; what the hardware device has, printed" {
+    const com = try win.ComThread.init();
+    defer com.deinit();
+    const d3d = try warp();
+    defer d3d.destroy();
+    // WARP has no video decoder profiles.
+    for ([_]u32{ c.MSWC_CODEC_H264, c.MSWC_CODEC_HEVC, c.MSWC_CODEC_AV1 }) |codec|
+        try testing.expectEqual(@as(u32, 0), c.mswc_decoder_hw_formats(client.d3dPtr(d3d), codec));
+    // On a GPU (Jeff's box), say what the hardware could decode beyond 8-bit 4:2:0.
+    const hw = client.createDevice(.hardware, 0) catch return;
+    defer hw.destroy();
+    const f = client.probeHardwareFormats(hw);
+    std.debug.print("D3D11VA formats: h264 {any}\nhevc {any}\nav1 {any}\n", .{ f.h264, f.hevc, f.av1 });
+}
+
 test "decoder rejects garbage without wedging" {
     const com = try win.ComThread.init();
     defer com.deinit();
@@ -328,4 +343,16 @@ test "openClient: the bundle through the platform interface" {
 
     // An unsupported codec is reported as such.
     try testing.expectError(error.Unsupported, be.decoder.configure(.{ .codec = .av1, .width = 1, .height = 1 }));
+}
+
+test "XInput: loads, and the input source polls pads alongside Raw Input" {
+    var pads = client.gamepad.xinput.Source.open(client.clock);
+    defer pads.close();
+    // xinput1_4.dll ships with Windows 8 and later, Server editions included.
+    try testing.expect(pads.available());
+    try testing.expectEqualStrings("xinput1_4.dll", pads.dll);
+    var evs: [8]api.InputEvent = undefined;
+    // Runners have no controllers; any event must be a pad event in a valid slot.
+    const n = try pads.poll(&evs);
+    for (evs[0..n]) |e| try testing.expect(e.what == .pad and e.what.pad.index < 4);
 }

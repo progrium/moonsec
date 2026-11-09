@@ -9,6 +9,9 @@ Design and plan: [docs/design.md](docs/design.md). Wire protocol: [spec/wire-v0.
 Zig is pinned to **0.16.0** (`build.zig.zon` `minimum_zig_version`).
 
 ```
+/include       moonsec.h, the public C ABI (spec/c-abi-v1.md)
+/abi           the C ABI's tests, ABI dump and build
+/examples      a small C host and client on the C ABI
 /core          pure Zig core (sans-I/O)
 /transport     PacketPipe, iroh binding, sim pipe
 /codec         libopus built from source and its Zig binding
@@ -39,6 +42,9 @@ zig build test-app        # Phase 2 host and client apps over the in-process sim
 zig build soak            # one hour of simulated LAN streaming, fails on any freeze
 zig build moonsec -- run all   # host and client processes over iroh and the sim (builds the shim)
 zig build test-pair       # pairing (QR ticket, PIN) and session admission over iroh (part of test-shim)
+zig build abi             # the C ABI: zig-out/include/moonsec.h, zig-out/lib/libmoonsec.{a,so}
+zig build test-abi        # C test over the sim, C++ check, ABI dump (part of `zig build test`)
+zig build examples        # examples/host.c and examples/client.c on the shared library
 zig build echo            # builds the shim with cargo, links it, runs the loopback datagram echo
 zig build echo -- selftest --relay -n 50   # same, but through n0's public relays
 ```
@@ -53,6 +59,10 @@ retransmits, audio, input with acks, transport feedback driving the rate control
 pacing rate goes back to the transport) over `PacketPipe`: once over iroh, once over the
 simulated network, where the parent process is the hub that owns the network. Each side
 checks every byte it received and the other side's counts; CI runs it on every target.
+
+Apps in any language embed moonsec through the public C ABI: [include/moonsec.h](include/moonsec.h),
+designed in [spec/c-abi-v1.md](spec/c-abi-v1.md) (1.0 draft), with tests and examples in
+[abi/](abi/README.md) and [examples/](examples).
 
 The Phase 2 session spine ([app/](app/README.md)) runs a host and a client over any platform
 backend ([platform/api.zig](platform/api.zig)); the synthetic backend streams a self-checking

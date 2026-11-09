@@ -18,7 +18,9 @@ const builtin = @import("builtin");
 const options = @import("app_options");
 const core = @import("core");
 const pairing = @import("pairing.zig");
+const keystore = @import("keystore.zig");
 const iroh = if (options.iroh) @import("iroh") else struct {};
+const iroh_pipe = if (options.iroh) @import("iroh_pipe") else struct {};
 
 const Io = std.Io;
 const pair = core.pair;
@@ -60,6 +62,7 @@ fn openState(c: Ctx) !pairing.State {
     const path = owned orelse c.p.state_dir;
     return pairing.State.open(c.gpa, c.io, path) catch |e| {
         std.debug.print("moonsec: cannot open state directory {s}: {t}\n", .{ path, e });
+        if (e == error.InsecurePermissions) std.debug.print("moonsec: group or others can write it; run `chmod go-w {s}`\n", .{path});
         return e;
     };
 }
@@ -76,7 +79,7 @@ fn deviceName(c: Ctx, buf: []u8, fallback: []const u8) []const u8 {
     return fallback;
 }
 
-fn unixNow(io: Io) u64 {
+pub fn unixNow(io: Io) u64 {
     return @intCast(@max(0, Io.Clock.real.now(io).toSeconds()));
 }
 
@@ -131,36 +134,96 @@ pub fn cmdUnpair(c: Ctx, prefix: []const u8, w: *Io.Writer) !bool {
 
 // --- over iroh ----------------------------------------------------------------------
 
-const IrohStream = struct {
+pub const IrohStream = struct {
     s: if (options.iroh) iroh.Stream else void,
     timeout_ms: u32 = 10_000,
+    /// Shim clock (`iroh.nowUs`) after which every read and write fails at once, and
+    /// `close` stops waiting: the whole exchange's budget. 0: none.
+    deadline_us: u64 = 0,
 
-    fn stream(self: *IrohStream) pairing.Stream {
+    /// Whole-exchange budgets on the host, against peers that connect and stall.
+    pub const pair_budget_ms: u32 = 5_000;
+    pub const admit_budget_ms: u32 = 3_000;
+    /// The longest `close` waits for the peer to finish its side.
+    const close_wait_ms: u32 = 1_000;
+
+    /// A stream with a total budget from now.
+    pub fn withBudget(s: iroh.Stream, budget_ms: u32) IrohStream {
+        return .{ .s = s, .deadline_us = iroh.nowUs() + @as(u64, budget_ms) * 1000 };
+    }
+
+    fn wait(self: *const IrohStream, cap_ms: u32) error{Timeout}!u32 {
+        if (self.deadline_us == 0) return cap_ms;
+        const now = iroh.nowUs();
+        if (now >= self.deadline_us) return error.Timeout;
+        return @intCast(@max(1, @min(cap_ms, (self.deadline_us - now) / 1000)));
+    }
+
+    pub fn stream(self: *IrohStream) pairing.Stream {
         return .{ .ptr = self, .writeFn = write, .readFn = read };
     }
     fn write(ptr: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *IrohStream = @ptrCast(@alignCast(ptr));
-        try self.s.writeAll(bytes, self.timeout_ms);
+        try self.s.writeAll(bytes, try self.wait(self.timeout_ms));
     }
     fn read(ptr: *anyopaque, buf: []u8) anyerror!usize {
         const self: *IrohStream = @ptrCast(@alignCast(ptr));
-        return (try self.s.read(buf, self.timeout_ms)).len;
+        return (try self.s.read(buf, try self.wait(self.timeout_ms))).len;
     }
 
-    /// Finish our side and wait (briefly) for the peer to finish theirs, so the last
-    /// message is delivered before the connection closes.
-    fn close(self: *IrohStream) void {
+    /// Finish our side and wait (briefly: at most a second, and never past the deadline)
+    /// for the peer to finish theirs, so the last message is delivered before the
+    /// connection closes.
+    pub fn close(self: *IrohStream) void {
         self.s.finish() catch {};
+        const until = iroh.nowUs() + close_wait_ms * 1000;
+        if (self.deadline_us == 0 or self.deadline_us > until) self.deadline_us = until;
         var junk: [256]u8 = undefined;
-        for (0..16) |_| {
-            const got = self.s.read(&junk, 2000) catch break;
+        while (true) {
+            const ms = self.wait(close_wait_ms) catch break;
+            const got = self.s.read(&junk, ms) catch break;
             if (got.len == 0) break;
         }
         self.s.deinit(0);
     }
 };
 
-fn initIroh() !void {
+/// Runs connections on their own tasks, at most `max` at once, so one peer that connects
+/// and stalls holds up neither pairing nor admission for anyone else. Each task calls
+/// `done` when it ends.
+pub const ConnTasks = struct {
+    io: Io,
+    max: u32 = 16,
+    active: std.atomic.Value(u32) = .init(0),
+    group: Io.Group = .init,
+
+    /// Starts `func(args)`; false (nothing started) when `max` are already running.
+    pub fn spawn(t: *ConnTasks, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) bool {
+        if (t.active.fetchAdd(1, .acq_rel) >= t.max) {
+            _ = t.active.fetchSub(1, .acq_rel);
+            return false;
+        }
+        t.group.concurrent(t.io, func, args) catch {
+            _ = t.active.fetchSub(1, .acq_rel);
+            return false;
+        };
+        return true;
+    }
+
+    pub fn done(t: *ConnTasks) void {
+        _ = t.active.fetchSub(1, .acq_rel);
+    }
+
+    /// Waits for every task.
+    pub fn wait(t: *ConnTasks) void {
+        t.group.await(t.io) catch {};
+    }
+};
+
+/// Application error code for a connection closed because the host is serving too many.
+pub const close_busy: u32 = 0x5051;
+
+pub fn initIroh() !void {
     iroh.init(null, null) catch |e| switch (e) {
         error.Invalid => {}, // already started
         else => {
@@ -197,16 +260,21 @@ pub fn bind(c: Ctx, secret: *const [32]u8, accept: bool) !iroh.Endpoint {
     return ep;
 }
 
-fn remoteId(conn: iroh.Conn) !pair.Id {
+pub fn remoteId(conn: iroh.Conn) !pair.Id {
     var b: [128]u8 = undefined;
     return pair.id.parseHex(try conn.remoteId(&b)) orelse error.BadRemoteId;
 }
 
+/// Writes a file the host hands to a script (`--ticket-file`, `--pin-file`, `--qr-svg`). The
+/// QR ticket, its SVG and the PIN are pairing secrets, so the file is private (0600 on
+/// POSIX) and goes through an exclusive, randomly named temporary file in the same
+/// directory: another local user can neither read it nor plant a symlink at a guessable
+/// temporary name to redirect the write.
 fn writeFileAtomic(c: Ctx, path: []const u8, data: []const u8) !void {
-    var tb: [512]u8 = undefined;
-    const tmp = try std.fmt.bufPrint(&tb, "{s}.tmp", .{path});
-    try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = tmp, .data = data });
-    try Io.Dir.rename(.cwd(), tmp, .cwd(), path, c.io);
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    var dir = try Io.Dir.cwd().openDir(c.io, dir_path, .{});
+    defer dir.close(c.io);
+    try keystore.writeFileAtomic(c.io, dir, std.fs.path.basename(path), data, true);
 }
 
 pub fn cmdPairHost(c: Ctx, w: *Io.Writer) !bool {
@@ -268,42 +336,79 @@ pub fn cmdPairHost(c: Ctx, w: *Io.Writer) !bool {
     }
     if (c.p.pin_file.len > 0) if (window.pin) |p| try writeFileAtomic(c, c.p.pin_file, &p);
 
-    var paired: usize = 0;
-    while (window.isOpen(monoNow())) {
-        const left_ms: u32 = @intCast(@max(1, @divTrunc(window.deadline_us - monoNow(), 1000)));
-        const conn = ep.accept(left_ms) catch |e| switch (e) {
-            error.Timeout, error.Closed => break,
+    var srv: PairServer = .{ .c = c, .w = w, .st = &st, .clients = &clients, .window = &window, .host_id = ident.id, .name = name, .tasks = .{ .io = c.io } };
+    while (true) {
+        srv.mu.lockUncancelable(c.io);
+        const open = window.isOpen(monoNow());
+        srv.mu.unlock(c.io);
+        if (!open) break;
+        const conn = ep.accept(200) catch |e| switch (e) {
+            error.Timeout => continue,
+            error.Closed => break,
             else => {
                 std.debug.print("accept: {s}\n", .{iroh.lastError()});
                 continue;
             },
         };
+        if (!srv.tasks.spawn(PairServer.serve, .{ &srv, conn })) conn.deinit(close_busy);
+    }
+    srv.tasks.wait();
+    try w.print("pairing window closed: {d} device(s) paired\n", .{srv.paired});
+    return srv.paired > 0;
+}
+
+/// `pair host`: each connection on its own task (`ConnTasks`), sharing the window under
+/// `mu`, each with a total budget (`IrohStream.pair_budget_ms`).
+const PairServer = struct {
+    c: Ctx,
+    w: *Io.Writer,
+    st: *pairing.State,
+    clients: *pair.Allowlist,
+    window: *ex.Window,
+    host_id: pair.Id,
+    name: []const u8,
+    tasks: ConnTasks,
+    mu: Io.Mutex = .init,
+    paired: usize = 0,
+
+    fn serve(srv: *PairServer, conn: iroh.Conn) void {
+        defer srv.tasks.done();
         defer conn.deinit(0);
-        const peer_id = remoteId(conn) catch continue;
-        var s: IrohStream = .{ .s = conn.acceptBi(10_000) catch continue };
+        srv.serveConn(conn) catch {};
+    }
+
+    fn serveConn(srv: *PairServer, conn: iroh.Conn) !void {
+        const c = srv.c;
+        const peer_id = try remoteId(conn);
+        var s: IrohStream = .withBudget(try conn.acceptBi(IrohStream.pair_budget_ms), IrohStream.pair_budget_ms);
         defer s.close();
         var f: ex.Framer = .{};
         var mb: [ex.max_message]u8 = undefined;
-        const first = (readFirst(s.stream(), &f, &mb) catch continue) orelse continue;
+        const first = (try readFirst(s.stream(), &f, &mb)) orelse return;
         var nonce: ex.Nonce = undefined;
         try c.io.randomSecure(&nonce);
+        var seed: ex.Seed = undefined;
+        try c.io.randomSecure(&seed);
         switch (ex.classify(first)) {
             .pair => {
-                var h = ex.Host.init(&window, ident.id, peer_id, nonce, name);
-                const out = pairing.serveHost(s.stream(), &f, &h, first, &monoNow) catch |e| {
+                var h = ex.Host.init(srv.window, srv.host_id, peer_id, nonce, seed, srv.name);
+                var g: pairing.Guard.Simple = .{ .io = c.io, .mu = &srv.mu };
+                const out = pairing.serveHost(s.stream(), &f, &h, first, &monoNow, g.guard()) catch |e| {
                     std.debug.print("pairing with {s}: stream error {t}\n", .{ &pair.id.short(&peer_id), e });
-                    continue;
+                    return;
                 };
+                srv.mu.lockUncancelable(c.io);
+                defer srv.mu.unlock(c.io);
                 switch (out) {
                     .paired => |p| {
-                        try clients.put(.{ .id = p.peer_id, .paired_unix_s = unixNow(c.io), .name = p.name() });
-                        try st.saveList(.clients, &clients);
-                        paired += 1;
-                        try w.print("paired with {s} ({s}) by {s}\n", .{ p.name(), &pair.id.short(&p.peer_id), if (p.method == .pin) "PIN" else "QR ticket" });
+                        try srv.clients.put(.{ .id = p.peer_id, .paired_unix_s = unixNow(c.io), .name = p.name() });
+                        try srv.st.saveList(.clients, srv.clients);
+                        srv.paired += 1;
+                        try srv.w.print("paired with {s} ({s}) by {s}\n", .{ p.name(), &pair.id.short(&p.peer_id), if (p.method == .pin) "PIN" else "QR ticket" });
                     },
-                    .failed => |why| try w.print("refused {s}: {s} ({d} attempts left)\n", .{ &pair.id.short(&peer_id), pairing.reasonText(why), window.attempts_left }),
+                    .failed => |why| try srv.w.print("refused {s}: {s} ({d} attempts left)\n", .{ &pair.id.short(&peer_id), pairing.reasonText(why), srv.window.attempts_left }),
                 }
-                try w.flush();
+                try srv.w.flush();
             },
             .admit => {
                 var o: ex.Out = .{};
@@ -312,12 +417,10 @@ pub fn cmdPairHost(c: Ctx, w: *Io.Writer) !bool {
             .invalid => {},
         }
     }
-    try w.print("pairing window closed: {d} device(s) paired\n", .{paired});
-    return paired > 0;
-}
+};
 
 /// Copies the first message out of the framer's scratch so later reads can't clobber it.
-fn readFirst(s: pairing.Stream, f: *ex.Framer, out: *[ex.max_message]u8) !?[]const u8 {
+pub fn readFirst(s: pairing.Stream, f: *ex.Framer, out: *[ex.max_message]u8) !?[]const u8 {
     var tmp: [ex.max_message]u8 = undefined;
     const m = (try pairing.readMessage(s, f, &tmp)) orelse return null;
     @memcpy(out[0..m.len], m);
@@ -379,7 +482,9 @@ pub fn cmdPairClient(c: Ctx, w: *Io.Writer) !bool {
     defer s.close();
     var nonce: ex.Nonce = undefined;
     try c.io.randomSecure(&nonce);
-    var cl = ex.Client.init(t.host_id, ident.id, nonce, cred, name);
+    var seed: ex.Seed = undefined;
+    try c.io.randomSecure(&seed);
+    var cl = ex.Client.init(t.host_id, ident.id, nonce, seed, cred, name);
     const out = try pairing.runClient(s.stream(), &cl);
     switch (out) {
         .paired => |p| {
@@ -401,27 +506,11 @@ pub fn cmdPairClient(c: Ctx, w: *Io.Writer) !bool {
 
 // --- session admission ------------------------------------------------------------------
 
-/// Host side of `peer iroh host --state-dir`: accepts connections until one comes from a
-/// paired client that asks for a session, refusing (and closing) the rest.
-pub fn acceptAdmitted(c: Ctx, ep: iroh.Endpoint, clients: *const pair.Allowlist, timeout_ms: u32) !iroh.Conn {
-    mono_io = c.io;
-    const deadline = monoNow() + @as(i64, timeout_ms) * 1000;
-    while (true) {
-        const left: i64 = @divTrunc(deadline - monoNow(), 1000);
-        if (left <= 0) return error.Timeout;
-        const conn = ep.accept(@intCast(left)) catch |e| {
-            std.debug.print("accept: {s}\n", .{iroh.lastError()});
-            return e;
-        };
-        const ok = admitOne(conn, clients) catch false;
-        if (ok) return conn;
-        conn.deinit(close_not_paired);
-    }
-}
-
+/// Host side of admission: true if `conn` asked for a session and its device is on the
+/// allowlist. Bounded by `IrohStream.admit_budget_ms` in all.
 fn admitOne(conn: iroh.Conn, clients: *const pair.Allowlist) !bool {
     const peer_id = try remoteId(conn);
-    var s: IrohStream = .{ .s = try conn.acceptBi(5_000) };
+    var s: IrohStream = .withBudget(try conn.acceptBi(IrohStream.admit_budget_ms), IrohStream.admit_budget_ms);
     defer s.close();
     var f: ex.Framer = .{};
     var mb: [ex.max_message]u8 = undefined;
@@ -432,6 +521,27 @@ fn admitOne(conn: iroh.Conn, clients: *const pair.Allowlist) !bool {
     if (!allowed) std.debug.print("refused {s}: not on the allowlist\n", .{&pair.id.short(&peer_id)});
     return allowed;
 }
+
+/// `IrohLink` gates for `peer iroh`: admission on every connection, the first and each
+/// reconnect. Host: only clients on the allowlist. Client: only hosts on this device's list,
+/// and only if the host admits it.
+pub const LinkGate = struct {
+    list: *const pair.Allowlist,
+    role: enum { host, client },
+
+    pub fn gate(self: *LinkGate) iroh_pipe.IrohLink.Gate {
+        return .{ .ctx = self, .check = check };
+    }
+
+    fn check(ctx: *anyopaque, conn: iroh.Conn) iroh_pipe.IrohLink.Verdict {
+        const self: *LinkGate = @ptrCast(@alignCast(ctx));
+        switch (self.role) {
+            .host => return if (admitOne(conn, self.list) catch false) .admit else .refuse,
+            // A broken stream is worth another dial; a refusal is final.
+            .client => return if (requestSession(conn, self.list)) |ok| (if (ok) .admit else .refuse) else |_| .retry,
+        }
+    }
+};
 
 /// Client side: checks that the host is one this device paired with, then asks it for a
 /// session. Returns false (with a message) if either fails.
@@ -478,10 +588,47 @@ fn waitFile(c: Ctx, path: []const u8, buf: []u8) ![]u8 {
     return error.Timeout;
 }
 
+/// Peers that connect to a host and stall, for `run pair`.
+const Stallers = struct {
+    ep: ?iroh.Endpoint = null,
+    conns: [3]iroh.Conn = undefined,
+    streams: [3]?iroh.Stream = @splat(null),
+    n: usize = 0,
+
+    /// `ticket_file` holds a moonsec address ticket or a bare iroh ticket.
+    fn start(st: *Stallers, c: Ctx, ticket_file: []const u8) !void {
+        var buf: [8192]u8 = undefined;
+        const text = std.mem.trim(u8, try Io.Dir.cwd().readFile(c.io, ticket_file, &buf), " \r\n");
+        var scratch: [pair.ticket.max_binary]u8 = undefined;
+        const addr = if (pair.Ticket.decode(text, &scratch)) |t| t.addr else |_| text;
+        const addr_z = try c.gpa.dupeZ(u8, addr);
+        defer c.gpa.free(addr_z);
+        var key: [32]u8 = undefined;
+        c.io.random(&key);
+        st.ep = try bind(c, &key, false);
+        for (0..3) |i| {
+            st.conns[i] = try st.ep.?.connect(addr_z, alpn, 10_000);
+            st.n += 1;
+            if (i == 0) {
+                const s = try st.conns[i].openBi(5_000);
+                st.streams[i] = s;
+                try s.writeAll(&.{ 40, 0, @intFromEnum(ex.Kind.hello) }, 5_000); // a third of a hello
+            }
+        }
+    }
+
+    fn deinit(st: *Stallers) void {
+        for (st.streams) |s| if (s) |x| x.deinit(0);
+        for (st.conns[0..st.n]) |cn| cn.deinit(0);
+        if (st.ep) |e| e.deinit();
+    }
+};
+
 /// `moonsec run pair`: pairs two clients with a host (QR ticket; wrong then right PIN),
 /// then runs a session from a paired client after the host has refused an unpaired one.
 pub fn runPairE2E(c: Ctx, self_exe: []const u8) !bool {
     std.debug.print("== pairing and admission over iroh, loopback, relays off ==\n", .{});
+    mono_io = c.io;
     var bb: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&bb, ".moonsec-pair-{d}", .{Io.Clock.awake.now(c.io).toNanoseconds()});
     try Io.Dir.cwd().createDirPath(c.io, base);
@@ -515,7 +662,14 @@ pub fn runPairE2E(c: Ctx, self_exe: []const u8) !bool {
             if (got != want) all.* = false;
         }
     }.f;
+    // Three peers that connect and stall (one opens a stream and sends half a message, the
+    // others nothing) must not hold up a real client.
+    var stallers: Stallers = .{};
+    defer stallers.deinit();
+    stallers.start(c, tfile_addr) catch |e| std.debug.print("  stallers: {t}\n", .{e});
+    const t0 = monoNow();
     step("pair by QR ticket", true, try runSelf(c.io, &.{ self_exe, "pair", "client", "--state-dir", c1, "--name", "qr-laptop", "--ticket-file", tfile }), &ok);
+    step("...while three peers stall (under 4 s)", true, stallers.n == 3 and monoNow() - t0 < 4 * std.time.us_per_s, &ok);
     step("wrong PIN is refused", false, try runSelf(c.io, &.{ self_exe, "pair", "client", "--state-dir", c2, "--name", "pin-laptop", "--ticket-file", tfile_addr, "--pin", &wrong }), &ok);
     step("pair by PIN", true, try runSelf(c.io, &.{ self_exe, "pair", "client", "--state-dir", c2, "--name", "pin-laptop", "--ticket-file", tfile_addr, "--pin", pin[0..6] }), &ok);
     const host_ok = switch (try host.wait(c.io)) {
@@ -556,6 +710,9 @@ pub fn runPairE2E(c: Ctx, self_exe: []const u8) !bool {
     };
     _ = try waitFile(c, sess_ticket, &junk);
     step("unpaired client is refused a session", false, try runSelf(c.io, &.{ self_exe, "peer", "iroh", "client", "--state-dir", c3, "--ticket-file", sess_ticket, "--seconds", secs_s }), &ok);
+    var stallers2: Stallers = .{};
+    defer stallers2.deinit();
+    stallers2.start(c, sess_ticket) catch |e| std.debug.print("  stallers: {t}\n", .{e});
     step("paired client streams", true, try runSelf(c.io, &.{ self_exe, "peer", "iroh", "client", "--state-dir", c1, "--ticket-file", sess_ticket, "--seconds", secs_s }), &ok);
     const sess_ok = switch (try sess_host.wait(c.io)) {
         .exited => |code| code == 0,

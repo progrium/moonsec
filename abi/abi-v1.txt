@@ -1,0 +1,277 @@
+struct moonsec_video_format size 16 align 4
+  moonsec_video_format.codec offset 0 size 4
+  moonsec_video_format.chroma offset 4 size 4
+  moonsec_video_format.bit_depth offset 8 size 4
+  moonsec_video_format.color offset 12 size 4
+struct moonsec_input size 48 align 8
+  moonsec_input.kind offset 0 size 4
+  moonsec_input.code offset 4 size 4
+  moonsec_input.down offset 8 size 4
+  moonsec_input.x offset 12 size 4
+  moonsec_input.y offset 16 size 4
+  moonsec_input.pad_buttons offset 20 size 4
+  moonsec_input.pad_lx offset 24 size 2
+  moonsec_input.pad_ly offset 26 size 2
+  moonsec_input.pad_rx offset 28 size 2
+  moonsec_input.pad_ry offset 30 size 2
+  moonsec_input.pad_lt offset 32 size 2
+  moonsec_input.pad_rt offset 34 size 2
+  moonsec_input.reserved offset 36 size 4
+  moonsec_input.time_us offset 40 size 8
+struct moonsec_host_config size 112 align 8
+  moonsec_host_config.struct_size offset 0 size 4
+  moonsec_host_config.backend offset 4 size 4
+  moonsec_host_config.state_dir offset 8 size 8
+  moonsec_host_config.name offset 16 size 8
+  moonsec_host_config.flags offset 24 size 4
+  moonsec_host_config.codec offset 28 size 4
+  moonsec_host_config.fps offset 32 size 4
+  moonsec_host_config.display offset 36 size 4
+  moonsec_host_config.width offset 40 size 4
+  moonsec_host_config.height offset 44 size 4
+  moonsec_host_config.bitrate_bps offset 48 size 8
+  moonsec_host_config.clipboard offset 56 size 4
+  moonsec_host_config.max_clients offset 60 size 4
+  moonsec_host_config.relay_mode offset 64 size 4
+  moonsec_host_config.reserved0 offset 68 size 4
+  moonsec_host_config.relay_url offset 72 size 8
+  moonsec_host_config.relay_ca_pem offset 80 size 8
+  moonsec_host_config.bind_addr offset 88 size 8
+  moonsec_host_config.notify offset 96 size 8
+  moonsec_host_config.notify_ctx offset 104 size 8
+struct moonsec_pair_config size 16 align 4
+  moonsec_pair_config.struct_size offset 0 size 4
+  moonsec_pair_config.seconds offset 4 size 4
+  moonsec_pair_config.pairings offset 8 size 4
+  moonsec_pair_config.method offset 12 size 4
+struct moonsec_pair_info size 1040 align 4
+  moonsec_pair_info.struct_size offset 0 size 4
+  moonsec_pair_info.seconds offset 4 size 4
+  moonsec_pair_info.qr_ticket offset 8 size 512
+  moonsec_pair_info.addr_ticket offset 520 size 512
+  moonsec_pair_info.pin offset 1032 size 8
+struct moonsec_display_info size 88 align 4
+  moonsec_display_info.index offset 0 size 4
+  moonsec_display_info.width offset 4 size 4
+  moonsec_display_info.height offset 8 size 4
+  moonsec_display_info.refresh_mhz offset 12 size 4
+  moonsec_display_info.primary offset 16 size 4
+  moonsec_display_info.hdr offset 20 size 4
+  moonsec_display_info.name offset 24 size 64
+struct moonsec_frame size 64 align 8
+  moonsec_frame.struct_size offset 0 size 4
+  moonsec_frame.frame_id offset 4 size 4
+  moonsec_frame.width offset 8 size 4
+  moonsec_frame.height offset 12 size 4
+  moonsec_frame.format offset 16 size 16
+  moonsec_frame.pixels offset 32 size 8
+  moonsec_frame.stride offset 40 size 4
+  moonsec_frame.reserved offset 44 size 4
+  moonsec_frame.gpu_texture offset 48 size 8
+  moonsec_frame.presented_us offset 56 size 8
+struct moonsec_client_config size 104 align 8
+  moonsec_client_config.struct_size offset 0 size 4
+  moonsec_client_config.backend offset 4 size 4
+  moonsec_client_config.state_dir offset 8 size 8
+  moonsec_client_config.name offset 16 size 8
+  moonsec_client_config.flags offset 24 size 4
+  moonsec_client_config.codecs offset 28 size 4
+  moonsec_client_config.max_width offset 32 size 4
+  moonsec_client_config.max_height offset 36 size 4
+  moonsec_client_config.clipboard offset 40 size 4
+  moonsec_client_config.relay_mode offset 44 size 4
+  moonsec_client_config.relay_url offset 48 size 8
+  moonsec_client_config.relay_ca_pem offset 56 size 8
+  moonsec_client_config.bind_addr offset 64 size 8
+  moonsec_client_config.notify offset 72 size 8
+  moonsec_client_config.notify_ctx offset 80 size 8
+  moonsec_client_config.on_frame offset 88 size 8
+  moonsec_client_config.frame_ctx offset 96 size 8
+struct moonsec_stage_stats size 56 align 8
+  moonsec_stage_stats.count offset 0 size 4
+  moonsec_stage_stats.reserved offset 4 size 4
+  moonsec_stage_stats.min_us offset 8 size 8
+  moonsec_stage_stats.mean_us offset 16 size 8
+  moonsec_stage_stats.p50_us offset 24 size 8
+  moonsec_stage_stats.p95_us offset 32 size 8
+  moonsec_stage_stats.p99_us offset 40 size 8
+  moonsec_stage_stats.max_us offset 48 size 8
+struct moonsec_telemetry size 608 align 8
+  moonsec_telemetry.struct_size offset 0 size 4
+  moonsec_telemetry.state offset 4 size 4
+  moonsec_telemetry.end_reason offset 8 size 4
+  moonsec_telemetry.flags offset 12 size 4
+  moonsec_telemetry.format offset 16 size 16
+  moonsec_telemetry.width offset 32 size 4
+  moonsec_telemetry.height offset 36 size 4
+  moonsec_telemetry.fps offset 40 size 4
+  moonsec_telemetry.stage_count offset 44 size 4
+  moonsec_telemetry.bitrate_bps offset 48 size 8
+  moonsec_telemetry.pacing_bps offset 56 size 8
+  moonsec_telemetry.rtt_us offset 64 size 8
+  moonsec_telemetry.frames offset 72 size 8
+  moonsec_telemetry.frames_lost offset 80 size 8
+  moonsec_telemetry.keyframes offset 88 size 8
+  moonsec_telemetry.refreshes offset 96 size 8
+  moonsec_telemetry.freezes offset 104 size 8
+  moonsec_telemetry.longest_gap_us offset 112 size 8
+  moonsec_telemetry.retransmits offset 120 size 8
+  moonsec_telemetry.parity_shards offset 128 size 8
+  moonsec_telemetry.input_events offset 136 size 8
+  moonsec_telemetry.path_changes offset 144 size 8
+  moonsec_telemetry.reconnects offset 152 size 8
+  moonsec_telemetry.stages offset 160 size 448
+struct moonsec_event size 240 align 8
+  moonsec_event.struct_size offset 0 size 4
+  moonsec_event.type offset 4 size 4
+  moonsec_event.session offset 8 size 8
+  moonsec_event.time_us offset 16 size 8
+  moonsec_event.code offset 24 size 4
+  moonsec_event.width offset 28 size 4
+  moonsec_event.height offset 32 size 4
+  moonsec_event.reserved offset 36 size 4
+  moonsec_event.format offset 40 size 16
+  moonsec_event.input offset 56 size 48
+  moonsec_event.peer_id offset 104 size 72
+  moonsec_event.peer_name offset 176 size 64
+struct moonsec_loopback_config size 16 align 8
+  moonsec_loopback_config.struct_size offset 0 size 4
+  moonsec_loopback_config.profile offset 4 size 4
+  moonsec_loopback_config.seed offset 8 size 8
+const MOONSEC_ABI_MAJOR 1
+const MOONSEC_ABI_MINOR 0
+const MOONSEC_ABI_PATCH 0
+const MOONSEC_ABI_VERSION 65536
+const MOONSEC_FEATURE_LOOPBACK 1
+const MOONSEC_FEATURE_IROH 2
+const MOONSEC_FEATURE_SYSTEM_BACKEND 4
+const MOONSEC_FEATURE_MULTI_USER 8
+const MOONSEC_FEATURE_DISPLAYS 16
+const MOONSEC_OK 0
+const MOONSEC_ERR_INVALID -1
+const MOONSEC_ERR_UNSUPPORTED -2
+const MOONSEC_ERR_NO_MEMORY -3
+const MOONSEC_ERR_STATE -4
+const MOONSEC_ERR_BUFFER_TOO_SMALL -5
+const MOONSEC_ERR_TIMEOUT -6
+const MOONSEC_ERR_TRANSPORT -7
+const MOONSEC_ERR_REFUSED -8
+const MOONSEC_ERR_BACKEND -9
+const MOONSEC_ERR_IO -10
+const MOONSEC_ERR_INTERNAL -99
+const MOONSEC_BACKEND_SYNTHETIC 0
+const MOONSEC_BACKEND_SYSTEM 1
+const MOONSEC_CODEC_H264 1
+const MOONSEC_CODEC_HEVC 2
+const MOONSEC_CODEC_AV1 3
+const MOONSEC_CODEC_PASSTHROUGH 250
+const MOONSEC_CODECS_H264 1
+const MOONSEC_CODECS_HEVC 2
+const MOONSEC_CODECS_AV1 4
+const MOONSEC_CODECS_PASSTHROUGH 8
+const MOONSEC_CHROMA_420 0
+const MOONSEC_CHROMA_444 1
+const MOONSEC_COLOR_SDR_BT709 0
+const MOONSEC_COLOR_HDR10 1
+const MOONSEC_RELAY_DISABLED 0
+const MOONSEC_RELAY_DEFAULT 1
+const MOONSEC_RELAY_CUSTOM 2
+const MOONSEC_CLIPBOARD_OFF 0
+const MOONSEC_CLIPBOARD_SYSTEM 1
+const MOONSEC_CLIPBOARD_APP 2
+const MOONSEC_INPUT_KEY 1
+const MOONSEC_INPUT_BUTTON 2
+const MOONSEC_INPUT_SCROLL 3
+const MOONSEC_INPUT_MOVE_REL 4
+const MOONSEC_INPUT_MOVE_ABS 5
+const MOONSEC_INPUT_GAMEPAD 6
+const MOONSEC_HOST_YUV444 1
+const MOONSEC_HOST_TEN_BIT 2
+const MOONSEC_HOST_NO_HDR 4
+const MOONSEC_HOST_RATE_CONTROL 8
+const MOONSEC_HOST_LOSS_POLICY 16
+const MOONSEC_HOST_NO_AUDIO 32
+const MOONSEC_HOST_APP_INPUT 64
+const MOONSEC_HOST_REQUIRE_PAIRED 128
+const MOONSEC_HOST_INSECURE_NO_PAIRING 256
+const MOONSEC_PAIR_QR_AND_PIN 0
+const MOONSEC_PAIR_QR_ONLY 1
+const MOONSEC_PAIR_PIN_ONLY 2
+const MOONSEC_CLIENT_NO_AUDIO 1
+const MOONSEC_CLIENT_NO_OS_INPUT 2
+const MOONSEC_CLIENT_FULLSCREEN 4
+const MOONSEC_CLIENT_REQUIRE_PAIRED 8
+const MOONSEC_CLIENT_INSECURE_NO_PAIRING 16
+const MOONSEC_STATE_CONNECTING 0
+const MOONSEC_STATE_STREAMING 1
+const MOONSEC_STATE_ENDED 2
+const MOONSEC_END_NONE 0
+const MOONSEC_END_CLOSED 1
+const MOONSEC_END_PEER_CLOSED 2
+const MOONSEC_END_TIMEOUT 3
+const MOONSEC_END_TRANSPORT 4
+const MOONSEC_END_FAILED 5
+const MOONSEC_STAGE_CAPTURE 0
+const MOONSEC_STAGE_ENCODE 1
+const MOONSEC_STAGE_NETWORK 2
+const MOONSEC_STAGE_DECODE 3
+const MOONSEC_STAGE_PRESENT 4
+const MOONSEC_STAGE_TOTAL 5
+const MOONSEC_STAGE_INPUT 6
+const MOONSEC_STAGE_MAX 8
+const MOONSEC_TELEMETRY_RELAYED 1
+const MOONSEC_TELEMETRY_CLOCK_SYNCED 2
+const MOONSEC_TELEMETRY_STALLED 4
+const MOONSEC_EVENT_SESSION_STARTED 1
+const MOONSEC_EVENT_SESSION_ENDED 2
+const MOONSEC_EVENT_FORMAT_CHANGED 3
+const MOONSEC_EVENT_INPUT 4
+const MOONSEC_EVENT_CLIPBOARD 5
+const MOONSEC_EVENT_PATH_CHANGED 6
+const MOONSEC_EVENT_PAIRED 7
+const MOONSEC_EVENT_PAIR_FAILED 8
+const MOONSEC_EVENT_PAIR_CLOSED 9
+const MOONSEC_EVENT_INPUT_OWNER 10
+const MOONSEC_EVENT_REFUSED 11
+const MOONSEC_PAIR_FAIL_BAD_PROOF 1
+const MOONSEC_PAIR_FAIL_EXPIRED 2
+const MOONSEC_PAIR_FAIL_OTHER 3
+const MOONSEC_PROFILE_CLEAN 0
+const MOONSEC_PROFILE_LAN 1
+const MOONSEC_PROFILE_WAN 2
+fn moonsec_version
+fn moonsec_version_string
+fn moonsec_features
+fn moonsec_status_string
+fn moonsec_last_error
+fn moonsec_host_create
+fn moonsec_host_destroy
+fn moonsec_host_id
+fn moonsec_host_listen
+fn moonsec_host_ticket
+fn moonsec_host_pair_begin
+fn moonsec_host_pair_end
+fn moonsec_host_listen_loopback
+fn moonsec_host_give_input
+fn moonsec_host_displays
+fn moonsec_client_create
+fn moonsec_client_destroy
+fn moonsec_client_id
+fn moonsec_client_connect
+fn moonsec_client_pair
+fn moonsec_client_connect_loopback
+fn moonsec_session_state
+fn moonsec_session_close
+fn moonsec_session_release
+fn moonsec_session_send_input
+fn moonsec_session_request_input
+fn moonsec_session_clipboard_set
+fn moonsec_session_clipboard_get
+fn moonsec_session_format
+fn moonsec_session_telemetry
+fn moonsec_host_poll_event
+fn moonsec_client_poll_event
+fn moonsec_loopback_create
+fn moonsec_loopback_destroy
+fn moonsec_loopback_advance
+fn moonsec_loopback_now

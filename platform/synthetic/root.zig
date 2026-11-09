@@ -5,12 +5,16 @@
 //!                  capture clock and frame number, at the configured rate.
 //!   Encoder        the passthrough codec: each access unit carries the pattern's stamp,
 //!                  a CRC-32 of the pixels, reference bookkeeping (IDR, P, LTR, LTR
-//!                  refresh) and deterministic filler that sizes it to the bitrate.
+//!                  refresh), the coded format (chroma, bit depth, colour space, HDR
+//!                  light levels) and deterministic filler that sizes it to the bitrate.
+//!                  Every format of platform/format.zig, unless `Options` narrows it.
 //!   Decoder        checks the filler, enforces references the way a real decoder does
-//!                  (a P frame after a gap fails, a refresh needs its LTR), re-renders the
-//!                  pattern and checks it against the CRC.
+//!                  (a P frame after a gap fails, a refresh needs its LTR), checks the
+//!                  coded format against its config, re-renders the pattern and checks it
+//!                  against the CRC.
 //!   Presenter      reads the stamp back from the pixels, so every presented frame is
-//!                  verified end to end; counts presents and unreadable frames.
+//!                  verified end to end; counts presents, unreadable frames and frames
+//!                  whose colour space is not the configured one.
 //!   InputSource    a scripted key press/release every `input_interval_us` and some motion.
 //!   InputInjector  checks the keys arrive in the script's order.
 //!   AudioSource    a stereo tone (440 Hz left, 660 Hz right) at 48 kHz, paced by the clock.
@@ -33,6 +37,23 @@ pub const Sleeper = ?*const fn (ctx: ?*anyopaque, us: Micros) void;
 
 pub const magic: u32 = 0x5450_534d; // "MSPT"
 pub const header_len = 56;
+
+/// The coded format as the access unit header carries it: chroma, bit depth and colour
+/// space at bytes 5–7, HDR light levels at 44–47 (0 without metadata).
+fn putFormat(f: api.VideoFormat, out: *[header_len]u8) void {
+    out[5] = @intFromEnum(f.chroma);
+    out[6] = f.bit_depth;
+    out[7] = @intFromEnum(f.color);
+    const m = f.hdr orelse return;
+    std.mem.writeInt(u16, out[44..46], m.max_cll, .little);
+    std.mem.writeInt(u16, out[46..48], m.max_fall, .little);
+}
+
+fn formatMatches(b: []const u8, f: api.VideoFormat) bool {
+    const m = f.hdr orelse api.HdrMetadata{ .primaries = undefined, .white = undefined, .max_luminance = 0, .min_luminance = 0 };
+    return b[5] == @intFromEnum(f.chroma) and b[6] == f.bit_depth and b[7] == @intFromEnum(f.color) and
+        std.mem.readInt(u16, b[44..46], .little) == m.max_cll and std.mem.readInt(u16, b[46..48], .little) == m.max_fall;
+}
 
 pub const AuFlags = packed struct(u8) {
     keyframe: bool = false,
@@ -115,6 +136,10 @@ pub const Capture = struct {
     last: ?api.CapturedFrame = null,
     out: bool = false,
     default_size: api.Size,
+    /// The "display" is in HDR mode: with `CaptureConfig.hdr`, frames are tagged HDR10 and
+    /// `start` reports this metadata (the pixels stay the 8-bit pattern).
+    hdr_display: ?api.HdrMetadata = null,
+    color: api.ColorSpace = .sdr_bt709,
 
     pub fn start(c: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
         c.width = if (cfg.width != 0) cfg.width else c.default_size.width;
@@ -124,6 +149,11 @@ pub const Capture = struct {
         if (c.buf.len > 0) c.gpa.free(c.buf);
         c.buf = c.gpa.alloc(u8, c.width * c.height * 4) catch return error.OutOfMemory;
         c.next_due = null;
+        if (cfg.hdr) if (c.hdr_display) |m| {
+            c.color = .hdr10;
+            return .{ .width = c.width, .height = c.height, .color = .hdr10, .hdr = m };
+        };
+        c.color = .sdr_bt709;
         return .{ .width = c.width, .height = c.height };
     }
 
@@ -151,7 +181,7 @@ pub const Capture = struct {
         const start_us = now;
         pattern.render(c.buf, c.width, c.height, c.width * 4, .{ .time_us = stampTime(start_us), .frame = @truncate(c.seq) });
         const f: api.CapturedFrame = .{
-            .image = .{ .width = c.width, .height = c.height, .cpu = .{ .data = c.buf, .stride = c.width * 4 } },
+            .image = .{ .width = c.width, .height = c.height, .color = c.color, .cpu = .{ .data = c.buf, .stride = c.width * 4 } },
             .seq = c.seq,
             .capture_start_us = start_us,
             .captured_us = c.clock.now(),
@@ -198,16 +228,25 @@ pub const Encoder = struct {
     ltr_interval: u32 = 30,
     /// Make a frame with seq in this set fail to "encode" (null): tests the drop path.
     drop_every: u32 = 0,
-    stats: struct { frames: u64 = 0, keyframes: u64 = 0, refreshes: u64 = 0, dropped: u64 = 0, bytes: u64 = 0 } = .{},
+    /// Coded formats it offers for the passthrough codec.
+    formats: api.Formats = api.Formats.all,
+    stats: struct { frames: u64 = 0, keyframes: u64 = 0, refreshes: u64 = 0, dropped: u64 = 0, bytes: u64 = 0, configures: u64 = 0 } = .{},
 
-    pub fn caps(_: *Encoder) api.EncoderCaps {
-        return .{ .codecs = .{ .passthrough = true }, .ltr = true, .max_slices = 16, .cpu_input = true };
+    pub fn caps(e: *Encoder) api.EncoderCaps {
+        return .{ .codecs = .{ .passthrough = true }, .ltr = true, .max_slices = 16, .cpu_input = true, .coded = .{ .passthrough = e.formats } };
     }
 
     pub fn configure(e: *Encoder, cfg: api.EncoderConfig) api.Error!void {
         if (cfg.codec != .passthrough) return error.Unsupported;
         if (cfg.slices == 0 or cfg.slices > e.slices.len) return error.Unsupported;
+        if (!e.formats.supports(cfg.format)) return error.Unsupported;
+        // A new format is a new sequence: it starts from a keyframe, with no references.
+        if (e.cfg) |old| if (!old.format.eql(cfg.format)) {
+            e.last_seq = null;
+            e.ltrs = @splat(null);
+        };
         e.cfg = cfg;
+        e.stats.configures += 1;
     }
 
     fn frameBytes(e: *const Encoder, key: bool, refresh: bool) usize {
@@ -295,6 +334,7 @@ pub const Encoder = struct {
             .total_len = @intCast(total),
             .ltr_token = token,
         }).encode(out[0..header_len]);
+        putFormat(c.format, out[0..header_len]);
         filler(seq, out[header_len..]);
 
         const n: usize = @min(c.slices, total / 64);
@@ -340,17 +380,24 @@ pub const Decoder = struct {
     ltrs: [32]?u32 = @splat(null),
     ltr_next: usize = 0,
     out: bool = false,
-    stats: struct { frames: u64 = 0, missing_ref: u64 = 0, corrupt: u64 = 0 } = .{},
+    /// Coded formats it takes for the passthrough codec.
+    formats: api.Formats = api.Formats.all,
+    stats: struct { frames: u64 = 0, missing_ref: u64 = 0, corrupt: u64 = 0, wrong_format: u64 = 0 } = .{},
 
-    pub fn caps(_: *Decoder) api.DecoderCaps {
-        return .{ .codecs = .{ .passthrough = true }, .cpu_output = true };
+    pub fn caps(d: *Decoder) api.DecoderCaps {
+        return .{ .codecs = .{ .passthrough = true }, .cpu_output = true, .coded = .{ .passthrough = d.formats } };
     }
 
     pub fn configure(d: *Decoder, cfg: api.DecoderConfig) api.Error!void {
         if (cfg.codec != .passthrough) return error.Unsupported;
+        if (!d.formats.supports(cfg.format)) return error.Unsupported;
         if (cfg.width < pattern.min_width or cfg.height < pattern.min_height) return error.Unsupported;
+        // The dimensions come from the host: refuse a frame whose size (or row stride)
+        // does not fit in a u32 instead of overflowing.
+        const size = std.math.mul(u32, cfg.width, 4) catch return error.Unsupported;
+        const total = std.math.mul(u32, size, cfg.height) catch return error.Unsupported;
         d.freeBufs();
-        d.buf = d.gpa.alloc(u8, cfg.width * cfg.height * 4) catch return error.OutOfMemory;
+        d.buf = d.gpa.alloc(u8, total) catch return error.OutOfMemory;
         d.check = d.gpa.alloc(u8, 64 * 1024) catch return error.OutOfMemory;
         d.cfg = cfg;
         d.last_seq = null;
@@ -370,6 +417,13 @@ pub const Decoder = struct {
             return error.CodecFailed;
         };
         if (h.total_len != au.data.len or h.width != c.width or h.height != c.height or h.flags.keyframe != au.keyframe) {
+            d.stats.corrupt += 1;
+            return error.CodecFailed;
+        }
+        // A stream in another format than the config named: the host's bug, and a real
+        // decoder would produce garbage or fail.
+        if (!formatMatches(au.data, c.format)) {
+            d.stats.wrong_format += 1;
             d.stats.corrupt += 1;
             return error.CodecFailed;
         }
@@ -411,7 +465,7 @@ pub const Decoder = struct {
         d.out = true;
         return .{
             .frame_id = au.frame_id,
-            .image = .{ .width = c.width, .height = c.height, .cpu = .{ .data = d.buf, .stride = c.width * 4 } },
+            .image = .{ .width = c.width, .height = c.height, .color = c.format.color, .cpu = .{ .data = d.buf, .stride = c.width * 4 } },
             .decoded_us = d.clock.now(),
         };
     }
@@ -440,7 +494,7 @@ pub const Presenter = struct {
     cfg: ?api.PresenterConfig = null,
     /// Stamp read back from the last presented picture.
     last_stamp: ?pattern.Stamp = null,
-    stats: struct { presents: u64 = 0, unreadable: u64 = 0, overlays: u64 = 0 } = .{},
+    stats: struct { presents: u64 = 0, unreadable: u64 = 0, overlays: u64 = 0, wrong_color: u64 = 0 } = .{},
 
     pub fn configure(p: *Presenter, cfg: api.PresenterConfig) api.Error!void {
         p.cfg = cfg;
@@ -456,6 +510,7 @@ pub const Presenter = struct {
             p.stats.unreadable += 1;
         }
         if (o != null) p.stats.overlays += 1;
+        if (f.image.color != p.cfg.?.format.color) p.stats.wrong_color += 1;
         p.stats.presents += 1;
         return .{ .presented_us = p.clock.now() };
     }
@@ -667,6 +722,13 @@ pub const Options = struct {
     input_limit: u64 = 0,
     /// Offer the audio source (host) and sink (client).
     audio: bool = true,
+    /// Coded formats the encoder (host) and decoder (client) offer for passthrough.
+    encoder_formats: api.Formats = api.Formats.all,
+    decoder_formats: api.Formats = api.Formats.all,
+    /// Host: the captured display is in HDR mode with this metadata (frames are HDR10
+    /// when the app asks for HDR capture). Client: what its display shows.
+    hdr_display: ?api.HdrMetadata = null,
+    display: api.DisplayCaps = .{},
 };
 
 pub const Host = struct {
@@ -707,6 +769,7 @@ pub const Client = struct {
     clock: api.Clock,
     with_input: bool,
     with_audio: bool,
+    display: api.DisplayCaps,
 
     pub fn backend(c: *Client) api.ClientBackend {
         return .{
@@ -715,6 +778,7 @@ pub const Client = struct {
             .presenter = api.bind(api.Presenter, Presenter, &c.presenter),
             .input = if (c.with_input) api.bind(api.InputSource, InputSource, &c.input) else null,
             .audio = if (c.with_audio) api.bind(api.AudioSink, AudioSink, &c.audio) else null,
+            .display = c.display,
             .deinit_ptr = c,
             .deinitFn = deinitClient,
         };
@@ -733,8 +797,8 @@ pub fn openHost(gpa: std.mem.Allocator, o: Options) !*Host {
     h.* = .{
         .gpa = gpa,
         .clock = o.clock,
-        .capture = .{ .gpa = gpa, .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx, .default_size = .{ .width = o.width, .height = o.height } },
-        .encoder = .{ .gpa = gpa, .clock = o.clock },
+        .capture = .{ .gpa = gpa, .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx, .default_size = .{ .width = o.width, .height = o.height }, .hdr_display = o.hdr_display },
+        .encoder = .{ .gpa = gpa, .clock = o.clock, .formats = o.encoder_formats },
         .audio = .{ .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx },
         .with_audio = o.audio,
     };
@@ -746,12 +810,13 @@ pub fn openClient(gpa: std.mem.Allocator, o: Options) !*Client {
     c.* = .{
         .gpa = gpa,
         .clock = o.clock,
-        .decoder = .{ .gpa = gpa, .clock = o.clock },
+        .decoder = .{ .gpa = gpa, .clock = o.clock, .formats = o.decoder_formats },
         .presenter = .{ .clock = o.clock },
         .input = .{ .clock = o.clock, .interval_us = @max(o.input_interval_us, 1), .limit = o.input_limit },
         .with_input = o.input_interval_us > 0,
         .audio = .{ .clock = o.clock },
         .with_audio = o.audio,
+        .display = o.display,
     };
     return c;
 }
@@ -827,6 +892,62 @@ test "capture, encode, decode, present round trip with references" {
     try testing.expectError(error.CodecFailed, cb.decoder.decode(&bad));
     try testing.expectEqual(@as(u64, 1), c.decoder.stats.corrupt);
     try testing.expectEqual(@as(u64, 1), c.decoder.stats.missing_ref);
+}
+
+test "every coded format round trips, and a mismatch fails the decode" {
+    const gpa = testing.allocator;
+    const clock = api.clockFn(testClock);
+    const h = try openHost(gpa, .{ .clock = clock, .width = 160, .height = 90, .hdr_display = api.HdrMetadata.default_hdr10 });
+    const hb = h.backend();
+    defer hb.deinit();
+    const c = try openClient(gpa, .{ .clock = clock, .width = 160, .height = 90 });
+    const cb = c.backend();
+    defer cb.deinit();
+    const sz = try hb.capture.start(.{ .fps = 60, .hdr = true });
+    try testing.expectEqual(api.ColorSpace.hdr10, sz.color);
+    try cb.presenter.configure(.{ .width = sz.width, .height = sz.height });
+
+    var buf: [64 * 1024]u8 = undefined;
+    var id: u32 = 0;
+    for ([_]api.format.Chroma{ .yuv420, .yuv444 }) |chroma| for ([_]u8{ 8, 10 }) |depth| for ([_]api.ColorSpace{ .sdr_bt709, .hdr10 }) |color| {
+        const fmt: api.VideoFormat = .{ .chroma = chroma, .bit_depth = depth, .color = color, .hdr = if (color == .hdr10) api.HdrMetadata.default_hdr10 else null };
+        if (!fmt.valid()) {
+            try testing.expectError(error.Unsupported, hb.encoder.configure(.{ .codec = .passthrough, .width = sz.width, .height = sz.height, .bitrate_bps = 1_000_000, .format = fmt }));
+            continue;
+        }
+        try hb.encoder.configure(.{ .codec = .passthrough, .width = sz.width, .height = sz.height, .bitrate_bps = 1_000_000, .format = fmt });
+        try cb.decoder.configure(.{ .codec = .passthrough, .width = sz.width, .height = sz.height, .format = fmt });
+        try cb.presenter.configure(.{ .width = sz.width, .height = sz.height, .format = fmt });
+        for (0..2) |i| {
+            test_now += 16_667;
+            const f = (try hb.capture.acquire(0)).?;
+            const ef = (try hb.encoder.encode(&f, .{})).?;
+            hb.capture.release(&f);
+            // A new format starts a new sequence.
+            try testing.expectEqual(i == 0, ef.keyframe);
+            const au = auOf(ef, &buf, id);
+            id += 1;
+            const df = (try cb.decoder.decode(&au)).?;
+            try testing.expectEqual(color, df.image.color);
+            _ = try cb.presenter.present(&df, null);
+            cb.decoder.release(&df);
+        }
+    };
+    try testing.expectEqual(@as(u64, 0), c.presenter.stats.wrong_color);
+    try testing.expectEqual(@as(u64, 0), c.presenter.stats.unreadable);
+    // The decoder configured for 4:2:0 8-bit SDR rejects the encoder's 4:4:4.
+    try hb.encoder.configure(.{ .codec = .passthrough, .width = sz.width, .height = sz.height, .bitrate_bps = 1_000_000, .format = .{ .chroma = .yuv444 } });
+    try cb.decoder.configure(.{ .codec = .passthrough, .width = sz.width, .height = sz.height });
+    test_now += 16_667;
+    const f = (try hb.capture.acquire(0)).?;
+    const ef = (try hb.encoder.encode(&f, .{})).?;
+    hb.capture.release(&f);
+    try testing.expectError(error.CodecFailed, cb.decoder.decode(&auOf(ef, &buf, id)));
+    try testing.expectEqual(@as(u64, 1), c.decoder.stats.wrong_format);
+    // A narrower decoder refuses formats it does not have.
+    c.decoder.formats = .{ .yuv420_8 = true, .yuv444_8 = true };
+    try testing.expectError(error.Unsupported, cb.decoder.configure(.{ .codec = .passthrough, .width = sz.width, .height = sz.height, .format = .{ .bit_depth = 10 } }));
+    try testing.expectEqual(api.Formats{ .yuv420_8 = true, .yuv444_8 = true }, cb.decoder.caps().coded.passthrough);
 }
 
 test "capture keeps cadence and repeats" {

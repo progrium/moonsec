@@ -66,6 +66,10 @@ pub const HostAudio = struct {
 };
 
 pub const ClientAudio = struct {
+    /// The longest Opus frame, 120 ms at 48 kHz: size render buffers for this many
+    /// samples per channel to play every frame the spec allows.
+    pub const max_frame_samples = 5760;
+
     dec: opus.Decoder,
     rx: *audio.Receiver,
     channels: u8,
@@ -86,6 +90,12 @@ pub const ClientAudio = struct {
         c.rx.onMessage(env, body, recv_us);
     }
 
+    fn frameOut(c: *const ClientAudio, out: []f32, samples: u16) error{FrameTooLong}![]f32 {
+        const n = @as(usize, samples) * c.channels;
+        if (n > out.len) return error.FrameTooLong;
+        return out[0..n];
+    }
+
     pub const Rendered = struct {
         /// Samples per channel written to `out`.
         samples: usize,
@@ -96,9 +106,13 @@ pub const ClientAudio = struct {
     };
 
     /// Produces the next frame of output at client time `now_us` into `out` (at least
-    /// `frame_samples * channels` long; longer if the host sends longer frames).
+    /// `frame_samples * channels` long; longer if the host sends longer frames, up to
+    /// `max_frame_samples * channels` for any Opus frame). A frame longer than `out` is
+    /// dropped with `error.FrameTooLong`: the host decides frame lengths, so they are
+    /// checked here rather than trusted.
     pub fn render(c: *ClientAudio, now_us: i64, out: []f32) !Rendered {
         const fl = @as(usize, c.rx.cfg.frame_samples) * c.channels;
+        if (fl > out.len) return error.FrameTooLong;
         while (true) {
             const seq = c.rx.next_seq;
             const inserted = c.rx.stats.inserted;
@@ -109,7 +123,7 @@ pub const ClientAudio = struct {
                     return .{ .samples = n, .kind = a, .seq = null };
                 },
                 .decode => |f| {
-                    const n = try c.dec.decode(f.packet, out[0 .. @as(usize, f.header.samples) * c.channels]);
+                    const n = try c.dec.decode(f.packet, try c.frameOut(out, f.header.samples));
                     return .{ .samples = n, .kind = a, .seq = f.header.seq };
                 },
                 .fec => |f| {
@@ -121,7 +135,7 @@ pub const ClientAudio = struct {
                     return .{ .samples = n, .kind = a, .seq = if (c.rx.stats.inserted == inserted) seq else null };
                 },
                 // Keep decoder state, discard the output, and play the next frame.
-                .drop => |f| _ = try c.dec.decode(f.packet, out[0 .. @as(usize, f.header.samples) * c.channels]),
+                .drop => |f| _ = try c.dec.decode(f.packet, try c.frameOut(out, f.header.samples)),
             }
         }
     }

@@ -41,7 +41,8 @@ bound() { echo $(( $1 + $2 * RTT_MS )); }
 start() {
   local name=$1 secs=$2; shift 2
   OUT=$LAB_DIR/$name; mkdir -p "$OUT"; rm -f "$OUT/ticket"
-  local common=(--ticket-file "$OUT/ticket" --relay-url $RELAY --relay-ca "$LAB_DIR/ca.pem" --seconds "$secs" "$@" ${PEER_ARGS:-})
+  # Throwaway endpoints in a lab: no pairing.
+  local common=(--insecure-no-pairing --ticket-file "$OUT/ticket" --relay-url $RELAY --relay-ca "$LAB_DIR/ca.pem" --seconds "$secs" "$@" ${PEER_ARGS:-})
   ip netns exec x3h "$MOONSEC" peer iroh host --bind 0.0.0.0:$PORT "${common[@]}" > "$OUT/host.log" 2>&1 &
   HOST_PID=$!
   ip netns exec x3c "$MOONSEC" peer iroh client "${common[@]}" > "$OUT/client.log" 2>&1 &

@@ -81,6 +81,11 @@ const DEFAULT_NO_ACK_MS: u32 = 150;
 const EVENT_QUEUE: usize = 256;
 /// Bound on an accepted connection's handshake (see `iroh_endpoint_accept`).
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Incoming handshakes in progress at once; a newcomer past it aborts the oldest, so peers
+/// that start handshakes and stall cannot keep a real client out.
+const MAX_HANDSHAKES: usize = 16;
+/// Connections whose handshake completed, waiting for `iroh_endpoint_accept`.
+const ACCEPTED_QUEUE: usize = 8;
 const MONITOR_TICK: Duration = Duration::from_millis(5);
 /// Bytes of bookkeeping noq charges per queued datagram (`size_of::<frame::Datagram>()`).
 const DGRAM_OVERHEAD: usize = std::mem::size_of::<Bytes>();
@@ -178,7 +183,7 @@ pub extern "C" fn iroh_shim_init(on_thread_start: IrohThreadStartFn, ctx: *mut s
 /// Returns the shim ABI version as (major << 16) | (minor << 8) | patch.
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_shim_version() -> u32 {
-    0x00_02_00
+    0x00_02_01
 }
 
 /// Microseconds on the shim's monotonic clock (the clock event timestamps use).
@@ -305,6 +310,54 @@ pub struct IrohEndpoint {
     ep: Endpoint,
     alpn: Vec<u8>,
     cfg: ConnConfig,
+    /// Started by the first `iroh_endpoint_accept`.
+    acceptor: Mutex<Option<Acceptor>>,
+}
+
+/// A handshake that completed, with the rate knob its transport config was built with.
+type Accepted = (Connection, Arc<RateKnob>, Arc<AppRateFactory>);
+
+/// Accepts incoming connections in the background and runs each handshake on its own task
+/// (at most `MAX_HANDSHAKES`, each bounded by `ACCEPT_HANDSHAKE_TIMEOUT`), queueing the ones
+/// that complete for `iroh_endpoint_accept`. So one peer that stalls its handshake holds
+/// neither the caller nor anyone else's handshake.
+struct Acceptor {
+    rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Accepted>>>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Acceptor {
+    fn start(endpoint: Endpoint, alpn: Vec<u8>, cfg: ConnConfig) -> Acceptor {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Accepted>(ACCEPTED_QUEUE);
+        let task = runtime().spawn(async move {
+            let mut running: VecDeque<tokio::task::AbortHandle> = VecDeque::new();
+            while let Some(incoming) = endpoint.accept().await {
+                running.retain(|h| !h.is_finished());
+                if running.len() >= MAX_HANDSHAKES {
+                    if let Some(oldest) = running.pop_front() {
+                        oldest.abort();
+                    }
+                }
+                let knob = Arc::new(RateKnob::new(cfg.target_bps, cfg.burst_us));
+                let factory = AppRateFactory::new(knob.clone());
+                let Ok(tc) = cfg.transport(factory.clone()) else { continue };
+                let sc = endpoint.create_server_config_builder(vec![alpn.clone()]).set_transport_config(tc).build();
+                let Ok(accepting) = incoming.accept_with(Arc::new(sc)) else { continue };
+                let tx = tx.clone();
+                let h = tokio::spawn(async move {
+                    if let Ok(Ok(conn)) = tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT, accepting).await {
+                        // Waits while the queue is full: the caller is slow to accept.
+                        let _ = tx.send((conn, knob, factory)).await;
+                    }
+                });
+                running.push_back(h.abort_handle());
+            }
+            for h in running {
+                h.abort();
+            }
+        });
+        Acceptor { rx: Arc::new(tokio::sync::Mutex::new(rx)), task: task.abort_handle() }
+    }
 }
 
 unsafe fn opt_str<'a>(p: *const c_char) -> Result<Option<&'a str>, String> {
@@ -378,7 +431,7 @@ pub unsafe extern "C" fn iroh_endpoint_bind(opts: *const IrohBindOpts, out: *mut
     })();
     match built {
         Ok(ep) => {
-            unsafe { *out = Box::into_raw(Box::new(IrohEndpoint { ep, alpn, cfg })) };
+            unsafe { *out = Box::into_raw(Box::new(IrohEndpoint { ep, alpn, cfg, acceptor: Mutex::new(None) })) };
             IROH_OK
         }
         Err(e) => fail(IROH_ERR_INTERNAL, e),
@@ -469,16 +522,21 @@ pub unsafe extern "C" fn iroh_endpoint_connect(
         endpoint.connect_with_opts(addr, &alpn, opts).await.map_err(|e| e.to_string())?.await.map_err(|e| e.to_string())
     };
     match block_on_timeout(timeout_ms, fut) {
-        Ok(Ok(conn)) => {
-            unsafe { *out = wrap_conn(conn, cfg, knob, factory) };
-            IROH_OK
-        }
+        Ok(Ok(conn)) => match wrap_conn(conn, cfg, knob, factory) {
+            Ok(c) => {
+                unsafe { *out = c };
+                IROH_OK
+            }
+            Err(e) => fail(IROH_ERR_INTERNAL, format!("connect: {e}")),
+        },
         Ok(Err(e)) => fail(IROH_ERR_INTERNAL, format!("connect: {e}")),
         Err(_) => fail(IROH_ERR_TIMEOUT, "connect timed out"),
     }
 }
 
-/// Waits up to timeout_ms for an incoming connection and completes its handshake.
+/// Waits up to timeout_ms for an incoming connection whose handshake has completed.
+/// Handshakes run in the background from the first call on (see `Acceptor`), each bounded
+/// on its own, so the timeout bounds only the wait.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn iroh_endpoint_accept(ep: *const IrohEndpoint, timeout_ms: u32, out: *mut *mut IrohConn) -> i32 {
     let Some(ep) = (unsafe { ep.as_ref() }) else { return fail(IROH_ERR_INVALID, "null endpoint") };
@@ -488,38 +546,28 @@ pub unsafe extern "C" fn iroh_endpoint_accept(ep: *const IrohEndpoint, timeout_m
     if ep.alpn.is_empty() {
         return fail(IROH_ERR_INVALID, "endpoint was bound without an ALPN (dial-only)");
     }
+    if let Err(e) = ep.cfg.transport(AppRateFactory::new(Arc::new(RateKnob::new(ep.cfg.target_bps, ep.cfg.burst_us)))) {
+        return fail(IROH_ERR_INVALID, e);
+    }
+    let rx = {
+        let mut a = ep.acceptor.lock().unwrap();
+        a.get_or_insert_with(|| Acceptor::start(ep.ep.clone(), ep.alpn.clone(), ep.cfg)).rx.clone()
+    };
     let cfg = ep.cfg;
-    let knob = Arc::new(RateKnob::new(cfg.target_bps, cfg.burst_us));
-    let factory = AppRateFactory::new(knob.clone());
-    let tc = match cfg.transport(factory.clone()) {
-        Ok(tc) => tc,
-        Err(e) => return fail(IROH_ERR_INVALID, e),
-    };
-    let endpoint = ep.ep.clone();
-    let alpn = ep.alpn.clone();
-    // The timeout bounds the wait for an incoming connection, not its handshake: dropping a
-    // half-done handshake would close a connection the dialer already counts as up (a relayed
-    // handshake takes a few RTTs). The handshake gets its own bound.
     let fut = async move {
-        let d = Duration::from_millis(timeout_ms as u64);
-        let incoming = match tokio::time::timeout(d, endpoint.accept()).await {
-            Err(_) => return Err((IROH_ERR_TIMEOUT, "accept timed out".to_string())),
-            Ok(None) => return Err((IROH_ERR_CLOSED, "endpoint closed".to_string())),
-            Ok(Some(i)) => i,
-        };
-        let sc = endpoint.create_server_config_builder(vec![alpn]).set_transport_config(tc).build();
-        let accepting = incoming.accept_with(Arc::new(sc)).map_err(|e| (IROH_ERR_INTERNAL, format!("accept: {e}")))?;
-        match tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT.max(d), accepting).await {
-            Err(_) => Err((IROH_ERR_TIMEOUT, "accept: handshake timed out".to_string())),
-            Ok(r) => r.map_err(|e| (IROH_ERR_INTERNAL, format!("accept: {e}"))),
-        }
+        let mut rx = rx.lock().await;
+        rx.recv().await
     };
-    match run(fut) {
-        Ok(conn) => {
-            unsafe { *out = wrap_conn(conn, cfg, knob, factory) };
-            IROH_OK
-        }
-        Err((code, msg)) => fail(code, msg),
+    match block_on_timeout(timeout_ms, fut) {
+        Err(_) => fail(IROH_ERR_TIMEOUT, "accept timed out"),
+        Ok(None) => fail(IROH_ERR_CLOSED, "endpoint closed"),
+        Ok(Some((conn, knob, factory))) => match wrap_conn(conn, cfg, knob, factory) {
+            Ok(c) => {
+                unsafe { *out = c };
+                IROH_OK
+            }
+            Err(e) => fail(IROH_ERR_INTERNAL, format!("accept: {e}")),
+        },
     }
 }
 
@@ -540,6 +588,9 @@ pub unsafe extern "C" fn iroh_endpoint_free(ep: *mut IrohEndpoint) {
         return;
     }
     let ep = unsafe { Box::from_raw(ep) };
+    if let Some(a) = ep.acceptor.lock().unwrap().take() {
+        a.task.abort();
+    }
     run(async move { ep.ep.close().await });
 }
 
@@ -751,13 +802,28 @@ impl Shared {
     }
 }
 
-fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Arc<AppRateFactory>) -> *mut IrohConn {
+/// Wraps an established connection. Fails (closing the connection) only if the wakeup socket
+/// pair cannot be made, e.g. when the process is out of file descriptors: with
+/// `panic = "abort"` a panic here would let a peer that opens connections end the process.
+fn wrap_conn(
+    conn: Connection,
+    cfg: ConnConfig,
+    knob: Arc<RateKnob>,
+    factory: Arc<AppRateFactory>,
+) -> Result<*mut IrohConn, String> {
+    let wake = match Wakeup::new() {
+        Ok(w) => w,
+        Err(e) => {
+            conn.close(0u32.into(), b"");
+            return Err(format!("wakeup socket: {e}"));
+        }
+    };
     let (tx, rx): (SyncSender<Bytes>, _) = std::sync::mpsc::sync_channel(cfg.recv_queue);
     let sh = Arc::new(Shared {
         knob,
         factory,
         cfg,
-        wake: Wakeup::new().expect("wakeup socket"),
+        wake,
         paths: Mutex::new(HashMap::new()),
         selected_path: AtomicU32::new(IROH_PATH_NONE),
         selections: AtomicU32::new(0),
@@ -891,7 +957,7 @@ fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Ar
         );
     }
 
-    Box::into_raw(Box::new(IrohConn { conn, sh, rx: Mutex::new(rx), tasks }))
+    Ok(Box::into_raw(Box::new(IrohConn { conn, sh, rx: Mutex::new(rx), tasks })))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -966,7 +1032,11 @@ pub unsafe extern "C" fn iroh_conn_recv_datagram(
     if d.len() > cap || (buf.is_null() && !d.is_empty()) {
         return fail(IROH_ERR_TOO_SMALL, "datagram larger than buffer");
     }
-    unsafe { std::ptr::copy_nonoverlapping(d.as_ptr(), buf, d.len()) };
+    // `copy_nonoverlapping` needs non-null pointers even for zero bytes, and a peer can send
+    // an empty datagram into a NULL buffer.
+    if !d.is_empty() {
+        unsafe { std::ptr::copy_nonoverlapping(d.as_ptr(), buf, d.len()) };
+    }
     IROH_OK
 }
 
@@ -1275,6 +1345,41 @@ pub unsafe extern "C" fn iroh_stream_write(s: *const IrohStream, buf: *const u8,
     }
 }
 
+/// Writes as much of `buf` as the stream takes now, up to `timeout_ms` for the first byte
+/// (`timeout_ms == 0` polls once: IROH_ERR_AGAIN when flow control has no room). Unlike
+/// `iroh_stream_write`, a timeout never leaves part of `buf` written unreported, so it is safe
+/// for non-blocking callers. Since ABI 0.2.1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_stream_write_some(
+    s: *const IrohStream,
+    buf: *const u8,
+    len: usize,
+    timeout_ms: u32,
+    out_written: *mut usize,
+) -> i32 {
+    let Some(s) = (unsafe { s.as_ref() }) else { return fail(IROH_ERR_INVALID, "null stream") };
+    if out_written.is_null() {
+        return fail(IROH_ERR_INVALID, "null out_written");
+    }
+    unsafe { *out_written = 0 };
+    if len == 0 {
+        return IROH_OK;
+    }
+    let data = unsafe { bytes_arg(buf, len) }.to_vec();
+    let send = s.send.clone();
+    // `SendStream::write` either writes some bytes and returns how many, or writes nothing,
+    // so dropping it on the timeout loses no data.
+    match block_on_timeout(timeout_ms, async move { send.lock().await.write(&data).await }) {
+        Ok(Ok(n)) => {
+            unsafe { *out_written = n };
+            IROH_OK
+        }
+        Ok(Err(e)) => fail(IROH_ERR_CLOSED, format!("write: {e}")),
+        Err(_) if timeout_ms == 0 => IROH_ERR_AGAIN,
+        Err(_) => fail(IROH_ERR_TIMEOUT, "write timed out"),
+    }
+}
+
 /// Reads up to `cap` bytes. `*out_len == 0` with IROH_OK means the peer finished the stream.
 /// timeout_ms == 0 polls once (IROH_ERR_AGAIN if nothing is buffered).
 #[unsafe(no_mangle)]
@@ -1334,4 +1439,138 @@ pub unsafe extern "C" fn iroh_stream_free(s: *mut IrohStream, error_code: u32) {
         }
         drop(s);
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Boundary tests that need no runtime or sockets, so they also run under Miri:
+//   cargo +nightly miri test --lib
+// The calls that drive iroh are covered by the ASan fuzzer (fuzz/) and transport/iroh_test.zig.
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn last_error() -> String {
+        unsafe { CStr::from_ptr(iroh_last_error()) }.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn write_cstr_stays_inside_the_buffer() {
+        let mut buf = [0x55u8; 8];
+        let mut n = 0usize;
+        // Exactly fits: 5 bytes + NUL, guard bytes untouched.
+        let r = unsafe { write_cstr("hello", buf.as_mut_ptr() as *mut c_char, 6, &mut n) };
+        assert_eq!(r, IROH_OK);
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..6], b"hello\0");
+        assert_eq!(&buf[6..], &[0x55, 0x55]);
+        // One short: refused, nothing written, required length reported.
+        let mut buf = [0x55u8; 8];
+        let r = unsafe { write_cstr("hello", buf.as_mut_ptr() as *mut c_char, 5, &mut n) };
+        assert_eq!(r, IROH_ERR_TOO_SMALL);
+        assert_eq!(n, 5);
+        assert_eq!(buf, [0x55u8; 8]);
+        // NULL buffer and NULL out_len.
+        let r = unsafe { write_cstr("x", std::ptr::null_mut(), 100, std::ptr::null_mut()) };
+        assert_eq!(r, IROH_ERR_TOO_SMALL);
+    }
+
+    #[test]
+    fn null_and_empty_arguments() {
+        assert!(unsafe { bytes_arg(std::ptr::null(), 10) }.is_empty());
+        let b = [1u8, 2];
+        assert!(unsafe { bytes_arg(b.as_ptr(), 0) }.is_empty());
+        assert_eq!(unsafe { opt_str(std::ptr::null()) }, Ok(None));
+        let bad = [0xffu8, 0];
+        assert!(unsafe { opt_str(bad.as_ptr() as *const c_char) }.is_err());
+
+        let mut out: *mut IrohEndpoint = std::ptr::null_mut();
+        assert_eq!(unsafe { iroh_endpoint_bind(std::ptr::null(), &mut out) }, IROH_ERR_INVALID);
+        assert_eq!(unsafe { iroh_endpoint_online(std::ptr::null(), 0) }, IROH_ERR_INVALID);
+        assert_eq!(unsafe { iroh_endpoint_id(std::ptr::null(), std::ptr::null_mut(), 0) }, IROH_ERR_INVALID);
+        let mut conn: *mut IrohConn = std::ptr::null_mut();
+        assert_eq!(unsafe { iroh_endpoint_accept(std::ptr::null(), 0, &mut conn) }, IROH_ERR_INVALID);
+        assert_eq!(unsafe { iroh_conn_send_datagram(std::ptr::null(), b.as_ptr(), 2) }, IROH_ERR_INVALID);
+        let mut n = 0usize;
+        assert_eq!(
+            unsafe { iroh_conn_recv_datagram(std::ptr::null(), std::ptr::null_mut(), 0, 0, &mut n) },
+            IROH_ERR_INVALID
+        );
+        assert_eq!(unsafe { iroh_conn_max_datagram_size(std::ptr::null()) }, 0);
+        assert_eq!(unsafe { iroh_conn_wakeup_handle(std::ptr::null()) }, -1);
+        let mut s: *mut IrohStream = std::ptr::null_mut();
+        assert_eq!(unsafe { iroh_conn_open_bi(std::ptr::null(), 0, &mut s) }, IROH_ERR_INVALID);
+        assert_eq!(
+            unsafe { iroh_stream_read(std::ptr::null(), std::ptr::null_mut(), 0, 0, &mut n) },
+            IROH_ERR_INVALID
+        );
+        assert_eq!(unsafe { iroh_stream_finish(std::ptr::null()) }, IROH_ERR_INVALID);
+        // Frees of NULL are no-ops.
+        unsafe {
+            iroh_endpoint_free(std::ptr::null_mut());
+            iroh_conn_free(std::ptr::null_mut(), 0);
+            iroh_stream_free(std::ptr::null_mut(), 0);
+        }
+        assert!(!last_error().is_empty());
+    }
+
+    fn zeroed_opts() -> IrohBindOpts {
+        IrohBindOpts {
+            secret_key: std::ptr::null(),
+            alpn: std::ptr::null(),
+            alpn_len: 0,
+            relay_mode: 0,
+            relay_urls: std::ptr::null(),
+            bind_addr: std::ptr::null(),
+            datagram_send_buffer: 0,
+            datagram_recv_buffer: 0,
+            recv_queue_len: 0,
+            path_idle_timeout_ms: 0,
+            path_keepalive_ms: 0,
+            conn_idle_timeout_ms: 0,
+            initial_target_bps: 0,
+            burst_us: 0,
+            no_ack_progress_ms: 0,
+            relay_ca_pem: std::ptr::null(),
+        }
+    }
+
+    #[test]
+    fn bind_options_are_validated_before_anything_starts() {
+        let c = ConnConfig::from_opts(&zeroed_opts()).unwrap();
+        assert_eq!(c.send_buffer, DEFAULT_SEND_BUFFER);
+        assert_eq!(c.burst_us, DEFAULT_BURST_US as u64);
+        let mut o = zeroed_opts();
+        o.path_idle_timeout_ms = 100;
+        o.path_keepalive_ms = 100;
+        assert!(ConnConfig::from_opts(&o).is_err());
+        let mut o = zeroed_opts();
+        o.datagram_send_buffer = 4095;
+        assert!(ConnConfig::from_opts(&o).is_err());
+        let mut o = zeroed_opts();
+        o.burst_us = IROH_BURST_OFF;
+        o.no_ack_progress_ms = IROH_NO_ACK_OFF;
+        let c = ConnConfig::from_opts(&o).unwrap();
+        assert_eq!(c.burst_us, 0);
+        assert_eq!(c.no_ack_us, None);
+        // A bad option fails in iroh_endpoint_bind without starting the runtime.
+        let mut o = zeroed_opts();
+        o.path_keepalive_ms = 5000;
+        let mut out: *mut IrohEndpoint = std::ptr::null_mut();
+        assert_eq!(unsafe { iroh_endpoint_bind(&o, &mut out) }, IROH_ERR_INVALID);
+        assert!(out.is_null());
+        assert!(last_error().contains("keep-alive"));
+    }
+
+    #[test]
+    fn event_addresses_are_truncated_and_terminated() {
+        let long = format!("https://{}.example/", "r".repeat(200));
+        let ev = IrohEvent::new(1, 0, 0).with_addr(&TransportAddr::Relay(RelayUrl::from_str(&long).unwrap()));
+        assert_eq!(ev.remote_addr[95], 0);
+        assert_eq!(ev.is_relay, 1);
+        let s = unsafe { CStr::from_ptr(ev.remote_addr.as_ptr()) }.to_str().unwrap();
+        assert_eq!(s.len(), 95);
+        assert!(long.starts_with(s));
+    }
 }
