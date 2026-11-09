@@ -31,7 +31,6 @@ const apps = @import("apps.zig");
 
 const HostSession = host_session.HostSession;
 const multi = core.multi;
-const control = core.control;
 const recovery = core.recovery;
 const rate = core.rate;
 const Micros = i64;
@@ -68,7 +67,9 @@ pub const Peer = struct {
     /// Roster id (0 once the member left).
     id: u16,
     bit: u5,
-    ctl: control.Channel,
+    /// The session control channel's `ups` when the roster last went out: a new channel
+    /// (a reconnect) gets the roster again.
+    ups_seen: u64 = 0,
     left: bool = false,
     roster_epoch_sent: ?u32 = null,
 };
@@ -130,6 +131,8 @@ pub const MultiHost = struct {
         join.* = .{};
         var c = cfg;
         c.session.shared = true;
+        c.session.control.features |= multi.feature_bit;
+        if (c.session.control.known.len == 0) c.session.control.known = &multi.known;
         return .{
             .gpa = gpa,
             .cfg = c,
@@ -144,7 +147,6 @@ pub const MultiHost = struct {
     pub fn deinit(m: *MultiHost) void {
         for (m.peers.items) |p| {
             p.s.deinit();
-            p.ctl.deinit();
             m.gpa.destroy(p);
         }
         m.peers.deinit(m.gpa);
@@ -156,7 +158,8 @@ pub const MultiHost = struct {
 
     /// A client the host admitted (the allowlist said yes, and whether it may control).
     /// Returns its peer, or `error.Full` when the roster or the member masks are full.
-    pub fn addPeer(m: *MultiHost, p: pipe_mod.PacketPipe, name: []const u8, may_control: bool) !*Peer {
+    /// `control_stream` is the client's control stream (spec/control-v0.md), if it has one.
+    pub fn addPeer(m: *MultiHost, p: pipe_mod.PacketPipe, control_stream: ?pipe_mod.ByteStream, name: []const u8, may_control: bool) !*Peer {
         const bit = m.freeBit() orelse return error.Full;
         const id = m.roster.join(name, may_control) orelse return error.Full;
         errdefer m.roster.leave(id);
@@ -166,14 +169,12 @@ pub const MultiHost = struct {
             .s = try HostSession.initPeer(m.gpa, m.cfg.session, p, m.rec, m.join, bit),
             .id = id,
             .bit = bit,
-            .ctl = undefined,
         };
         errdefer peer.s.deinit();
         if (!m.cfg.intersect_acks) peer.s.join = null;
         peer.s.next_frame_id = m.next_frame_id;
         peer.s.bitrate_bps = m.bitrate_bps;
-        peer.ctl = try control.Channel.init(m.gpa, .{ .role = .host, .features = multi.feature_bit, .known = &multi.known }, null);
-        errdefer peer.ctl.deinit();
+        if (control_stream) |cs| try peer.s.control.attach(cs);
         try m.peers.append(m.gpa, peer);
         m.stats.joins += 1;
         return peer;
@@ -226,16 +227,21 @@ pub const MultiHost = struct {
         p.left = true;
         m.join.remove(p.bit, if (m.next_frame_id > 0) m.next_frame_id -% 1 else null, m.rec);
         m.roster.leave(p.id);
-        p.ctl.close(.done, "") catch {};
+        p.s.control.close();
         m.stats.leaves += 1;
     }
 
     // --- control channel ------------------------------------------------
 
     fn pollControl(m: *MultiHost, p: *Peer) void {
-        while (p.ctl.poll() catch null) |ev| switch (ev) {
-            .up => p.roster_epoch_sent = null,
-            .message => |f| switch (f.type) {
+        const c = &p.s.control;
+        if (c.stats.ups != p.ups_seen) {
+            p.ups_seen = c.stats.ups;
+            p.roster_epoch_sent = null;
+        }
+        while (c.takeMessage()) |f| {
+            defer c.gpa.free(f.body);
+            switch (f.type) {
                 multi.msg.input_request => {
                     const want = multi.msg.parseRequest(f.body) catch {
                         m.stats.control_malformed += 1;
@@ -251,18 +257,18 @@ pub const MultiHost = struct {
                     if (m.roster.give(p.id, to) != .ok) m.stats.gives_refused += 1;
                 },
                 else => {},
-            },
-            else => {},
-        };
+            }
+        }
     }
 
     fn sendRosters(m: *MultiHost) void {
         var buf: [multi.msg.max_roster_len]u8 = undefined;
         for (m.peers.items) |p| {
-            if (p.left or p.ctl.state != .up or !p.ctl.peerHas(multi.feature_bit)) continue;
+            const c = &p.s.control;
+            if (p.left or !c.up() or c.peer.?.features & multi.feature_bit == 0) continue;
             if (p.roster_epoch_sent) |e| if (e == m.roster.epoch) continue;
             const body = m.roster.encodeFor(p.id, &buf);
-            p.ctl.send(.{ .type = multi.msg.roster, .body = body }, multi.feature_bit) catch continue;
+            c.send(.{ .type = multi.msg.roster, .body = body }, multi.feature_bit) catch continue;
             p.roster_epoch_sent = m.roster.epoch;
             m.stats.rosters_sent += 1;
         }

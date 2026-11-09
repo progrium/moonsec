@@ -1,9 +1,8 @@
 //! A multi-user session over the in-process sim, in virtual time: one host (`MultiHostApp`
 //! on the synthetic backend) and N synthetic clients, each on its own simulated path with
 //! its own profile. Clients can join late and leave early, and scripted control-channel
-//! events (input requests and handoffs) run between the host's and the clients' control
-//! channels, which this harness connects back to back (reliable and in order, like the
-//! QUIC stream they stand in for).
+//! events (input requests and handoffs) run over each path's reliable sim stream, as the
+//! sessions' control channels do over iroh.
 const std = @import("std");
 const core = @import("core");
 const api = @import("platform");
@@ -15,7 +14,6 @@ const simrun = @import("simrun.zig");
 const multi_host = @import("multi_host.zig");
 
 const multi = core.multi;
-const control = core.control;
 const Micros = i64;
 
 pub const ClientSpec = struct {
@@ -189,7 +187,6 @@ const Slot = struct {
     sc: ?*synthetic.Client = null,
     app: ?apps.ClientApp = null,
     peer: ?*multi_host.Peer = null,
-    ctl: ?control.Channel = null,
     view: multi.View = .{},
     closing: bool = false,
     /// The roster view just before the run's end (before anyone leaves), and the most
@@ -249,7 +246,6 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     defer host.deinit();
     defer for (slots) |*s| {
         if (s.app) |*a| a.deinit();
-        if (s.ctl) |*c| c.deinit();
         if (s.sc) |sc| sc.backend().deinit();
     };
 
@@ -275,9 +271,14 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             if (s.app == null and t >= s.spec.join_at_us and t < end_us) {
                 const sc = try synthetic.openClient(gpa, .{ .clock = s.cclock.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio });
                 s.sc = sc;
-                s.app = try apps.ClientApp.init(gpa, sc.backend(), .{ .content_ctx = sc, .contentFn = patternContent, .audio = o.audio, .session = .{ .nonce = @intCast(i + 1) } }, s.pipeFor(.b));
-                s.peer = try host.m.addPeer(s.pipeFor(.a), s.spec.name, s.spec.may_control);
-                s.ctl = try control.Channel.init(gpa, .{ .role = .client, .features = if (s.spec.multi_user) multi.feature_bit else 0, .known = &multi.known }, null);
+                s.app = try apps.ClientApp.init(gpa, sc.backend(), .{
+                    .content_ctx = sc,
+                    .contentFn = patternContent,
+                    .audio = o.audio,
+                    .session = .{ .nonce = @intCast(i + 1), .control = .{ .features = if (s.spec.multi_user) multi.feature_bit else 0, .known = &multi.known } },
+                    .control_stream = s.net.streamFor(.b),
+                }, s.pipeFor(.b));
+                s.peer = try host.m.addPeer(s.pipeFor(.a), s.net.streamFor(.a), s.spec.name, s.spec.may_control);
             }
             if (s.app) |*a| if (!s.closing) {
                 const leave = s.spec.leave_at_us orelse end_us;
@@ -289,43 +290,29 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         }
         while (next_event < o.events.len and o.events[next_event].at() <= t) : (next_event += 1) {
             switch (o.events[next_event]) {
-                .request => |e| if (slots[e.client].ctl) |*c| {
-                    c.send(.{ .type = multi.msg.input_request, .body = &multi.msg.encodeRequest(true) }, multi.feature_bit) catch {};
+                .request => |e| if (slots[e.client].app) |*a| {
+                    a.s.control.send(.{ .type = multi.msg.input_request, .body = &multi.msg.encodeRequest(true) }, multi.feature_bit) catch {};
                 },
-                .give => |e| if (slots[e.from].ctl) |*c| {
+                .give => |e| if (slots[e.from].app) |*a| {
                     const to = slots[e.to].view.you;
-                    c.send(.{ .type = multi.msg.input_give, .body = &multi.msg.encodeGive(to) }, multi.feature_bit) catch {};
+                    a.s.control.send(.{ .type = multi.msg.input_give, .body = &multi.msg.encodeGive(to) }, multi.feature_bit) catch {};
                 },
                 .host_take => _ = host.m.hostGive(multi.host_id),
             }
         }
         for (slots) |*s| try s.net.runUntil(t);
-        // Control channels, back to back.
-        for (slots) |*s| {
-            const c = if (s.ctl) |*c| c else continue;
-            const p = s.peer.?;
-            if (p.ctl.pending().len > 0) {
-                try c.receive(p.ctl.pending());
-                p.ctl.consume(p.ctl.pending().len);
-            }
-            if (c.pending().len > 0) {
-                try p.ctl.receive(c.pending());
-                c.consume(c.pending().len);
-            }
-        }
         host.tick();
         var all_done = host.done();
         for (slots) |*s| {
             if (s.app) |*a| {
                 a.tick();
-                if (s.ctl) |*c| while (c.poll() catch null) |ev| switch (ev) {
-                    .message => |f| if (f.type == multi.msg.roster) {
-                        s.view.onRoster(f.body);
-                        s.most_members = @max(s.most_members, s.view.len);
-                        a.setPresence(s.view.presence(&buf));
-                    },
-                    else => {},
-                };
+                while (a.s.control.takeMessage()) |f| {
+                    defer a.s.control.gpa.free(f.body);
+                    if (f.type != multi.msg.roster) continue;
+                    s.view.onRoster(f.body);
+                    s.most_members = @max(s.most_members, s.view.len);
+                    a.setPresence(s.view.presence(&buf));
+                }
             }
             if (!s.done()) all_done = false;
         }

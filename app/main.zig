@@ -43,6 +43,7 @@ const simrun = @import("simrun.zig");
 const iroh = if (options.iroh) @import("iroh") else struct {};
 const iroh_pipe = if (options.iroh) @import("iroh_pipe") else struct {};
 const pair_cmd = @import("pair_cmd.zig");
+const clipboard = @import("clipboard");
 
 const Io = std.Io;
 const Micros = i64;
@@ -79,6 +80,8 @@ const Args = struct {
     repunch_ms: ?i64 = null,
     relay_delay_ms: ?i64 = null,
     no_stall_pause: bool = false,
+    /// peer iroh: sync the system clipboard instead of the scripted in-memory one.
+    system_clipboard: bool = false,
     path_idle_ms: u32 = 0,
     relay_url: ?[:0]const u8 = null,
     relay_ca: ?[:0]const u8 = null,
@@ -122,6 +125,7 @@ fn usage() error{Usage} {
         \\       --loss-policy (sim, soak: NACK/FEC/relay chosen per path)
         \\sim:   --flaps T:D,.. --drops T:D,.. --idle-ms N --repunch-ms N --relay-delay-ms N --no-stall-pause
         \\iroh:  --relay-url URL --relay-ca PEM --bind IP:PORT --path-idle-ms N --conn-idle-ms N --min-presented PCT
+        \\       --clipboard (sync the system clipboard over the control channel; default: a scripted check)
         \\
     , .{});
     return error.Usage;
@@ -144,6 +148,10 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         }
         if (std.mem.eql(u8, s, "--loss-policy")) {
             a.loss_policy = true;
+            continue;
+        }
+        if (std.mem.eql(u8, s, "--clipboard")) {
+            a.system_clipboard = true;
             continue;
         }
         if (std.mem.eql(u8, s, "--no-stall-pause")) {
@@ -478,7 +486,7 @@ fn cmdPeer(gpa: std.mem.Allocator, io: Io, a: Args) !bool {
         defer gpa.destroy(link);
         try link.init(gpa, io, a.hub_port, if (role == .host) .a else .b);
         defer link.deinit();
-        return peer(gpa, io, a, role, link.packetPipe());
+        return peer(gpa, io, a, role, link.packetPipe(), null);
     }
     if (std.mem.eql(u8, a.pos[0], "iroh")) {
         if (!options.iroh) return usage();
@@ -487,8 +495,72 @@ fn cmdPeer(gpa: std.mem.Allocator, io: Io, a: Args) !bool {
     return usage();
 }
 
-fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketPipe) !bool {
+/// A clipboard for wall-clock peer runs: in memory, with one scripted copy `copy_after_us`
+/// after the first poll (made on the network thread, which polls it). Checks that the
+/// control channel carries a copy each way over the real transport.
+const ScriptedClipboard = struct {
+    mem: clipboard.Memory,
+    text: []const u8,
+    copy_after_us: Micros,
+    start: ?Micros = null,
+    copied: bool = false,
+
+    fn clip(s: *ScriptedClipboard) clipboard.Clipboard {
+        return .{ .ptr = s, .vtable = &vt };
+    }
+    fn changeCount(p: *anyopaque) u64 {
+        const s: *ScriptedClipboard = @ptrCast(@alignCast(p));
+        const now = wallNow();
+        const t0 = s.start orelse blk: {
+            s.start = now;
+            break :blk now;
+        };
+        if (!s.copied and now - t0 >= s.copy_after_us) {
+            s.mem.set(s.text) catch {};
+            s.copied = true;
+        }
+        return s.mem.count;
+    }
+    fn readText(p: *anyopaque, gpa: std.mem.Allocator) clipboard.Error!?[]u8 {
+        const s: *ScriptedClipboard = @ptrCast(@alignCast(p));
+        return s.mem.clipboard().readText(gpa);
+    }
+    fn writeText(p: *anyopaque, text: []const u8) clipboard.Error!void {
+        const s: *ScriptedClipboard = @ptrCast(@alignCast(p));
+        return s.mem.clipboard().writeText(text);
+    }
+    const vt = clipboard.Clipboard.VTable{ .changeCount = changeCount, .readText = readText, .writeText = writeText };
+
+    /// The peer's copy arrived (and nothing newer replaced it).
+    fn got(s: *const ScriptedClipboard, want: []const u8) bool {
+        return s.mem.writes > 0 and std.mem.eql(u8, s.mem.get() orelse "", want);
+    }
+};
+
+const host_copy = "copied on the host";
+const client_copy = "copied on the client";
+
+fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketPipe, ctl_stream: ?pipe_mod.ByteStream) !bool {
     const clock = api.clockFn(wallNow);
+    // With a control stream: the host copies after 1 s, the client after 2 s, so each side
+    // ends up holding the client's copy and the host also got it from the client.
+    var clip: ScriptedClipboard = .{
+        .mem = .init(gpa),
+        .text = if (role == .host) host_copy else client_copy,
+        .copy_after_us = if (role == .host) 1_000_000 else 2_000_000,
+    };
+    defer clip.mem.deinit();
+    var sys: ?clipboard.System = null;
+    if (a.system_clipboard and ctl_stream != null) {
+        sys = clipboard.System.open() orelse {
+            std.debug.print("{s}: no system clipboard here (Linux: build with -Dlinux-clipboard, and run under Wayland or X11)\n", .{@tagName(role)});
+            return false;
+        };
+        std.debug.print("{s}: syncing the system clipboard ({s}); copy on either machine and paste on the other\n", .{ @tagName(role), sys.?.name() });
+    }
+    defer if (sys) |*sy| sy.close();
+    const scripted = ctl_stream != null and sys == null;
+    const clip_opt: ?clipboard.Clipboard = if (sys) |*sy| sy.clipboard() else if (scripted) clip.clip() else null;
     const seconds = a.seconds orelse 10;
     var buf: [16384]u8 = undefined;
     var w = Io.Writer.fixed(&buf);
@@ -498,7 +570,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             const sh = try synthetic.openHost(gpa, .{ .clock = clock, .sleeper = wallSleep, .width = a.width, .height = a.height });
             const hb = sh.backend();
             defer hb.deinit();
-            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .session = .{ .rate_control = a.rate_control } }, p);
+            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
             defer app.deinit();
             try app.runThreaded(io);
             try app.s.report(&w);
@@ -508,12 +580,18 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             // Keys older than the sender's 500 ms window are dropped by design (an outage);
             // the injector's script check then reads the rest as out of order.
             ok = app.s.end == .client_bye and (sh.injector.wrong == 0 or lost_input > 0) and sh.injector.keys > 0 and app.s.stats.frames > 0;
+            if (ctl_stream != null) {
+                const cs = app.s.control.stats;
+                const clip_ok = !scripted or clip.got(client_copy);
+                try w.print("  control: {d} channels, {d} up, {d} resets, {d} errors; clipboard {s} (sent {d}, applied {d}, echoes {d})\n", .{ cs.channels, cs.ups, cs.resets, cs.errors, if (clip_ok) "ok" else "MISSING the client's copy", app.s.control.clip.stats.sent, app.s.control.clip.stats.applied, app.s.control.clip.stats.echoes });
+                ok = ok and clip_ok;
+            }
         },
         .client => {
             const sc = try synthetic.openClient(gpa, .{ .clock = clock, .input_interval_us = 25_000 });
             const cb = sc.backend();
             defer cb.deinit();
-            var app = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent }, p);
+            var app = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
             defer app.deinit();
             // Stop after `seconds` of streaming: the input source asks to quit.
             var timer = try io.concurrent(quitAfter, .{ &app, io, seconds });
@@ -534,6 +612,13 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             // has; hold them to most frames and no corruption, and report freezes.
             ok = app.s.end == .closed and app.s.stats.frames_presented * 100 >= want * a.min_presented_pct and
                 sc.presenter.stats.unreadable == 0 and sc.decoder.stats.corrupt == 0 and audio_ok;
+            if (ctl_stream != null) {
+                const cs = app.s.control.stats;
+                // The host's copy arrived before ours replaced it.
+                const clip_ok = !scripted or (clip.mem.writes >= 1 and app.s.control.clip.stats.applied >= 1 and std.mem.eql(u8, clip.mem.get() orelse "", client_copy));
+                try w.print("  control: {d} channels, {d} up, {d} resets, {d} errors; clipboard {s} (sent {d}, applied {d}, echoes {d})\n", .{ cs.channels, cs.ups, cs.resets, cs.errors, if (clip_ok) "ok" else "MISSING the host's copy", app.s.control.clip.stats.sent, app.s.control.clip.stats.applied, app.s.control.clip.stats.echoes });
+                ok = ok and clip_ok;
+            }
         },
     }
     std.debug.print("{s}", .{w.buffered()});
@@ -628,7 +713,7 @@ fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
         }
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    const ok = try peer(gpa, io, a, role, p);
+    const ok = try peer(gpa, io, a, role, p, link.controlStream());
     const ls = link.linkStats();
     std.debug.print("  {s} link: {d} dials ({d} failed), {d} accepts, {d} reconnects, {d} discarded, {d} datagrams dropped offline\n", .{ @tagName(role), ls.dials, ls.dial_failures, ls.accepts, ls.switches, ls.discarded, ls.offline_drops });
     if (link.conn()) |conn| printQuic(conn, role);
@@ -657,7 +742,8 @@ fn peerPaired(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, ep: iroh.Endp
         if (!try pair_cmd.requestSession(conn, &hosts)) return false;
     }
     var ip = iroh_pipe.IrohPipe.init(conn);
-    const ok = try peer(gpa, io, a, role, ip.packetPipe());
+    defer ip.ctl.drop();
+    const ok = try peer(gpa, io, a, role, ip.packetPipe(), ip.controlStream(role == .client));
     printQuic(conn, role);
     io.sleep(.fromMilliseconds(200), .awake) catch {};
     return ok;

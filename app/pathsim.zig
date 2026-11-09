@@ -165,6 +165,8 @@ pub const Model = struct {
             if (self.reconnect_asked) |asked| if (t >= self.dead_until and t >= asked + self.cfg.dial_us) {
                 self.dead_since = null;
                 self.conn_epoch +%= 1;
+                // A new connection gets a new control stream.
+                self.net.resetStream();
             };
             if (self.dead_since != null) {
                 if (t - since >= self.cfg.stall_after_us) stalled = true;

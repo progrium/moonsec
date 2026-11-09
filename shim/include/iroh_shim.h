@@ -179,6 +179,10 @@ int32_t iroh_conn_path_stats(const IrohConn *c, IrohPathStats *out, size_t cap, 
 int32_t iroh_conn_open_bi(const IrohConn *c, uint32_t timeout_ms, IrohStream **out);
 int32_t iroh_conn_accept_bi(const IrohConn *c, uint32_t timeout_ms, IrohStream **out);
 int32_t iroh_stream_write(const IrohStream *s, const uint8_t *buf, size_t len, uint32_t timeout_ms);
+/* Writes what fits now (*out_written bytes); timeout_ms == 0 polls once (IROH_ERR_AGAIN when
+ * flow control has no room). Never loses bytes on a timeout. Since 0.2.1. */
+int32_t iroh_stream_write_some(const IrohStream *s, const uint8_t *buf, size_t len, uint32_t timeout_ms,
+                               size_t *out_written);
 int32_t iroh_stream_read(const IrohStream *s, uint8_t *buf, size_t cap, uint32_t timeout_ms,
                          size_t *out_len);
 int32_t iroh_stream_finish(const IrohStream *s);
