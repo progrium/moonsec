@@ -389,6 +389,19 @@ pub fn build(b: *std.Build) void {
     }
     // Windows client backend tests join both steps (platform/client/build.zig).
     @import("platform/client/build.zig").addWindowsTests(b, target, optimize, check_win, test_win);
+
+    // macOS client backend tests (platform/client/build.zig): their own `test-mac-client`
+    // step, which also joins the macOS host's `test-mac` and `check-mac`.
+    @import("platform/client/build.zig").addMacosTests(b, target, optimize, &b.top_level_steps.get("test-mac").?.step, &b.top_level_steps.get("check-mac").?.step);
+}
+
+/// Points `m` at the macOS SDK's frameworks, headers and libraries (Zig does not
+/// search the SDK on its own). No-op off macOS hosts.
+pub fn addMacosSdkPaths(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    const sdk = b.sysroot orelse macosSdk(b, target.result) orelse return;
+    m.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+    m.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+    m.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
 }
 
 /// Compiler flags for every C file under platform/ on Windows.
