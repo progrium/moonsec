@@ -3,8 +3,9 @@
 The Linux host's capture and audio: [host.zig](host.zig) implements the platform
 interface's `Capture` and `AudioSource`. Like the Linux client, the OS APIs are called from
 small C files behind a narrow header ([mlh.h](mlh.h)) that translate-c reads; Zig never
-sees the system headers. Encoders (VAAPI, NVENC) and uinput injection are separate
-workstreams; the host bundle is put together where those meet.
+sees the system headers. The video encoders (VAAPI with long-term references, a libx264
+fallback) are described in [ENCODERS.md](ENCODERS.md). uinput injection is a separate
+workstream; the host bundle is put together where those meet.
 
 | Object | How |
 | --- | --- |
