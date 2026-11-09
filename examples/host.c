@@ -1,12 +1,13 @@
 /* A small moonsec host on the public C API.
  *
- *   moonsec-example-host [--relay] [--pair] [--seconds N] [--state-dir DIR]
+ *   moonsec-example-host [--system] [--relay] [--pair] [--seconds N] [--state-dir DIR]
  *
  * Listens over iroh, prints the ticket clients connect with, and with --pair opens a
  * pairing window and prints the QR ticket and PIN; then only paired clients get in.
- * Prints events as they come and the session's telemetry every two seconds. This build
- * streams the synthetic test pattern (MOONSEC_BACKEND_SYNTHETIC); the OS backends come
- * in through the same config field. */
+ * Prints events as they come and the session's telemetry every two seconds. It streams
+ * the synthetic test pattern (MOONSEC_BACKEND_SYNTHETIC), or with --system the screen,
+ * through the OS's capture and encoder (MOONSEC_BACKEND_SYSTEM, in libraries built with
+ * it: MOONSEC_FEATURE_SYSTEM_BACKEND). */
 #define _POSIX_C_SOURCE 200809L
 #include <moonsec.h>
 
@@ -40,15 +41,16 @@ static const char *event_name(uint32_t type) {
 }
 
 int main(int argc, char **argv) {
-    int relay = 0, pair = 0, seconds = 60;
+    int relay = 0, pair = 0, sys = 0, seconds = 60;
     const char *state_dir = NULL; /* the per-user default */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--relay") == 0) relay = 1;
+        else if (strcmp(argv[i], "--system") == 0) sys = 1;
         else if (strcmp(argv[i], "--pair") == 0) pair = 1;
         else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc) state_dir = argv[++i];
         else {
-            fprintf(stderr, "usage: %s [--relay] [--pair] [--seconds N] [--state-dir DIR]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--system] [--relay] [--pair] [--seconds N] [--state-dir DIR]\n", argv[0]);
             return 2;
         }
     }
@@ -57,6 +59,7 @@ int main(int argc, char **argv) {
     moonsec_host_config cfg;
     memset(&cfg, 0, sizeof cfg); /* zero is the default for every field */
     cfg.struct_size = sizeof cfg;
+    cfg.backend = sys ? MOONSEC_BACKEND_SYSTEM : MOONSEC_BACKEND_SYNTHETIC;
     cfg.state_dir = state_dir;
     cfg.relay_mode = relay ? MOONSEC_RELAY_DEFAULT : MOONSEC_RELAY_DISABLED;
     cfg.flags = MOONSEC_HOST_RATE_CONTROL | MOONSEC_HOST_LOSS_POLICY;

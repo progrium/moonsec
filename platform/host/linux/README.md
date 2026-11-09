@@ -8,11 +8,12 @@ header ([mlh.h](mlh.h)) that translate-c reads; Zig never sees the system header
 video encoders (VAAPI with long-term references, a libx264 fallback) are described in
 [ENCODERS.md](ENCODERS.md).
 
-`--host linux` uses the uinput injector with the synthetic capture, encoder and audio for
-now. Wiring the ScreenCast capture, PipeWire audio and the encoders into `backend.zig` is
-the next step (`CaptureKind` and `EncoderKind` mark where). The capture is wrapped so its
-`start` tells the injector the captured output's size, so absolute positions land on the
-captured pixels.
+`backend.zig` offers two captures: `.portal` (the ScreenCast capture below, with PipeWire
+audio and a real encoder: VAAPI, then NVENC, then libx264) and `.synthetic` (the test
+pattern, with the synthetic encoder and tone). The C ABI's `MOONSEC_BACKEND_SYSTEM` opens
+`.portal` (app/system.zig); `--host linux` in the `moonsec` tool still uses `.synthetic`
+with the uinput injector. The capture is wrapped so its `start` tells the injector the
+captured output's size, so absolute positions land on the captured pixels.
 
 | Object | How |
 | --- | --- |

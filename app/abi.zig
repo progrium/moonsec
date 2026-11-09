@@ -24,6 +24,7 @@ const simrun = @import("simrun.zig");
 const pairing = @import("pairing.zig");
 const keystore = @import("keystore.zig");
 const pair_cmd = @import("pair_cmd.zig");
+const system = @import("system.zig");
 const iroh = if (options.iroh) @import("iroh") else struct {};
 const iroh_pipe = if (options.iroh) @import("iroh_pipe") else struct {};
 pub const c = @import("moonsec_h");
@@ -133,6 +134,7 @@ export fn moonsec_version_string() [*:0]const u8 {
 export fn moonsec_features() u32 {
     var f: u32 = c.MOONSEC_FEATURE_LOOPBACK;
     if (options.iroh) f |= c.MOONSEC_FEATURE_IROH;
+    if (system.available) f |= c.MOONSEC_FEATURE_SYSTEM_BACKEND;
     return f;
 }
 
@@ -186,6 +188,8 @@ const Endpoint = struct {
     /// `state` when there is one.
     allow: pair.Allowlist,
     name: []u8,
+    /// The state directory's path (null: none, or the key is in memory only).
+    state_path: ?[]u8 = null,
     relay_url: ?[:0]u8 = null,
     relay_ca: ?[:0]u8 = null,
     bind_addr: ?[:0]u8 = null,
@@ -295,6 +299,9 @@ fn createEndpoint(role: Role, state_dir: [*c]const u8, name: [*c]const u8, relay
         .clip_mode = 0,
         .relay_mode = 0,
     };
+    if (dir) |d| if (d.len > 0) {
+        e.state_path = try gpa.dupe(u8, d);
+    };
     e.relay_url = try dupZ(relay_url);
     e.relay_ca = try dupZ(relay_ca);
     e.bind_addr = try dupZ(bind_addr);
@@ -319,8 +326,8 @@ fn createError(e: anyerror) Status {
 }
 
 fn checkCommon(backend: u32, clip: u32, relay: u32, relay_url: [*c]const u8) Status {
-    if (backend == c.MOONSEC_BACKEND_SYSTEM) return fail(c.MOONSEC_ERR_UNSUPPORTED, "this build has no system backend (MOONSEC_FEATURE_SYSTEM_BACKEND)", .{});
-    if (backend != c.MOONSEC_BACKEND_SYNTHETIC) return invalid("unknown backend");
+    if (backend == c.MOONSEC_BACKEND_SYSTEM and !system.available) return fail(c.MOONSEC_ERR_UNSUPPORTED, "this build has no system backend (MOONSEC_FEATURE_SYSTEM_BACKEND)", .{});
+    if (backend != c.MOONSEC_BACKEND_SYNTHETIC and backend != c.MOONSEC_BACKEND_SYSTEM) return invalid("unknown backend");
     if (clip > c.MOONSEC_CLIPBOARD_APP) return invalid("unknown clipboard mode");
     if (relay > c.MOONSEC_RELAY_CUSTOM) return invalid("unknown relay mode");
     if (relay == c.MOONSEC_RELAY_CUSTOM and relay_url == null) return invalid("MOONSEC_RELAY_CUSTOM needs relay_url");
@@ -394,6 +401,7 @@ fn destroyEndpoint(e: *Endpoint) void {
     e.allow.deinit();
     if (e.state) |*st| st.close();
     gpa.free(e.name);
+    if (e.state_path) |sp| gpa.free(sp);
     inline for (.{ "relay_url", "relay_ca", "bind_addr" }) |f| if (@field(e, f)) |s| gpa.free(s);
     e.magic = 0;
     gpa.destroy(e);
@@ -808,16 +816,27 @@ fn newHostSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStrea
         s.clock = s.side_clock.clock();
     } else s.clock = api.clockFn(wallNow);
     const cfg = e.hc;
-    const sh = synthetic.openHost(gpa, .{
-        .clock = s.clock,
-        .sleeper = if (virtual == null) wallSleep else null,
-        .width = if (cfg.width != 0) cfg.width else 640,
-        .height = if (cfg.height != 0) cfg.height else 360,
-        .audio = cfg.flags & c.MOONSEC_HOST_NO_AUDIO == 0,
-    }) catch return error.OutOfMemory;
-    var be = sh.backend();
+    var be: api.HostBackend = undefined;
+    if (cfg.backend == c.MOONSEC_BACKEND_SYSTEM) {
+        // The OS's capture, encoder, audio and input (app/system.zig), on its clock.
+        std.debug.assert(virtual == null);
+        be = try system.openHost(gpa, .{
+            .audio = cfg.flags & c.MOONSEC_HOST_NO_AUDIO == 0,
+            .state_dir = e.state_path,
+        });
+        s.clock = be.clock;
+    } else {
+        const sh = synthetic.openHost(gpa, .{
+            .clock = s.clock,
+            .sleeper = if (virtual == null) wallSleep else null,
+            .width = if (cfg.width != 0) cfg.width else 640,
+            .height = if (cfg.height != 0) cfg.height else 360,
+            .audio = cfg.flags & c.MOONSEC_HOST_NO_AUDIO == 0,
+        }) catch return error.OutOfMemory;
+        be = sh.backend();
+        s.syn_host = sh;
+    }
     errdefer be.deinit();
-    s.syn_host = sh;
     if (cfg.flags & c.MOONSEC_HOST_APP_INPUT != 0) {
         s.injector = .{ .s = s };
         be.input = api.bind(api.InputInjector, AppInjector, &s.injector);
@@ -860,15 +879,27 @@ fn newClientSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStr
         s.clock = s.side_clock.clock();
     } else s.clock = api.clockFn(wallNow);
     const cfg = e.cc;
-    const sc = synthetic.openClient(gpa, .{
-        .clock = s.clock,
-        // No scripted input: the app sends its own with moonsec_session_send_input.
-        .input_interval_us = 0,
-        .audio = cfg.flags & c.MOONSEC_CLIENT_NO_AUDIO == 0,
-    }) catch return error.OutOfMemory;
-    var be = sc.backend();
+    var be: api.ClientBackend = undefined;
+    if (cfg.backend == c.MOONSEC_BACKEND_SYSTEM) {
+        // The OS's decoder, window, audio and input (app/system.zig), on its clock.
+        std.debug.assert(virtual == null);
+        be = try system.openClient(gpa, .{
+            .title = "moonsec",
+            .audio = cfg.flags & c.MOONSEC_CLIENT_NO_AUDIO == 0,
+            .input = cfg.flags & c.MOONSEC_CLIENT_NO_OS_INPUT == 0,
+        });
+        s.clock = be.clock;
+    } else {
+        const sc = synthetic.openClient(gpa, .{
+            .clock = s.clock,
+            // No scripted input: the app sends its own with moonsec_session_send_input.
+            .input_interval_us = 0,
+            .audio = cfg.flags & c.MOONSEC_CLIENT_NO_AUDIO == 0,
+        }) catch return error.OutOfMemory;
+        be = sc.backend();
+        s.syn_client = sc;
+    }
     errdefer be.deinit();
-    s.syn_client = sc;
     if (cfg.flags & c.MOONSEC_CLIENT_NO_OS_INPUT != 0) be.input = null;
     if (cfg.on_frame) |cb| {
         s.presenter = .{ .inner = be.presenter, .cb = cb, .ctx = cfg.frame_ctx };
@@ -904,7 +935,7 @@ fn newClientSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStr
 fn sessionError(err: SessionError) Status {
     return switch (err) {
         error.OutOfMemory => fail(c.MOONSEC_ERR_NO_MEMORY, "out of memory", .{}),
-        error.Unsupported => fail(c.MOONSEC_ERR_UNSUPPORTED, "the backend has no such codec, or no system clipboard here", .{}),
+        error.Unsupported => fail(c.MOONSEC_ERR_UNSUPPORTED, "the backend is not available here, has no such codec, or there is no system clipboard", .{}),
         error.Backend => fail(c.MOONSEC_ERR_BACKEND, "the backend failed to start", .{}),
     };
 }
@@ -1225,6 +1256,7 @@ export fn moonsec_host_listen_loopback(h: ?*c.moonsec_host, lp: ?*c.moonsec_loop
     e.lock();
     defer e.unlock();
     if (l.host != null) return fail(c.MOONSEC_ERR_STATE, "a host is already on this loopback", .{});
+    if (e.hc.backend == c.MOONSEC_BACKEND_SYSTEM) return fail(c.MOONSEC_ERR_UNSUPPORTED, "the loopback runs in virtual time: system backends need iroh", .{});
     if (e.activeSession()) return fail(c.MOONSEC_ERR_STATE, "the host already has a session", .{});
     const s = newHostSession(e, l.net.pipeFor(.a), l.net.streamFor(.a), .{ .loopback = l }, l) catch |err| return sessionError(err);
     e.sessions.append(gpa, s) catch {
@@ -1245,6 +1277,7 @@ export fn moonsec_client_connect_loopback(h: ?*c.moonsec_client, lp: ?*c.moonsec
     e.lock();
     defer e.unlock();
     if (l.client != null) return fail(c.MOONSEC_ERR_STATE, "a client is already on this loopback", .{});
+    if (e.cc.backend == c.MOONSEC_BACKEND_SYSTEM) return fail(c.MOONSEC_ERR_UNSUPPORTED, "the loopback runs in virtual time: system backends need iroh", .{});
     if (e.activeSession()) return fail(c.MOONSEC_ERR_STATE, "the client already has a session", .{});
     const s = newClientSession(e, l.net.pipeFor(.b), l.net.streamFor(.b), .{ .loopback = l }, l) catch |err| return sessionError(err);
     e.sessions.append(gpa, s) catch {
@@ -1415,7 +1448,9 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
                 e.push(peerEvent(c.MOONSEC_EVENT_REFUSED, &peer_id, "", if (busy) 1 else 0));
                 return;
             }
-            try startIrohSession(e, conn);
+            // It owns `conn` from here, also when it fails (the backend did not
+            // open): the client's session then ends with the connection.
+            startIrohSession(e, conn) catch {};
         },
         .invalid => {
             s.close();

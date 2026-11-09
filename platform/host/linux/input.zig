@@ -111,6 +111,7 @@ pub fn spec(kind: Kind, size: api.Size, index: u8, scratch: *Scratch) ui.Spec {
             .props = &.{ui.INPUT_PROP_DIRECT},
         },
         .pad => .{
+            // The client skips pads with this prefix (platform/client/gamepad/evdev.zig, isHostPad).
             .name = std.fmt.bufPrint(&scratch.name, "moonsec pad {d} (Xbox 360 layout)", .{index + 1}) catch unreachable,
             .bustype = ui.BUS_USB,
             .vendor = 0x045e,

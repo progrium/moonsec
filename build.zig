@@ -379,6 +379,7 @@ pub fn build(b: *std.Build) void {
         .app_imports = &app_imports,
         .iroh = iroh_mod,
         .iroh_pipe = iroh_pipe_mod,
+        .linux_uinput = linux_uinput_mod,
         .shim_archive = if (shim_link == .static and !(target.result.os.tag == .windows and target.result.abi == .msvc)) shim.lib_dir.path(b, "libiroh_shim.a") else null,
     }, test_step);
 

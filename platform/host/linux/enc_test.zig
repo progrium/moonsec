@@ -357,7 +357,7 @@ test "VAAPI: not available without a GPU, or the recovery scenario on one" {
         std.debug.print("VAAPI not available: {s}\n", .{c.mlh_last_error()});
         var auto = try enc_mod.Encoder.create(.{ .kind = .auto });
         defer auto.deinit();
-        try testing.expectEqual(enc_mod.Kind.software, auto.kind);
+        try testing.expect(auto.kind == .nvenc or auto.kind == .software);
         return;
     }
     c.mlh_enc_destroy(e);
@@ -375,8 +375,23 @@ test "VAAPI: a missing render node is not found" {
     try testing.expectEqual(@as(c_int, c.MLH_E_NOTFOUND), c.mlh_enc_create(c.MLH_ENC_VAAPI, "/dev/dri/does-not-exist", &e));
 }
 
-test "NVENC: not available here" {
+test "NVENC: not available without an NVIDIA driver, or the recovery scenario with one" {
     var e: ?*c.mlh_enc = null;
-    try testing.expectEqual(@as(c_int, c.MLH_E_NOTFOUND), c.mlh_enc_create(c.MLH_ENC_NVENC, null, &e));
-    try testing.expectError(error.Unsupported, enc_mod.Encoder.create(.{ .kind = .nvenc }));
+    const rc = c.mlh_enc_create(c.MLH_ENC_NVENC, null, &e);
+    if (rc != c.MLH_OK) {
+        // No libcuda/libnvidia-encode or no NVENC GPU: "not found", so `auto` moves on.
+        try testing.expectEqual(@as(c_int, c.MLH_E_NOTFOUND), rc);
+        try testing.expect(e == null);
+        std.debug.print("NVENC not available: {s}\n", .{c.mlh_last_error()});
+        try testing.expectError(error.Unsupported, enc_mod.Encoder.create(.{ .kind = .nvenc }));
+        return;
+    }
+    c.mlh_enc_destroy(e);
+    // An NVIDIA GPU is here: run the hardware check on it.
+    var enc = try enc_mod.Encoder.create(.{ .kind = .nvenc });
+    defer enc.deinit();
+    const o: check.Options = .{ .kind = .nvenc, .frames = 150, .expect = if (enc.caps().ltr) .ltr else .idr };
+    const r = try check.run(gpa, &enc, o);
+    r.print(o);
+    try testing.expect(r.passed(o));
 }

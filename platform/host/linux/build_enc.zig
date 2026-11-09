@@ -9,17 +9,26 @@ const client_build = @import("../../client/build.zig");
 pub const Modules = client_build.LinuxModules;
 
 /// System libraries the encoders link (pkg-config): libavcodec and libavutil for the
-/// software encoder. libva is loaded at run time; only its headers are needed to build
+/// software encoder. libva, libcuda and libnvidia-encode are loaded at run time; only its headers are needed to build
 /// (libva-dev). On Ubuntu 24.04: libavcodec-dev libavutil-dev libva-dev, and libx264 in
 /// libavcodec (libavcodec60 has it).
 pub const libs: []const []const u8 = &.{ "libavcodec", "libavutil" };
 
 pub const c_flags: []const []const u8 = &.{ "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-fno-sanitize=undefined" };
 
-pub const c_files: []const []const u8 = &.{ "enc.c", "enc_sw.c", "enc_vaapi.c", "dmabuf.c", "h26x.c", "testenc.c" };
+pub const c_files: []const []const u8 = &.{ "enc.c", "enc_sw.c", "enc_vaapi.c", "enc_nv.c", "enc_nvenc.c", "dmabuf.c", "h26x.c", "testenc.c" };
 
-/// The encoder module ("host_linux_enc", encoder.zig) with its C files and libraries.
+/// The encoder module ("host_linux_enc", encoder.zig) with its C files and libraries, and
+/// its own error functions (enc_errors.c).
 pub fn encoderModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, platform: *std.Build.Module) *std.Build.Module {
+    const mod = encoderModuleShared(b, target, optimize, platform);
+    mod.addCSourceFiles(.{ .root = b.path("platform/host/linux"), .files = &.{"enc_errors.c"}, .flags = c_flags });
+    return mod;
+}
+
+/// The encoder module without the error functions, for linking next to the capture side
+/// (host.zig's mlh_common.c defines them): what the host backend imports.
+pub fn encoderModuleShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, platform: *std.Build.Module) *std.Build.Module {
     const tc = b.addTranslateC(.{ .root_source_file = b.path("platform/host/linux/mlh_enc.h"), .target = target, .optimize = optimize });
     const mod = b.createModule(.{
         .root_source_file = b.path("platform/host/linux/encoder.zig"),
@@ -32,7 +41,12 @@ pub fn encoderModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
         },
     });
     mod.addIncludePath(b.path("platform/host/linux"));
+    // NVENC: the core shared with the Windows host, and NVIDIA's API header (libcuda and
+    // libnvidia-encode are loaded at run time, so nothing NVIDIA is linked).
+    mod.addIncludePath(b.path("platform/nvenc"));
+    mod.addIncludePath(b.path("third_party/nvenc"));
     mod.addCSourceFiles(.{ .root = b.path("platform/host/linux"), .files = c_files, .flags = c_flags });
+    mod.addCSourceFiles(.{ .root = b.path("platform/nvenc"), .files = &.{"nvenc_core.c"}, .flags = c_flags });
     for (libs) |lib| mod.linkSystemLibrary(lib, .{});
     return mod;
 }

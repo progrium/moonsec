@@ -1,11 +1,14 @@
-//! The Linux host's `HostBackend` (platform/api.zig) for `moonsec ... host --host linux`:
-//! `open` puts the pieces together.
+//! The Linux host's `HostBackend` (platform/api.zig): `open` puts the pieces together.
 //!
-//!   Capture       synthetic test pattern for now; the ScreenCast capture (host.zig) is
-//!                 wired in together with the encoders (encoder.zig), since the synthetic
-//!                 encoder only carries the pattern.
-//!   Encoder       synthetic passthrough for now; `.auto` will try VAAPI, then libx264.
-//!   AudioSource   synthetic tone for now; host.zig's PipeWire source joins with capture.
+//!   Capture       `.portal`: the ScreenCast portal and its PipeWire stream (host.zig),
+//!                 memory frames (bgra8). `.synthetic`: the test pattern.
+//!   Encoder       `.auto`: with portal capture, the first of VAAPI, NVENC and the
+//!                 software encoder that opens (encoder.zig); with synthetic capture, the
+//!                 synthetic passthrough (the pattern rides it end to end). `.vaapi`,
+//!                 `.software` force one; `.synthetic` only carries synthetic frames.
+//!   AudioSource   `.portal` capture: the default sink's monitor over PipeWire
+//!                 (host.zig), checked at open and left out when PipeWire is not there.
+//!                 Synthetic capture: the synthetic tone.
 //!   InputInjector uinput keyboard, mouse, absolute pointer and gamepads (input.zig).
 //!   Clock         CLOCK_MONOTONIC.
 //!
@@ -14,6 +17,7 @@
 const std = @import("std");
 const api = @import("platform");
 const synthetic = @import("synthetic");
+const enc_mod = @import("host_linux_enc");
 
 const host = @import("host.zig");
 pub const input = host.input;
@@ -23,21 +27,22 @@ const log = std.log.scoped(.host_linux);
 
 pub const clock = host.clock;
 
-/// Screen capture backends, best first.
+/// Screen capture backends.
 pub const CaptureKind = enum {
-    // portal (host.zig's Capture): next, with the encoders.
+    /// xdg-desktop-portal ScreenCast + PipeWire (host.zig).
+    portal,
+    /// The synthetic test pattern.
     synthetic,
 };
 
-/// Encoders, in the order `.auto` tries them.
+/// Encoders. `.auto` depends on the capture (see the top of this file).
 pub const EncoderKind = enum {
     auto,
-    // vaapi, software (encoder.zig): next.
+    vaapi,
+    nvenc,
+    software,
     synthetic,
 };
-
-/// `.auto`'s order. VAAPI and the software encoder go ahead of synthetic when wired in.
-pub const encoder_order = [_]EncoderKind{.synthetic};
 
 pub const Options = struct {
     capture: CaptureKind = .synthetic,
@@ -56,9 +61,14 @@ pub const Options = struct {
     sleep_ctx: ?*anyopaque = null,
     /// Creates the uinput devices (tests replace it).
     opener: input.Opener = input.Opener.uinput,
+    /// Portal capture: where the restore token lives (host.tokenPath), so an unattended
+    /// host asks the user once.
+    token_path: ?[:0]const u8 = null,
+    /// DRM render node for VAAPI (null: the first that opens).
+    va_device: ?[:0]const u8 = null,
 };
 
-pub const OpenError = error{ OutOfMemory, Unsupported, NoInput };
+pub const OpenError = error{ OutOfMemory, Unsupported, NoInput, NoEncoder };
 
 pub const Host = struct {
     gpa: std.mem.Allocator,
@@ -70,6 +80,12 @@ pub const Host = struct {
     input_error: ?ui.Error = null,
     with_audio: bool,
     capture: OutputCapture = undefined,
+    /// Portal capture and PipeWire audio (capture_kind == .portal).
+    portal: host.Capture = undefined,
+    pw_audio: host.AudioSource = undefined,
+    /// A real encoder (encoder_kind != .synthetic).
+    enc: enc_mod.Encoder = undefined,
+    token_path: ?[:0]u8 = null,
 
     /// The capture, which also tells the injector the output's size when it starts, so
     /// absolute positions land on the captured pixels.
@@ -98,12 +114,13 @@ pub const Host = struct {
 
     pub fn backend(h: *Host) api.HostBackend {
         const sb = h.synth.backend();
-        h.capture = .{ .inner = sb.capture, .host = h };
+        const portal = h.capture_kind == .portal;
+        h.capture = .{ .inner = if (portal) h.portal.iface() else sb.capture, .host = h };
         return .{
             .clock = clock,
             .capture = api.bind(api.Capture, OutputCapture, &h.capture),
-            .encoder = sb.encoder,
-            .audio = if (h.with_audio) sb.audio else null,
+            .encoder = if (h.encoder_kind == .synthetic) sb.encoder else api.bind(api.Encoder, enc_mod.Encoder, &h.enc),
+            .audio = if (!h.with_audio) null else if (portal) h.pw_audio.iface() else sb.audio,
             .input = if (h.injector) |*j| api.bind(api.InputInjector, input.Injector, j) else null,
             .deinit_ptr = h,
             .deinitFn = deinitHost,
@@ -112,35 +129,74 @@ pub const Host = struct {
 
     /// What was chosen, for logs and reports.
     pub fn describe(h: *const Host, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("capture {s}, encoder {s}, audio {s}, input ", .{ @tagName(h.capture_kind), @tagName(h.encoder_kind), if (h.with_audio) "synthetic" else "off" });
+        try w.print("capture {s}, encoder {s}, audio {s}, input ", .{
+            @tagName(h.capture_kind),
+            if (h.encoder_kind == .synthetic) "synthetic" else h.enc.describe(),
+            if (!h.with_audio) "off" else if (h.capture_kind == .portal) "pipewire" else "synthetic",
+        });
         if (h.injector != null) try w.writeAll("uinput") else if (h.input_error) |e| try w.print("none ({s})", .{@errorName(e)}) else try w.writeAll("off");
     }
 
     fn deinitHost(p: ?*anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p.?));
         if (h.injector) |*j| j.deinit();
+        if (h.capture_kind == .portal) {
+            h.portal.deinit();
+            h.pw_audio.stop();
+        }
+        if (h.encoder_kind != .synthetic) h.enc.deinit();
+        if (h.token_path) |t| h.gpa.free(t);
         h.synth.backend().deinit();
         h.gpa.destroy(h);
     }
 };
 
+fn encoderKind(k: EncoderKind) enc_mod.Kind {
+    return switch (k) {
+        .vaapi => .vaapi,
+        .nvenc => .nvenc,
+        .software => .software,
+        .auto, .synthetic => .auto,
+    };
+}
+
 pub fn open(gpa: std.mem.Allocator, o: Options) OpenError!*Host {
     const encoder_kind: EncoderKind = switch (o.encoder) {
-        .auto => encoder_order[0],
+        .auto => if (o.capture == .synthetic) .synthetic else .auto,
         else => |k| k,
     };
+    if (encoder_kind == .synthetic and o.capture != .synthetic) {
+        log.err("the synthetic encoder only carries the synthetic capture's frames", .{});
+        return error.Unsupported;
+    }
     const synth = synthetic.openHost(gpa, .{ .clock = clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx, .width = o.width, .height = o.height, .audio = o.audio }) catch return error.OutOfMemory;
     errdefer synth.backend().deinit();
     const h = try gpa.create(Host);
+    errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .synth = synth, .capture_kind = o.capture, .encoder_kind = encoder_kind, .with_audio = o.audio };
+    if (encoder_kind != .synthetic) {
+        h.enc = enc_mod.Encoder.create(.{ .kind = encoderKind(encoder_kind), .device = o.va_device }) catch return error.NoEncoder;
+    }
+    errdefer if (encoder_kind != .synthetic) h.enc.deinit();
+    if (o.capture == .portal) {
+        if (o.token_path) |t| h.token_path = try gpa.dupeZ(u8, t);
+        h.portal = host.Capture.init(.{ .token_path = h.token_path });
+        h.pw_audio = host.AudioSource.init(.{});
+        // The app fails to start when its audio source does: check PipeWire now and
+        // stream without audio when it is not there.
+        if (o.audio) {
+            if (h.pw_audio.start(.{})) |_| h.pw_audio.stop() else |e| {
+                log.warn("audio: no PipeWire capture ({s}); streaming without audio", .{@errorName(e)});
+                h.with_audio = false;
+            }
+        }
+    }
+    errdefer if (h.token_path) |t| gpa.free(t);
     if (o.input) {
         if (input.Injector.init(o.opener)) |j| h.injector = j else |e| {
             h.input_error = e;
             logInputError(e);
-            if (o.require_input) {
-                gpa.destroy(h);
-                return error.NoInput;
-            }
+            if (o.require_input) return error.NoInput;
         }
     }
     return h;

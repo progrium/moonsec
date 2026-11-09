@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const client_build = @import("../../client/build.zig");
+const build_enc = @import("build_enc.zig");
 
 pub const Modules = struct {
     core: *std.Build.Module,
@@ -39,6 +40,8 @@ pub fn linuxHostModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize
             .{ .name = "synthetic", .module = m.synthetic },
             .{ .name = "linux_uinput", .module = m.linux_uinput },
             .{ .name = "mlh_c", .module = tc.createModule() },
+            // The encoders (encoder.zig, build_enc.zig): VAAPI, NVENC, libx264.
+            .{ .name = "host_linux_enc", .module = build_enc.encoderModuleShared(b, target, optimize, m.platform) },
         },
     });
     mod.addIncludePath(b.path("platform/host/linux"));

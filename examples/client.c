@@ -1,7 +1,10 @@
 /* A small moonsec client on the public C API.
  *
  *   moonsec-example-client pair TICKET [PIN]       pair with a host (QR ticket, or address ticket + PIN)
- *   moonsec-example-client connect TICKET [--seconds N] [--relay] [--state-dir DIR]
+ *   moonsec-example-client connect TICKET [--system] [--seconds N] [--relay] [--state-dir DIR]
+ *
+ * With --system the stream is decoded and shown in a window by the OS's backend
+ * (MOONSEC_BACKEND_SYSTEM), and the keyboard and mouse go to the host.
  *
  * Connects to a paired host, counts the pictures the frame callback sees, sends a key
  * press every second, and prints the stream's telemetry: frames, loss, freezes, and the
@@ -36,13 +39,14 @@ static void stage(const char *name, const moonsec_stage_stats *s) {
 
 int main(int argc, char **argv) {
     if (argc < 3 || (strcmp(argv[1], "pair") != 0 && strcmp(argv[1], "connect") != 0)) {
-        fprintf(stderr, "usage: %s pair TICKET [PIN]\n       %s connect TICKET [--seconds N] [--relay] [--state-dir DIR]\n", argv[0], argv[0]);
+        fprintf(stderr, "usage: %s pair TICKET [PIN]\n       %s connect TICKET [--system] [--seconds N] [--relay] [--state-dir DIR]\n", argv[0], argv[0]);
         return 2;
     }
-    int relay = 0, seconds = 10;
+    int relay = 0, sys = 0, seconds = 10;
     const char *state_dir = NULL, *pin = NULL;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--relay") == 0) relay = 1;
+        else if (strcmp(argv[i], "--system") == 0) sys = 1;
         else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) seconds = atoi(argv[++i]);
         else if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc) state_dir = argv[++i];
         else pin = argv[i];
@@ -53,7 +57,8 @@ int main(int argc, char **argv) {
     cfg.struct_size = sizeof cfg;
     cfg.state_dir = state_dir;
     cfg.relay_mode = relay ? MOONSEC_RELAY_DEFAULT : MOONSEC_RELAY_DISABLED;
-    cfg.flags = MOONSEC_CLIENT_NO_OS_INPUT;
+    cfg.backend = sys ? MOONSEC_BACKEND_SYSTEM : MOONSEC_BACKEND_SYNTHETIC;
+    cfg.flags = sys ? 0 : MOONSEC_CLIENT_NO_OS_INPUT;
     cfg.on_frame = on_frame;
     moonsec_client *client = NULL;
     moonsec_status st = moonsec_client_create(&cfg, &client);
@@ -86,7 +91,7 @@ int main(int argc, char **argv) {
                 printf("path: %s\n", ev.code ? "relayed" : "direct");
             }
         }
-        if (streaming && time(NULL) >= next_key) {
+        if (!sys && streaming && time(NULL) >= next_key) { /* --system: the real keyboard instead */
             moonsec_input key;
             memset(&key, 0, sizeof key);
             key.kind = MOONSEC_INPUT_KEY;
