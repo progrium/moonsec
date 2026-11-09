@@ -15,7 +15,8 @@
 // recovery and the browser's drop-until-keyframe path run.
 //
 // Also serves client.html, web/dist and zig-out/web (wasm under /dist/). Logs each host's
-// end-of-session report to stderr, and keeps the last ones at /reports.
+// end-of-session report to stderr, and keeps the last ones at /reports (each with its
+// session number; /sessions says how many sessions have started).
 //
 // Usage: node e2e/media-host.mjs [--port 8788] [--fixture PATH] [--fps 60] [--size 640x360]
 
@@ -152,6 +153,10 @@ const server = createServer(async (req, res) => {
   if (url.pathname === "/reports") {
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify(reports));
+  }
+  if (url.pathname === "/sessions") {
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ started: sessions }));
   }
   let rel = url.pathname === "/" ? "/client.html" : url.pathname;
   const candidates = [path.join(webRoot, rel)];

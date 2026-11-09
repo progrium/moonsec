@@ -51,10 +51,18 @@ async function save(name: string, key: string, m: any, hostReport: unknown) {
 }
 
 async function hostReport(page: Page) {
-  // The host prints its report when the session ends (on our bye).
-  await expect.poll(async () => (await (await page.request.get(`${base}/reports`)).json()).length, { timeout: 10_000 }).toBeGreaterThan(0);
-  const all = await (await page.request.get(`${base}/reports`)).json();
-  return all[all.length - 1];
+  // The host prints its report when the session ends (on our bye), which can be after the
+  // page already shows "ended". Wait for this test's session (the newest one the media host
+  // started; tests run one at a time) rather than taking the newest report, which may
+  // still be the previous test's.
+  const { started } = await (await page.request.get(`${base}/sessions`)).json();
+  let mine: { session: number; code: number; dropped: number; report: string } | undefined;
+  await expect
+    .poll(async () => (mine = (await (await page.request.get(`${base}/reports`)).json()).find((r: { session: number }) => r.session === started)) !== undefined, {
+      timeout: 10_000,
+    })
+    .toBe(true);
+  return mine!;
 }
 
 /**
