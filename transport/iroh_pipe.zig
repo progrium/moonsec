@@ -280,6 +280,10 @@ pub const IrohLink = struct {
         gate: ?Gate = null,
         /// The application error code a connection the gate turned away is closed with.
         refuse_code: u32 = 0,
+        /// accept: gates running at once, each on its own task, so a peer that stalls its
+        /// admission holds up no one else. Connections past it are closed (`busy_code`).
+        max_gates: u32 = 16,
+        busy_code: u32 = 0,
     };
 
     pub const Stats = struct {
@@ -329,6 +333,9 @@ pub const IrohLink = struct {
     w_refused: std.atomic.Value(u64) = .init(0),
     /// dial: the gate refused the host; no more dials.
     w_gave_up: std.atomic.Value(bool) = .init(false),
+    /// accept: gate tasks.
+    gates: Io.Group = .init,
+    gates_running: std.atomic.Value(u32) = .init(0),
 
     /// Starts the worker; a dialing link dials at once. `self` must not move afterwards.
     pub fn start(self: *IrohLink, io: Io, ep: iroh.Endpoint, opts: Options) !void {
@@ -342,6 +349,7 @@ pub const IrohLink = struct {
         self.stop.store(true, .release);
         if (self.worker) |*w| w.await(self.io);
         self.worker = null;
+        self.gates.await(self.io) catch {};
         self.ctl.drop();
         if (self.ready) |c| c.deinit(0);
         if (self.cand) |c| c.deinit(0);
@@ -442,10 +450,33 @@ pub const IrohLink = struct {
             .accept => {
                 const c = self.ep.accept(200) catch continue;
                 _ = self.w_accepts.fetchAdd(1, .monotonic);
-                if (self.gateCheck(c) != .admit) continue;
-                self.handOver(c);
+                if (self.opts.gate == null) {
+                    self.handOver(c);
+                    continue;
+                }
+                if (self.gates_running.fetchAdd(1, .acq_rel) >= self.opts.max_gates) {
+                    _ = self.gates_running.fetchSub(1, .acq_rel);
+                    _ = self.w_refused.fetchAdd(1, .monotonic);
+                    c.deinit(self.opts.busy_code);
+                    continue;
+                }
+                self.gates.concurrent(self.io, gateTask, .{ self, c }) catch {
+                    _ = self.gates_running.fetchSub(1, .acq_rel);
+                    // No task to run it on: gate it here.
+                    if (self.gateCheck(c) == .admit) self.handOver(c);
+                };
             },
         };
+    }
+
+    fn gateTask(self: *IrohLink, c: iroh.Conn) void {
+        defer _ = self.gates_running.fetchSub(1, .acq_rel);
+        if (self.gateCheck(c) != .admit) return;
+        if (self.stop.load(.acquire)) {
+            c.deinit(0);
+            return;
+        }
+        self.handOver(c);
     }
 
     /// Runs the gate on `c`; anything but `admit` closes and frees it.

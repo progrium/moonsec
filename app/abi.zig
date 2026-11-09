@@ -239,7 +239,14 @@ const Net = if (options.iroh) struct {
     accept: ?Io.Future(void) = null,
     stopping: std.atomic.Value(bool) = .init(false),
     window: ?ex.Window = null,
+    /// Changes whenever a window opens or closes, so an exchange that started on one window
+    /// never touches the next.
+    window_gen: u64 = 0,
     paired_in_window: u32 = 0,
+    /// Connections being paired or admitted, each on its own task.
+    tasks: ?*pair_cmd.ConnTasks = null,
+    /// Admitted connections whose session is being set up (one session at a time).
+    admitting: u32 = 0,
 } else struct {};
 
 fn hostOf(h: ?*c.moonsec_host) ?*Endpoint {
@@ -387,6 +394,11 @@ fn destroyEndpoint(e: *Endpoint) void {
     if (options.iroh) {
         e.net.stopping.store(true, .release);
         if (e.net.accept) |*f| f.await(io());
+        if (e.net.tasks) |t| {
+            t.wait();
+            gpa.destroy(t);
+            e.net.tasks = null;
+        }
     }
     // Each session is closed (a bye to the peer) and its threads joined.
     while (true) {
@@ -1363,37 +1375,71 @@ fn peerEvent(ty: u32, id: *const pair.Id, name: []const u8, code: i32) c.moonsec
 }
 
 /// The host's accept thread: pairing requests while a window is open, and session
-/// admission. One session at a time.
+/// admission, each connection on its own task with a total budget (`pair_cmd.ConnTasks`),
+/// so one peer that connects and stalls holds up no one else. One session at a time.
 fn acceptLoop(e: *Endpoint) void {
     if (!options.iroh) return;
+    const tasks = gpa.create(pair_cmd.ConnTasks) catch return;
+    tasks.* = .{ .io = io() };
+    e.net.tasks = tasks;
     while (!e.net.stopping.load(.acquire)) {
         closeWindowIfDone(e);
         const conn = e.net.ep.?.accept(200) catch |err| switch (err) {
             error.Closed => return,
             else => continue,
         };
-        handleConn(e, conn) catch {
-            conn.deinit(0);
-        };
+        if (!tasks.spawn(connTask, .{ e, conn })) conn.deinit(pair_cmd.close_busy);
     }
+}
+
+fn connTask(e: *Endpoint, conn: iroh.Conn) void {
+    defer e.net.tasks.?.done();
+    handleConn(e, conn) catch {
+        conn.deinit(0);
+    };
 }
 
 fn closeWindowIfDone(e: *Endpoint) void {
     if (!options.iroh) return;
     e.lock();
     defer e.unlock();
-    if (e.net.window) |*w| if (!w.isOpen(wallNow())) {
+    if (e.net.window) |*w| {
+        const now = wallNow();
+        if (w.isOpen(now)) return;
+        // Full only because a pairing awaits its confirm: keep it until that settles.
+        if (w.pending > 0 and now < w.deadline_us and w.attempts_left > 0) return;
         var ev = std.mem.zeroes(c.moonsec_event);
         ev.type = c.MOONSEC_EVENT_PAIR_CLOSED;
         ev.code = @intCast(e.net.paired_in_window);
         e.push(ev);
         e.net.window = null;
-    };
+        e.net.window_gen +%= 1;
+    }
 }
+
+/// `pairing.Guard` over the endpoint's lock and the window an exchange started on.
+const WindowGuard = struct {
+    e: *Endpoint,
+    gen: u64,
+
+    fn guard(g: *WindowGuard) pairing.Guard {
+        return .{ .ctx = g, .enter = enter, .leave = leave };
+    }
+    fn enter(ctx: *anyopaque) bool {
+        const g: *WindowGuard = @ptrCast(@alignCast(ctx));
+        g.e.lock();
+        return g.e.net.window != null and g.e.net.window_gen == g.gen;
+    }
+    fn leave(ctx: *anyopaque) void {
+        const g: *WindowGuard = @ptrCast(@alignCast(ctx));
+        g.e.unlock();
+    }
+};
 
 fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
     const peer_id = try pair_cmd.remoteId(conn);
-    var s: pair_cmd.IrohStream = .{ .s = try conn.acceptBi(5_000) };
+    const budget = pair_cmd.IrohStream.pair_budget_ms;
+    var s: pair_cmd.IrohStream = .withBudget(try conn.acceptBi(budget), budget);
     var f: ex.Framer = .{};
     var mb: [ex.max_message]u8 = undefined;
     const first = (pair_cmd.readFirst(s.stream(), &f, &mb) catch null) orelse {
@@ -1404,20 +1450,21 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
         .pair => {
             defer s.close();
             defer conn.deinit(0);
-            e.lock();
-            // No window open: a closed one, so the client hears "not pairing right now".
-            var window = e.net.window orelse ex.Window{ .deadline_us = 0 };
-            e.unlock();
             var nonce: ex.Nonce = undefined;
             io().random(&nonce);
             var seed: ex.Seed = undefined;
             io().random(&seed);
-            var hs = ex.Host.init(&window, e.identity.id, peer_id, nonce, seed, e.name);
-            const out = pairing.serveHost(s.stream(), &f, &hs, first, &wallNow) catch return;
+            // No window open: a closed one, so the client hears "not pairing right now".
+            var closed: ex.Window = .{ .deadline_us = 0 };
+            e.lock();
+            var wg: WindowGuard = .{ .e = e, .gen = e.net.window_gen };
+            const window: *ex.Window = if (e.net.window) |*w| w else &closed;
+            const shared = e.net.window != null;
+            e.unlock();
+            var hs = ex.Host.init(window, e.identity.id, peer_id, nonce, seed, e.name);
+            const out = pairing.serveHost(s.stream(), &f, &hs, first, &wallNow, if (shared) wg.guard() else null) catch return;
             e.lock();
             defer e.unlock();
-            // The window's counters moved; keep them unless pair_end closed it meanwhile.
-            if (e.net.window != null) e.net.window = window;
             switch (out) {
                 .paired => |pd| {
                     e.allow.put(.{ .id = pd.peer_id, .paired_unix_s = pair_cmd.unixNow(io()), .name = pd.name() }) catch {};
@@ -1435,11 +1482,11 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
         .admit => {
             e.lock();
             const paired = e.allow.contains(&peer_id);
-            // Pairing is required unless the app opted out for a test or lab.
             const need = e.flags & c.MOONSEC_HOST_INSECURE_NO_PAIRING == 0;
-            const busy = e.activeSession();
-            e.unlock();
+            const busy = e.activeSession() or e.net.admitting > 0;
             const allowed = (paired or !need) and !busy;
+            if (allowed) e.net.admitting += 1;
+            e.unlock();
             var o: ex.Out = .{};
             s.stream().write(ex.admitReply(&o, allowed)) catch {};
             s.close();
@@ -1450,8 +1497,12 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
                 e.push(peerEvent(c.MOONSEC_EVENT_REFUSED, &peer_id, "", if (busy) 1 else 0));
                 return;
             }
-            // It owns `conn` from here, also when it fails (the backend did not
-            // open): the client's session then ends with the connection.
+            defer {
+                e.lock();
+                e.net.admitting -= 1;
+                e.unlock();
+            }
+            // It owns `conn` from here, also when it fails.
             startIrohSession(e, conn) catch {};
         },
         .invalid => {
@@ -1534,6 +1585,7 @@ export fn moonsec_host_pair_begin(h: ?*c.moonsec_host, config: ?*const c.moonsec
     }
     if (window.pin) |p| fixedStr(&r.pin, &p);
     e.net.window = window;
+    e.net.window_gen +%= 1;
     e.net.paired_in_window = 0;
     _ = writeOut(c.moonsec_pair_info, out, r);
     return ok;
@@ -1546,6 +1598,7 @@ export fn moonsec_host_pair_end(h: ?*c.moonsec_host) Status {
     defer e.unlock();
     if (e.net.window == null) return ok;
     e.net.window = null;
+    e.net.window_gen +%= 1;
     var ev = std.mem.zeroes(c.moonsec_event);
     ev.type = c.MOONSEC_EVENT_PAIR_CLOSED;
     ev.code = @intCast(e.net.paired_in_window);

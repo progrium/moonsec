@@ -589,3 +589,44 @@ test "link gate: a dialing link that is refused stops dialing" {
     try std.testing.expectEqual(@as(u64, 1), st.dials);
     try std.testing.expect(!link.packetPipe().stats().connected);
 }
+
+/// Admits a connection whose first stream starts with 'k'; waits up to 5 s for it.
+const StreamGate = struct {
+    fn check(_: *anyopaque, conn: iroh.Conn) IrohLink.Verdict {
+        const s = conn.acceptBi(5_000) catch return .refuse;
+        defer s.deinit(0);
+        var b: [1]u8 = undefined;
+        const got = s.read(&b, 5_000) catch return .refuse;
+        return if (got.len == 1 and got[0] == 'k') .admit else .refuse;
+    }
+};
+
+test "link gate: peers that connect and stall do not hold up an admitted one" {
+    setup();
+    const io = std.testing.io;
+    const host_ep = try iroh.Endpoint.bind(.{ .alpn = alpn, .relay_mode = .disabled, .bind_addr = "127.0.0.1:0" });
+    defer host_ep.deinit();
+    const peer_ep = try iroh.Endpoint.bind(.{ .relay_mode = .disabled, .bind_addr = "127.0.0.1:0" });
+    defer peer_ep.deinit();
+    var tbuf: [4096]u8 = undefined;
+    const ticket = try host_ep.ticket(&tbuf);
+    var dummy: u8 = 0;
+    const host = try std.testing.allocator.create(IrohLink);
+    defer std.testing.allocator.destroy(host);
+    try host.start(io, host_ep, .{ .role = .accept, .alpn = alpn, .gate = .{ .ctx = &dummy, .check = StreamGate.check } });
+    defer host.deinit();
+    const hp = host.packetPipe();
+
+    var stalled: [3]iroh.Conn = undefined;
+    for (&stalled) |*c| c.* = try peer_ep.connect(ticket, alpn, 10_000);
+    defer for (stalled) |c| c.deinit(0);
+    const t0 = iroh.nowUs();
+    const good = try peer_ep.connect(ticket, alpn, 10_000);
+    defer good.deinit(0);
+    const s = try good.openBi(5_000);
+    defer s.deinit(0);
+    try s.writeAll("k", 5_000);
+    try std.testing.expect(waitConnected(hp, 3_000));
+    // Well inside the stalled gates' 5 s.
+    try std.testing.expect(iroh.nowUs() - t0 < 3_000_000);
+}
