@@ -13,8 +13,9 @@
 import { CoreSession, State } from "../core";
 import { WebSocketTransport, type Transport } from "../transport";
 import { codecString, probeDecoders, type DecoderSupport } from "./codec";
-import type { AudioReport, FromWorker, InputOp, NeedMsg, PcmMsg, ProbeEvent, StartMsg, ToWorker, VideoReport } from "./protocol";
+import type { AudioReport, FromWorker, IrohDial, InputOp, NeedMsg, PcmMsg, ProbeEvent, StartMsg, ToWorker, VideoReport } from "./protocol";
 import { IrohTransport } from "../../../shim-web/js/transport.js";
+import { loadPair, PairError } from "../../../shim-web/js/pair.js";
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -307,20 +308,73 @@ function transportStats(t: Transport): Record<string, number | boolean> | null {
   return Object.fromEntries(Object.entries(conn.stats() as Record<string, unknown>).map(([k, v]) => [k, typeof v === "bigint" ? Number(v) : (v as number | boolean)]));
 }
 
-/** shim-web in this worker: bind a relay-only endpoint and dial the host's ticket. */
-async function dialIroh(o: { ticket: string; relayUrls: string[]; pkgUrl: string }): Promise<Transport> {
+let pinWaiter: ((pin: string) => void) | null = null;
+const status = (text: string) => self.postMessage({ type: "status", text } satisfies FromWorker);
+
+/**
+ * shim-web in this worker: bind this device's endpoint, pair with the host in the ticket
+ * unless it already did (spec/pairing-v0.md, Exchange), then dial it and ask for a session
+ * (Admission). Media datagrams start only once the host admitted this device.
+ */
+async function dialIroh(o: IrohDial): Promise<Transport> {
   type IrohModule = typeof import("../../../shim-web/pkg/iroh_web.js");
   const iroh: IrohModule = await import(/* @vite-ignore */ new URL("iroh_web.js", o.pkgUrl).href);
   await iroh.default({ module_or_path: new URL("iroh_web_bg.wasm", o.pkgUrl) });
-  const ep = await iroh.Endpoint.bind({ relayUrls: o.relayUrls });
+  const pair = await loadPair(new URL("moonsec-pair.wasm", o.pkgUrl));
+  const t = pair.decodeTicket(o.ticket.trim());
+  const ep = await iroh.Endpoint.bind({ relayUrls: o.relayUrls, ...(o.secretKey ? { secretKey: o.secretKey } : {}) });
   await ep.online(15000);
-  const conn = await ep.connect(o.ticket, "moonsec/0", 30000);
-  // No admission yet (spec/pairing-v0.md): the browser host lets in whoever has its ticket.
-  const t = new IrohTransport(conn);
-  // Keep the endpoint reachable: when its wrapper is garbage collected, wasm-bindgen's
-  // finalizer drops the Rust endpoint and the connection closes under the session.
-  (t as IrohTransport & { endpoint?: unknown }).endpoint = ep;
-  return t;
+  let known = o.hosts.find((h) => h.hostId === t.hostId) ?? null;
+  let pin = o.pin ?? "";
+  const pairOnce = async () => {
+    for (;;) {
+      if (!t.hasSecret && !pin) pin = await askPin(t.hostId, "", -1);
+      status("pairing");
+      try {
+        const h = await pair.pairWithTicket(ep, o.ticket.trim(), { pin, name: o.name });
+        self.postMessage({ type: "paired-host", host: h } satisfies FromWorker);
+        return h;
+      } catch (e) {
+        // A wrong PIN: ask again while the host has attempts left.
+        if (e instanceof PairError && e.reason === 3 && !t.hasSecret) {
+          pin = await askPin(t.hostId, e.message, e.attemptsLeft);
+          continue;
+        }
+        throw e;
+      }
+    }
+  };
+  if (!known) known = await pairOnce();
+  for (let attempt = 0; ; attempt++) {
+    status("connecting");
+    // The ticket's address is the freshest; a paired host's stored one is the fallback.
+    const conn = await ep.connect(t.addr || known.addr, "moonsec/0", 30000);
+    if (conn.remoteId !== t.hostId) {
+      conn.close(0);
+      throw new Error("the host at that address is not the one in the ticket");
+    }
+    try {
+      await pair.admit(conn);
+    } catch (e) {
+      conn.close(0);
+      // The host forgot this device: pair again once if the ticket allows it.
+      if (attempt === 0 && e instanceof PairError && e.reason === 9 && (t.hasSecret || o.pin !== undefined)) {
+        known = await pairOnce();
+        continue;
+      }
+      throw e;
+    }
+    const tr = new IrohTransport(conn);
+    // Keep the endpoint reachable: when its wrapper is garbage collected, wasm-bindgen's
+    // finalizer drops the Rust endpoint and the connection closes under the session.
+    (tr as IrohTransport & { endpoint?: unknown }).endpoint = ep;
+    return tr;
+  }
+}
+
+function askPin(hostId: string, error: string, attemptsLeft: number): Promise<string> {
+  self.postMessage({ type: "pin-needed", hostId, error, attemptsLeft } satisfies FromWorker);
+  return new Promise((resolve) => (pinWaiter = resolve));
 }
 
 self.onmessage = async (ev: MessageEvent<ToWorker>) => {
@@ -331,16 +385,22 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
       if (support.codecs === 0) throw new Error("this browser has no WebCodecs video decoder for H.264, HEVC or AV1");
       let transport: Transport | null = null;
       const pending: Uint8Array[] = [];
+      // Pairing can wait on a person typing a PIN: dial before the session starts its clock.
+      const dialed = m.iroh ? await dialIroh(m.iroh) : null;
       const core = await CoreSession.create(fetch(m.wasmUrl), { codecs: support.codecs, channels: m.audio ? 2 : 0 }, (dg) => {
         // Copy out of wasm memory before returning.
         if (transport) transport.send(dg.slice());
         else pending.push(dg.slice());
       });
-      transport = m.iroh ? await dialIroh(m.iroh) : await WebSocketTransport.connect(m.wsUrl);
+      transport = dialed ?? (await WebSocketTransport.connect(m.wsUrl));
       for (const dg of pending) transport.send(dg);
       media = new Media(core, transport, m, support);
     } else if (m.type === "input") {
       media?.input(m.ops);
+    } else if (m.type === "pin") {
+      const w = pinWaiter;
+      pinWaiter = null;
+      w?.(m.pin);
     } else if (m.type === "close") {
       media?.close();
     }

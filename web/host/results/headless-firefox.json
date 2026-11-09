@@ -1,0 +1,788 @@
+{
+  "browser": "firefox 155.0",
+  "relayUrl": "https://127.0.0.1:3443",
+  "variants": [
+    {
+      "variant": "default",
+      "failures": [],
+      "hostReadyMs": 6705,
+      "connectToFirstFrameMs": 778,
+      "codec": "av01.0.08M.08",
+      "client": {
+        "video": {
+          "codec": "av01.0.04M.08",
+          "hardware": "prefer-hardware",
+          "configured": 1,
+          "submitted": 318,
+          "decoded": 318,
+          "drawn": 318,
+          "failed": 0,
+          "errors": [],
+          "nonBlank": true
+        },
+        "audio": {
+          "rendered": 624,
+          "paced": 0,
+          "played": 298239,
+          "loud": 275330,
+          "underruns": 1793,
+          "queued": 321,
+          "sampleRate": 48000
+        },
+        "stages": {
+          "capture": {
+            "count": 0,
+            "last": -1,
+            "p50": -1,
+            "p99": -1
+          },
+          "encode": {
+            "count": 318,
+            "last": 14000,
+            "p50": 14000,
+            "p99": 24000
+          },
+          "network": {
+            "count": 318,
+            "last": 1492,
+            "p50": 2500,
+            "p99": 9000
+          },
+          "decode": {
+            "count": 318,
+            "last": 1000,
+            "p50": 2000,
+            "p99": 8000
+          },
+          "present": {
+            "count": 318,
+            "last": 4000,
+            "p50": 2000,
+            "p99": 6000
+          },
+          "total": {
+            "count": 318,
+            "last": 20492,
+            "p50": 22010,
+            "p99": 32005
+          },
+          "input": {
+            "count": 0,
+            "last": -1,
+            "p50": -1,
+            "p99": -1
+          }
+        },
+        "rttMs": 5,
+        "stats": {
+          "frames_received": 318,
+          "frames_lost": 0,
+          "frames_dropped": 0,
+          "frames_stale": 0,
+          "frames_decoded": 318,
+          "decode_errors": 0,
+          "frames_presented": 318,
+          "queue_overflows": 0,
+          "shards": 323,
+          "nacks": 0,
+          "feedback": 509,
+          "frame_acks": 0,
+          "pongs": 32,
+          "input_events": 0,
+          "input_packets": 0,
+          "malformed": 0,
+          "recovery_requests": 0,
+          "freezes": 0,
+          "audio_decoded": 619,
+          "audio_fec": 0,
+          "audio_rs_recovered": 0,
+          "audio_concealed": 1,
+          "audio_late": 1,
+          "audio_silence": 4,
+          "audio_delay_us": 49000,
+          "rx_drops": 0
+        }
+      },
+      "host": {
+        "transport": {
+          "dgramSent": 1283,
+          "dgramTxWire": 1283,
+          "dgramSendBacklog": 0,
+          "dgramRxWire": 544,
+          "dgramRead": 544,
+          "dgramRecvDropsQuic": 0,
+          "dgramRecvDropsShim": 0,
+          "dgramRecvQueued": 0,
+          "sentPackets": 1262,
+          "lostPackets": 0,
+          "lostBytes": 0,
+          "udpTxBytes": 343341,
+          "udpRxBytes": 55240,
+          "eventsDropped": 0,
+          "selectedPath": 0,
+          "pathCount": 1,
+          "closed": false,
+          "pathSelections": 0
+        },
+        "stats": {
+          "frames": 315,
+          "keyframes": 1,
+          "refreshes": 0,
+          "encode_drops": 0,
+          "bytes": 107228,
+          "shards": 320,
+          "nacks": 0,
+          "retransmits": 0,
+          "feedback": 505,
+          "frame_acks": 0,
+          "recovery_requests": 0,
+          "pings": 31,
+          "inputs_applied": 0,
+          "hellos": 1,
+          "malformed": 0,
+          "pacing_bps": 24000000,
+          "rtt_us": 4181,
+          "bitrate_bps": 6000000,
+          "audio_frames": 0,
+          "audio_datagrams": 0,
+          "audio_errors": 0,
+          "rx_drops": 0,
+          "stages": {
+            "capture": {
+              "count": 315,
+              "last": 1000,
+              "p50": 1000,
+              "p99": 3000
+            },
+            "encode": {
+              "count": 315,
+              "last": 13000,
+              "p50": 14000,
+              "p99": 24000
+            },
+            "input": {
+              "count": 0,
+              "last": -1,
+              "p50": -1,
+              "p99": -1
+            }
+          }
+        },
+        "multi": {
+          "frames": 315,
+          "keyframes": 1,
+          "refreshes": 0,
+          "encode_drops": 0,
+          "joins": 1,
+          "leaves": 0,
+          "inputs_dropped": 0,
+          "inputs_applied": 0,
+          "releases": 0,
+          "format_refusals": 0,
+          "members": 1,
+          "owner": 0,
+          "bitrate_bps": 6000000,
+          "audio_frames": 621,
+          "audio_datagrams": 931,
+          "audio_errors": 0
+        },
+        "pairing": {
+          "paired": 1,
+          "failed": 0,
+          "admitted": 1,
+          "refused": 0,
+          "full": 0,
+          "lastFailure": ""
+        },
+        "encoder": {
+          "ltrMarks": 0,
+          "ltrRefreshes": 0,
+          "configured": 1,
+          "frames": 315,
+          "busyDrops": 54,
+          "timeouts": 0,
+          "lateDiscards": 0,
+          "errors": [],
+          "encodeMs": [
+            15,
+            13,
+            13,
+            13,
+            14,
+            14,
+            15,
+            13,
+            12,
+            15,
+            12,
+            12,
+            13,
+            12,
+            14
+          ],
+          "queueMax": 0
+        },
+        "audio": {
+          "encoder": "wasm",
+          "frames": 621,
+          "packets": 931,
+          "dropped": 0,
+          "peak": 0.09,
+          "errors": []
+        },
+        "captured": 797,
+        "media": {
+          "routed": 0,
+          "skipped": 0
+        }
+      },
+      "input": {
+        "before": {
+          "x": 480,
+          "y": 270,
+          "r": 18
+        },
+        "after": {
+          "x": 580,
+          "y": 174,
+          "r": 20,
+          "mouse": {
+            "x": 719,
+            "y": 135,
+            "down": false,
+            "clicks": 1,
+            "moves": 7
+          },
+          "wheel": -1,
+          "pad": {
+            "connected": true,
+            "id": "moonsec remote pad (STANDARD GAMEPAD Vendor: 045e Product: 028e)",
+            "a": false,
+            "lx": 0,
+            "ly": 0,
+            "events": 1
+          },
+          "keyCodesSeen": []
+        },
+        "injector": {
+          "keys": 2,
+          "buttons": 2,
+          "moves": 7,
+          "scrolls": 1,
+          "pads": 2,
+          "unknownKeys": 0
+        }
+      },
+      "inputToPhotonMs": {
+        "key": {
+          "n": 20,
+          "min": 33,
+          "p50": 44,
+          "p90": 62,
+          "max": 65
+        },
+        "mouse": {
+          "n": 20,
+          "min": 31,
+          "p50": 41,
+          "p90": 54,
+          "max": 63
+        },
+        "pad": {
+          "n": 20,
+          "min": 30,
+          "p50": 44,
+          "p90": 61,
+          "max": 61
+        }
+      },
+      "hostStages": {
+        "capture": {
+          "count": 512,
+          "last": 1000,
+          "p50": 1000,
+          "p99": 4000
+        },
+        "encode": {
+          "count": 512,
+          "last": 21000,
+          "p50": 17000,
+          "p99": 31000
+        },
+        "input": {
+          "count": 85,
+          "last": -1,
+          "p50": 5926,
+          "p99": 17492
+        }
+      },
+      "clientStages": {
+        "capture": {
+          "count": 0,
+          "last": -1,
+          "p50": -1,
+          "p99": -1
+        },
+        "encode": {
+          "count": 512,
+          "last": 22000,
+          "p50": 17000,
+          "p99": 31000
+        },
+        "network": {
+          "count": 512,
+          "last": 757,
+          "p50": 1904,
+          "p99": 7883
+        },
+        "decode": {
+          "count": 512,
+          "last": 1000,
+          "p50": 2000,
+          "p99": 7000
+        },
+        "present": {
+          "count": 512,
+          "last": 2000,
+          "p50": 2000,
+          "p99": 6000
+        },
+        "total": {
+          "count": 512,
+          "last": 25757,
+          "p50": 24744,
+          "p99": 41265
+        },
+        "input": {
+          "count": 0,
+          "last": -1,
+          "p50": -1,
+          "p99": -1
+        }
+      },
+      "clientFinal": {
+        "drawn": 1550,
+        "failed": 0,
+        "freezes": 0,
+        "lost": 0,
+        "recoveryRequests": 0,
+        "audioFec": 0,
+        "audioRs": 0,
+        "audioConcealed": 1
+      },
+      "hostFinal": {
+        "ltr": false,
+        "ltrMarks": 0,
+        "ltrRefreshes": 0,
+        "refreshes": 0,
+        "frameAcks": 0,
+        "frames": 1551,
+        "keyframes": 1,
+        "bytes": 937942,
+        "nacks": 0,
+        "retransmits": 0,
+        "recovery": 0,
+        "busyDrops": 704,
+        "timeouts": 0,
+        "encodeMs": {
+          "n": 8,
+          "min": 19,
+          "p50": 22,
+          "p90": 29,
+          "max": 29
+        }
+      },
+      "logs": []
+    },
+    {
+      "variant": "media",
+      "failures": [],
+      "hostReadyMs": 6902,
+      "connectToFirstFrameMs": 804,
+      "codec": "av01.0.08M.08",
+      "client": {
+        "video": {
+          "codec": "av01.0.04M.08",
+          "hardware": "prefer-hardware",
+          "configured": 1,
+          "submitted": 309,
+          "decoded": 309,
+          "drawn": 309,
+          "failed": 0,
+          "errors": [],
+          "nonBlank": true
+        },
+        "audio": {
+          "rendered": 627,
+          "paced": 0,
+          "played": 299711,
+          "loud": 290468,
+          "underruns": 1473,
+          "queued": 289,
+          "sampleRate": 48000
+        },
+        "stages": {
+          "capture": {
+            "count": 0,
+            "last": -1,
+            "p50": -1,
+            "p99": -1
+          },
+          "encode": {
+            "count": 309,
+            "last": 22000,
+            "p50": 16000,
+            "p99": 25000
+          },
+          "network": {
+            "count": 309,
+            "last": 2665,
+            "p50": 2992,
+            "p99": 9992
+          },
+          "decode": {
+            "count": 309,
+            "last": 1000,
+            "p50": 2000,
+            "p99": 7000
+          },
+          "present": {
+            "count": 309,
+            "last": 2000,
+            "p50": 2000,
+            "p99": 5000
+          },
+          "total": {
+            "count": 309,
+            "last": 27665,
+            "p50": 23992,
+            "p99": 39985
+          },
+          "input": {
+            "count": 0,
+            "last": -1,
+            "p50": -1,
+            "p99": -1
+          }
+        },
+        "rttMs": 4,
+        "stats": {
+          "frames_received": 309,
+          "frames_lost": 0,
+          "frames_dropped": 0,
+          "frames_stale": 0,
+          "frames_decoded": 309,
+          "decode_errors": 0,
+          "frames_presented": 309,
+          "queue_overflows": 0,
+          "shards": 314,
+          "nacks": 0,
+          "feedback": 498,
+          "frame_acks": 0,
+          "pongs": 32,
+          "input_events": 0,
+          "input_packets": 0,
+          "malformed": 0,
+          "recovery_requests": 0,
+          "freezes": 0,
+          "audio_decoded": 622,
+          "audio_fec": 0,
+          "audio_rs_recovered": 0,
+          "audio_concealed": 1,
+          "audio_late": 1,
+          "audio_silence": 4,
+          "audio_delay_us": 39000,
+          "rx_drops": 0
+        }
+      },
+      "host": {
+        "transport": {
+          "dgramSent": 1279,
+          "dgramTxWire": 1279,
+          "dgramSendBacklog": 0,
+          "dgramRxWire": 531,
+          "dgramRead": 531,
+          "dgramRecvDropsQuic": 0,
+          "dgramRecvDropsShim": 0,
+          "dgramRecvQueued": 0,
+          "sentPackets": 1248,
+          "lostPackets": 0,
+          "lostBytes": 0,
+          "udpTxBytes": 341842,
+          "udpRxBytes": 54322,
+          "eventsDropped": 0,
+          "selectedPath": 0,
+          "pathCount": 1,
+          "closed": false,
+          "pathSelections": 0
+        },
+        "stats": {
+          "frames": 307,
+          "keyframes": 1,
+          "refreshes": 0,
+          "encode_drops": 0,
+          "bytes": 105638,
+          "shards": 312,
+          "nacks": 0,
+          "retransmits": 0,
+          "feedback": 491,
+          "frame_acks": 0,
+          "recovery_requests": 0,
+          "pings": 32,
+          "inputs_applied": 0,
+          "hellos": 1,
+          "malformed": 0,
+          "pacing_bps": 24000000,
+          "rtt_us": 4585,
+          "bitrate_bps": 6000000,
+          "audio_frames": 0,
+          "audio_datagrams": 0,
+          "audio_errors": 0,
+          "rx_drops": 0,
+          "stages": {
+            "capture": {
+              "count": 307,
+              "last": 1000,
+              "p50": 1000,
+              "p99": 3000
+            },
+            "encode": {
+              "count": 307,
+              "last": 14000,
+              "p50": 16000,
+              "p99": 25000
+            },
+            "input": {
+              "count": 0,
+              "last": -1,
+              "p50": -1,
+              "p99": -1
+            }
+          }
+        },
+        "multi": {
+          "frames": 307,
+          "keyframes": 1,
+          "refreshes": 0,
+          "encode_drops": 0,
+          "joins": 1,
+          "leaves": 0,
+          "inputs_dropped": 0,
+          "inputs_applied": 0,
+          "releases": 0,
+          "format_refusals": 0,
+          "members": 1,
+          "owner": 0,
+          "bitrate_bps": 6000000,
+          "audio_frames": 623,
+          "audio_datagrams": 934,
+          "audio_errors": 0
+        },
+        "pairing": {
+          "paired": 1,
+          "failed": 0,
+          "admitted": 1,
+          "refused": 0,
+          "full": 0,
+          "lastFailure": ""
+        },
+        "encoder": {
+          "ltrMarks": 0,
+          "ltrRefreshes": 0,
+          "configured": 1,
+          "frames": 307,
+          "busyDrops": 66,
+          "timeouts": 0,
+          "lateDiscards": 0,
+          "errors": [],
+          "encodeMs": [
+            13,
+            13,
+            14,
+            16,
+            14,
+            14,
+            12,
+            13,
+            14,
+            19,
+            18,
+            12,
+            12
+          ],
+          "queueMax": 0
+        },
+        "audio": {
+          "encoder": "wasm",
+          "frames": 623,
+          "packets": 934,
+          "dropped": 0,
+          "peak": 0.24,
+          "errors": []
+        },
+        "captured": 796,
+        "media": {
+          "routed": 1,
+          "skipped": 0
+        }
+      },
+      "input": {
+        "before": {
+          "x": 480,
+          "y": 270,
+          "r": 18
+        },
+        "after": {
+          "x": 576,
+          "y": 174,
+          "r": 20,
+          "mouse": {
+            "x": 719,
+            "y": 135,
+            "down": false,
+            "clicks": 1,
+            "moves": 7
+          },
+          "wheel": -1,
+          "pad": {
+            "connected": true,
+            "id": "moonsec remote pad (STANDARD GAMEPAD Vendor: 045e Product: 028e)",
+            "a": false,
+            "lx": 0,
+            "ly": 0,
+            "events": 1
+          },
+          "keyCodesSeen": []
+        },
+        "injector": {
+          "keys": 2,
+          "buttons": 2,
+          "moves": 7,
+          "scrolls": 1,
+          "pads": 2,
+          "unknownKeys": 0
+        }
+      },
+      "inputToPhotonMs": {
+        "key": {
+          "n": 20,
+          "min": 32,
+          "p50": 46,
+          "p90": 57,
+          "max": 57
+        },
+        "mouse": {
+          "n": 20,
+          "min": 32,
+          "p50": 41,
+          "p90": 51,
+          "max": 56
+        },
+        "pad": {
+          "n": 20,
+          "min": 31,
+          "p50": 44,
+          "p90": 56,
+          "max": 74
+        }
+      },
+      "hostStages": {
+        "capture": {
+          "count": 512,
+          "last": 2000,
+          "p50": 1000,
+          "p99": 3000
+        },
+        "encode": {
+          "count": 512,
+          "last": 22000,
+          "p50": 19000,
+          "p99": 34000
+        },
+        "input": {
+          "count": 85,
+          "last": -1,
+          "p50": 4778,
+          "p99": 15335
+        }
+      },
+      "clientStages": {
+        "capture": {
+          "count": 0,
+          "last": -1,
+          "p50": -1,
+          "p99": -1
+        },
+        "encode": {
+          "count": 512,
+          "last": 22000,
+          "p50": 19000,
+          "p99": 34000
+        },
+        "network": {
+          "count": 512,
+          "last": 804,
+          "p50": 2234,
+          "p99": 8447
+        },
+        "decode": {
+          "count": 512,
+          "last": 2000,
+          "p50": 2000,
+          "p99": 9000
+        },
+        "present": {
+          "count": 512,
+          "last": 3000,
+          "p50": 2000,
+          "p99": 6000
+        },
+        "total": {
+          "count": 512,
+          "last": 27804,
+          "p50": 26321,
+          "p99": 45219
+        },
+        "input": {
+          "count": 0,
+          "last": -1,
+          "p50": -1,
+          "p99": -1
+        }
+      },
+      "clientFinal": {
+        "drawn": 1541,
+        "failed": 0,
+        "freezes": 0,
+        "lost": 0,
+        "recoveryRequests": 0,
+        "audioFec": 0,
+        "audioRs": 0,
+        "audioConcealed": 1
+      },
+      "hostFinal": {
+        "ltr": false,
+        "ltrMarks": 0,
+        "ltrRefreshes": 0,
+        "refreshes": 0,
+        "frameAcks": 0,
+        "frames": 1541,
+        "keyframes": 1,
+        "bytes": 934737,
+        "nacks": 0,
+        "retransmits": 0,
+        "recovery": 0,
+        "busyDrops": 714,
+        "timeouts": 0,
+        "encodeMs": {
+          "n": 8,
+          "min": 18,
+          "p50": 25,
+          "p90": 36,
+          "max": 36
+        }
+      },
+      "logs": []
+    }
+  ]
+}

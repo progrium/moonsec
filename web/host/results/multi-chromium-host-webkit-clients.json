@@ -1,0 +1,138 @@
+{
+  "host": "chromium",
+  "client": "webkit",
+  "steps": {
+    "pair": {
+      "pairing": {
+        "paired": 2,
+        "failed": 0,
+        "admitted": 2,
+        "refused": 0,
+        "full": 0,
+        "lastFailure": ""
+      },
+      "members": [
+        [
+          "bob",
+          "streaming"
+        ],
+        [
+          "alice",
+          "streaming"
+        ]
+      ],
+      "drawn": [
+        147,
+        152
+      ],
+      "loud": [
+        14378,
+        14853
+      ],
+      "audio": [
+        {
+          "rendered": 40,
+          "paced": 0,
+          "played": 17919,
+          "loud": 14378,
+          "underruns": 96897,
+          "queued": 321,
+          "sampleRate": 48000
+        },
+        {
+          "rendered": 38,
+          "paced": 0,
+          "played": 16959,
+          "loud": 14853,
+          "underruns": 63937,
+          "queued": 321,
+          "sampleRate": 48000
+        }
+      ],
+      "audioStats": [
+        32,
+        35
+      ],
+      "keyframes": 1
+    },
+    "input": {
+      "before": {
+        "x": 480,
+        "y": 270,
+        "pads": 0
+      },
+      "after": {
+        "x": 584,
+        "y": 370,
+        "pads": 2
+      }
+    },
+    "rejoin": {
+      "pairing": {
+        "paired": 2,
+        "failed": 0,
+        "admitted": 3,
+        "refused": 0,
+        "full": 0,
+        "lastFailure": ""
+      },
+      "members": 2,
+      "bobDrawn": [
+        261,
+        359
+      ]
+    },
+    "stranger": {
+      "state": null,
+      "errors": [
+        "pairing failed: the host is not pairing right now"
+      ],
+      "pairing": {
+        "paired": 2,
+        "failed": 1,
+        "admitted": 3,
+        "refused": 0,
+        "full": 0,
+        "lastFailure": "7c37533f: not pairing right now"
+      }
+    },
+    "pin": {
+      "pairing": {
+        "paired": 3,
+        "failed": 1,
+        "admitted": 4,
+        "refused": 0,
+        "full": 0,
+        "lastFailure": "7c37533f: not pairing right now"
+      },
+      "members": [
+        "bob",
+        "alice",
+        "carol"
+      ]
+    },
+    "forget": {
+      "aliceState": null,
+      "errors": [
+        "pairing failed: this device is not paired with the host"
+      ],
+      "pairing": {
+        "paired": 3,
+        "failed": 1,
+        "admitted": 4,
+        "refused": 1,
+        "full": 0,
+        "lastFailure": "7c37533f: not pairing right now"
+      }
+    }
+  },
+  "failures": [],
+  "versions": {
+    "host": "153.0.8010.12",
+    "client": "26.6"
+  },
+  "logs": [
+    "[carol] pairing failed: the host is not pairing right now",
+    "[alice] pairing failed: this device is not paired with the host"
+  ]
+}

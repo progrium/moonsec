@@ -17,9 +17,35 @@ export interface StartMsg {
   /** Stop after this long streaming (0: never). */
   seconds: number;
   /** Dial a host over iroh (shim-web) instead of the WebSocket test transport. */
-  iroh?: { ticket: string; relayUrls: string[]; pkgUrl: string } | null;
+  iroh?: IrohDial | null;
   /** Watch the pixel at (x, y) of each drawn frame and report when it turns light or dark (latency tests). */
   probe?: { x: number; y: number } | null;
+}
+
+/** A host this device paired with (spec/pairing-v0.md): its ID, name and address. */
+export interface PairedHost {
+  hostId: string;
+  hostName: string;
+  addr: string;
+}
+
+/**
+ * Dialing a host over iroh: pair with the `MOONSEC1:` ticket if this device has not paired
+ * with that host yet (the ticket's secret, or a PIN), then ask for a session (admission).
+ */
+export interface IrohDial {
+  ticket: string;
+  relayUrls: string[];
+  /** shim-web's pkg/ (iroh_web.js, iroh_web_bg.wasm, moonsec-pair.wasm). */
+  pkgUrl: string;
+  /** This device's 32-byte endpoint key: its identity, which hosts know it by once paired. */
+  secretKey: Uint8Array | null;
+  /** Hosts this device has paired with. */
+  hosts: PairedHost[];
+  /** The name a host shows for this device. */
+  name: string;
+  /** The host's PIN, for an address ticket (else the page is asked for it). */
+  pin?: string;
 }
 
 /** A probe pixel change: when the frame showing it was drawn (absolute µs) and its new state. */
@@ -40,7 +66,7 @@ export type InputOp =
   | { op: "rel" | "abs"; x: number; y: number; t: number }
   | { op: "pad"; index: number; state: PadState | null; t: number };
 
-export type ToWorker = StartMsg | { type: "close" } | { type: "input"; ops: InputOp[] };
+export type ToWorker = StartMsg | { type: "close" } | { type: "input"; ops: InputOp[] } | { type: "pin"; pin: string };
 
 export interface VideoReport {
   codec: string | null;
@@ -87,7 +113,13 @@ export interface StatsMsg {
   probe: ProbeEvent[];
 }
 
-export type FromWorker = StatsMsg | { type: "error"; message: string };
+export type FromWorker =
+  | StatsMsg
+  | { type: "error"; message: string }
+  /** Pairing with an address ticket: answer with { type: "pin" }. */
+  | { type: "pin-needed"; hostId: string; error: string; attemptsLeft: number }
+  | { type: "paired-host"; host: PairedHost }
+  | { type: "status"; text: string };
 
 /** Worklet -> worker. */
 export interface NeedMsg {

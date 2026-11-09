@@ -5,6 +5,9 @@
 //    redirected to the bus, which feeds the real destination and, once the host starts, a
 //    tap worklet that copies the mix out (tap-worklet.ts). Contexts are created at 48 kHz
 //    unless the game asks for another rate.
+//  - Media elements: every <audio>/<video> (in the document or not) that plays is
+//    remembered, so the host can route its sound into the tapped AudioContext
+//    (host.ts, createMediaElementSource) once hosting starts.
 //  - Gamepads: navigator.getGamepads() also returns the remote clients' pads (virtual
 //    Gamepad objects with the standard mapping) and gamepadconnected/disconnected fire.
 //  - Frames: requestAnimationFrame callbacks are wrapped so a capture runs right after the
@@ -40,6 +43,10 @@ export interface PatchHooks {
   onContext: ((ctx: AudioContext) => void) | null;
   /** AudioNode.connect before the patch (for wiring the tap without the redirect). */
   nativeConnect: (from: AudioNode, to: AudioNode) => void;
+  /** Media elements that have played (weakly held). */
+  media: Set<WeakRef<HTMLMediaElement>>;
+  /** Called when a media element starts playing (the host routes its audio). */
+  onMediaPlay: ((el: HTMLMediaElement) => void) | null;
 }
 
 declare global {
@@ -73,6 +80,8 @@ declare global {
     timerFrames: 0,
     onContext: null,
     nativeConnect: (from, to) => void from.connect(to),
+    media: new Set(),
+    onMediaPlay: null,
   };
   window.__moonsecHost = hooks;
 
@@ -108,6 +117,24 @@ declare global {
       return nativeDisconnect.apply(this, a);
     } as typeof AudioNode.prototype.disconnect;
   }
+
+  // --- media elements -------------------------------------------------------------------
+  // play() covers elements made with `new Audio()` and never put in the document; the
+  // capturing "play" listener covers autoplay and the built-in controls.
+  const seen = new WeakSet<HTMLMediaElement>();
+  const onPlay = (el: HTMLMediaElement) => {
+    if (!seen.has(el)) {
+      seen.add(el);
+      hooks.media.add(new WeakRef(el));
+    }
+    hooks.onMediaPlay?.(el);
+  };
+  const nativePlay = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function (this: HTMLMediaElement) {
+    onPlay(this);
+    return nativePlay.call(this);
+  };
+  document.addEventListener("play", (e) => e.target instanceof HTMLMediaElement && onPlay(e.target), true);
 
   // --- gamepads ----------------------------------------------------------------------------
   const nativeGetGamepads = navigator.getGamepads?.bind(navigator);

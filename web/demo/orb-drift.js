@@ -23,6 +23,7 @@
     mouse: { x: W / 2, y: H / 2, down: false, clicks: 0, moves: 0 },
     wheel: 0,
     pad: { connected: false, id: "", a: false, lx: 0, ly: 0, events: 0 },
+    pads: 0,
     pulses: [],
     orbs: [],
     sounds: 0,
@@ -38,7 +39,8 @@
   const drone = ac.createOscillator();
   drone.frequency.value = 440;
   const droneGain = ac.createGain();
-  droneGain.gain.value = 0.15;
+  // ?drone=0 silences it (the media element test listens for another sound).
+  droneGain.gain.value = new URLSearchParams(location.search).get("drone") === "0" ? 0 : 0.15;
   drone.connect(droneGain).connect(master);
   drone.start();
   window.addEventListener("pointerdown", () => ac.resume(), { once: true });
@@ -120,6 +122,7 @@
     if (k.has("ArrowDown") || k.has("KeyS")) dy += 1;
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     const gp = Array.from(pads).find((p) => p && p.connected);
+    state.pads = Array.from(pads).filter((p) => p && p.connected).length;
     state.pad.connected = !!gp;
     state.pad.a = false;
     if (gp) {

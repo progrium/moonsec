@@ -10,6 +10,8 @@
       #video { max-width: 100%; max-height: 100%; background: #000; }
       #overlay { position: absolute; top: 8px; left: 8px; margin: 0; padding: 6px 8px; background: rgba(0, 0, 0, 0.6); white-space: pre; pointer-events: none; }
       #overlay[data-relayed="true"]::after { content: "relayed"; margin-left: 8px; padding: 0 4px; background: #b36b00; color: #fff; }
+      #pin { position: absolute; padding: 12px; background: #222; }
+      #pin input, #pin button { font: inherit; padding: 6px; }
       #start { position: absolute; padding: 12px 20px; font: inherit; }
     </style>
   </head>
@@ -18,6 +20,7 @@
       <canvas id="video" width="640" height="360"></canvas>
       <pre id="overlay"></pre>
       <button id="start">Connect</button>
+      <form id="pin" hidden><div id="pin-msg"></div><input inputmode="numeric" autocomplete="one-time-code" placeholder="123 456" /> <button>Pair</button></form>
     </div>
     <script type="module" src="dist/client-page.js"></script>
   </body>

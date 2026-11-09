@@ -1,6 +1,6 @@
 # web: browser client
 
-(The browser *host* spike, a tab streaming a canvas game to other clients, is in
+(The browser *host*, a tab streaming a canvas game to other clients, with pairing and several viewers, is in
 [host/README.md](host/README.md).)
 
 TypeScript glue around the Zig core compiled to wasm32 (docs/design.md, "Web client").
@@ -17,7 +17,7 @@ src/input/core.ts       the core's input sender (core/input/wasm.zig) from JS
 src/input/capture.ts    DOM, Pointer Lock, Keyboard Lock, Gamepad API -> core input calls
 src/input/hid.ts        KeyboardEvent.code -> USB HID usage
 src/input/gamepad.ts    Gamepad API -> core.input.Gamepad (XInput button order)
-src/host/               browser host spike: a canvas game streamed from a tab (host/README.md)
+src/host/               browser host: a canvas game streamed from a tab (host/README.md)
 host.html, demo/        the browser host's demo page and game
 e2e/                    Playwright harness, stub host, Safari (safaridriver) runner,
                         media-host.mjs (a real host behind a WebSocket bridge), media.spec.ts

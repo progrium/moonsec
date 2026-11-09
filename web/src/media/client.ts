@@ -2,7 +2,7 @@
 // worklet, and the overlay. Everything else (core, transport, decode, draw) runs in the
 // worker; see worker.ts.
 
-import type { FromWorker, InputOp, StatsMsg, ToWorker } from "./protocol";
+import type { FromWorker, InputOp, IrohDial, PairedHost, StatsMsg, ToWorker } from "./protocol";
 import { InputCapture, type InputSink, type MouseMode } from "../input/index";
 import type { PadState } from "../input/gamepad";
 import { renderOverlay } from "./overlay";
@@ -21,8 +21,14 @@ export interface ClientOptions {
   input?: HTMLElement | false;
   mouseMode?: MouseMode;
   onError?: (message: string) => void;
-  /** Dial a browser or native host over iroh instead of `wsUrl`. */
-  iroh?: { ticket: string; relayUrls: string[]; pkgUrl: string };
+  /** Dial a browser or native host over iroh instead of `wsUrl` (pairing first if needed). */
+  iroh?: IrohDial;
+  /** Pairing with an address ticket needs the host's PIN: resolve with what the person typed. */
+  onPin?: (info: { hostId: string; error: string; attemptsLeft: number }) => Promise<string>;
+  /** This device paired with a host: keep it (and the device's key) for later sessions. */
+  onPaired?: (host: PairedHost) => void;
+  /** "pairing", "connecting". */
+  onStatus?: (text: string) => void;
   probe?: { x: number; y: number };
 }
 
@@ -95,11 +101,32 @@ export class WebClient {
       audioPort = ch.port2;
       // Firefox without an audio device never finishes resuming; closing then rejects this.
       ctx.resume().catch(() => {});
+      // WebKit can start a context "interrupted" (its audio session was not granted yet) or
+      // interrupt it later; it does not come back by itself. Resume it, and again on the
+      // next gesture.
+      const revive = () => {
+        const st = ctx.state as string;
+        if (st === "interrupted" || st === "suspended") ctx.resume().catch(() => {});
+      };
+      let tries = 0;
+      const poll = setInterval(() => {
+        if ((ctx.state as string) === "closed" || ++tries > 50) return clearInterval(poll);
+        revive();
+      }, 200);
+      for (const t of ["pointerdown", "keydown"]) addEventListener(t, revive, { capture: true });
       c.audioContext = ctx;
     }
     worker.onmessage = (ev: MessageEvent<FromWorker>) => {
       const m = ev.data;
       if (m.type === "error") return o.onError?.(m.message);
+      if (m.type === "paired-host") return o.onPaired?.(m.host);
+      if (m.type === "status") return o.onStatus?.(m.text);
+      if (m.type === "pin-needed") {
+        const { type: _t, ...info } = m;
+        if (!o.onPin) return o.onError?.("this host needs its PIN to pair (an address ticket)");
+        void o.onPin(info).then((pin) => worker.postMessage({ type: "pin", pin } satisfies ToWorker));
+        return;
+      }
       c.last = m;
       if (o.overlay) renderOverlay(o.overlay, m);
       o.onStats?.(m);
