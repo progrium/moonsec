@@ -1,26 +1,29 @@
-# Browser host (spike)
+# Browser host
 
-A browser tab as a moonsec host: an HTML5 canvas game streams its canvas and audio to
-remote clients, and their keyboard, mouse and gamepad input comes back into the page. The
-same core runs as on native hosts (`app/host_session.zig` and the Opus stage, in wasm). The
-transport is iroh in the browser (shim-web, PR #33), and the client is the web client
-(PRs #32 and #34) dialing over iroh.
+A browser tab as a moonsec host: an HTML5 canvas game (or a video) streams its picture and
+sound to remote clients, and their keyboard, mouse and gamepad input comes back into the
+page. The same core runs as on native hosts: the multi-user host (`app/multi_host.zig`, one
+encode fanned out to every member), the Opus stage and the pairing exchange (`core/pair`),
+all in wasm. The transport is iroh in the browser (shim-web), and the clients are web
+clients (or any moonsec client) dialing over iroh.
 
-Status: spike. It works end to end in headless Chromium through a local relay, including
-the game's audio and gamepads. It has no admission or pairing yet, so anyone with the ticket
-can connect. Only Chromium has been tried.
+Status: works end to end through a local relay with Chromium, Firefox and WebKit as host
+and as clients (Playwright builds on Linux; real Safari not tried). Only paired devices get
+a session, several can watch and play at once, and `<audio>`/`<video>` sound streams along
+with the game's Web Audio.
 
 ```
-host tab                                                  client tab
+host tab                                                  client tabs
 ┌──────────────────────────────────────────┐              ┌──────────────────────────┐
 │ host-patch.js (first in <head>)           │              │ client.html (web client) │
-│   AudioContext tap bus, virtual pads,     │              │ InputCapture -> worker   │
-│   rAF hook (+ timer when rAF stops)       │              │ worker: core (client),   │
-│ game (any canvas game, untouched)         │              │   WebCodecs decode,      │
-│ host.js: VideoFrame(canvas) per game      │   iroh over  │   iroh (shim-web)        │
-│   frame -> worker; actions -> DOM events  │◄── relay ───►│ AudioWorklet sink        │
-│ host-worker.js: core (host session +      │              └──────────────────────────┘
-│   Opus) in wasm, VideoEncoder,            │
+│   AudioContext tap bus, media elements,   │              │ pairing (pair.js + core/ │
+│   virtual pads, rAF hook (+ timer)        │              │   pair in wasm), then    │
+│ game (any canvas game, untouched)         │              │   admission              │
+│ host.js: VideoFrame(canvas) per game      │   iroh over  │ InputCapture -> worker   │
+│   frame -> worker; actions -> DOM events  │◄── relay ───►│ worker: core (client),   │
+│   per member; identity + allowlist        │              │   WebCodecs decode, iroh │
+│ host-worker.js: core in wasm (multi host  │              │ AudioWorklet sink        │
+│   + Opus + pairing), VideoEncoder,        │              └──────────────────────────┘
 │   AudioEncoder or libopus, iroh accept    │
 │ host-tap.js (AudioWorklet): mix -> worker │
 └──────────────────────────────────────────┘
@@ -28,15 +31,18 @@ host tab                                                  client tab
 
 | Path | What it is |
 | --- | --- |
-| [`app/web_host.zig`](../../app/web_host.zig) | The host session and the host Opus stage behind a C ABI (`mh_*`), `zig-out/web/moonsec-host.wasm` |
-| [`app/web_pipe.zig`](../../app/web_pipe.zig) | The JS-backed `PacketPipe`, shared with the client's `app/web.zig` |
-| [`src/host/patch.ts`](../src/host/patch.ts) | Page patches loaded before the game: AudioContext tap, `navigator.getGamepads`, rAF hook |
-| [`src/host/host.ts`](../src/host/host.ts) | `BrowserHost.start({canvas, relayUrls})`: capture, worker, injection |
-| [`src/host/worker.ts`](../src/host/worker.ts) | Core, iroh endpoint (accepts one client at a time), WebCodecs video and audio encode, LTR on reference buffers |
-| [`src/host/inject.ts`](../src/host/inject.ts) | Actions to synthetic key, pointer, mouse and wheel events, and virtual gamepads |
-| [`src/host/tap-worklet.ts`](../src/host/tap-worklet.ts) | AudioWorklet that copies the game's mix to the worker |
-| [`host.html`](../host.html), [`demo/orb-drift.js`](../demo/orb-drift.js) | The demo: a small original canvas game with Web Audio, keys, mouse, wheel and gamepad |
-| [`e2e/browser-host.mjs`](../e2e/browser-host.mjs) | End-to-end run: relay, host tab, client tab, checks and latency |
+| [`app/web_host.zig`](../../app/web_host.zig) | The multi-user host, the host Opus stage and the host side of pairing and admission behind a C ABI (`mh_*`), `zig-out/web/moonsec-host.wasm` |
+| [`app/web_pipe.zig`](../../app/web_pipe.zig) | The JS-backed `PacketPipe`, shared with the client's `app/web.zig` (one per member on the host) |
+| [`src/host/patch.ts`](../src/host/patch.ts) | Page patches loaded before the game: AudioContext tap, media element hook, `navigator.getGamepads`, rAF hook |
+| [`src/host/host.ts`](../src/host/host.ts) | `BrowserHost.start({canvas, relayUrls})`: capture, identity and allowlist, invites, media elements, injection |
+| [`src/host/worker.ts`](../src/host/worker.ts) | Core, iroh endpoint (pairing and admission on each connection, members), WebCodecs video and audio encode, LTR on reference buffers |
+| [`src/host/inject.ts`](../src/host/inject.ts) | Actions to synthetic key, pointer, mouse and wheel events, and virtual gamepads, per member |
+| [`src/host/tap-worklet.ts`](../src/host/tap-worklet.ts) | AudioWorklet that copies the page's mix to the worker |
+| [`host.html`](../host.html), [`demo/orb-drift.js`](../demo/orb-drift.js) | The demo: a small original canvas game with Web Audio, keys, mouse, wheel and gamepad; the invite (link, QR code, PIN) and paired devices |
+| [`src/media/worker.ts`](../src/media/worker.ts) (`dialIroh`) | The web client's side: pair with a `MOONSEC1:` ticket if needed, then ask for a session |
+| [`e2e/browser-host.mjs`](../e2e/browser-host.mjs) | End-to-end run per browser: relay, host tab, client tab, checks and latency |
+| [`e2e/browser-host-multi.mjs`](../e2e/browser-host-multi.mjs) | Pairing and several viewers: invite link, two players at once, leave and rejoin, a stranger refused, PIN pairing, forgetting a device |
+| [`e2e/host-lab.mjs`](../e2e/host-lab.mjs) | What both share: the relay, the static server, browser launch options |
 | [`e2e/webcodecs-caps.mjs`](../e2e/webcodecs-caps.mjs) | What this Chromium's WebCodecs can do (encoders, scalability, reference buffers) |
 | [`results/`](results) | Raw JSON of the runs below |
 
@@ -44,24 +50,89 @@ host tab                                                  client tab
 
 ```sh
 zig build web-wasm                    # zig-out/web/moonsec-host.wasm, moonsec-client.wasm
-shim-web/build.sh                     # shim-web/pkg (iroh in the browser)
-cd web && npm ci && npm run build && cd ..
-node web/e2e/browser-host.mjs --variants default,webcodecs-audio,stream,av1,loss,loss-av1,loss-ltr-av1
+shim-web/build.sh                     # shim-web/pkg (iroh in the browser, moonsec-pair.wasm)
+cd web && npm ci && npm run build && npx playwright install chromium firefox webkit && cd ..
+node web/e2e/browser-host.mjs --variants default,webcodecs-audio,stream,av1,loss,loss-av1,loss-ltr-av1,media
+node web/e2e/browser-host.mjs --browser firefox --variants default,media     # or webkit
+node web/e2e/browser-host-multi.mjs --host chromium --client firefox          # any pair
 xvfb-run -a node web/e2e/browser-host.mjs --variants background --headed
 ```
 
-`browser-host.mjs` starts `iroh-relay` with `relay/lab.toml`, serves `web/` (plus the wasm and
-`shim-web/pkg`), and opens the host and the client in separate browser contexts.
+Firefox plays audio only through PulseAudio; on a machine without a sound server, start one
+with a null sink first (`pulseaudio --start; pactl load-module module-null-sink
+sink_name=harness; pactl set-default-sink harness`), as `.github/workflows/web.yml` does.
+
+The scripts start `iroh-relay` with `relay/lab.toml`, serve `web/` (plus the wasm and
+`shim-web/pkg`), and open the host and each client in its own browser context.
 
 By hand, with a relay the browsers trust, serve `web/` the same way and open
-`host.html?relay=https://your-relay`, then click **Start hosting**. The panel prints a
-`client.html?ticket=…` link to open anywhere. Host query options are `audioenc=wasm|webcodecs`,
+`host.html?relay=https://your-relay`, then click **Start hosting**. The panel shows an
+invite: a `client.html?ticket=MOONSEC1:…` link and its QR code (open it on the device to
+pair), and a PIN for the address link. **Invite a device** opens another window. Host query
+options are `invite=N` (devices the first window pairs, 0 for none), `input=everyone|owner|view`,
+`max`, `media=1` (also play a looping tone in an `<audio>` element), `audioenc=wasm|webcodecs`,
 `capture=raf|stream`, `codec=h264,av1`, `bitrate`, `fps` and `ltr=0`, plus the test-only
-`loss` and `outage`. On the client, `mouse=absolute` and `probe` are useful.
+`loss` and `outage`. On the client, `pin`, `name`, `mouse=absolute` and `probe` are useful.
 
 To host another game, put `<script src="dist/host-patch.js"></script>` first in its
-`<head>`, then call `BrowserHost.start({ canvas, relayUrls })` from a click. The game itself
-needs no changes.
+`<head>`, then call `BrowserHost.start({ canvas, relayUrls })` from a click, and
+`host.invite()` to let a device pair. The game itself needs no changes.
+
+## Pairing and admission
+
+The browser host follows spec/pairing-v0.md like a native host, with the same code: the
+exchange, tickets, PINs (CPace) and admission run in `core/pair` inside moonsec-host.wasm,
+and the web client runs the client side in moonsec-pair.wasm (shim-web/js/pair.js).
+
+- **Identity.** The host's endpoint key is its identity. `BrowserHost` keeps it in
+  `localStorage` (`moonsec.host.key`), so the host's ID, and with it every pairing,
+  survives reloads. `secretKey` and `storage` override that.
+- **Invites.** `host.invite({ seconds, pairings, attempts, secret, pin })` opens a pairing
+  window (120 s, 1 device, 5 wrong guesses by default). The report's `invite` has a QR
+  ticket with the window's one-time secret (shown as a link and a QR code, made by
+  `core/pair/qr.zig`) and a six-digit PIN for the address ticket. Every connection's first
+  stream is either a pairing exchange or `admit`; outside a window, a pairing attempt hears
+  "not pairing right now".
+- **Allowlist.** Paired devices go to `localStorage` (`moonsec.host.clients`), with a name
+  and whether their input applies. Each `admit` checks it. `host.forget(id)` removes a device
+  and ends its session at once; `host.setInput(id, false)` makes it view only from its next
+  session; `host.kick(id)` ends a session but leaves the device paired.
+- **Client.** `client.html?ticket=MOONSEC1:…` pairs with the ticket's secret (or asks for the
+  PIN, or takes `?pin=`) unless this browser already paired with that host, then connects,
+  checks the host's ID against the ticket and asks for a session. Its key and paired hosts
+  are in `localStorage` (`moonsec.client.key`, `moonsec.client.hosts`). Two tabs of one
+  browser profile share that key, so the host sees them as one device.
+- The host's storage is the hosted page's storage: the game can read the host's key and
+  allowlist. Host only games you trust with that.
+
+## Several viewers
+
+Admitted clients are members of one multi-user session (spec/multi-user-v0.md), the same
+`MultiHost` the C ABI uses for `max_clients > 1`: one capture and one encode; each member
+has its own pipe, pacing, NACK retransmits, rate estimate, clock and input stream. A
+recovery request from any member makes the next frame a keyframe for all (with long-term
+references, only references every member acked are used). A member that joins mid-stream
+gets a keyframe. The session starts with the first member and ends with the last, and its
+wasm instance goes with it (members are never freed inside a `MultiHost`, so a long session
+holds the state of every member that left until it ends).
+
+Input follows the roster's policy. The browser host's default is `everyone`, since a
+hosted game is usually something to play together: every member's keys, buttons and pads
+apply. A key is down on the page while any member holds it, each member's gamepads get
+virtual pad slots of their own (up to the page's 4), and a member that leaves has everything
+it held released. `owner` (one member at a time, as on native hosts) and `view` are options.
+The web client has no control channel yet, so under `owner` it cannot ask for or hand on
+input: the first member that may control holds it until it leaves.
+
+## Media elements
+
+The patch remembers every `<audio>` and `<video>` element that plays, in the document or not
+(`new Audio()`), and once hosting starts their sound is routed into the tapped AudioContext
+with `createMediaElementSource`, so it streams and still plays on the host. A page with no
+AudioContext gets one for this. Cross-origin media without CORS (no `crossorigin`
+attribute) is left alone: Web Audio would only get silence from it, and it would go quiet
+on the host too. Elements fed by a `MediaStream` are left alone as well. `mediaElements:
+false` turns this off. A `<video>` element can also be the picture: pass it as `canvas`.
 
 ## Results
 

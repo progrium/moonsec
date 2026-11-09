@@ -10,16 +10,20 @@
       html, body { margin: 0; background: #000; color: #eee; font: 13px/1.4 ui-monospace, monospace; }
       main { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px; }
       #game { max-width: 100%; background: #000; }
-      #panel { width: 960px; max-width: 100%; white-space: pre-wrap; word-break: break-all; }
-      #panel a { color: #8cf; }
+      #panel, #invite, #devices { width: 960px; max-width: 100%; white-space: pre-wrap; word-break: break-all; }
+      pre a { color: #8cf; }
+      #invite canvas { display: block; margin: 6px 0; image-rendering: pixelated; }
+      #devices button { padding: 2px 8px; margin-left: 4px; }
       button { font: inherit; padding: 8px 16px; }
     </style>
   </head>
   <body>
     <main>
       <canvas id="game" width="960" height="540" tabindex="0"></canvas>
-      <button id="start">Start hosting</button>
+      <div><button id="start">Start hosting</button> <button id="invite-btn" hidden>Invite a device</button></div>
+      <pre id="invite"></pre>
       <pre id="panel"></pre>
+      <pre id="devices"></pre>
     </main>
     <script src="demo/orb-drift.js"></script>
     <script type="module" src="dist/host-page.js"></script>

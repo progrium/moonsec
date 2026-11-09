@@ -3,6 +3,10 @@
 // their canvas, wheel events and navigator.getGamepads(); all of those are covered. What a
 // synthetic event cannot do: it has isTrusted false, so it cannot start Pointer Lock,
 // fullscreen, audio playback or a popup (the browser wants a real user gesture for those).
+//
+// Several members can play at once (the "everyone" input policy): a key or button is down
+// on the page while any member holds it, each member's gamepads get virtual pad slots of
+// their own, and a member who leaves has everything it held released.
 
 import { codeForUsage } from "../input/hid";
 import { Button } from "../input/gamepad";
@@ -55,6 +59,8 @@ function keyFor(code: string, shift: boolean): { key: string; keyCode: number } 
   return { key, keyCode: legacyKeyCodes[code] ?? 0 };
 }
 
+const usageFor = (code: string) => [...Array(0xe8).keys()].find((u) => codeForUsage(u) === code);
+
 export interface InjectorStats {
   keys: number;
   buttons: number;
@@ -69,11 +75,17 @@ export class Injector {
   x = 0;
   y = 0;
   private held = new Set<string>();
+  /** Who holds each key that is down. */
+  private keyOwners = new Map<string, Set<number>>();
   private buttons = 0;
+  /** Mouse buttons each member holds (MouseEvent.buttons bits). */
+  private memberButtons = new Map<number, number>();
+  /** "member:index" to a virtual pad slot. */
+  private padSlots = new Map<string, number>();
   private downTarget: Element | null = null;
   stats: InjectorStats = { keys: 0, buttons: 0, moves: 0, scrolls: 0, pads: 0, unknownKeys: 0 };
 
-  constructor(private canvas: HTMLCanvasElement) {
+  constructor(private canvas: HTMLElement) {
     const r = canvas.getBoundingClientRect();
     this.x = r.left + r.width / 2;
     this.y = r.top + r.height / 2;
@@ -82,9 +94,9 @@ export class Injector {
   apply(a: Action): void {
     switch (a.kind) {
       case "key":
-        return this.key(a.code, a.down);
+        return this.key(a.code, a.down, a.from);
       case "button":
-        return this.button(a.code, a.down);
+        return this.button(a.code, a.down, a.from);
       case "scroll":
         return this.wheel(a.dx, a.dy);
       case "motion":
@@ -110,11 +122,23 @@ export class Injector {
     };
   }
 
-  private key(usage: number, down: boolean) {
+  /** `from` 0 is the host releasing a key for whoever held it (input changed hands). */
+  private key(usage: number, down: boolean, from: number) {
     const code = codeForUsage(usage);
     if (!code) {
       this.stats.unknownKeys++;
       return;
+    }
+    const owners = this.keyOwners.get(code) ?? new Set<number>();
+    if (down) {
+      owners.add(from);
+      this.keyOwners.set(code, owners);
+    } else {
+      if (from === 0) owners.clear();
+      else owners.delete(from);
+      // Another member still holds it: the page keeps seeing it down.
+      if (owners.size > 0) return;
+      this.keyOwners.delete(code);
     }
     const repeat = down && this.held.has(code);
     if (down) this.held.add(code);
@@ -170,10 +194,15 @@ export class Injector {
     this.stats.moves++;
   }
 
-  private button(code: number, down: boolean) {
+  private button(code: number, down: boolean, from: number) {
     const b = domButton[code];
     if (b === undefined) return;
     const bit = buttonsBit[b];
+    if (from === 0 && !down) for (const [k, v] of this.memberButtons) this.memberButtons.set(k, v & ~bit);
+    else this.memberButtons.set(from, down ? (this.memberButtons.get(from) ?? 0) | bit : (this.memberButtons.get(from) ?? 0) & ~bit);
+    let any = 0;
+    for (const v of this.memberButtons.values()) any |= v;
+    if (!down && (any & bit) !== 0) return; // another member still holds it
     if (down === ((this.buttons & bit) !== 0)) return;
     const t = down ? this.target() : (this.downTarget ?? this.target());
     if (down) {
@@ -198,12 +227,33 @@ export class Injector {
     this.stats.scrolls++;
   }
 
+  /** The virtual pad slot for a member's pad `index`, allocated on first use (null when all are taken). */
+  private padSlot(from: number, index: number, alloc: boolean): number | null {
+    const hooks = window.__moonsecHost;
+    const key = `${from}:${index}`;
+    const have = this.padSlots.get(key);
+    if (have !== undefined || !alloc) return have ?? null;
+    const used = new Set(this.padSlots.values());
+    for (let i = 0; i < hooks.pads.length; i++) {
+      if (!used.has(i) && !hooks.pads[i]) {
+        this.padSlots.set(key, i);
+        return i;
+      }
+    }
+    return null;
+  }
+
   private pad(a: Extract<Action, { kind: "pad" }>) {
     const hooks = window.__moonsecHost;
-    if (!hooks || a.index >= hooks.pads.length) return;
+    if (!hooks) return;
+    const slot = this.padSlot(a.from, a.index, a.connected);
+    if (slot === null) return;
     this.stats.pads++;
-    if (!a.connected) return hooks.setPad(a.index, null);
-    const prev = hooks.pads[a.index];
+    if (!a.connected) {
+      this.padSlots.delete(`${a.from}:${a.index}`);
+      return hooks.setPad(slot, null);
+    }
+    const prev = hooks.pads[slot];
     const axis = (v: number) => (v < 0 ? v / 32768 : v / 32767);
     const trig = (v: number) => v / 65535;
     const buttons = standardBits.map((bit, i) => {
@@ -212,7 +262,7 @@ export class Injector {
     });
     const pad: VirtualPad = {
       id: "moonsec remote pad (STANDARD GAMEPAD Vendor: 045e Product: 028e)",
-      index: a.index,
+      index: slot,
       connected: true,
       mapping: "standard",
       timestamp: performance.now(),
@@ -224,16 +274,36 @@ export class Injector {
     };
     // A fresh object each update, like Chromium's snapshots; keep the slot's index.
     if (prev) pad.index = prev.index;
-    hooks.setPad(a.index, pad);
+    hooks.setPad(slot, pad);
   }
 
-  /** Release everything held (the client left). */
+  /** Release everything member `from` held (it left). */
+  releaseMember(from: number) {
+    for (const [code, owners] of [...this.keyOwners]) {
+      if (!owners.has(from)) continue;
+      const usage = usageFor(code);
+      if (usage !== undefined) this.key(usage, false, from);
+    }
+    const bits = this.memberButtons.get(from) ?? 0;
+    for (const c of [1, 2, 3, 4, 5]) if (bits & buttonsBit[domButton[c]]) this.button(c, false, from);
+    this.memberButtons.delete(from);
+    const hooks = window.__moonsecHost;
+    for (const [key, slot] of [...this.padSlots]) {
+      if (!key.startsWith(`${from}:`)) continue;
+      this.padSlots.delete(key);
+      hooks?.setPad(slot, null);
+    }
+  }
+
+  /** Release everything held (the session ended). */
   releaseAll() {
     for (const code of [...this.held]) {
-      const usage = [...Array(0xe8).keys()].find((u) => codeForUsage(u) === code);
-      if (usage !== undefined) this.key(usage, false);
+      const usage = usageFor(code);
+      if (usage !== undefined) this.key(usage, false, 0);
     }
-    for (const c of [1, 2, 3, 4, 5]) if (this.buttons & buttonsBit[domButton[c]]) this.button(c, false);
+    for (const c of [1, 2, 3, 4, 5]) if (this.buttons & buttonsBit[domButton[c]]) this.button(c, false, 0);
+    this.memberButtons.clear();
+    this.padSlots.clear();
     const hooks = window.__moonsecHost;
     if (hooks) for (let i = 0; i < hooks.pads.length; i++) if (hooks.pads[i]) hooks.setPad(i, null);
   }

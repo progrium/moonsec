@@ -410,8 +410,8 @@ pub fn build(b: *std.Build) void {
         web_wasm.wasi_exec_model = .reactor;
         const install_wasm = b.addInstallArtifact(web_wasm, .{ .dest_dir = .{ .override = .{ .custom = "web" } } });
         web_step.dependOn(&install_wasm.step);
-        // The browser host (spike, web/host/README.md): the host session and the host end of
-        // the audio stage, zig-out/web/moonsec-host.wasm.
+        // The browser host (web/host/README.md): the multi-user host, the host end of the
+        // audio stage and the host side of pairing, zig-out/web/moonsec-host.wasm.
         const host_wasm = b.addExecutable(.{ .name = "moonsec-host", .root_module = b.createModule(.{
             .root_source_file = b.path("app/web_host.zig"),
             .target = wasm_wasi,
