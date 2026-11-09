@@ -137,7 +137,7 @@ test "runtime: init hook runs on the shim thread, second init fails, version and
     try std.testing.expect(hook_ran.load(.acquire));
     if (builtin.os.tag == .linux) try std.testing.expect(hook_pinned.load(.acquire));
     try std.testing.expectError(error.Invalid, iroh.init(null, null));
-    try std.testing.expectEqual(@as(u32, 0x000200), iroh.version());
+    try std.testing.expectEqual(@as(u32, 0x000201), iroh.version());
     // The shim clock ticks in microseconds at the same rate as Zig's monotonic clock.
     const z0 = std.Io.Clock.awake.now(std.testing.io);
     const a = iroh.nowUs();

@@ -4,6 +4,11 @@
 const core = @import("root.zig");
 const proto = core.proto;
 
+comptime {
+    // Input sender ABI for the web client (web/src/input).
+    _ = @import("input/wasm.zig");
+}
+
 /// Parses one datagram; returns its stream ID, or 0 if it does not parse.
 export fn moonsec_proto_stream(ptr: [*]const u8, len: usize) u8 {
     const m = proto.decode(ptr[0..len]) catch return 0;
@@ -40,4 +45,27 @@ export fn moonsec_proto_encode_feedback(ptr: [*]u8, cap: usize, seq: u32, base_s
     for (arrivals[0..n], tmp[0..n]) |a, *t| t.* = if (a == 0) null else a;
     const out = proto.encodeFeedback(ptr[0..cap], seq, .{ .feedback_seq = 0, .base_seq = base_seq, .ref_time_us = ref_us, .arrivals = tmp[0..n] }) catch return 0;
     return out.len;
+}
+
+/// Feeds stream bytes to a fresh client control channel and returns the number of events
+/// they produce (analyzes the control channel for wasm32; the real ABI comes with 6B).
+export fn moonsec_control_events(ptr: [*]const u8, len: usize) u32 {
+    var mem: [1 << 16]u8 = undefined;
+    var fba = @import("std").heap.FixedBufferAllocator.init(&mem);
+    const gpa = fba.allocator();
+    var clip = core.control.Clipboard.init(.client, .{ .max_text = 4096 });
+    var ch = core.control.Channel.init(gpa, .{ .role = .client, .max_message = 1 << 16 }, &clip) catch return 0;
+    ch.receive(ptr[0..len]) catch return 0;
+    var n: u32 = 0;
+    while (ch.poll() catch return n) |_| n += 1;
+    return n;
+}
+
+/// Parses a multi-user roster message body; returns 1 if it gives this client input, 0 if
+/// not, -1 if it does not parse.
+export fn moonsec_multi_roster_have_input(ptr: [*]const u8, len: usize) i32 {
+    var v: core.multi.View = .{};
+    v.onRoster(ptr[0..len]);
+    if (!v.have) return -1;
+    return @intFromBool(v.haveInput());
 }

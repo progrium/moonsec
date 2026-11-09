@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>moonsec web harness</title>
+<style>
+  html, body { margin: 0; background: #111; color: #ddd; font: 12px ui-monospace, monospace; }
+  #stream { position: relative; width: 640px; height: 360px; background: #000; outline: none; }
+  #stream canvas { width: 100%; height: 100%; display: block; }
+  #log { padding: 8px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="stream" tabindex="0"><canvas id="video" width="320" height="180"></canvas></div>
+<div id="log"></div>
+<script type="module" src="/dist/harness.js"></script>
+</body>
+</html>

@@ -9,6 +9,7 @@ const api = @import("platform");
 const simnet = @import("simnet");
 const synthetic = @import("synthetic");
 const apps = @import("apps.zig");
+const clipboard = @import("clipboard");
 pub const pathsim = @import("pathsim.zig");
 
 const Micros = i64;
@@ -68,6 +69,50 @@ pub const Options = struct {
     path: ?pathsim.Config = null,
     /// Host and client session settings that differ from the defaults.
     pause_on_stall: bool = true,
+    /// Coded formats the synthetic encoder and decoder offer, the host's preferences, the
+    /// host display's HDR mode and the client display (format negotiation, platform/format.zig).
+    encoder_formats: api.Formats = api.Formats.all,
+    decoder_formats: api.Formats = api.Formats.all,
+    yuv444: bool = false,
+    ten_bit: bool = false,
+    hdr: bool = true,
+    hdr_source: ?api.HdrMetadata = null,
+    client_display: api.DisplayCaps = .{},
+    /// Run the control channel with in-memory clipboards and this script of copies; the
+    /// outcome is written back into it.
+    clipboard: ?*ClipScript = null,
+};
+
+/// Copies made on either side during a run, and what each clipboard held at the end.
+pub const ClipScript = struct {
+    copies: []const Copy = &.{},
+    /// Initial content of each side's clipboard (seeded, not sent).
+    host_start: []const u8 = "",
+    client_start: []const u8 = "",
+    // Results.
+    host_text: [4096]u8 = undefined,
+    host_len: usize = 0,
+    client_text: [4096]u8 = undefined,
+    client_len: usize = 0,
+    /// Writes of the peer's copies into each side's clipboard.
+    host_writes: u64 = 0,
+    client_writes: u64 = 0,
+    /// Copies each side sent, and echoes it suppressed.
+    host_sent: u64 = 0,
+    client_sent: u64 = 0,
+    echoes: u64 = 0,
+    /// Control channels that came up (a reconnect brings up a new one).
+    host_ups: u64 = 0,
+    client_ups: u64 = 0,
+
+    pub const Copy = struct { at_us: Micros, client: bool, text: []const u8 };
+
+    pub fn host(c: *const ClipScript) []const u8 {
+        return c.host_text[0..c.host_len];
+    }
+    pub fn client(c: *const ClipScript) []const u8 {
+        return c.client_text[0..c.client_len];
+    }
 };
 
 pub const Result = struct {
@@ -86,6 +131,8 @@ pub const Result = struct {
         reconnects: u64 = 0,
         stall_pauses: u64 = 0,
         stall_frames: u64 = 0,
+        /// What the hello negotiated.
+        format: api.VideoFormat = .{},
         end: []const u8,
     },
     client: struct {
@@ -104,6 +151,9 @@ pub const Result = struct {
         path_changes: u64 = 0,
         reconnects: u64 = 0,
         reconnect_requests: u64 = 0,
+        /// The format in the config the client got, and frames presented in another colour space.
+        format: api.VideoFormat = .{},
+        wrong_color: u64 = 0,
         end: []const u8,
     },
     sim_losses: u64,
@@ -142,6 +192,8 @@ pub const Result = struct {
         if (r.client.freezes > 0) return "the freeze detector saw a freeze";
         if (r.client.unreadable > 0) return "a presented frame's pattern did not read back";
         if (r.client.corrupt > 0) return "the decoder saw a corrupt access unit";
+        if (r.client.wrong_color > 0) return "a presented frame was in another colour space than the config";
+        if (!r.client.format.eql(r.host.format)) return "the client's config names another format than the host streams";
         if (r.host.keys_wrong > 0) return "input arrived out of order";
         if (o.input_interval_us > 0 and r.host.keys * 100 < r.client.input_sent * 95) return "input events went missing";
         if (r.client.total_p50_us <= 0) return "no glass-to-glass samples";
@@ -206,20 +258,48 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
 
     var hc: SideClock = .{ .net = net, .side = .a };
     var cc: SideClock = .{ .net = net, .side = .b };
-    const sh = try synthetic.openHost(gpa, .{ .clock = hc.clock(), .width = o.width, .height = o.height, .audio = o.audio });
+    const sh = try synthetic.openHost(gpa, .{ .clock = hc.clock(), .width = o.width, .height = o.height, .audio = o.audio, .encoder_formats = o.encoder_formats, .hdr_display = o.hdr_source });
     const hb = sh.backend();
     defer hb.deinit();
-    const sc = try synthetic.openClient(gpa, .{ .clock = cc.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio });
+    const sc = try synthetic.openClient(gpa, .{ .clock = cc.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio, .decoder_formats = o.decoder_formats, .display = o.client_display });
     const cb = sc.backend();
     defer cb.deinit();
 
     var model: pathsim.Model = undefined;
     if (o.path) |pc| model.init(pc, net);
     const pipes = if (o.path != null) [2]@TypeOf(net.pipeFor(.a)){ model.pipeFor(.a), model.pipeFor(.b) } else .{ net.pipeFor(.a), net.pipeFor(.b) };
-    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices, .pause_on_stall = o.pause_on_stall, .session = .{ .rate_control = o.rate_control, .loss_policy = o.loss_policy } }, pipes[0]);
+    var host_clip = clipboard.Memory.init(gpa);
+    defer host_clip.deinit();
+    var client_clip = clipboard.Memory.init(gpa);
+    defer client_clip.deinit();
+    if (o.clipboard) |cs| {
+        if (cs.host_start.len > 0) try host_clip.set(cs.host_start);
+        if (cs.client_start.len > 0) try client_clip.set(cs.client_start);
+    }
+    const with_clip = o.clipboard != null;
+    var host = try apps.HostApp.init(gpa, hb, .{
+        .fps = o.fps,
+        .bitrate_bps = o.bitrate_bps,
+        .slices = o.slices,
+        .pause_on_stall = o.pause_on_stall,
+        .yuv444 = o.yuv444,
+        .ten_bit = o.ten_bit,
+        .hdr = o.hdr,
+        .session = .{ .rate_control = o.rate_control, .loss_policy = o.loss_policy },
+        .control_stream = if (with_clip) net.streamFor(.a) else null,
+        .clipboard = if (with_clip) host_clip.clipboard() else null,
+        .clipboard_poll_us = 50_000,
+    }, pipes[0]);
     defer host.deinit();
-    var client = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent }, pipes[1]);
+    var client = try apps.ClientApp.init(gpa, cb, .{
+        .content_ctx = sc,
+        .contentFn = patternContent,
+        .control_stream = if (with_clip) net.streamFor(.b) else null,
+        .clipboard = if (with_clip) client_clip.clipboard() else null,
+        .clipboard_poll_us = 50_000,
+    }, pipes[1]);
     defer client.deinit();
+    var next_copy: usize = 0;
 
     const end_us: Micros = @as(Micros, o.seconds) * simnet.SEC;
     var t: Micros = 0;
@@ -246,6 +326,10 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         }
         if (t > end_us + 30 * simnet.SEC) return error.Hung;
         try net.runUntil(t);
+        if (o.clipboard) |cs| while (next_copy < cs.copies.len and cs.copies[next_copy].at_us <= t) : (next_copy += 1) {
+            const cp = cs.copies[next_copy];
+            try (if (cp.client) &client_clip else &host_clip).set(cp.text);
+        };
         host.tick();
         client.tick();
         if (log) |w| if (o.progress_every_s > 0 and t >= next_progress) {
@@ -256,6 +340,21 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         };
     }
     client.s.freeze.finish(client.s.freeze.last_new_us orelse 0);
+    if (o.clipboard) |cs| {
+        const ht = host_clip.get() orelse "";
+        const ct = client_clip.get() orelse "";
+        cs.host_len = @min(ht.len, cs.host_text.len);
+        @memcpy(cs.host_text[0..cs.host_len], ht[0..cs.host_len]);
+        cs.client_len = @min(ct.len, cs.client_text.len);
+        @memcpy(cs.client_text[0..cs.client_len], ct[0..cs.client_len]);
+        cs.host_writes = host_clip.writes;
+        cs.client_writes = client_clip.writes;
+        cs.host_sent = host.s.control.clip.stats.sent;
+        cs.client_sent = client.s.control.clip.stats.sent;
+        cs.echoes = host.s.control.clip.stats.echoes + client.s.control.clip.stats.echoes;
+        cs.host_ups = host.s.control.stats.ups;
+        cs.client_ups = client.s.control.stats.ups;
+    }
 
     if (log) |w| {
         try host.s.report(w);
@@ -284,6 +383,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .reconnects = host.s.stats.reconnects,
             .stall_pauses = host.s.stats.stall_pauses,
             .stall_frames = host.s.stats.stall_frames,
+            .format = host.s.format,
             .end = @tagName(host.s.end),
         },
         .client = .{
@@ -302,6 +402,8 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .path_changes = client.s.stats.path_changes,
             .reconnects = client.s.stats.reconnects,
             .reconnect_requests = client.s.stats.reconnect_requests,
+            .format = if (client.s.config) |c| c.format else .{},
+            .wrong_color = sc.presenter.stats.wrong_color,
             .end = @tagName(client.s.end),
         },
         .sim_losses = net.linkStats(.a).random_losses + net.linkStats(.b).random_losses,

@@ -1,0 +1,38 @@
+name: linux-host
+
+# Linux host capture and audio (platform/host/linux): the tests in a headless desktop,
+# Weston's PipeWire output behind the real xdg-desktop-portal frontend with the test's own
+# ScreenCast backend, and PipeWire on a null sink. No GPU on the runners: the dma-buf
+# path is compile-only. Manual only, like every workflow here: start it from the Actions
+# tab on the branch to test.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Packages (D-Bus, PipeWire, Weston, the portal; the client's libraries for the audio test)
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            libdbus-1-dev libpipewire-0.3-dev \
+            libavcodec-dev libavutil-dev libva-dev libwayland-dev libegl-dev libgles-dev \
+            weston pipewire pipewire-bin wireplumber dbus-daemon xdg-desktop-portal pkg-config
+      - name: zig fmt
+        run: zig fmt --check platform/host build.zig platform/api.zig
+      - name: Host capture and audio tests (portal and PipeWire required)
+        env:
+          MOONSEC_REQUIRE: portal,pipewire
+        run: platform/host/linux/headless.sh zig build test-linux-host --summary all

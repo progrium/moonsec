@@ -66,7 +66,7 @@ pub const ShardHeader = struct {
     /// Payload bytes this shard carries on the wire.
     pub fn payloadLen(self: ShardHeader) u32 {
         const sz = self.shardSize();
-        if (self.shard + 1 == self.data_shards) return self.group_len - sz * (self.data_shards - 1);
+        if (@as(u16, self.shard) + 1 == self.data_shards) return self.group_len - sz * (self.data_shards - 1);
         return sz;
     }
 

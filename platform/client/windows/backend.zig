@@ -9,7 +9,8 @@
 //!               the latency overlay drawn on the CPU (platform/client/common).
 //!   AudioSink   WASAPI shared mode, f32; IAudioClient3's smallest period when the
 //!               mix format allows it.
-//!   InputSource Raw Input keyboard and mouse from the window's own thread.
+//!   InputSource Raw Input keyboard and mouse from the window's own thread; gamepads
+//!               through XInput (platform/client/gamepad/xinput.zig).
 //!
 //! Decoder and presenter share one D3D11 device (multithread-protected), so decoded
 //! textures go to the presenter without a copy.
@@ -19,6 +20,7 @@ const api = @import("platform");
 const win = @import("win");
 const overlay = @import("client_overlay");
 const rawinput = @import("rawinput.zig");
+pub const gamepad = @import("client_gamepad");
 
 pub const c = @import("mswc_c");
 
@@ -36,6 +38,8 @@ pub const Options = struct {
     raw_input: bool = true,
     /// Raw Input while the window is in the background too (tests use it).
     input_sink: bool = false,
+    /// Gamepads through XInput.
+    gamepads: bool = true,
     overlay_style: overlay.Style = .{},
     /// How often the overlay image is redrawn from the latest snapshot.
     overlay_interval_us: api.Micros = 100_000,
@@ -100,6 +104,8 @@ pub const Decoder = struct {
             .hevc => c.MSWC_CODEC_HEVC,
             else => return error.Unsupported,
         };
+        // NV12 out of the MFT and through the presenter: 8-bit 4:2:0 SDR only.
+        if (!cfg.format.eql(.{})) return error.Unsupported;
         d.close();
         var h: ?*c.mswc_decoder = null;
         try ok("mswc_decoder_create", c.mswc_decoder_create(d3dPtr(d.d3d), codec, @intFromBool(d.hardware), &h));
@@ -161,6 +167,17 @@ pub const Decoder = struct {
         d.close();
     }
 };
+
+/// What the GPU's D3D11VA decoder has per codec beyond 8-bit 4:2:0 (Main10, 4:4:4,
+/// AV1), for logs and the hardware check. Not `DecoderCaps.coded`: the MFT path and the
+/// presenter take NV12 only (mswc_formats.c lists what each format still needs).
+pub fn probeHardwareFormats(d3d: win.D3d) api.FormatCaps {
+    return .{
+        .h264 = @bitCast(@as(u8, @truncate(c.mswc_decoder_hw_formats(d3dPtr(d3d), c.MSWC_CODEC_H264)))),
+        .hevc = @bitCast(@as(u8, @truncate(c.mswc_decoder_hw_formats(d3dPtr(d3d), c.MSWC_CODEC_HEVC)))),
+        .av1 = @bitCast(@as(u8, @truncate(c.mswc_decoder_hw_formats(d3dPtr(d3d), c.MSWC_CODEC_AV1)))),
+    };
+}
 
 /// Which codecs this machine's Media Foundation can decode (a decoder MFT exists).
 pub fn probeCodecs(d3d: win.D3d) api.CodecSet {
@@ -319,6 +336,8 @@ pub const InputSource = struct {
     /// Events translated from a record that did not fit in the caller's buffer.
     pending: [rawinput.max_mouse_events]api.InputEvent = undefined,
     pending_n: usize = 0,
+    /// XInput pads; without XInput (or with `Options.gamepads` off) it reports none.
+    pads: gamepad.xinput.Source = .{ .clock = clock },
 
     pub fn poll(s: *InputSource, out: []api.InputEvent) api.Error!usize {
         var n: usize = 0;
@@ -347,6 +366,8 @@ pub const InputSource = struct {
                 }
             }
         }
+        // Pads keep their own queue, so whatever does not fit waits for the next poll.
+        if (n < out.len) n += try s.pads.poll(out[n..]);
         return n;
     }
 };
@@ -470,7 +491,10 @@ pub fn open(gpa: std.mem.Allocator, opts: Options) !*Client {
             .canvas_w = cw,
             .canvas_h = ch,
         },
-        .input = .{ .window = w.? },
+        .input = .{
+            .window = w.?,
+            .pads = if (opts.gamepads) gamepad.xinput.Source.open(clock) else .{ .clock = clock },
+        },
     };
     return cl;
 }
