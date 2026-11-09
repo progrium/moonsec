@@ -119,6 +119,44 @@ pub const PacketPipe = struct {
     }
 };
 
+pub const StreamError = error{
+    /// The stream is gone for good (the connection closed and will not come back).
+    Closed,
+    /// The stream was replaced (a reconnect opened a new one): whatever the reader was
+    /// parsing is gone, and the next bytes start a new stream. Start over (a new `hello`).
+    Reset,
+};
+
+/// A reliable, ordered byte stream next to a `PacketPipe`: the control channel's transport
+/// (spec/control-v0.md). Non-blocking like the pipe. Implementations: the sim's stream
+/// (`transport/sim.zig`) and iroh's bidirectional streams (`transport/iroh_pipe.zig`).
+pub const ByteStream = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        write: *const fn (ptr: *anyopaque, data: []const u8) StreamError!usize,
+        read: *const fn (ptr: *anyopaque, buf: []u8) StreamError!?usize,
+        finish: *const fn (ptr: *anyopaque) void,
+    };
+
+    /// Writes what fits now and returns how much (0 when the stream has no room, or is
+    /// not open yet). Bytes written are delivered in order unless the stream is reset.
+    pub fn write(self: ByteStream, data: []const u8) StreamError!usize {
+        return self.vtable.write(self.ptr, data);
+    }
+
+    /// Reads what has arrived: null when nothing has, 0 when the peer finished its side.
+    pub fn read(self: ByteStream, buf: []u8) StreamError!?usize {
+        return self.vtable.read(self.ptr, buf);
+    }
+
+    /// Ends our side after the bytes already written.
+    pub fn finish(self: ByteStream) void {
+        self.vtable.finish(self.ptr);
+    }
+};
+
 test "PacketPipe dispatches through the vtable" {
     const Loop = struct {
         buf: [64]u8 = undefined,

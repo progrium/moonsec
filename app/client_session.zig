@@ -20,6 +20,7 @@ const core = @import("core");
 const api = @import("platform");
 const pipe_mod = @import("pipe");
 const wire = @import("wire.zig");
+const control = @import("control.zig");
 const host_session = @import("host_session.zig");
 const pathlog = @import("pathlog.zig");
 
@@ -66,6 +67,9 @@ pub const Config = struct {
     /// Every audio datagram (stream 2), for the audio stage: envelope, payload, arrival.
     audio_ctx: ?*anyopaque = null,
     onAudio: ?*const fn (ctx: ?*anyopaque, env: proto.Envelope, payload: []const u8, recv_us: Micros) void = null,
+    /// The reliable control channel (spec/control-v0.md): clipboard and the features built
+    /// on it. It runs once the app attaches a stream (`control.attach`).
+    control: control.Config = .{},
 };
 
 pub const State = enum { connecting, streaming, ended };
@@ -107,6 +111,8 @@ const times_cap = 128;
 
 pub const ClientSession = struct {
     gpa: std.mem.Allocator,
+    /// The control channel; the app attaches its stream and feeds the clipboard.
+    control: control.Control,
     cfg: Config,
     pipe: PacketPipe,
     state: State = .connecting,
@@ -168,8 +174,11 @@ pub const ClientSession = struct {
         tele.* = .init();
         const times = try gpa.alloc(Times, times_cap);
         @memset(times, .{});
+        var control_ = try control.Control.init(gpa, .client, cfg.control);
+        errdefer control_.deinit();
         return .{
             .gpa = gpa,
+            .control = control_,
             .cfg = cfg,
             .pipe = p,
             .receiver = receiver,
@@ -183,6 +192,7 @@ pub const ClientSession = struct {
     }
 
     pub fn deinit(s: *ClientSession) void {
+        s.control.deinit();
         s.receiver.deinit();
         s.gpa.destroy(s.est);
         s.gpa.destroy(s.tele);
@@ -202,6 +212,7 @@ pub const ClientSession = struct {
     fn finish(s: *ClientSession, e: End, why: []const u8) void {
         if (s.state == .ended) return;
         s.state = .ended;
+        s.control.close();
         s.end = e;
         s.reason = why;
     }
@@ -242,6 +253,7 @@ pub const ClientSession = struct {
     }
 
     pub fn step(s: *ClientSession, now: Micros) void {
+        s.control.step();
         if (s.state == .ended) return;
         const start = s.start_us orelse blk: {
             s.start_us = now;

@@ -37,6 +37,7 @@ const core = @import("core");
 const api = @import("platform");
 const pipe_mod = @import("pipe");
 const wire = @import("wire.zig");
+const control = @import("control.zig");
 const pathlog = @import("pathlog.zig");
 
 const proto = core.proto;
@@ -94,6 +95,9 @@ pub const Config = struct {
     /// Byes sent when leaving, `bye_interval_us` apart.
     byes: u8 = 3,
     bye_interval_us: Micros = 20_000,
+    /// The reliable control channel (spec/control-v0.md): clipboard and the features built
+    /// on it. It runs once the app attaches a stream (`control.attach`).
+    control: control.Config = .{},
 };
 
 pub const Negotiate = struct {
@@ -147,6 +151,8 @@ const Pending = struct { action: core.input.Action, time: Micros };
 
 pub const HostSession = struct {
     gpa: std.mem.Allocator,
+    /// The control channel; the app attaches its stream and feeds the clipboard.
+    control: control.Control,
     cfg: Config,
     pipe: PacketPipe,
     state: State = .waiting,
@@ -213,8 +219,11 @@ pub const HostSession = struct {
         errdefer gpa.destroy(tele);
         tele.* = .init();
         const pb = try gpa.create(media.ParityBuffer);
+        var control_ = try control.Control.init(gpa, .host, cfg.control);
+        errdefer control_.deinit();
         return .{
             .gpa = gpa,
+            .control = control_,
             .cfg = cfg,
             .pipe = p,
             .history = history,
@@ -232,6 +241,7 @@ pub const HostSession = struct {
     }
 
     pub fn deinit(s: *HostSession) void {
+        s.control.deinit();
         s.history.deinit(s.gpa);
         s.gpa.destroy(s.ctl);
         s.gpa.destroy(s.rec);
@@ -251,6 +261,7 @@ pub const HostSession = struct {
     fn finish(s: *HostSession, e: End, why: []const u8) void {
         if (s.state == .ended) return;
         s.state = .ended;
+        s.control.close();
         s.end = e;
         s.reason = why;
     }
@@ -303,6 +314,7 @@ pub const HostSession = struct {
     }
 
     pub fn step(s: *HostSession, now: Micros) void {
+        s.control.step();
         if (s.state == .ended) return;
         var buf: [2048]u8 = undefined;
         while (s.state != .ended) {

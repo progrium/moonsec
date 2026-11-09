@@ -183,6 +183,41 @@ test "a drop longer than the 5 s peer timeout still reconnects" {
     try std.testing.expect(r.client.presented > 4 * 60);
 }
 
+test "clipboard sync over the control channel: both ways, no echo, start content kept" {
+    var cs: simrun.ClipScript = .{
+        .host_start = "host had this",
+        .client_start = "client had this",
+        .copies = &.{
+            .{ .at_us = 500_000, .client = true, .text = "copied on the client" },
+            .{ .at_us = 1_000_000, .client = false, .text = "copied on the host ✓" },
+        },
+    };
+    _ = try expectPass(.{ .seed = 1, .profile = .lan, .seconds = 2, .clipboard = &cs });
+    try std.testing.expectEqualStrings("copied on the host ✓", cs.host());
+    try std.testing.expectEqualStrings("copied on the host ✓", cs.client());
+    try std.testing.expectEqual(@as(u64, 1), cs.host_sent);
+    try std.testing.expectEqual(@as(u64, 1), cs.client_sent);
+    try std.testing.expectEqual(@as(u64, 1), cs.host_writes);
+    try std.testing.expectEqual(@as(u64, 1), cs.client_writes);
+    // Each side read back the copy it was given and did not send it again.
+    try std.testing.expectEqual(@as(u64, 2), cs.echoes);
+    try std.testing.expectEqual(@as(u64, 1), cs.host_ups);
+}
+
+test "clipboard: a copy made while the connection is down arrives after the reconnect" {
+    var cs: simrun.ClipScript = .{
+        .copies = &.{
+            .{ .at_us = 500_000, .client = false, .text = "before" },
+            .{ .at_us = 2_500_000, .client = true, .text = "made while dropped" },
+        },
+    };
+    const r = try runPath(.{ .seed = 5, .profile = .lan, .seconds = 7, .clipboard = &cs, .path = .{ .drops = &.{.{ .at_us = 2_000_000, .outage_us = 1_000_000 }} } });
+    try std.testing.expectEqual(@as(u64, 1), r.client.reconnects);
+    try std.testing.expectEqual(@as(u64, 2), cs.host_ups);
+    try std.testing.expectEqualStrings("made while dropped", cs.host());
+    try std.testing.expectEqualStrings("made while dropped", cs.client());
+}
+
 test "format negotiation: every combination of decoder formats, preferences and HDR streams" {
     const api = @import("platform");
     const fmt = api.format;

@@ -9,6 +9,7 @@ const api = @import("platform");
 const simnet = @import("simnet");
 const synthetic = @import("synthetic");
 const apps = @import("apps.zig");
+const clipboard = @import("clipboard");
 pub const pathsim = @import("pathsim.zig");
 
 const Micros = i64;
@@ -77,6 +78,41 @@ pub const Options = struct {
     hdr: bool = true,
     hdr_source: ?api.HdrMetadata = null,
     client_display: api.DisplayCaps = .{},
+    /// Run the control channel with in-memory clipboards and this script of copies; the
+    /// outcome is written back into it.
+    clipboard: ?*ClipScript = null,
+};
+
+/// Copies made on either side during a run, and what each clipboard held at the end.
+pub const ClipScript = struct {
+    copies: []const Copy = &.{},
+    /// Initial content of each side's clipboard (seeded, not sent).
+    host_start: []const u8 = "",
+    client_start: []const u8 = "",
+    // Results.
+    host_text: [4096]u8 = undefined,
+    host_len: usize = 0,
+    client_text: [4096]u8 = undefined,
+    client_len: usize = 0,
+    /// Writes of the peer's copies into each side's clipboard.
+    host_writes: u64 = 0,
+    client_writes: u64 = 0,
+    /// Copies each side sent, and echoes it suppressed.
+    host_sent: u64 = 0,
+    client_sent: u64 = 0,
+    echoes: u64 = 0,
+    /// Control channels that came up (a reconnect brings up a new one).
+    host_ups: u64 = 0,
+    client_ups: u64 = 0,
+
+    pub const Copy = struct { at_us: Micros, client: bool, text: []const u8 };
+
+    pub fn host(c: *const ClipScript) []const u8 {
+        return c.host_text[0..c.host_len];
+    }
+    pub fn client(c: *const ClipScript) []const u8 {
+        return c.client_text[0..c.client_len];
+    }
 };
 
 pub const Result = struct {
@@ -232,10 +268,38 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     var model: pathsim.Model = undefined;
     if (o.path) |pc| model.init(pc, net);
     const pipes = if (o.path != null) [2]@TypeOf(net.pipeFor(.a)){ model.pipeFor(.a), model.pipeFor(.b) } else .{ net.pipeFor(.a), net.pipeFor(.b) };
-    var host = try apps.HostApp.init(gpa, hb, .{ .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = o.slices, .pause_on_stall = o.pause_on_stall, .yuv444 = o.yuv444, .ten_bit = o.ten_bit, .hdr = o.hdr, .session = .{ .rate_control = o.rate_control, .loss_policy = o.loss_policy } }, pipes[0]);
+    var host_clip = clipboard.Memory.init(gpa);
+    defer host_clip.deinit();
+    var client_clip = clipboard.Memory.init(gpa);
+    defer client_clip.deinit();
+    if (o.clipboard) |cs| {
+        if (cs.host_start.len > 0) try host_clip.set(cs.host_start);
+        if (cs.client_start.len > 0) try client_clip.set(cs.client_start);
+    }
+    const with_clip = o.clipboard != null;
+    var host = try apps.HostApp.init(gpa, hb, .{
+        .fps = o.fps,
+        .bitrate_bps = o.bitrate_bps,
+        .slices = o.slices,
+        .pause_on_stall = o.pause_on_stall,
+        .yuv444 = o.yuv444,
+        .ten_bit = o.ten_bit,
+        .hdr = o.hdr,
+        .session = .{ .rate_control = o.rate_control, .loss_policy = o.loss_policy },
+        .control_stream = if (with_clip) net.streamFor(.a) else null,
+        .clipboard = if (with_clip) host_clip.clipboard() else null,
+        .clipboard_poll_us = 50_000,
+    }, pipes[0]);
     defer host.deinit();
-    var client = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent }, pipes[1]);
+    var client = try apps.ClientApp.init(gpa, cb, .{
+        .content_ctx = sc,
+        .contentFn = patternContent,
+        .control_stream = if (with_clip) net.streamFor(.b) else null,
+        .clipboard = if (with_clip) client_clip.clipboard() else null,
+        .clipboard_poll_us = 50_000,
+    }, pipes[1]);
     defer client.deinit();
+    var next_copy: usize = 0;
 
     const end_us: Micros = @as(Micros, o.seconds) * simnet.SEC;
     var t: Micros = 0;
@@ -262,6 +326,10 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         }
         if (t > end_us + 30 * simnet.SEC) return error.Hung;
         try net.runUntil(t);
+        if (o.clipboard) |cs| while (next_copy < cs.copies.len and cs.copies[next_copy].at_us <= t) : (next_copy += 1) {
+            const cp = cs.copies[next_copy];
+            try (if (cp.client) &client_clip else &host_clip).set(cp.text);
+        };
         host.tick();
         client.tick();
         if (log) |w| if (o.progress_every_s > 0 and t >= next_progress) {
@@ -272,6 +340,21 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         };
     }
     client.s.freeze.finish(client.s.freeze.last_new_us orelse 0);
+    if (o.clipboard) |cs| {
+        const ht = host_clip.get() orelse "";
+        const ct = client_clip.get() orelse "";
+        cs.host_len = @min(ht.len, cs.host_text.len);
+        @memcpy(cs.host_text[0..cs.host_len], ht[0..cs.host_len]);
+        cs.client_len = @min(ct.len, cs.client_text.len);
+        @memcpy(cs.client_text[0..cs.client_len], ct[0..cs.client_len]);
+        cs.host_writes = host_clip.writes;
+        cs.client_writes = client_clip.writes;
+        cs.host_sent = host.s.control.clip.stats.sent;
+        cs.client_sent = client.s.control.clip.stats.sent;
+        cs.echoes = host.s.control.clip.stats.echoes + client.s.control.clip.stats.echoes;
+        cs.host_ups = host.s.control.stats.ups;
+        cs.client_ups = client.s.control.stats.ups;
+    }
 
     if (log) |w| {
         try host.s.report(w);
