@@ -73,6 +73,24 @@ pub fn build(b: *std.Build) void {
     }) });
     wasm_step.dependOn(&wasm_tests.step);
 
+    // Browser pairing (shim-web/pair/pair.zig): core/pair as a small wasm module that the
+    // browser transport (shim-web/) drives. `zig build web-pair` -> zig-out/web/moonsec-pair.wasm.
+    const wasm_free = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const web_pair = b.addExecutable(.{
+        .name = "moonsec-pair",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("shim-web/pair/pair.zig"),
+            .target = wasm_free,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "core", .module = b.createModule(.{ .root_source_file = b.path("core/root.zig"), .target = wasm_free, .optimize = .ReleaseSmall }) }},
+        }),
+    });
+    web_pair.entry = .disabled;
+    web_pair.rdynamic = true;
+    const install_web_pair = b.addInstallArtifact(web_pair, .{ .dest_dir = .{ .override = .{ .custom = "web" } } });
+    b.step("web-pair", "Build core/pair for the browser: zig-out/web/moonsec-pair.wasm").dependOn(&install_web_pair.step);
+    wasm_step.dependOn(&web_pair.step);
+
     // libopus from source (codec/opus/libopus.zig) and its Zig binding, for every target.
     const opus = addOpus(b, target, optimize);
     const opus_tests = b.addTest(.{ .name = "opus-test", .root_module = opus.module });
@@ -324,6 +342,9 @@ pub fn build(b: *std.Build) void {
             step.dependOn(&b.addInstallArtifact(exe, .{}).step);
         } else step.dependOn(&b.addFail("moonsec-linux needs a Linux host").step);
     }
+
+    // Fuzz harnesses for every parser (fuzz/, docs/fuzzing.md): `zig build fuzz --fuzz`.
+    @import("fuzz/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod }, fuzzOpus, test_step, wasm_step);
 
     // core/rate driving the simulated network with S11's metrics (sim/rate.zig).
     const sim_rate = b.addExecutable(.{ .name = "sim-rate", .root_module = b.createModule(.{ .root_source_file = b.path("sim/rate.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "simnet", .module = simnet_mod }, .{ .name = "core", .module = core_mod } } }) });
@@ -620,6 +641,13 @@ const Opus = struct {
     /// The Zig binding (codec/opus/opus.zig), linked against `lib`. Import it as "opus".
     module: *std.Build.Module,
 };
+
+/// libopus, its binding and the audio stage over a given core module, for fuzz/build.zig.
+fn fuzzOpus(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module) @import("fuzz/build.zig").Opus {
+    const opus = addOpus(b, target, optimize);
+    const stage = b.createModule(.{ .root_source_file = b.path("codec/opus/stage.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "opus", .module = opus.module } } });
+    return .{ .opus = opus.module, .audio_stage = stage };
+}
 
 fn addOpus(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Opus {
     const src = b.dependency("opus", .{});
