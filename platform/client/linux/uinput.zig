@@ -30,6 +30,30 @@ pub const Device = struct {
         return .{ .dev = d, .node = d.node.? };
     }
 
+    /// A gamepad: the face buttons, shoulders, start/select and two sticks
+    /// (ABS_X/Y, ABS_RX/RY at -32768..32767), as the kernel gamepad spec lays them out.
+    pub fn createPad(name: []const u8) Error!Device {
+        const d = try shared.Device.create(.{
+            .name = name,
+            .keys = &pad_keys,
+            .abs = &.{
+                .{ .code = shared.ABS_X, .min = -32768, .max = 32767 },
+                .{ .code = shared.ABS_Y, .min = -32768, .max = 32767 },
+                .{ .code = shared.ABS_RX, .min = -32768, .max = 32767 },
+                .{ .code = shared.ABS_RY, .min = -32768, .max = 32767 },
+            },
+            .wait_readable = true,
+        });
+        return .{ .dev = d, .node = d.node.? };
+    }
+
+    /// BTN_SOUTH .. BTN_THUMBR (0x130..0x13e).
+    const pad_keys = blk: {
+        var k: [0x13e - shared.BTN_SOUTH + 1]u16 = undefined;
+        for (&k, 0..) |*c, i| c.* = shared.BTN_SOUTH + i;
+        break :blk k;
+    };
+
     /// A key (KEY_* code) press or release, as its own report.
     pub fn key(d: Device, code: u16, down: bool) void {
         d.dev.key(code, down);

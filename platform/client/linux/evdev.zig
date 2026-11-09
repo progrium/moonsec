@@ -45,6 +45,8 @@ pub const BTN_SIDE = shared.BTN_SIDE;
 pub const BTN_EXTRA = shared.BTN_EXTRA;
 pub const BTN_FORWARD = shared.BTN_FORWARD;
 pub const BTN_BACK = shared.BTN_BACK;
+/// A gamepad's south face button: such nodes belong to the gamepad source.
+pub const BTN_SOUTH = shared.BTN_SOUTH;
 pub const KEY_MAX = shared.KEY_MAX;
 pub const REL_MAX = shared.REL_MAX;
 
@@ -254,6 +256,8 @@ pub const Kind = packed struct(u8) {
 /// relative X/Y and a left button. Gamepads, touchpads and tablets are neither.
 pub fn classify(ev_bits: []const u8, key_bits: []const u8, rel_bits: []const u8) Kind {
     var k: Kind = .{};
+    // Gamepads (BTN_SOUTH) are read by platform/client/gamepad, not here.
+    if (testBit(key_bits, BTN_SOUTH)) return k;
     if (testBit(ev_bits, EV_KEY) and testBit(key_bits, KEY_A) and testBit(key_bits, KEY_SPACE)) k.keyboard = true;
     if (testBit(ev_bits, EV_REL) and testBit(rel_bits, REL_X) and testBit(rel_bits, REL_Y) and testBit(key_bits, BTN_LEFT)) k.mouse = true;
     return k;
@@ -529,4 +533,6 @@ test "classify by capability bits" {
     rel_bits[0] = 0b11;
     key_bits[BTN_LEFT / 8] |= 1 << (BTN_LEFT % 8);
     try testing.expect(classify(&ev_bits, &key_bits, &rel_bits).mouse);
+    key_bits[BTN_SOUTH / 8] |= 1 << (BTN_SOUTH % 8);
+    try testing.expect(!classify(&ev_bits, &key_bits, &rel_bits).any());
 }
