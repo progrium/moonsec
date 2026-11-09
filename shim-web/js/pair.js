@@ -120,9 +120,10 @@ export class Pair {
       const idB = Uint8Array.from(endpoint.id.match(/../g), (h) => parseInt(h, 16));
       const inp = this.#in;
       inp.set(idB, 0);
-      inp.set(crypto.getRandomValues(new Uint8Array(16)), 32);
-      inp.set(pinB, 48);
-      inp.set(nameB, 48 + pinB.length);
+      inp.set(crypto.getRandomValues(new Uint8Array(16)), 32); // nonce
+      inp.set(crypto.getRandomValues(new Uint8Array(32)), 48); // secret CPace seed
+      inp.set(pinB, 80);
+      inp.set(nameB, 80 + pinB.length);
       const hl = this.x.mp_client_start(pinB.length, nameB.length);
       if (hl < 0) throw new Error(hl === -2 ? "bad PIN: six digits" : `cannot start pairing (${hl})`);
       await s.write(this.#out(hl), 10000);

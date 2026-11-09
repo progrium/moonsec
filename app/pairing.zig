@@ -256,7 +256,7 @@ fn hostSide(end: *End, w: *ex.Window, out: *Outcome) anyerror!void {
     @memcpy(first_copy[0..first.len], first);
     switch (ex.classify(first)) {
         .pair => {
-            var h = ex.Host.init(w, host_id, client_id, [_]u8{3} ** 16, "desk");
+            var h = ex.Host.init(w, host_id, client_id, [_]u8{3} ** 16, [_]u8{5} ** 32, "desk");
             out.* = try serveHost(end.stream(), &f, &h, first_copy[0..first.len], &zeroClock);
         },
         .admit => {
@@ -281,7 +281,7 @@ test "the exchange over a byte stream: PIN pairs, then admission is refused for 
     var w: ex.Window = .{ .pin = "424242".*, .deadline_us = 1 };
     var host_out: Outcome = undefined;
     var task = try testing.io.concurrent(hostSide, .{ &ends[0], &w, &host_out });
-    var c = ex.Client.init(host_id, client_id, [_]u8{4} ** 16, .{ .pin = "424242".* }, "laptop");
+    var c = ex.Client.init(host_id, client_id, [_]u8{4} ** 16, [_]u8{6} ** 32, .{ .pin = "424242".* }, "laptop");
     const r = try runClient(ends[1].stream(), &c);
     ends[1].finish();
     try task.await(testing.io);
@@ -305,7 +305,7 @@ test "the exchange over a byte stream: a wrong PIN fails on both sides" {
     var w: ex.Window = .{ .pin = "424242".*, .deadline_us = 1 };
     var host_out: Outcome = undefined;
     var task = try testing.io.concurrent(hostSide, .{ &ends[0], &w, &host_out });
-    var c = ex.Client.init(host_id, client_id, [_]u8{4} ** 16, .{ .pin = "000000".* }, "laptop");
+    var c = ex.Client.init(host_id, client_id, [_]u8{4} ** 16, [_]u8{6} ** 32, .{ .pin = "000000".* }, "laptop");
     const r = try runClient(ends[1].stream(), &c);
     ends[1].finish();
     try task.await(testing.io);

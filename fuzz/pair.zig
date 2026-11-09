@@ -120,10 +120,10 @@ pub fn exchangeHost(_: std.mem.Allocator, s: *c.Smith) !void {
         switch (s.value(ExOp)) {
             .connect => {
                 const cid: ex.Id = @splat(@intCast(0x20 + i));
-                conns[i] = ex.Host.init(&window, host_id, cid, @splat(i), "desk");
+                conns[i] = ex.Host.init(&window, host_id, cid, @splat(i), @splat(0x60 + i), "desk");
                 framers[i] = .{};
                 // Half the time an honest client (right or wrong credential) drives it.
-                clients[i] = if (s.value(bool)) ex.Client.init(host_id, cid, @splat(0x40 + i), switch (s.valueRangeAtMost(u8, 0, 3)) {
+                clients[i] = if (s.value(bool)) ex.Client.init(host_id, cid, @splat(0x40 + i), @splat(0x70 + i), switch (s.valueRangeAtMost(u8, 0, 3)) {
                     0 => .{ .pin = pin },
                     1 => .{ .ticket_secret = secret },
                     2 => .{ .pin = "000000".* },
@@ -228,7 +228,7 @@ fn exchangeSeeds(ss: *c.Seeds) void {
 /// A client mid-pairing fed any host messages, and the framer and admission parsers on
 /// the same bytes.
 pub fn exchangeClient(_: std.mem.Allocator, s: *c.Smith) !void {
-    var cl = ex.Client.init(@splat(0x11), @splat(0x22), @splat(2), if (s.value(bool)) .{ .pin = "123456".* } else .{ .ticket_secret = @splat(7) }, "laptop");
+    var cl = ex.Client.init(@splat(0x11), @splat(0x22), @splat(2), @splat(3), if (s.value(bool)) .{ .pin = "123456".* } else .{ .ticket_secret = @splat(7) }, "laptop");
     _ = cl.start();
     var f: ex.Framer = .{};
     while (!s.eosWeightedSimple(16, 1)) {
