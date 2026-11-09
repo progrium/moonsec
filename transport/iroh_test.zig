@@ -454,3 +454,138 @@ test "events: peer close raises conn_closed, wakes the handle, recv reports clos
     try std.testing.expectEqual(@as(u32, 1), (try p.server.stats()).closed);
     try std.testing.expectError(error.Closed, p.server.sendDatagram("x"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// IrohLink admission gate (iroh_pipe.zig)
+// ---------------------------------------------------------------------------------------------
+
+const iroh_pipe = @import("iroh_pipe");
+const IrohLink = iroh_pipe.IrohLink;
+
+/// Admits only connections from `allowed` (an endpoint ID in hex) and counts its calls.
+const IdGate = struct {
+    allowed: [64]u8,
+    calls: std.atomic.Value(u32) = .init(0),
+
+    fn check(ctx: *anyopaque, conn: iroh.Conn) IrohLink.Verdict {
+        const self: *IdGate = @ptrCast(@alignCast(ctx));
+        _ = self.calls.fetchAdd(1, .monotonic);
+        var b: [128]u8 = undefined;
+        const rid = conn.remoteId(&b) catch return .refuse;
+        return if (std.mem.eql(u8, rid, &self.allowed)) .admit else .refuse;
+    }
+};
+
+const RefuseGate = struct {
+    fn check(_: *anyopaque, _: iroh.Conn) IrohLink.Verdict {
+        return .refuse;
+    }
+};
+
+fn waitConnected(p: anytype, ms: u32) bool {
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 10) {
+        if (p.stats().connected) return true;
+        sleepMs(10);
+    }
+    return false;
+}
+
+test "link gate: every connection is checked, a refused one never reaches the session, reconnects are checked again" {
+    setup();
+    const io = std.testing.io;
+    const host_ep = try iroh.Endpoint.bind(.{ .alpn = alpn, .relay_mode = .disabled, .bind_addr = "127.0.0.1:0" });
+    defer host_ep.deinit();
+    const good_ep = try iroh.Endpoint.bind(.{ .relay_mode = .disabled, .bind_addr = "127.0.0.1:0" });
+    defer good_ep.deinit();
+    const bad_ep = try iroh.Endpoint.bind(.{ .relay_mode = .disabled, .bind_addr = "127.0.0.1:0" });
+    defer bad_ep.deinit();
+    var tbuf: [4096]u8 = undefined;
+    const ticket = try host_ep.ticket(&tbuf);
+    var ib: [128]u8 = undefined;
+    var gate: IdGate = .{ .allowed = (try good_ep.id(&ib))[0..64].* };
+
+    const host = try std.testing.allocator.create(IrohLink);
+    defer std.testing.allocator.destroy(host);
+    try host.start(io, host_ep, .{ .role = .accept, .alpn = alpn, .gate = .{ .ctx = &gate, .check = IdGate.check }, .refuse_code = 0x5050 });
+    defer host.deinit();
+    const hp = host.packetPipe();
+
+    // A stranger's connection is closed by the gate: the host never sees it.
+    const stranger = try bad_ep.connect(ticket, alpn, 10_000);
+    var in: [64]u8 = undefined;
+    try std.testing.expectError(error.Closed, stranger.recvDatagram(&in, 5_000));
+    stranger.deinit(0);
+    try std.testing.expect(!hp.stats().connected);
+    try std.testing.expectEqual(@as(u64, 1), host.linkStats().refused);
+
+    // The paired device gets in, and again after its connection drops.
+    for (0..2) |round| {
+        const c = try good_ep.connect(ticket, alpn, 10_000);
+        try std.testing.expect(waitConnected(hp, 5_000));
+        try c.sendDatagram("hi");
+        var got = false;
+        for (0..300) |_| {
+            if (try hp.recv(&in)) |r| {
+                try std.testing.expectEqualStrings("hi", in[0..r.len]);
+                got = true;
+                break;
+            }
+            sleepMs(10);
+        }
+        try std.testing.expect(got);
+        // While the paired device's connection is up, another (admitted) device cannot take
+        // it over: the gate admits only `good` here, so check the stranger is still refused.
+        const s2 = try bad_ep.connect(ticket, alpn, 10_000);
+        try std.testing.expectError(error.Closed, s2.recvDatagram(&in, 5_000));
+        s2.deinit(0);
+        c.deinit(0);
+        // Wait for the host to notice the drop.
+        var closed = false;
+        for (0..300) |_| {
+            if (!hp.stats().connected) {
+                closed = true;
+                break;
+            }
+            _ = hp.recv(&in) catch {};
+            sleepMs(10);
+        }
+        try std.testing.expect(closed);
+        try std.testing.expectEqual(@as(u32, @intCast(2 + 2 * round + 1)), gate.calls.load(.monotonic));
+    }
+    try std.testing.expectEqual(@as(u64, 3), host.linkStats().refused);
+}
+
+test "link gate: a dialing link that is refused stops dialing" {
+    setup();
+    const io = std.testing.io;
+    const host_ep = try iroh.Endpoint.bind(.{ .alpn = alpn, .relay_mode = .disabled, .bind_addr = "127.0.0.1:0" });
+    defer host_ep.deinit();
+    const client_ep = try iroh.Endpoint.bind(.{ .relay_mode = .disabled, .bind_addr = "127.0.0.1:0" });
+    defer client_ep.deinit();
+    var tbuf: [4096]u8 = undefined;
+    const ticket = try host_ep.ticket(&tbuf);
+    // Something accepts on the host so the dial completes.
+    const Acc = struct {
+        fn run(ep: iroh.Endpoint) void {
+            for (0..5) |_| {
+                const c = ep.accept(2_000) catch continue;
+                c.deinit(0);
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Acc.run, .{host_ep});
+    defer t.join();
+    const link = try std.testing.allocator.create(IrohLink);
+    defer std.testing.allocator.destroy(link);
+    var dummy: u8 = 0;
+    try link.start(io, client_ep, .{ .role = .dial, .ticket = ticket, .alpn = alpn, .gate = .{ .ctx = &dummy, .check = RefuseGate.check } });
+    defer link.deinit();
+    var waited: u32 = 0;
+    while (!link.refused() and waited < 10_000) : (waited += 10) sleepMs(10);
+    try std.testing.expect(link.refused());
+    sleepMs(300);
+    const st = link.linkStats();
+    try std.testing.expectEqual(@as(u64, 1), st.dials);
+    try std.testing.expect(!link.packetPipe().stats().connected);
+}

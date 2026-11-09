@@ -53,7 +53,7 @@ int main(int argc, char **argv) {
     cfg.struct_size = sizeof cfg;
     cfg.state_dir = state_dir;
     cfg.relay_mode = relay ? MOONSEC_RELAY_DEFAULT : MOONSEC_RELAY_DISABLED;
-    cfg.flags = MOONSEC_CLIENT_REQUIRE_PAIRED | MOONSEC_CLIENT_NO_OS_INPUT;
+    cfg.flags = MOONSEC_CLIENT_NO_OS_INPUT;
     cfg.on_frame = on_frame;
     moonsec_client *client = NULL;
     moonsec_status st = moonsec_client_create(&cfg, &client);

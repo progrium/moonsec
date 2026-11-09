@@ -219,7 +219,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("transport/iroh_test.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "iroh", .module = iroh_mod }},
+            .imports = &.{ .{ .name = "iroh", .module = iroh_mod }, .{ .name = "iroh_pipe", .module = b.createModule(.{ .root_source_file = b.path("transport/iroh_pipe.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "iroh", .module = iroh_mod }, .{ .name = "pipe", .module = pipe_mod } } }) } },
         }),
     });
     const run_iroh_tests = b.addRunArtifact(iroh_tests);
