@@ -434,7 +434,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 ### Phase 4: macOS host and more clients (about 5 weeks)
 
 - Host: ScreenCaptureKit, VideoToolbox, CGEvent input.
-- Clients: macOS (VideoToolbox, Metal) and Linux (VAAPI, Wayland/EGL).
+- Clients: macOS (VideoToolbox, Metal) and Linux (VAAPI, Wayland/EGL). Linux client built in [platform/client/linux](../platform/client/linux/README.md): libavcodec with VAAPI and a software fallback, Wayland/EGL (GLES 3, dma-buf import of VAAPI surfaces), PipeWire, evdev. CI runs it end to end against the synthetic host in headless Weston on llvmpipe; VAAPI decode and dma-buf import are untested without a GPU.
 - Gamepads on all clients; virtual gamepad on Windows host (driver path decided in Phase 3).
 
 **Gate:** every host/client pair in the target table streams with the Phase 2 latency bar.
@@ -456,7 +456,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 ### Phase 7: Linux host and hardening (about 5 weeks)
 
-- Linux host: PipeWire capture, VAAPI/NVENC, uinput.
+- Linux host: PipeWire capture, VAAPI/NVENC, uinput. Capture and audio built in [platform/host/linux](../platform/host/linux/README.md): the ScreenCast portal with restore tokens (approve once, then unattended), a PipeWire stream with dma-buf or memfd buffers and cursor metadata, and the default sink's monitor for audio. Tested headless against Weston's PipeWire output behind the real portal frontend; dma-buf is untested without a GPU.
 - Fuzzing of every parser; external security review of pairing and the shim boundary.
 - Packaging, code signing, driver signing, notices; public C ABI frozen as 1.0.
 
