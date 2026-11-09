@@ -613,6 +613,10 @@ const Session = struct {
     clip_seen: u64 = 0,
     sys_clip: ?clipboard.System = null,
     runner: ?Io.Future(void) = null,
+    /// Host: the client device (iroh sessions) and what it may do. Read on the session's
+    /// threads; `moonsec_host_set_permissions` changes it under the endpoint's lock.
+    peer: ?pair.Id = null,
+    perms: pair.allowlist.Perms = .full,
 
     // What `check` last reported.
     started: bool = false,
@@ -818,10 +822,15 @@ fn sessionClipboard(s: *Session) SessionError!?clipboard.Clipboard {
 }
 
 /// A host session over `p`. `virtual`: the clock is the loopback's, nothing may block.
-fn newHostSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStream, transport: Transport, virtual: ?*Loopback) SessionError!*Session {
+fn sessionPerms(ctx: *anyopaque) pair.allowlist.Perms {
+    const s: *Session = @ptrCast(@alignCast(ctx));
+    return @atomicLoad(pair.allowlist.Perms, &s.perms, .acquire);
+}
+
+fn newHostSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStream, transport: Transport, virtual: ?*Loopback, peer: ?pair.Id, perms: pair.allowlist.Perms) SessionError!*Session {
     const s = try gpa.create(Session);
     errdefer gpa.destroy(s);
-    s.* = .{ .ep = e, .app = undefined, .transport = transport, .clock = undefined, .clip = .init(gpa) };
+    s.* = .{ .ep = e, .app = undefined, .transport = transport, .clock = undefined, .clip = .init(gpa), .peer = peer, .perms = perms };
     errdefer s.clip.deinit();
     if (virtual) |lb| {
         s.side_clock = .{ .net = lb.net, .side = .a };
@@ -873,6 +882,7 @@ fn newHostSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStrea
         .control_stream = ctl,
         .clipboard = clip,
         .clipboard_poll_us = 50_000,
+        .perms = .{ .ctx = s, .get = sessionPerms },
     }, p) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Unsupported => error.Unsupported,
@@ -1270,7 +1280,7 @@ export fn moonsec_host_listen_loopback(h: ?*c.moonsec_host, lp: ?*c.moonsec_loop
     if (l.host != null) return fail(c.MOONSEC_ERR_STATE, "a host is already on this loopback", .{});
     if (e.hc.backend == c.MOONSEC_BACKEND_SYSTEM) return fail(c.MOONSEC_ERR_UNSUPPORTED, "the loopback runs in virtual time: system backends need iroh", .{});
     if (e.activeSession()) return fail(c.MOONSEC_ERR_STATE, "the host already has a session", .{});
-    const s = newHostSession(e, l.net.pipeFor(.a), l.net.streamFor(.a), .{ .loopback = l }, l) catch |err| return sessionError(err);
+    const s = newHostSession(e, l.net.pipeFor(.a), l.net.streamFor(.a), .{ .loopback = l }, l, null, .full) catch |err| return sessionError(err);
     e.sessions.append(gpa, s) catch {
         s.deinit();
         return fail(c.MOONSEC_ERR_NO_MEMORY, "out of memory", .{});
@@ -1503,7 +1513,7 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
                 e.unlock();
             }
             // It owns `conn` from here, also when it fails.
-            startIrohSession(e, conn) catch {};
+            startIrohSession(e, conn, peer_id) catch {};
         },
         .invalid => {
             s.close();
@@ -1513,7 +1523,8 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
 }
 
 /// A session over `conn` on its own threads. Owns `conn` from here (also on failure).
-fn startIrohSession(e: *Endpoint, conn: iroh.Conn) !void {
+/// `peer` (host): the admitted client, whose allowlist permissions the session applies.
+fn startIrohSession(e: *Endpoint, conn: iroh.Conn, peer: ?pair.Id) !void {
     if (!options.iroh) unreachable;
     const ip = gpa.create(iroh_pipe.IrohPipe) catch |err| {
         conn.deinit(0);
@@ -1523,7 +1534,7 @@ fn startIrohSession(e: *Endpoint, conn: iroh.Conn) !void {
     e.lock();
     defer e.unlock();
     const s = (if (e.role == .host)
-        newHostSession(e, ip.packetPipe(), ip.controlStream(false), .{ .iroh = ip }, null)
+        newHostSession(e, ip.packetPipe(), ip.controlStream(false), .{ .iroh = ip }, null, peer, if (peer) |*id| e.allow.perms(id) orelse .full else .full)
     else
         newClientSession(e, ip.packetPipe(), ip.controlStream(true), .{ .iroh = ip }, null)) catch |err| {
         ip.ctl.drop();
@@ -1589,6 +1600,25 @@ export fn moonsec_host_pair_begin(h: ?*c.moonsec_host, config: ?*const c.moonsec
     e.net.paired_in_window = 0;
     _ = writeOut(c.moonsec_pair_info, out, r);
     return ok;
+}
+
+export fn moonsec_host_set_permissions(h: ?*c.moonsec_host, peer_id: ?[*:0]const u8, perms: u32) Status {
+    const e = hostOf(h) orelse return invalid("not a host");
+    const text = peer_id orelse return invalid("peer_id is NULL");
+    const id = pair.id.parseHex(std.mem.span(text)) orelse return invalid("peer_id is not a 64 hex digit endpoint ID");
+    if (perms & ~@as(u32, c.MOONSEC_PERM_ALL) != 0) return invalid("unknown permission bits");
+    const p: pair.allowlist.Perms = .{ .input = perms & c.MOONSEC_PERM_INPUT != 0, .clipboard = perms & c.MOONSEC_PERM_CLIPBOARD != 0 };
+    e.lock();
+    defer e.unlock();
+    for (e.allow.entries.items) |*entry| {
+        if (!std.mem.eql(u8, &entry.id, &id)) continue;
+        entry.perms = p;
+        e.saveAllow();
+        // Its live session follows: input at once, the clipboard from the next channel.
+        for (e.sessions.items) |s| if (s.peer) |sp| if (std.mem.eql(u8, &sp, &id)) @atomicStore(pair.allowlist.Perms, &s.perms, p, .release);
+        return ok;
+    }
+    return fail(c.MOONSEC_ERR_REFUSED, "{s} is not paired with this host", .{&pair.id.short(&id)});
 }
 
 export fn moonsec_host_pair_end(h: ?*c.moonsec_host) Status {
@@ -1671,7 +1701,7 @@ export fn moonsec_client_connect(h: ?*c.moonsec_client, ticket: ?[*:0]const u8, 
         return fail(c.MOONSEC_ERR_REFUSED, "the host refused the session: {s}", .{pairing.reasonText(why)});
     }
     last_started = null;
-    startIrohSession(e, conn) catch |err| return sessionError(switch (err) {
+    startIrohSession(e, conn, null) catch |err| return sessionError(switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Unsupported => error.Unsupported,
         else => error.Backend,

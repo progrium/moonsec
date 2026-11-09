@@ -467,7 +467,7 @@ const IdGate = struct {
     allowed: [64]u8,
     calls: std.atomic.Value(u32) = .init(0),
 
-    fn check(ctx: *anyopaque, conn: iroh.Conn) IrohLink.Verdict {
+    fn check(ctx: *anyopaque, conn: iroh.Conn, _: *u32) IrohLink.Verdict {
         const self: *IdGate = @ptrCast(@alignCast(ctx));
         _ = self.calls.fetchAdd(1, .monotonic);
         var b: [128]u8 = undefined;
@@ -477,7 +477,7 @@ const IdGate = struct {
 };
 
 const RefuseGate = struct {
-    fn check(_: *anyopaque, _: iroh.Conn) IrohLink.Verdict {
+    fn check(_: *anyopaque, _: iroh.Conn, _: *u32) IrohLink.Verdict {
         return .refuse;
     }
 };
@@ -592,7 +592,7 @@ test "link gate: a dialing link that is refused stops dialing" {
 
 /// Admits a connection whose first stream starts with 'k'; waits up to 5 s for it.
 const StreamGate = struct {
-    fn check(_: *anyopaque, conn: iroh.Conn) IrohLink.Verdict {
+    fn check(_: *anyopaque, conn: iroh.Conn, _: *u32) IrohLink.Verdict {
         const s = conn.acceptBi(5_000) catch return .refuse;
         defer s.deinit(0);
         var b: [1]u8 = undefined;

@@ -44,6 +44,7 @@ const simnet = @import("simnet");
 const simlink = @import("simlink");
 const pipe_mod = @import("pipe");
 const apps = @import("apps.zig");
+const control_mod = @import("control.zig");
 const simrun = @import("simrun.zig");
 const iroh = if (options.iroh) @import("iroh") else struct {};
 const iroh_pipe = if (options.iroh) @import("iroh_pipe") else struct {};
@@ -123,6 +124,9 @@ const Args = struct {
     /// peer iroh: no pairing, anyone who reaches the endpoint gets a session (`run iroh`
     /// and other lab runs only).
     insecure_no_pairing: bool = false,
+    /// peer iroh client (lab check): the host gave this device view-only permissions, so
+    /// no clipboard arrives.
+    expect_view_only: bool = false,
 };
 
 /// "T:D,T:D" (ms) into `out`.
@@ -152,6 +156,8 @@ fn usage() error{Usage} {
         \\       moonsec pair client (--ticket T | --ticket-file F) [--pin P] [--state-dir D] [--name N] [--relay]
         \\       moonsec paired [--state-dir D]
         \\       moonsec unpair ID-PREFIX [--state-dir D]
+        \\       moonsec allow ID-PREFIX view|full|input,clipboard [--state-dir D]   what a paired client may do
+        \\       (pair host --allow PERMS: what devices paired in this window may do; default full)
         \\       moonsec run pair [--seconds N]
         \\       (peer iroh uses the device key in --state-dir or the default state directory: the host
         \\        admits only paired clients, the client connects only to paired hosts, on every
@@ -218,6 +224,10 @@ fn parseArgs(args: []const [:0]const u8) !Args {
             a.ten_bit = true;
             continue;
         }
+        if (std.mem.eql(u8, s, "--expect-view-only")) {
+            a.expect_view_only = true;
+            continue;
+        }
         if (std.mem.eql(u8, s, "--insecure-no-pairing")) {
             a.insecure_no_pairing = true;
             continue;
@@ -245,7 +255,9 @@ fn parseArgs(args: []const [:0]const u8) !Args {
                 a.client = std.meta.stringToEnum(ClientKind, v) orelse return usage();
             } else if (eq(u8, s, "--host")) {
                 a.host = std.meta.stringToEnum(HostKind, v) orelse return usage();
-            } else if (eq(u8, s, "--state-dir")) a.p.state_dir = v else if (eq(u8, s, "--name")) a.p.name = v else if (eq(u8, s, "--ticket")) a.p.ticket = v else if (eq(u8, s, "--pin")) a.p.pin = v else if (eq(u8, s, "--pin-file")) a.p.pin_file = v else if (eq(u8, s, "--qr-svg")) a.p.qr_svg = v else if (eq(u8, s, "--pairings")) a.p.pairings = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--size")) {
+            } else if (eq(u8, s, "--state-dir")) a.p.state_dir = v else if (eq(u8, s, "--name")) a.p.name = v else if (eq(u8, s, "--ticket")) a.p.ticket = v else if (eq(u8, s, "--pin")) a.p.pin = v else if (eq(u8, s, "--pin-file")) a.p.pin_file = v else if (eq(u8, s, "--qr-svg")) a.p.qr_svg = v else if (eq(u8, s, "--pairings")) a.p.pairings = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--allow")) {
+                a.p.perms = core.pair.allowlist.Perms.parse(v) orelse return usage();
+            } else if (eq(u8, s, "--size")) {
                 const x = std.mem.indexOfScalar(u8, v, 'x') orelse return usage();
                 a.width = try std.fmt.parseInt(u32, v[0..x], 10);
                 a.height = try std.fmt.parseInt(u32, v[x + 1 ..], 10);
@@ -292,6 +304,8 @@ pub fn main(init: std.process.Init) !void {
         try pair_cmd.cmdPaired(pctx(gpa, io, a), w)
     else if (eq(u8, a.cmd, "unpair"))
         (if (a.npos == 1) try pair_cmd.cmdUnpair(pctx(gpa, io, a), a.pos[0], w) else return usage())
+    else if (eq(u8, a.cmd, "allow"))
+        (if (a.npos == 2) try pair_cmd.cmdAllow(pctx(gpa, io, a), a.pos[0], a.pos[1], w) else return usage())
     else if (eq(u8, a.cmd, "pair"))
         try cmdPair(gpa, io, a, w)
     else
@@ -587,7 +601,7 @@ fn cmdPeer(gpa: std.mem.Allocator, io: Io, a: Args) !bool {
         defer gpa.destroy(link);
         try link.init(gpa, io, a.hub_port, if (role == .host) .a else .b);
         defer link.deinit();
-        return peer(gpa, io, a, role, link.packetPipe(), null);
+        return peer(gpa, io, a, role, link.packetPipe(), null, null);
     }
     if (std.mem.eql(u8, a.pos[0], "iroh")) {
         if (!options.iroh) return usage();
@@ -641,7 +655,8 @@ const ScriptedClipboard = struct {
 const host_copy = "copied on the host";
 const client_copy = "copied on the client";
 
-fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketPipe, ctl_stream: ?pipe_mod.ByteStream) !bool {
+/// `perms` (host): what the connected device may do; null for everything.
+fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketPipe, ctl_stream: ?pipe_mod.ByteStream, perms: ?control_mod.PermsSource) !bool {
     const clock = api.clockFn(wallNow);
     // With a control stream: the host copies after 1 s, the client after 2 s, so each side
     // ends up holding the client's copy and the host also got it from the client.
@@ -672,7 +687,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
                 std.debug.print("moonsec: built without the Linux host; use `zig build moonsec-linux`\n", .{});
                 return false;
             }
-            ok = try peerLinuxHost(gpa, io, a, p, &w);
+            ok = try peerLinuxHost(gpa, io, a, p, &w, perms);
         } else {
             const sh = try synthetic.openHost(gpa, .{ .clock = clock, .sleeper = wallSleep, .width = a.width, .height = a.height });
             var hb = sh.backend();
@@ -692,10 +707,12 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
                 fx = .init(clock, codec, fixture_data, split);
                 hb.encoder = api.bind(api.Encoder, synthetic.fixture.Encoder, &fx);
             }
-            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .codec = codec, .pause_on_stall = !a.no_stall_pause, .yuv444 = a.yuv444, .ten_bit = a.ten_bit, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
+            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .codec = codec, .pause_on_stall = !a.no_stall_pause, .yuv444 = a.yuv444, .ten_bit = a.ten_bit, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt, .perms = perms }, p);
             defer app.deinit();
             try app.runThreaded(io);
             try app.s.report(&w);
+            const pm: core.pair.allowlist.Perms = if (perms) |src| src.read() else .full;
+            if (!pm.eql(.full)) try w.print("  device permissions: {f}\n", .{pm});
             const lost_input = app.s.input_rx.stats.lost_events;
             try w.print("  injected keys {d} (out of order {d}, lost {d}), capture timeouts {d}, encode errors {d}\n", .{ sh.injector.keys, sh.injector.wrong, lost_input, app.stats.capture_timeouts, app.stats.encode_errors });
             if (app.audio) |au| try w.print("  audio: {d} frames encoded, {d} datagrams, {d} errors; source skipped {d} frames\n", .{ au.stats.frames, au.stats.datagrams, au.stats.errors, sh.audio.stats.skipped });
@@ -705,10 +722,15 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
                 try w.print("  fixture: {d} frames ({d} keyframes, {d} skipped for recovery), {d} bytes\n", .{ fx.stats.frames, fx.stats.keyframes, fx.stats.skipped, fx.stats.bytes });
                 // A real client's input is whatever its user typed, not the scripted keys.
                 ok = app.s.end == .client_bye and app.s.stats.frames > 0;
-            } else ok = app.s.end == .client_bye and (sh.injector.wrong == 0 or lost_input > 0) and sh.injector.keys > 0 and app.s.stats.frames > 0;
+            } else {
+                // A device without the input permission: nothing injected, its input refused.
+                const input_ok = if (pm.input) (sh.injector.wrong == 0 or lost_input > 0) and sh.injector.keys > 0 else sh.injector.keys == 0 and app.s.stats.inputs_denied > 0;
+                ok = app.s.end == .client_bye and input_ok and app.s.stats.frames > 0;
+            }
             if (ctl_stream != null) {
                 const cs = app.s.control.stats;
-                const clip_ok = !scripted or clip.got(client_copy);
+                // Without the clipboard permission, the client's copy must not arrive.
+                const clip_ok = !scripted or if (pm.clipboard) clip.got(client_copy) else !clip.got(client_copy) and app.s.control.clip.stats.applied == 0;
                 try w.print("  control: {d} channels, {d} up, {d} resets, {d} errors; clipboard {s} (sent {d}, applied {d}, echoes {d})\n", .{ cs.channels, cs.ups, cs.resets, cs.errors, if (clip_ok) "ok" else "MISSING the client's copy", app.s.control.clip.stats.sent, app.s.control.clip.stats.applied, app.s.control.clip.stats.echoes });
                 ok = ok and clip_ok;
             }
@@ -747,7 +769,8 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             if (ctl_stream != null) {
                 const cs = app.s.control.stats;
                 // The host's copy arrived before ours replaced it.
-                const clip_ok = !scripted or (clip.mem.writes >= 1 and app.s.control.clip.stats.applied >= 1 and std.mem.eql(u8, clip.mem.get() orelse "", client_copy));
+                // --expect-view-only: the host gave this device no clipboard, so nothing came.
+                const clip_ok = !scripted or if (a.expect_view_only) app.s.control.clip.stats.applied == 0 else (clip.mem.writes >= 1 and app.s.control.clip.stats.applied >= 1 and std.mem.eql(u8, clip.mem.get() orelse "", client_copy));
                 try w.print("  control: {d} channels, {d} up, {d} resets, {d} errors; clipboard {s} (sent {d}, applied {d}, echoes {d})\n", .{ cs.channels, cs.ups, cs.resets, cs.errors, if (clip_ok) "ok" else "MISSING the host's copy", app.s.control.clip.stats.sent, app.s.control.clip.stats.applied, app.s.control.clip.stats.echoes });
                 ok = ok and clip_ok;
             }
@@ -761,7 +784,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
 /// encoders are wired in) the synthetic capture, encoder and audio. With --verify-input the injected keys
 /// are read back from the uinput keyboard's event node, as the compositor reads them, and
 /// checked against the synthetic client's key script.
-fn peerLinuxHost(gpa: std.mem.Allocator, io: Io, a: Args, p: pipe_mod.PacketPipe, w: *Io.Writer) !bool {
+fn peerLinuxHost(gpa: std.mem.Allocator, io: Io, a: Args, p: pipe_mod.PacketPipe, w: *Io.Writer, perms: ?control_mod.PermsSource) !bool {
     if (!options.linux_host) unreachable;
     const h = host_linux.backend.open(gpa, .{ .width = a.width, .height = a.height, .audio = !a.no_audio, .sleeper = wallSleep, .require_input = a.verify_input }) catch |e| {
         std.debug.print("linux host: {s}\n", .{@errorName(e)});
@@ -786,7 +809,7 @@ fn peerLinuxHost(gpa: std.mem.Allocator, io: Io, a: Args, p: pipe_mod.PacketPipe
         };
     }
     defer if (check.reader) |r| r.close();
-    var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .session = .{ .rate_control = a.rate_control } }, p);
+    var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .session = .{ .rate_control = a.rate_control }, .perms = perms }, p);
     defer app.deinit();
     var reading: ?Io.Future(Io.Cancelable!void) = if (check.reader != null) try io.concurrent(KeyCheck.run, .{ &check, io }) else null;
     defer if (reading) |*f| f.cancel(io) catch {};
@@ -986,11 +1009,12 @@ fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
     }
     const wait_ms: u32 = if (role == .host and a.relay) 600_000 else 30_000;
     // The allowlist (host) or paired-host list (client) the gate checks every connection
-    // against. Loaded once: `moonsec unpair` takes effect at the next `peer iroh`.
+    // against. The host's gate reads it again on every connection, so `moonsec unpair` and
+    // `moonsec allow` apply from a device's next connection.
     var list: ?core.pair.Allowlist = if (!a.insecure_no_pairing) try state.?.loadList(if (role == .host) .clients else .hosts) else null;
     defer if (list) |*l| l.deinit();
     var gate: pair_cmd.LinkGate = undefined;
-    if (list) |*l| gate = .{ .list = l, .role = if (role == .host) .host else .client };
+    if (list) |*l| gate = .{ .list = l, .role = if (role == .host) .host else .client, .state = if (role == .host) &state.? else null };
     // The link accepts (host) or dials (client) in the background, and again after a drop.
     const link = try gpa.create(iroh_pipe.IrohLink);
     defer gpa.destroy(link);
@@ -1013,12 +1037,19 @@ fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
         }
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    const ok = try peer(gpa, io, a, role, p, link.controlStream());
+    // Host: the installed connection's device decides what the session applies.
+    const perms_src: ?control_mod.PermsSource = if (role == .host and list != null) .{ .ctx = link, .get = linkPerms } else null;
+    const ok = try peer(gpa, io, a, role, p, link.controlStream(), perms_src);
     const ls = link.linkStats();
     std.debug.print("  {s} link: {d} dials ({d} failed), {d} accepts, {d} refused, {d} reconnects, {d} discarded, {d} datagrams dropped offline\n", .{ @tagName(role), ls.dials, ls.dial_failures, ls.accepts, ls.refused, ls.switches, ls.discarded, ls.offline_drops });
     if (link.conn()) |conn| printQuic(conn, role);
     io.sleep(.fromMilliseconds(200), .awake) catch {};
     return ok;
+}
+
+fn linkPerms(ctx: *anyopaque) core.pair.allowlist.Perms {
+    const link: *iroh_pipe.IrohLink = @ptrCast(@alignCast(ctx));
+    return pair_cmd.tagPerms(link.curTag());
 }
 
 /// The current connection's shim counters and paths, so a lab run shows where datagrams went.

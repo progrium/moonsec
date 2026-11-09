@@ -239,6 +239,17 @@ typedef struct moonsec_pair_info {
 MOONSEC_API moonsec_status moonsec_host_pair_begin(moonsec_host *host, const moonsec_pair_config *config, moonsec_pair_info *info);
 MOONSEC_API moonsec_status moonsec_host_pair_end(moonsec_host *host);
 
+/* What a paired client may do besides watching and listening. New pairings
+ * get MOONSEC_PERM_ALL. */
+#define MOONSEC_PERM_INPUT 0x0001u     /* its keyboard, mouse and gamepad input is applied */
+#define MOONSEC_PERM_CLIPBOARD 0x0002u /* the clipboard syncs with it */
+#define MOONSEC_PERM_ALL 0x0003u
+
+/* Sets a paired client's permissions (peer_id: its 64 hex digit ID, as in
+ * events) and saves them with the allowlist. Applies at once to its session, if
+ * it has one. MOONSEC_ERR_REFUSED if it is not paired. */
+MOONSEC_API moonsec_status moonsec_host_set_permissions(moonsec_host *host, const char *peer_id, uint32_t perms);
+
 /* Loopback: serve one client over `loopback`, in virtual time. The session
  * exists at once (`*session`, may be NULL) and starts streaming when the
  * client says hello. */

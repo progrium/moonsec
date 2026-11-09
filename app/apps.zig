@@ -23,6 +23,7 @@ const client_session = @import("client_session.zig");
 const audio_stage = @import("audio_stage");
 const clipboard = @import("clipboard");
 const clipsync = @import("clipsync.zig");
+const control = @import("control.zig");
 
 const proto = core.proto;
 
@@ -58,6 +59,9 @@ pub const HostOptions = struct {
     /// The system clipboard to sync over the control channel (platform/clipboard).
     clipboard: ?clipboard.Clipboard = null,
     clipboard_poll_us: Micros = 250_000,
+    /// What the connected device may do (input, clipboard), asked again on every
+    /// reconnect. Null: everything (lab runs, the sim).
+    perms: ?control.PermsSource = null,
 };
 
 pub const HostApp = struct {
@@ -108,6 +112,7 @@ pub const HostApp = struct {
             .peer_timeout_us = o.session.peer_timeout_us,
             .loss_policy = o.session.loss_policy,
             .pause_on_stall = o.pause_on_stall,
+            .control = .{ .perms = o.perms },
         }, p);
         app.s = s;
         errdefer app.s.deinit();

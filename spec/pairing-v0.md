@@ -162,9 +162,20 @@ paired hosts and refuses to connect otherwise.
 Text, one device per line; `#` lines and blank lines are ignored:
 
 ```
-# moonsec paired devices v0: id, paired (unix s), name, address
-<64 hex id> TAB <paired unix s> TAB <name> [TAB <address>]
+# moonsec paired devices v0: id, paired (unix s), name, address, perms=
+<64 hex id> TAB <paired unix s> TAB <name> [TAB <address>] [TAB perms=<list>]
 ```
+
+`perms=` (on the host's list) says what the client may do besides watching and listening:
+`input` (its keyboard, mouse and gamepad input is applied), `clipboard` (the clipboard syncs
+with it), comma-separated, or `view` for neither. Without the field a client has both, so
+lists from before permissions keep working; the host writes the field only when it is not
+both. The host reads the list at every admission and applies the permissions of the device
+behind the session's current connection: input it lacks is acknowledged and dropped, and
+without the clipboard permission the control channel runs without the clipboard feature (a
+revocation during a channel also drops clipboard messages at once). `moonsec pair host
+--allow PERMS` sets them for devices paired in that window, `moonsec allow ID-PREFIX PERMS`
+changes them, `moonsec paired` shows them; the C ABI has `moonsec_host_set_permissions`.
 
 Names are sanitized on the way in: control characters and tabs become `?`, invalid UTF-8
 bytes become `?`, and names are cut to 64 bytes at a character boundary. Addresses contain
@@ -190,6 +201,8 @@ Support/moonsec` (macOS), `%APPDATA%\moonsec` (Windows).
 ## Not yet
 
 - LAN discovery (mDNS), so a PIN alone finds the host without an address ticket.
-- Revocation beyond `moonsec unpair`, and per-client permissions.
+- Revocation beyond `moonsec unpair` (which applies from the device's next connection).
+- Multi-user over the network: `app/multi_host.zig`'s "may control" should come from the
+  `input` permission when it is wired to iroh admission.
 - An external security review (Phase 7): threat model in [docs/security.md](../docs/security.md),
   reviewer packet and our findings in [docs/security-review.md](../docs/security-review.md).

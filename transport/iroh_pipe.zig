@@ -262,9 +262,11 @@ pub const IrohLink = struct {
 
     /// Runs on the worker task, before a connection is handed over. It may block (bounded
     /// by its own timeouts) and must not free the connection.
+    /// `tag` (0 unless set) stays with an admitted connection: `curTag` gives the installed
+    /// connection's, so the app can tell what the device behind it may do.
     pub const Gate = struct {
         ctx: *anyopaque,
-        check: *const fn (ctx: *anyopaque, conn: iroh.Conn) Verdict,
+        check: *const fn (ctx: *anyopaque, conn: iroh.Conn, tag: *u32) Verdict,
     };
 
     pub const Options = struct {
@@ -309,6 +311,9 @@ pub const IrohLink = struct {
     cur: ?IrohPipe = null,
     /// accept: a newer connection, adopted once it delivers.
     cand: ?iroh.Conn = null,
+    cand_tag: u32 = 0,
+    /// The gate's tag of the installed connection (any thread may read it).
+    cur_tag: std.atomic.Value(u32) = .init(0),
     installed: u64 = 0,
     conn_epoch: u32 = 0,
     pacing_bps: u64 = 0,
@@ -324,6 +329,7 @@ pub const IrohLink = struct {
     // Shared with the worker.
     mu: Io.Mutex = .init,
     ready: ?iroh.Conn = null,
+    ready_tag: u32 = 0,
     want_dial: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     worker: ?Io.Future(void) = null,
@@ -400,10 +406,16 @@ pub const IrohLink = struct {
         }
     }
 
-    fn handOver(self: *IrohLink, c: iroh.Conn) void {
+    /// The gate's tag of the installed connection (0 before one, or without a gate).
+    pub fn curTag(self: *const IrohLink) u32 {
+        return self.cur_tag.load(.acquire);
+    }
+
+    fn handOver(self: *IrohLink, c: iroh.Conn, tag: u32) void {
         self.lock();
         const old = self.ready;
         self.ready = c;
+        self.ready_tag = tag;
         if (self.opts.role == .dial) self.want_dial = false;
         self.unlock();
         // Never handed to the caller, so never used: free it here.
@@ -428,7 +440,8 @@ pub const IrohLink = struct {
                     backoff = @min(backoff * 2, self.opts.retry_max_ms);
                     continue;
                 };
-                switch (self.gateCheck(c)) {
+                var tag: u32 = 0;
+                switch (self.gateCheck(c, &tag)) {
                     .admit => {},
                     .retry => {
                         _ = self.w_failures.fetchAdd(1, .monotonic);
@@ -445,13 +458,13 @@ pub const IrohLink = struct {
                     },
                 }
                 backoff = self.opts.retry_min_ms;
-                self.handOver(c);
+                self.handOver(c, tag);
             },
             .accept => {
                 const c = self.ep.accept(200) catch continue;
                 _ = self.w_accepts.fetchAdd(1, .monotonic);
                 if (self.opts.gate == null) {
-                    self.handOver(c);
+                    self.handOver(c, 0);
                     continue;
                 }
                 if (self.gates_running.fetchAdd(1, .acq_rel) >= self.opts.max_gates) {
@@ -463,7 +476,8 @@ pub const IrohLink = struct {
                 self.gates.concurrent(self.io, gateTask, .{ self, c }) catch {
                     _ = self.gates_running.fetchSub(1, .acq_rel);
                     // No task to run it on: gate it here.
-                    if (self.gateCheck(c) == .admit) self.handOver(c);
+                    var tag: u32 = 0;
+                    if (self.gateCheck(c, &tag) == .admit) self.handOver(c, tag);
                 };
             },
         };
@@ -471,18 +485,19 @@ pub const IrohLink = struct {
 
     fn gateTask(self: *IrohLink, c: iroh.Conn) void {
         defer _ = self.gates_running.fetchSub(1, .acq_rel);
-        if (self.gateCheck(c) != .admit) return;
+        var tag: u32 = 0;
+        if (self.gateCheck(c, &tag) != .admit) return;
         if (self.stop.load(.acquire)) {
             c.deinit(0);
             return;
         }
-        self.handOver(c);
+        self.handOver(c, tag);
     }
 
     /// Runs the gate on `c`; anything but `admit` closes and frees it.
-    fn gateCheck(self: *IrohLink, c: iroh.Conn) Verdict {
+    fn gateCheck(self: *IrohLink, c: iroh.Conn, tag: *u32) Verdict {
         const g = self.opts.gate orelse return .admit;
-        const v = g.check(g.ctx, c);
+        const v = g.check(g.ctx, c, tag);
         if (v != .admit) {
             _ = self.w_refused.fetchAdd(1, .monotonic);
             c.deinit(self.opts.refuse_code);
@@ -504,9 +519,10 @@ pub const IrohLink = struct {
         self.cur = null;
     }
 
-    fn install(self: *IrohLink, c: iroh.Conn) void {
+    fn install(self: *IrohLink, c: iroh.Conn, tag: u32) void {
         self.retire();
         self.cur = IrohPipe.init(c);
+        self.cur_tag.store(tag, .release);
         if (self.installed > 0) {
             self.conn_epoch +%= 1;
             self.stats_.switches += 1;
@@ -525,6 +541,7 @@ pub const IrohLink = struct {
     fn adopt(self: *IrohLink) void {
         self.lock();
         const got = self.ready;
+        const tag = self.ready_tag;
         self.ready = null;
         self.unlock();
         const c = got orelse return;
@@ -537,10 +554,10 @@ pub const IrohLink = struct {
                     self.redialing = false;
                     return;
                 }
-                self.install(c);
+                self.install(c, tag);
             },
             .accept => {
-                if (!self.curOpen()) return self.install(c);
+                if (!self.curOpen()) return self.install(c, tag);
                 if (!sameRemote(self.cur.?.conn, c)) {
                     // Another device: it waits until this session's connection closes.
                     c.deinit(self.opts.refuse_code);
@@ -552,6 +569,7 @@ pub const IrohLink = struct {
                     self.stats_.discarded += 1;
                 }
                 self.cand = c;
+                self.cand_tag = tag;
             },
         }
     }
@@ -600,7 +618,7 @@ pub const IrohLink = struct {
         if (self.cand) |c| if (!self.curOpen()) {
             // The old connection is gone: no need to wait for the newcomer to speak.
             self.cand = null;
-            self.install(c);
+            self.install(c, self.cand_tag);
         };
         if (self.cand) |c| {
             var cp = IrohPipe.init(c);
@@ -608,7 +626,7 @@ pub const IrohLink = struct {
                 if (r) |got| {
                     // The client moved to this connection: follow it.
                     self.cand = null;
-                    self.install(c);
+                    self.install(c, self.cand_tag);
                     return got;
                 }
             } else |e| switch (e) {
