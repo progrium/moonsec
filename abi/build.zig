@@ -127,9 +127,13 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const multi_test = cProgram(b, target, optimize, "abi-test-multi", "abi/test_multi.c", full.static, false);
     const run_multi = b.addRunArtifact(multi_test);
     run_multi.step.dependOn(&run_iroh.step); // one loopback run at a time
-    const iroh_step = b.step("test-abi-iroh", "C ABI over iroh on loopback: pairing, admission, a session, a multi-user host (builds the shim)");
+    const reconnect_test = cProgram(b, target, optimize, "abi-test-reconnect", "abi/test_reconnect.c", full.static, false);
+    const run_reconnect = b.addRunArtifact(reconnect_test);
+    run_reconnect.step.dependOn(&run_multi.step);
+    const iroh_step = b.step("test-abi-iroh", "C ABI over iroh on loopback: pairing, admission, a session, a multi-user host, reconnects (builds the shim)");
     iroh_step.dependOn(&run_iroh.step);
     iroh_step.dependOn(&run_multi.step);
+    iroh_step.dependOn(&run_reconnect.step);
     if (b.top_level_steps.get("test-shim")) |ts| ts.step.dependOn(iroh_step);
 
     // --- the OS backends over iroh ---

@@ -248,7 +248,10 @@ pub const IrohPipe = struct {
 /// connections over to the caller's thread. Connections are freed on the caller's thread.
 /// `PathStats.conn_epoch` counts replacements, and the pacing rate carries over.
 pub const IrohLink = struct {
-    pub const Role = enum { dial, accept };
+    /// `offered`: like `accept`, but the caller accepts (and admits) connections itself and
+    /// hands this link the ones for its session with `offer`, as a host with several
+    /// sessions on one endpoint does; the link runs no worker.
+    pub const Role = enum { dial, accept, offered };
 
     pub const Verdict = enum {
         /// Hand the connection over.
@@ -335,12 +338,40 @@ pub const IrohLink = struct {
     w_gave_up: std.atomic.Value(bool) = .init(false),
     /// accept: gate tasks.
     gates: Io.Group = .init,
+    drop_requested: std.atomic.Value(bool) = .init(false),
     gates_running: std.atomic.Value(u32) = .init(0),
 
     /// Starts the worker; a dialing link dials at once. `self` must not move afterwards.
     pub fn start(self: *IrohLink, io: Io, ep: iroh.Endpoint, opts: Options) !void {
         self.* = .{ .io = io, .ep = ep, .opts = opts, .want_dial = opts.role == .dial };
-        self.worker = try io.concurrent(work, .{self});
+        if (opts.role != .offered) self.worker = try io.concurrent(work, .{self});
+    }
+
+    /// Starts on a connection the caller already has (dialed and admitted, or accepted and
+    /// admitted): the link owns it from here, also on failure. A dialing link dials again
+    /// only when it drops. `self` must not move afterwards.
+    pub fn startWith(self: *IrohLink, io: Io, ep: iroh.Endpoint, opts: Options, first: iroh.Conn) !void {
+        self.* = .{ .io = io, .ep = ep, .opts = opts };
+        self.install(first);
+        if (opts.role != .offered) self.worker = io.concurrent(work, .{self}) catch |e| {
+            self.deinit();
+            return e;
+        };
+    }
+
+    /// offered: a new connection from the same remote endpoint, admitted by the caller.
+    /// The link owns it from here. It replaces the current connection as an accepted one
+    /// would. Safe from any thread.
+    pub fn offer(self: *IrohLink, c: iroh.Conn) void {
+        _ = self.w_accepts.fetchAdd(1, .monotonic);
+        self.handOver(c);
+    }
+
+    /// Tests: drop the current connection as a network failure would (a dialing link then
+    /// dials again). Takes effect on the caller's thread at the link's next call. Safe
+    /// from any thread.
+    pub fn dropForTest(self: *IrohLink) void {
+        self.drop_requested.store(true, .release);
     }
 
     /// Stops the worker (waits for a dial or accept in progress) and frees every connection.
@@ -447,6 +478,7 @@ pub const IrohLink = struct {
                 backoff = self.opts.retry_min_ms;
                 self.handOver(c);
             },
+            .offered => return, // no worker
             .accept => {
                 const c = self.ep.accept(200) catch continue;
                 _ = self.w_accepts.fetchAdd(1, .monotonic);
@@ -523,6 +555,10 @@ pub const IrohLink = struct {
 
     /// Take a connection from the worker, if it has one.
     fn adopt(self: *IrohLink) void {
+        if (self.drop_requested.swap(false, .acq_rel) and self.cur != null) {
+            self.retire();
+            self.onClosed();
+        }
         self.lock();
         const got = self.ready;
         self.ready = null;
@@ -539,7 +575,7 @@ pub const IrohLink = struct {
                 }
                 self.install(c);
             },
-            .accept => {
+            .accept, .offered => {
                 if (!self.curOpen()) return self.install(c);
                 if (!sameRemote(self.cur.?.conn, c)) {
                     // Another device: it waits until this session's connection closes.
