@@ -169,7 +169,8 @@ typedef struct moonsec_input {
 #define MOONSEC_HOST_LOSS_POLICY 0x0010u   /* choose NACK, FEC or relay mode per path */
 #define MOONSEC_HOST_NO_AUDIO 0x0020u      /* don't stream the backend's audio */
 #define MOONSEC_HOST_APP_INPUT 0x0040u     /* deliver client input as MOONSEC_EVENT_INPUT instead of injecting it */
-#define MOONSEC_HOST_REQUIRE_PAIRED 0x0080u /* iroh: admit only paired clients (state_dir needed) */
+#define MOONSEC_HOST_REQUIRE_PAIRED 0x0080u /* iroh: admit only paired clients; the default now, kept for source compatibility */
+#define MOONSEC_HOST_INSECURE_NO_PAIRING 0x0100u /* iroh: admit any client that reaches the endpoint (tests and labs only) */
 
 typedef struct moonsec_host_config {
     uint32_t struct_size; /* sizeof(moonsec_host_config) */
@@ -266,7 +267,8 @@ MOONSEC_API moonsec_status moonsec_host_displays(moonsec_host *host, moonsec_dis
 #define MOONSEC_CLIENT_NO_AUDIO 0x0001u    /* don't play the stream's audio */
 #define MOONSEC_CLIENT_NO_OS_INPUT 0x0002u /* don't read the backend's input; send with moonsec_session_send_input only */
 #define MOONSEC_CLIENT_FULLSCREEN 0x0004u
-#define MOONSEC_CLIENT_REQUIRE_PAIRED 0x0008u /* iroh: connect only to paired hosts (state_dir needed) */
+#define MOONSEC_CLIENT_REQUIRE_PAIRED 0x0008u /* iroh: connect only to paired hosts; the default now, kept for source compatibility */
+#define MOONSEC_CLIENT_INSECURE_NO_PAIRING 0x0010u /* iroh: connect to any host the ticket names (tests and labs only) */
 
 /* A presented picture, for moonsec_client_config.on_frame. Valid during the
  * callback only. */

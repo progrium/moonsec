@@ -79,8 +79,8 @@ physical attacks.
 ## Security properties we claim
 
 1. **Only paired devices stream.** A host admits a session only from a connection whose
-   authenticated endpoint ID is on its allowlist. *Today only `peer iroh --state-dir`
-   enforces this; without `--state-dir` anyone with the address ticket is admitted (O1).*
+   authenticated endpoint ID is on its allowlist, on every connection: the first and each
+   reconnect. Only lab runs opt out, with `--insecure-no-pairing`.
 2. **Pairing needs the secret the host shows**, and each wrong guess costs one of the
    window's five attempts whatever connection it arrives on: a PIN guesser wins with
    probability 5 × 10⁻⁶ per window. A QR secret is 128 bits.

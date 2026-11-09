@@ -17,8 +17,10 @@
 //!       Write the measurement test pattern as a PPM.
 //!
 //!   moonsec id | pair host|client | paired | unpair | run pair
-//!       Device identity and pairing; see app/pair_cmd.zig. `peer iroh` with --state-dir
-//!       uses the device key, and the host admits only paired clients.
+//!       Device identity and pairing; see app/pair_cmd.zig. `peer iroh` uses the device key
+//!       (--state-dir, else the default state directory): the host admits only paired
+//!       clients and the client connects only to paired hosts, on every connection including
+//!       reconnects. `--insecure-no-pairing` turns that off; `run iroh` passes it.
 //!
 //! Options: --fps N, --bitrate BPS, --size WxH, --slices N. `peer sim host` also takes
 //! --fixture FILE.h264|FILE.h265: replay that Annex B stream instead of the synthetic codec
@@ -118,6 +120,9 @@ const Args = struct {
     yuv444: bool = false,
     ten_bit: bool = false,
     p: pair_cmd.Args = .{},
+    /// peer iroh: no pairing, anyone who reaches the endpoint gets a session (`run iroh`
+    /// and other lab runs only).
+    insecure_no_pairing: bool = false,
 };
 
 /// "T:D,T:D" (ms) into `out`.
@@ -148,7 +153,9 @@ fn usage() error{Usage} {
         \\       moonsec paired [--state-dir D]
         \\       moonsec unpair ID-PREFIX [--state-dir D]
         \\       moonsec run pair [--seconds N]
-        \\       (peer iroh also takes --state-dir: device key, and the host admits paired clients only)
+        \\       (peer iroh uses the device key in --state-dir or the default state directory: the host
+        \\        admits only paired clients, the client connects only to paired hosts, on every
+        \\        reconnect too; --insecure-no-pairing turns that off for lab runs)
         \\opts:  --fps N --bitrate BPS --size WxH --slices N --rate-control
         \\       --yuv444 --ten-bit (host: prefer 4:4:4 / 10-bit when the client decodes it)
         \\       --loss-policy (sim, soak: NACK/FEC/relay chosen per path)
@@ -209,6 +216,10 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         }
         if (std.mem.eql(u8, s, "--ten-bit")) {
             a.ten_bit = true;
+            continue;
+        }
+        if (std.mem.eql(u8, s, "--insecure-no-pairing")) {
+            a.insecure_no_pairing = true;
             continue;
         }
         if (std.mem.eql(u8, s, "--pin-only")) {
@@ -530,7 +541,8 @@ fn runIroh(io: Io, self_exe: []const u8, a: Args) !bool {
     var pa: PeerArgs = .{};
     pa.fill(a);
     var argv: [32][]const u8 = undefined;
-    const base = [_][]const u8{ self_exe, "peer", "iroh", "host", "--ticket-file", ticket_file };
+    // A lab run between two throwaway endpoints: no pairing (`run pair` covers it).
+    const base = [_][]const u8{ self_exe, "peer", "iroh", "host", "--ticket-file", ticket_file, "--insecure-no-pairing" };
     @memcpy(argv[0..base.len], &base);
     @memcpy(argv[base.len..][0..pa.n], pa.list[0..pa.n]);
     var host = try spawn(io, argv[0 .. base.len + pa.n]);
@@ -909,9 +921,12 @@ fn quitAfter(app: *apps.ClientApp, io: Io, seconds: u32) Io.Cancelable!void {
 
 fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
     if (a.ticket_file.len == 0) return usage();
-    // With --state-dir: the device key, and pairing enforced on both sides.
-    var state: ?@import("pairing.zig").State = if (a.p.state_dir.len > 0) try pair_cmd.openStateFor(pctx(gpa, io, a)) else null;
+    // Pairing is enforced unless a lab run turns it off: the device key from the state
+    // directory (--state-dir, else the default one), the host admits only paired clients and
+    // the client connects only to paired hosts, on every connection including reconnects.
+    var state: ?@import("pairing.zig").State = if (!a.insecure_no_pairing) try pair_cmd.openStateFor(pctx(gpa, io, a)) else if (a.p.state_dir.len > 0) try pair_cmd.openStateFor(pctx(gpa, io, a)) else null;
     defer if (state) |*st| st.close();
+    if (a.insecure_no_pairing and role == .host) std.debug.print("moonsec: --insecure-no-pairing: any peer that reaches this endpoint gets a session (lab use only)\n", .{});
     var secret: ?[32]u8 = null;
     if (state) |*st| secret = (try st.identity()).secret;
     iroh.init(null, null) catch |e| {
@@ -970,56 +985,38 @@ fn peerIroh(gpa: std.mem.Allocator, io: Io, a: Args, role: Role) !bool {
         },
     }
     const wait_ms: u32 = if (role == .host and a.relay) 600_000 else 30_000;
-    // With pairing, one connection admitted through the pairing exchange; no reconnect yet
-    // (IrohLink would have to run the admission on every new connection).
-    if (state) |*st| return peerPaired(gpa, io, a, role, ep, st, ticket_z orelse "", wait_ms);
+    // The allowlist (host) or paired-host list (client) the gate checks every connection
+    // against. Loaded once: `moonsec unpair` takes effect at the next `peer iroh`.
+    var list: ?core.pair.Allowlist = if (!a.insecure_no_pairing) try state.?.loadList(if (role == .host) .clients else .hosts) else null;
+    defer if (list) |*l| l.deinit();
+    var gate: pair_cmd.LinkGate = undefined;
+    if (list) |*l| gate = .{ .list = l, .role = if (role == .host) .host else .client };
     // The link accepts (host) or dials (client) in the background, and again after a drop.
     const link = try gpa.create(iroh_pipe.IrohLink);
     defer gpa.destroy(link);
-    try link.start(io, ep, .{ .role = if (role == .host) .accept else .dial, .ticket = ticket_z orelse "", .alpn = alpn });
+    try link.start(io, ep, .{
+        .role = if (role == .host) .accept else .dial,
+        .ticket = ticket_z orelse "",
+        .alpn = alpn,
+        .gate = if (list != null) gate.gate() else null,
+        .refuse_code = pair_cmd.close_not_paired,
+    });
     defer link.deinit();
     const p = link.packetPipe();
     // The first connection, within the old accept/connect timeouts.
     var waited: u64 = 0;
     while (!p.stats().connected) : (waited += 10) {
+        if (link.refused()) return false; // requestSession said why
         if (waited >= wait_ms) {
-            std.debug.print("{s}: no connection after {d} s ({d} dials, {d} failed): {s}\n", .{ @tagName(role), wait_ms / 1000, link.linkStats().dials, link.linkStats().dial_failures, iroh.lastError() });
+            std.debug.print("{s}: no connection after {d} s ({d} dials, {d} failed, {d} refused): {s}\n", .{ @tagName(role), wait_ms / 1000, link.linkStats().dials, link.linkStats().dial_failures, link.linkStats().refused, iroh.lastError() });
             return error.Timeout;
         }
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
     const ok = try peer(gpa, io, a, role, p, link.controlStream());
     const ls = link.linkStats();
-    std.debug.print("  {s} link: {d} dials ({d} failed), {d} accepts, {d} reconnects, {d} discarded, {d} datagrams dropped offline\n", .{ @tagName(role), ls.dials, ls.dial_failures, ls.accepts, ls.switches, ls.discarded, ls.offline_drops });
+    std.debug.print("  {s} link: {d} dials ({d} failed), {d} accepts, {d} refused, {d} reconnects, {d} discarded, {d} datagrams dropped offline\n", .{ @tagName(role), ls.dials, ls.dial_failures, ls.accepts, ls.refused, ls.switches, ls.discarded, ls.offline_drops });
     if (link.conn()) |conn| printQuic(conn, role);
-    io.sleep(.fromMilliseconds(200), .awake) catch {};
-    return ok;
-}
-
-/// `peerIroh` with --state-dir: the host admits only paired clients, the client asks for a
-/// session (spec/pairing-v0.md), over one connection.
-fn peerPaired(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, ep: iroh.Endpoint, st: *@import("pairing.zig").State, ticket: [:0]const u8, wait_ms: u32) !bool {
-    const conn = switch (role) {
-        .host => blk: {
-            var clients = try st.loadList(.clients);
-            defer clients.deinit();
-            break :blk try pair_cmd.acceptAdmitted(pctx(gpa, io, a), ep, &clients, wait_ms);
-        },
-        .client => ep.connect(ticket, alpn, 30_000) catch |e| {
-            std.debug.print("connect: {s}\n", .{iroh.lastError()});
-            return e;
-        },
-    };
-    defer conn.deinit(0);
-    if (role == .client) {
-        var hosts = try st.loadList(.hosts);
-        defer hosts.deinit();
-        if (!try pair_cmd.requestSession(conn, &hosts)) return false;
-    }
-    var ip = iroh_pipe.IrohPipe.init(conn);
-    defer ip.ctl.drop();
-    const ok = try peer(gpa, io, a, role, ip.packetPipe(), ip.controlStream(role == .client));
-    printQuic(conn, role);
     io.sleep(.fromMilliseconds(200), .awake) catch {};
     return ok;
 }

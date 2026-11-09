@@ -83,7 +83,7 @@ static moonsec_host *new_host(const char *dir) {
     hc.struct_size = sizeof hc;
     hc.state_dir = dir;
     hc.name = "abi test host";
-    hc.flags = MOONSEC_HOST_REQUIRE_PAIRED | MOONSEC_HOST_APP_INPUT;
+    hc.flags = MOONSEC_HOST_APP_INPUT; /* pairing required: the default */
     hc.clipboard = MOONSEC_CLIPBOARD_APP;
     hc.width = 320;
     hc.height = 180;
@@ -121,7 +121,9 @@ int main(void) {
     snprintf(client_dir, sizeof client_dir, "%s/moonsec-abi-client-%d-%ld", tmp, (int)getpid(), (long)time(NULL));
 
     moonsec_host *h = new_host(host_dir);
-    moonsec_client *c = new_client(client_dir, 0);
+    /* Insecure on the client side only, so it dials the unpaired host and the host's
+     * refusal is what gets tested. */
+    moonsec_client *c = new_client(client_dir, MOONSEC_CLIENT_INSECURE_NO_PAIRING);
     if (!h || !c) return 1;
     char host_id[80], client_id[80];
     size_t len = 0;
@@ -218,7 +220,7 @@ int main(void) {
 
     /* Both state directories kept the keys and the pairing: same IDs, connects at once. */
     h = new_host(host_dir);
-    c = new_client(client_dir, MOONSEC_CLIENT_REQUIRE_PAIRED);
+    c = new_client(client_dir, 0);
     char id2[80];
     OK(moonsec_host_id(h, id2, sizeof id2, &len));
     CHECK(strcmp(id2, host_id) == 0);
@@ -234,11 +236,11 @@ int main(void) {
     CHECK(ev.code == MOONSEC_END_PEER_CLOSED);
     moonsec_host_destroy(h);
 
-    /* A client that requires pairing refuses a host it never paired with. */
+    /* A client refuses a host it never paired with. */
     char other_dir[600];
     snprintf(other_dir, sizeof other_dir, "%s-other", host_dir);
     h = new_host(other_dir);
-    c = new_client(client_dir, MOONSEC_CLIENT_REQUIRE_PAIRED);
+    c = new_client(client_dir, 0);
     OK(moonsec_host_listen(h));
     OK(moonsec_host_ticket(h, ticket, sizeof ticket, &len));
     CHECK(moonsec_client_connect(c, ticket, 10000, &cs) == MOONSEC_ERR_REFUSED);

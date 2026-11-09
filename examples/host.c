@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
     cfg.backend = sys ? MOONSEC_BACKEND_SYSTEM : MOONSEC_BACKEND_SYNTHETIC;
     cfg.state_dir = state_dir;
     cfg.relay_mode = relay ? MOONSEC_RELAY_DEFAULT : MOONSEC_RELAY_DISABLED;
-    cfg.flags = MOONSEC_HOST_REQUIRE_PAIRED | MOONSEC_HOST_RATE_CONTROL | MOONSEC_HOST_LOSS_POLICY;
+    cfg.flags = MOONSEC_HOST_RATE_CONTROL | MOONSEC_HOST_LOSS_POLICY;
     moonsec_host *host = NULL;
     moonsec_status st = moonsec_host_create(&cfg, &host);
     if (st != MOONSEC_OK) die("create", st);

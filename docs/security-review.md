@@ -91,7 +91,7 @@ Checked against the spec, with what we found:
 | PIN offline guessing | Client sends its proof before the host proves anything | **Does not hold against a host the client was tricked into dialing** (O2). |
 | Ticket parsing | `Ticket.decode`: CRC, length checks, version | Holds; now also refuses undefined flag bits (fixed). |
 | Names cannot break the list format | `sanitizeName` on the way in; `cleanField` on addresses | Holds (fuzzed by `pair_text`). |
-| Admission checks the allowlist by authenticated ID | `admitOne` | Holds, **when the host runs with `--state-dir`** (O1). |
+| Admission checks the allowlist by authenticated ID | `admitOne`, `LinkGate` | Holds, on every connection including reconnects (O1, fixed). |
 | Key and list storage | `FileKeyStore`, `State` | Keys held. Lists were 0644 and a group-writable state directory went unnoticed (fixed). Windows relies on `%APPDATA%`'s ACL (O6). |
 | What a paired client can do | Everything; multi-user input policy is a host-wide setting | As designed; no per-device permissions yet (O4). |
 
@@ -128,11 +128,17 @@ Severity is for a release build that ships to users; nothing has shipped yet.
 Also added: `shim/deny.toml` (cargo-deny policy for both crates), shim boundary unit tests
 that run under Miri, and the threading contract in `iroh_shim.h`.
 
+### Fixed after the review
+
+| # | Fix |
+| --- | --- |
+| O1 | `peer iroh` always enforces pairing (the device key from `--state-dir` or the default state directory); `--insecure-no-pairing` opts out, and only `run iroh` and `tools/netlab` pass it. `IrohLink` takes an admission gate that runs on every connection it accepts or dials, reconnects included, and a newcomer replaces a live session's connection only if it comes from the same device; the paired mode now reconnects too. The C ABI requires pairing by default (`MOONSEC_HOST_INSECURE_NO_PAIRING` and `MOONSEC_CLIENT_INSECURE_NO_PAIRING` opt out; `REQUIRE_PAIRED` is still accepted). Tests: `transport/iroh_test.zig` "link gate", `run pair`, `abi/test_iroh.c`. |
+
 ### Open
 
 | # | Severity | Finding | Recommendation |
 | --- | --- | --- | --- |
-| O1 | **High (release blocker)** | `moonsec peer iroh host` without `--state-dir` admits any peer that has its address ticket: video, audio, input injection, and the clipboard with `--clipboard`. In that mode `IrohLink` also accepts a replacement connection after a drop without any check, so a stranger who reaches the endpoint can take over a running session. Pairing-enforced mode (`peerPaired`) has no reconnect. | Before any release: make pairing the only mode outside the `run` lab commands (an explicit `--insecure-no-pairing` for labs), and run admission on every connection `IrohLink` accepts, including reconnects. |
+| ~~O1~~ | **High (release blocker)**, fixed (above) | `moonsec peer iroh host` without `--state-dir` admits any peer that has its address ticket: video, audio, input injection, and the clipboard with `--clipboard`. In that mode `IrohLink` also accepts a replacement connection after a drop without any check, so a stranger who reaches the endpoint can take over a running session. Pairing-enforced mode (`peerPaired`) has no reconnect. | Before any release: make pairing the only mode outside the `run` lab commands (an explicit `--insecure-no-pairing` for labs), and run admission on every connection `IrohLink` accepts, including reconnects. |
 | O2 | Medium | PIN pairing is not a PAKE. The client sends `client_mac = HMAC(K(PIN), transcript)` before the host proves anything, so a host the client dials by mistake (an attacker's address ticket, substituted wherever the user got it) receives a value it can brute-force offline in well under a second (10⁶ HMACs), then pair with the real host as itself inside the same window. The QR method (128-bit secret) is not affected. | Use a balanced PAKE for the PIN method (CPace or SPAKE2 over the same transcript), or show the host's short ID next to the PIN and have the client confirm it before sending its proof. At minimum, say in the spec that an address ticket must come from the host itself. |
 | O3 | Medium | Availability: the host serves pairing and admission one connection at a time, with 10 s timeouts per step, up to about 32 s draining a stream on close, and an accept handshake bound of `max(10 s, accept timeout)` (600 s for `peer iroh --relay`). One unpaired peer that keeps connecting and stalling can stop the user from pairing or starting a session. No compromise. | Serve each connection on its own task with a total deadline (a few seconds for pairing, less for admission), cap concurrent unauthenticated connections, and bound the handshake by `ACCEPT_HANDSHAKE_TIMEOUT` alone. |
 | O4 | Medium | Every paired client gets full control. There are no per-device permissions (view-only, no clipboard) in the allowlist; the multi-user "may control" flag is a host-wide setting, and `app/multi_host.zig` is not wired to iroh admission yet. | Add a permissions field to the allowlist (the spec lists it as a follow-up) before multi-user ships over the network. |

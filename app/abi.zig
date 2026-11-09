@@ -343,8 +343,8 @@ export fn moonsec_host_create(config: ?*const c.moonsec_host_config, out: ?*?*c.
     if (cfg.max_clients > 1) return fail(c.MOONSEC_ERR_UNSUPPORTED, "more than one client needs MOONSEC_FEATURE_MULTI_USER", .{});
     if (cfg.codec != 0 and (cfg.codec > 255 or !api.CodecSet.has(.{ .h264 = true, .hevc = true, .av1 = true, .passthrough = true }, @enumFromInt(@as(u8, @intCast(cfg.codec))))))
         return invalid("unknown codec");
-    if (cfg.flags & c.MOONSEC_HOST_REQUIRE_PAIRED != 0 and cfg.state_dir != null and cfg.state_dir[0] == 0)
-        return invalid("MOONSEC_HOST_REQUIRE_PAIRED needs a state directory");
+    if (cfg.flags & c.MOONSEC_HOST_REQUIRE_PAIRED != 0 and cfg.flags & c.MOONSEC_HOST_INSECURE_NO_PAIRING != 0)
+        return invalid("MOONSEC_HOST_REQUIRE_PAIRED and MOONSEC_HOST_INSECURE_NO_PAIRING contradict each other");
     const e = createEndpoint(.host, cfg.state_dir, cfg.name, cfg.relay_url, cfg.relay_ca_pem, cfg.bind_addr) catch |err| return createError(err);
     e.hc = cfg;
     // Strings are copied; don't keep the caller's pointers.
@@ -366,8 +366,8 @@ export fn moonsec_client_create(config: ?*const c.moonsec_client_config, out: ?*
     const cfg = readIn(c.moonsec_client_config, config) orelse return invalid("config is NULL or struct_size is too small");
     const st = checkCommon(cfg.backend, cfg.clipboard, cfg.relay_mode, cfg.relay_url);
     if (st != ok) return st;
-    if (cfg.flags & c.MOONSEC_CLIENT_REQUIRE_PAIRED != 0 and cfg.state_dir != null and cfg.state_dir[0] == 0)
-        return invalid("MOONSEC_CLIENT_REQUIRE_PAIRED needs a state directory");
+    if (cfg.flags & c.MOONSEC_CLIENT_REQUIRE_PAIRED != 0 and cfg.flags & c.MOONSEC_CLIENT_INSECURE_NO_PAIRING != 0)
+        return invalid("MOONSEC_CLIENT_REQUIRE_PAIRED and MOONSEC_CLIENT_INSECURE_NO_PAIRING contradict each other");
     const e = createEndpoint(.client, cfg.state_dir, cfg.name, cfg.relay_url, cfg.relay_ca_pem, cfg.bind_addr) catch |err| return createError(err);
     e.cc = cfg;
     e.cc.state_dir = null;
@@ -1433,7 +1433,8 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
         .admit => {
             e.lock();
             const paired = e.allow.contains(&peer_id);
-            const need = e.flags & c.MOONSEC_HOST_REQUIRE_PAIRED != 0;
+            // Pairing is required unless the app opted out for a test or lab.
+            const need = e.flags & c.MOONSEC_HOST_INSECURE_NO_PAIRING == 0;
             const busy = e.activeSession();
             e.unlock();
             const allowed = (paired or !need) and !busy;
@@ -1594,7 +1595,7 @@ export fn moonsec_client_connect(h: ?*c.moonsec_client, ticket: ?[*:0]const u8, 
         e.lock();
         const paired = e.allow.contains(&rid);
         e.unlock();
-        if (e.flags & c.MOONSEC_CLIENT_REQUIRE_PAIRED != 0 and !paired) {
+        if (e.flags & c.MOONSEC_CLIENT_INSECURE_NO_PAIRING == 0 and !paired) {
             conn.deinit(0);
             return fail(c.MOONSEC_ERR_REFUSED, "host {s} is not paired with this device", .{&pair.id.short(&rid)});
         }

@@ -20,6 +20,7 @@ const core = @import("core");
 const pairing = @import("pairing.zig");
 const keystore = @import("keystore.zig");
 const iroh = if (options.iroh) @import("iroh") else struct {};
+const iroh_pipe = if (options.iroh) @import("iroh_pipe") else struct {};
 
 const Io = std.Io;
 const pair = core.pair;
@@ -439,6 +440,27 @@ fn admitOne(conn: iroh.Conn, clients: *const pair.Allowlist) !bool {
     if (!allowed) std.debug.print("refused {s}: not on the allowlist\n", .{&pair.id.short(&peer_id)});
     return allowed;
 }
+
+/// `IrohLink` gates for `peer iroh`: admission on every connection, the first and each
+/// reconnect. Host: only clients on the allowlist. Client: only hosts on this device's list,
+/// and only if the host admits it.
+pub const LinkGate = struct {
+    list: *const pair.Allowlist,
+    role: enum { host, client },
+
+    pub fn gate(self: *LinkGate) iroh_pipe.IrohLink.Gate {
+        return .{ .ctx = self, .check = check };
+    }
+
+    fn check(ctx: *anyopaque, conn: iroh.Conn) iroh_pipe.IrohLink.Verdict {
+        const self: *LinkGate = @ptrCast(@alignCast(ctx));
+        switch (self.role) {
+            .host => return if (admitOne(conn, self.list) catch false) .admit else .refuse,
+            // A broken stream is worth another dial; a refusal is final.
+            .client => return if (requestSession(conn, self.list)) |ok| (if (ok) .admit else .refuse) else |_| .retry,
+        }
+    }
+};
 
 /// Client side: checks that the host is one this device paired with, then asks it for a
 /// session. Returns false (with a message) if either fails.

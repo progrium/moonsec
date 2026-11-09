@@ -98,7 +98,7 @@ node shim-web/test/run.mjs --browsers chromium,firefox,webkit
    secret; then `--pin-only`, where a wrong PIN is refused (4 attempts left) and the right one
    pairs. `moonsec paired` must list both browser keys, and core/pair must derive the same ID
    from the key as iroh does.
-4. **admission**: `moonsec peer iroh host --state-dir` refuses an unpaired browser key
+4. **admission**: `moonsec peer iroh host` refuses an unpaired browser key
    (`not_paired`) and admits the paired one.
 
 CI: [`.github/workflows/shim-web.yml`](../.github/workflows/shim-web.yml), run from the Actions
