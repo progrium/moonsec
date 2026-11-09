@@ -407,7 +407,7 @@ typedef struct moonsec_telemetry {
     uint64_t parity_shards; /* host: FEC */
     uint64_t input_events;  /* host: applied; client: sent */
     uint64_t path_changes;
-    uint64_t reconnects;
+    uint64_t reconnects;    /* iroh: new connections under this session (spec: Reconnect) */
     moonsec_stage_stats stages[MOONSEC_STAGE_MAX]; /* by MOONSEC_STAGE_* */
 } moonsec_telemetry;
 

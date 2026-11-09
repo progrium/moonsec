@@ -640,8 +640,66 @@ const FramePresenter = struct {
 
 const Transport = union(enum) {
     loopback: *Loopback,
-    iroh: if (options.iroh) *iroh_pipe.IrohPipe else void,
+    iroh: if (options.iroh) *NetLink else void,
 };
+
+/// An iroh session's connection: an `IrohLink` that outlives a dropped connection. The
+/// client redials (admission again on each new connection, the link's gate); the host's
+/// accept loop admits the client's new connection and hands it to the session's link
+/// (`offered`), found by the client's endpoint id.
+const NetLink = if (options.iroh) struct {
+    link: iroh_pipe.IrohLink = undefined,
+    ep: *Endpoint,
+    /// The far end's endpoint id: the client on a host, the host on a client.
+    peer: pair.Id,
+    /// client: the address it dials again.
+    addr: ?[:0]u8 = null,
+
+    /// Starts on `conn` (admitted already); owns it from here, also on failure.
+    fn create(e: *Endpoint, conn: iroh.Conn, peer: pair.Id, addr: ?[]const u8) !*NetLink {
+        const n = gpa.create(NetLink) catch |err| {
+            conn.deinit(0);
+            return err;
+        };
+        n.* = .{ .ep = e, .peer = peer };
+        if (addr) |a| n.addr = gpa.dupeZ(u8, a) catch |err| {
+            gpa.destroy(n);
+            conn.deinit(0);
+            return err;
+        };
+        const dial = e.role == .client;
+        n.link.startWith(io(), e.net.ep.?, .{
+            .role = if (dial) .dial else .offered,
+            .ticket = n.addr orelse "",
+            .alpn = pair_cmd.alpn,
+            .gate = if (dial) .{ .ctx = n, .check = clientGate } else null,
+            .refuse_code = pair_cmd.close_not_paired,
+        }, conn) catch |err| {
+            if (n.addr) |a| gpa.free(a);
+            gpa.destroy(n);
+            return err;
+        };
+        return n;
+    }
+
+    fn destroy(n: *NetLink) void {
+        n.link.deinit();
+        if (n.addr) |a| gpa.free(a);
+        gpa.destroy(n);
+    }
+
+    /// client: each new connection goes to the same host and through admission, as
+    /// `moonsec_client_connect`'s first one did.
+    fn clientGate(ctx: *anyopaque, conn: iroh.Conn) iroh_pipe.IrohLink.Verdict {
+        const n: *NetLink = @ptrCast(@alignCast(ctx));
+        const rid = pair_cmd.remoteId(conn) catch return .retry;
+        if (!std.mem.eql(u8, &rid, &n.peer)) return .refuse;
+        var s: pair_cmd.IrohStream = .{ .s = conn.openBi(5_000) catch return .retry };
+        defer s.close();
+        const refused = pairing.requestAdmission(s.stream()) catch return .retry;
+        return if (refused == null) .admit else .refuse;
+    }
+} else struct {};
 
 const Session = struct {
     magic: u32 = magic,
@@ -794,11 +852,7 @@ const Session = struct {
             .member => {},
         }
         if (options.iroh) switch (s.transport) {
-            .iroh => |p| {
-                p.ctl.drop();
-                p.conn.deinit(0);
-                gpa.destroy(p);
-            },
+            .iroh => |n| n.destroy(),
             else => {},
         };
         s.clip.deinit();
@@ -1113,6 +1167,20 @@ fn removeEventAt(q: *std.Deque(c.moonsec_event), idx: usize) void {
     }
     q.deinit(gpa);
     q.* = tmp;
+}
+
+/// Not part of the ABI (not in moonsec.h): tests drop a session's iroh connection as a
+/// network failure would, to exercise reconnecting.
+export fn moonsec__test_drop_connection(p: ?*c.moonsec_session) Status {
+    const s = sessionOf(p) orelse return invalid("not a session");
+    if (!options.iroh) return noIroh();
+    s.ep.lock();
+    defer s.ep.unlock();
+    switch (s.transport) {
+        .iroh => |n| n.link.dropForTest(),
+        else => return fail(c.MOONSEC_ERR_UNSUPPORTED, "not an iroh session", .{}),
+    }
+    return ok;
 }
 
 export fn moonsec_session_state(p: ?*c.moonsec_session) i32 {
@@ -1591,13 +1659,16 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
             e.lock();
             const paired = e.allow.contains(&peer_id);
             const need = e.flags & c.MOONSEC_HOST_INSECURE_NO_PAIRING == 0;
-            const busy = e.full();
+            // A client of a live session coming back on a new connection (it dropped):
+            // it keeps its session, so it does not count against max_clients.
+            const back = liveLink(e, &peer_id) != null;
+            const busy = !back and e.full();
             const name = if (e.allow.get(&peer_id)) |d| d.name else "";
             var name_buf: [64]u8 = undefined;
             const nm = name_buf[0..@min(name.len, name_buf.len)];
             @memcpy(nm, name[0..nm.len]);
             const allowed = (paired or !need) and !busy;
-            if (allowed) e.net.admitting += 1;
+            if (allowed and !back) e.net.admitting += 1;
             e.unlock();
             var o: ex.Out = .{};
             s.stream().write(ex.admitReply(&o, allowed)) catch {};
@@ -1609,6 +1680,13 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
                 e.push(peerEvent(c.MOONSEC_EVENT_REFUSED, &peer_id, "", if (busy) 1 else 0));
                 return;
             }
+            if (back) {
+                e.lock();
+                defer e.unlock();
+                // Its session may have ended meanwhile: then the connection goes unused.
+                if (liveLink(e, &peer_id)) |n| n.link.offer(conn) else conn.deinit(0);
+                return;
+            }
             defer {
                 e.lock();
                 e.net.admitting -= 1;
@@ -1616,7 +1694,7 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
             }
             // It owns `conn` from here, also when it fails (the backend did not
             // open): the client's session then ends with the connection.
-            startIrohSession(e, conn, if (nm.len > 0) nm else "client") catch {};
+            startIrohSession(e, conn, if (nm.len > 0) nm else "client", peer_id, null) catch {};
         },
         .invalid => {
             s.close();
@@ -1626,31 +1704,33 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
 }
 
 /// A session over `conn` on its own threads. Owns `conn` from here (also on failure).
-fn startIrohSession(e: *Endpoint, conn: iroh.Conn, peer_name: []const u8) !void {
-    if (!options.iroh) unreachable;
-    const ip = gpa.create(iroh_pipe.IrohPipe) catch |err| {
-        conn.deinit(0);
-        return err;
+/// The link of a session with `peer` that has not ended, if any. Under the endpoint lock.
+fn liveLink(e: *Endpoint, peer: *const pair.Id) ?*NetLink {
+    for (e.sessions.items) |x| switch (x.transport) {
+        .iroh => |n| if (std.mem.eql(u8, &n.peer, peer) and !x.ended()) return n,
+        else => {},
     };
-    ip.* = .init(conn);
+    return null;
+}
+
+/// `peer` is the far end's endpoint id; `addr` (client) is where it dials again after a drop.
+fn startIrohSession(e: *Endpoint, conn: iroh.Conn, peer_name: []const u8, peer: pair.Id, addr: ?[]const u8) !void {
+    if (!options.iroh) unreachable;
+    const n = try NetLink.create(e, conn, peer, addr);
     e.lock();
     defer e.unlock();
     if (e.role == .host and e.multiUser()) {
-        last_started = joinMulti(e, ip, peer_name) catch |err| {
-            ip.ctl.drop();
-            conn.deinit(0);
-            gpa.destroy(ip);
+        last_started = joinMulti(e, n, peer_name) catch |err| {
+            n.destroy();
             return err;
         };
         return;
     }
     const s = (if (e.role == .host)
-        newHostSession(e, ip.packetPipe(), ip.controlStream(false), .{ .iroh = ip }, null)
+        newHostSession(e, n.link.packetPipe(), n.link.controlStream(), .{ .iroh = n }, null)
     else
-        newClientSession(e, ip.packetPipe(), ip.controlStream(true), .{ .iroh = ip }, null)) catch |err| {
-        ip.ctl.drop();
-        conn.deinit(0);
-        gpa.destroy(ip);
+        newClientSession(e, n.link.packetPipe(), n.link.controlStream(), .{ .iroh = n }, null)) catch |err| {
+        n.destroy();
         return err;
     };
     e.sessions.append(gpa, s) catch |err| {
@@ -1703,7 +1783,7 @@ const MultiRun = struct {
 };
 
 /// Admit a client into the endpoint's current run, starting one if there is none (lock held).
-fn joinMulti(e: *Endpoint, ip: *iroh_pipe.IrohPipe, name: []const u8) !*Session {
+fn joinMulti(e: *Endpoint, n: *NetLink, name: []const u8) !*Session {
     if (!options.iroh) unreachable;
     var fresh = false;
     const run = if (e.net.run) |r| r else blk: {
@@ -1717,12 +1797,12 @@ fn joinMulti(e: *Endpoint, ip: *iroh_pipe.IrohPipe, name: []const u8) !*Session 
     try e.sessions.ensureUnusedCapacity(gpa, 1);
     const s = try gpa.create(Session);
     errdefer gpa.destroy(s);
-    s.* = .{ .ep = e, .app = undefined, .run = run, .transport = .{ .iroh = ip }, .clock = run.app.be.clock, .clip = .init(gpa) };
+    s.* = .{ .ep = e, .app = undefined, .run = run, .transport = .{ .iroh = n }, .clock = run.app.be.clock, .clip = .init(gpa) };
     errdefer s.clip.deinit();
     if (try sessionClipboard(s)) |cb| s.clip_sync = .{ .cb = cb, .interval_us = 50_000 };
     errdefer if (s.sys_clip) |*y| y.close();
     // v0: every member may control (a per-device permission is a follow-up).
-    const peer = run.app.m.addPeer(ip.packetPipe(), ip.controlStream(false), name, true) catch |err| return switch (err) {
+    const peer = run.app.m.addPeer(n.link.packetPipe(), n.link.controlStream(), name, true) catch |err| return switch (err) {
         error.Full => error.Busy,
         else => err,
     };
@@ -1957,7 +2037,7 @@ export fn moonsec_client_connect(h: ?*c.moonsec_client, ticket: ?[*:0]const u8, 
         return fail(c.MOONSEC_ERR_REFUSED, "the host refused the session: {s}", .{pairing.reasonText(why)});
     }
     last_started = null;
-    startIrohSession(e, conn, "") catch |err| return sessionError(switch (err) {
+    startIrohSession(e, conn, "", rid, tg.addr) catch |err| return sessionError(switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Unsupported => error.Unsupported,
         else => error.Backend,

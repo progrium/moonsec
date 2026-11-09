@@ -208,6 +208,16 @@ side and blocks until it is done. Both ends save the other to their allowlists i
   `CLIPBOARD` event when the peer's text arrives.
 - **Format**: `moonsec_session_format` gives the negotiated codec, chroma, bit depth,
   colour space and size; `FORMAT_CHANGED` reports a change.
+- **Reconnect** (iroh): a session outlives a dropped connection. When the connection
+  closes, or nothing arrives from the host for 2 s, the client dials the host again from
+  the ticket, checks it is the same host and asks for admission again, as on its first
+  connection. The host's accept loop admits the new connection and hands it to the live
+  session of the same client endpoint (it does not count against `max_clients`), a
+  multi-user member included. The session stays `STREAMING` throughout, with no events;
+  `reconnects` in the telemetry counts the new connections. A session ends only after
+  60 s with no connection (`TIMEOUT`), or when the host refuses the client on a redial
+  (the client's session then times out). A close still sends a bye, so the peer ends
+  at once. The timeouts are fixed in this draft.
 
 ## Telemetry
 
@@ -276,7 +286,7 @@ mid-session will be a new function in 1.x.
 | Loopback transport | done |
 | iroh: listen, ticket, connect, admission (pairing required unless `INSECURE_NO_PAIRING`) | done |
 | Pairing (QR and PIN), key store in `state_dir` | done |
-| Reconnect after a dropped connection | not yet: an iroh session runs on one connection, and a drop ends it (the `moonsec` tool's `IrohLink` redials, but admission would have to run on each new connection) |
+| Reconnect after a dropped connection | done over iroh (client redials with admission, the host hands the connection to the live session; one-client and multi-user hosts); `abi/test_reconnect.c` |
 | Events, notify, frame callback | done |
 | Input both ways incl. gamepads | done |
 | Clipboard (app and system) | done |
