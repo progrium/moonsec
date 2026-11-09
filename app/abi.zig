@@ -137,6 +137,7 @@ export fn moonsec_version_string() [*:0]const u8 {
 export fn moonsec_features() u32 {
     var f: u32 = c.MOONSEC_FEATURE_LOOPBACK;
     if (options.iroh) f |= c.MOONSEC_FEATURE_IROH | c.MOONSEC_FEATURE_MULTI_USER;
+    f |= c.MOONSEC_FEATURE_DISPLAYS;
     if (system.available) f |= c.MOONSEC_FEATURE_SYSTEM_BACKEND;
     return f;
 }
@@ -510,11 +511,56 @@ export fn moonsec_host_give_input(h: ?*c.moonsec_host, p: ?*c.moonsec_session) S
 }
 
 export fn moonsec_host_displays(h: ?*c.moonsec_host, out: ?[*]c.moonsec_display_info, cap: usize, count: ?*usize) Status {
-    _ = hostOf(h) orelse return invalid("not a host");
-    _ = out;
-    _ = cap;
+    const e = hostOf(h) orelse return invalid("not a host");
     if (count) |n| n.* = 0;
-    return fail(c.MOONSEC_ERR_UNSUPPORTED, "display listing is not in this build (MOONSEC_FEATURE_DISPLAYS)", .{});
+    if (cap > 0 and out == null) return invalid("out is NULL");
+    var list: [core.display.DisplayList.max_displays]api.DisplayInfo = undefined;
+    const n = hostDisplays(e, &list) catch |err| return switch (err) {
+        error.Unsupported => fail(c.MOONSEC_ERR_UNSUPPORTED, "this host's capture backend does not list displays", .{}),
+        error.OutOfMemory => fail(c.MOONSEC_ERR_NO_MEMORY, "out of memory", .{}),
+        else => fail(c.MOONSEC_ERR_BACKEND, "listing displays failed", .{}),
+    };
+    if (count) |p| p.* = n;
+    for (list[0..@min(n, cap)], 0..) |d, i| {
+        var o = std.mem.zeroes(c.moonsec_display_info);
+        o.index = d.id;
+        o.width = d.width;
+        o.height = d.height;
+        o.refresh_mhz = d.refresh_mhz;
+        o.primary = @intFromBool(d.primary);
+        fixedStr(&o.name, d.name());
+        out.?[i] = o;
+    }
+    return ok;
+}
+
+/// The host's displays: the list a streaming session last got from its capture (it
+/// polls about once a second), or with none streaming, a fresh synthetic backend's.
+/// The OS capture backends do not list displays yet, and opening one only to ask would
+/// open its encoder and input device: `Unsupported` until a session streams.
+fn hostDisplays(e: *Endpoint, out: []api.DisplayInfo) !usize {
+    {
+        e.lock();
+        defer e.unlock();
+        for (e.sessions.items) |s| switch (s.app) {
+            .host => |*a| if (!s.ended() and a.s.n_displays > 0) {
+                const n = @min(out.len, a.s.n_displays);
+                @memcpy(out[0..n], a.s.displays[0..n]);
+                return n;
+            },
+            else => {},
+        };
+    }
+    if (e.hc.backend == c.MOONSEC_BACKEND_SYSTEM) return error.Unsupported;
+    const sh = try synthetic.openHost(gpa, .{
+        .clock = api.clockFn(wallNow),
+        .width = if (e.hc.width != 0) e.hc.width else 640,
+        .height = if (e.hc.height != 0) e.hc.height else 360,
+        .audio = false,
+    });
+    var be = sh.backend();
+    defer be.deinit();
+    return be.capture.displays(out);
 }
 
 // ---------------------------------------------------------------------------

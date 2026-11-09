@@ -123,11 +123,14 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
 
     // --- over iroh (shim) ---
     const iroh_test = cProgram(b, target, optimize, "abi-test-iroh", "abi/test_iroh.c", full.static, false);
+    linkShimInto(iroh_test, deps);
     const run_iroh = b.addRunArtifact(iroh_test);
     const multi_test = cProgram(b, target, optimize, "abi-test-multi", "abi/test_multi.c", full.static, false);
+    linkShimInto(multi_test, deps);
     const run_multi = b.addRunArtifact(multi_test);
     run_multi.step.dependOn(&run_iroh.step); // one loopback run at a time
     const reconnect_test = cProgram(b, target, optimize, "abi-test-reconnect", "abi/test_reconnect.c", full.static, false);
+    linkShimInto(reconnect_test, deps);
     const run_reconnect = b.addRunArtifact(reconnect_test);
     run_reconnect.step.dependOn(&run_multi.step);
     const iroh_step = b.step("test-abi-iroh", "C ABI over iroh on loopback: pairing, admission, a session, a multi-user host, reconnects (builds the shim)");
@@ -140,6 +143,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const test_system = b.step("test-abi-system", "C ABI: a host and a client on MOONSEC_BACKEND_SYSTEM over iroh (-Dabi-system; Linux: under platform/host/linux/headless.sh)");
     if (system) {
         const sys_test = cProgram(b, target, optimize, "abi-test-system", "abi/test_system.c", full.static, false);
+        linkShimInto(sys_test, deps);
         if (target.result.os.tag == .linux) {
             // The host tests' ScreenCast portal backend, served when MOONSEC_TEST_PORTAL is set.
             const m = sys_test.root_module;
@@ -188,8 +192,13 @@ fn libraries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         m.addImport("moonsec_h", header_mod);
         m.addOptions("app_options", opts);
         if (with_iroh) {
-            m.addImport("iroh", deps.iroh);
-            m.addImport("iroh_pipe", deps.iroh_pipe);
+            // The static library leaves the shim out: its consumers link libiroh_shim.a
+            // (installed next to it), as the spec says. Linked in, Zig's archiver either
+            // unpacks it (Debug) or nests the whole archive as one member, which linkers
+            // skip (release modes).
+            const iroh = if (linkage == .static) withoutLinks(b, deps.iroh, &.{}) else deps.iroh;
+            m.addImport("iroh", iroh);
+            m.addImport("iroh_pipe", if (linkage == .static) withoutLinks(b, deps.iroh_pipe, &.{.{ .name = "iroh", .module = iroh }}) else deps.iroh_pipe);
         }
         if (system) addSystem(b, target, optimize, deps, m);
         if (target.result.os.tag == .windows) m.linkSystemLibrary("winmm", .{});
@@ -197,6 +206,43 @@ fn libraries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         if (linkage == .static) out.static = lib else out.shared = lib;
     }
     return out;
+}
+
+/// A copy of `src` without its link objects (same source, imports, target), with the
+/// imports in `replace` swapped in by name.
+fn withoutLinks(b: *std.Build, src: *std.Build.Module, replace: []const std.Build.Module.Import) *std.Build.Module {
+    const m = b.createModule(.{
+        .root_source_file = src.root_source_file,
+        .target = src.resolved_target,
+        .optimize = src.optimize,
+        .link_libc = src.link_libc,
+    });
+    var it = src.import_table.iterator();
+    while (it.next()) |e| {
+        var dep = e.value_ptr.*;
+        for (replace) |r| if (std.mem.eql(u8, r.name, e.key_ptr.*)) {
+            dep = r.module;
+        };
+        m.addImport(e.key_ptr.*, dep);
+    }
+    return m;
+}
+
+/// A C program on the static libmoonsec links the shim archive too, as a static consumer
+/// does: the iroh module's archive and the Rust staticlib's system libraries.
+fn linkShimInto(exe: *std.Build.Step.Compile, deps: Deps) void {
+    const b = exe.step.owner;
+    const m = exe.root_module;
+    for (deps.iroh.link_objects.items) |lo| switch (lo) {
+        // The shim archive (static link) and the system libraries it needs.
+        .static_path, .system_lib => m.link_objects.append(b.allocator, lo) catch @panic("OOM"),
+        else => {},
+    };
+    for (deps.iroh.lib_paths.items) |p| m.addLibraryPath(p);
+    for (deps.iroh.rpaths.items) |r| m.rpaths.append(b.allocator, r) catch @panic("OOM");
+    for (deps.iroh.include_dirs.items) |d| if (d == .framework_path) m.include_dirs.append(b.allocator, d) catch @panic("OOM");
+    var it = deps.iroh.frameworks.iterator();
+    while (it.next()) |f| m.linkFramework(f.key_ptr.*, f.value_ptr.*);
 }
 
 fn cProgram(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, name: []const u8, src: []const u8, lib: *std.Build.Step.Compile, cpp: bool) *std.Build.Step.Compile {
