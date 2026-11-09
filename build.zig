@@ -49,6 +49,8 @@ pub fn build(b: *std.Build) void {
     // Client platform backends (platform/client/build.zig).
     @import("platform/client/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
     @import("platform/client/build.zig").addLinuxTests(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod });
+    // Linux host backend (platform/host/linux/build.zig): `test-linux-host`.
+    @import("platform/host/linux/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod });
 
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
