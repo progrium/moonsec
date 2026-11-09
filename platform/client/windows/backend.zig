@@ -100,6 +100,8 @@ pub const Decoder = struct {
             .hevc => c.MSWC_CODEC_HEVC,
             else => return error.Unsupported,
         };
+        // NV12 out of the MFT and through the presenter: 8-bit 4:2:0 SDR only.
+        if (!cfg.format.eql(.{})) return error.Unsupported;
         d.close();
         var h: ?*c.mswc_decoder = null;
         try ok("mswc_decoder_create", c.mswc_decoder_create(d3dPtr(d.d3d), codec, @intFromBool(d.hardware), &h));
@@ -161,6 +163,17 @@ pub const Decoder = struct {
         d.close();
     }
 };
+
+/// What the GPU's D3D11VA decoder has per codec beyond 8-bit 4:2:0 (Main10, 4:4:4,
+/// AV1), for logs and the hardware check. Not `DecoderCaps.coded`: the MFT path and the
+/// presenter take NV12 only (mswc_formats.c lists what each format still needs).
+pub fn probeHardwareFormats(d3d: win.D3d) api.FormatCaps {
+    return .{
+        .h264 = @bitCast(@as(u8, @truncate(c.mswc_decoder_hw_formats(d3dPtr(d3d), c.MSWC_CODEC_H264)))),
+        .hevc = @bitCast(@as(u8, @truncate(c.mswc_decoder_hw_formats(d3dPtr(d3d), c.MSWC_CODEC_HEVC)))),
+        .av1 = @bitCast(@as(u8, @truncate(c.mswc_decoder_hw_formats(d3dPtr(d3d), c.MSWC_CODEC_AV1)))),
+    };
+}
 
 /// Which codecs this machine's Media Foundation can decode (a decoder MFT exists).
 pub fn probeCodecs(d3d: win.D3d) api.CodecSet {

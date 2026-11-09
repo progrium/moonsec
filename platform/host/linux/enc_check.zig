@@ -19,7 +19,7 @@
 //! recovery is an IDR and the stamps still decode.
 //!
 //! Exit status: 0 pass, 1 fail, 2 when the encoder cannot be opened on this machine.
-//! The tests (test.zig) run the same scenario on the software encoder.
+//! The tests (enc_test.zig) run the same scenario on the software encoder.
 const std = @import("std");
 const api = @import("platform");
 const enc_mod = @import("host_linux_enc");

@@ -178,7 +178,7 @@ pub extern "C" fn iroh_shim_init(on_thread_start: IrohThreadStartFn, ctx: *mut s
 /// Returns the shim ABI version as (major << 16) | (minor << 8) | patch.
 #[unsafe(no_mangle)]
 pub extern "C" fn iroh_shim_version() -> u32 {
-    0x00_02_00
+    0x00_02_01
 }
 
 /// Microseconds on the shim's monotonic clock (the clock event timestamps use).
@@ -1271,6 +1271,41 @@ pub unsafe extern "C" fn iroh_stream_write(s: *const IrohStream, buf: *const u8,
     match block_on_timeout(timeout_ms, async move { send.lock().await.write_all(&data).await }) {
         Ok(Ok(())) => IROH_OK,
         Ok(Err(e)) => fail(IROH_ERR_CLOSED, format!("write: {e}")),
+        Err(_) => fail(IROH_ERR_TIMEOUT, "write timed out"),
+    }
+}
+
+/// Writes as much of `buf` as the stream takes now, up to `timeout_ms` for the first byte
+/// (`timeout_ms == 0` polls once: IROH_ERR_AGAIN when flow control has no room). Unlike
+/// `iroh_stream_write`, a timeout never leaves part of `buf` written unreported, so it is safe
+/// for non-blocking callers. Since ABI 0.2.1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn iroh_stream_write_some(
+    s: *const IrohStream,
+    buf: *const u8,
+    len: usize,
+    timeout_ms: u32,
+    out_written: *mut usize,
+) -> i32 {
+    let Some(s) = (unsafe { s.as_ref() }) else { return fail(IROH_ERR_INVALID, "null stream") };
+    if out_written.is_null() {
+        return fail(IROH_ERR_INVALID, "null out_written");
+    }
+    unsafe { *out_written = 0 };
+    if len == 0 {
+        return IROH_OK;
+    }
+    let data = unsafe { bytes_arg(buf, len) }.to_vec();
+    let send = s.send.clone();
+    // `SendStream::write` either writes some bytes and returns how many, or writes nothing,
+    // so dropping it on the timeout loses no data.
+    match block_on_timeout(timeout_ms, async move { send.lock().await.write(&data).await }) {
+        Ok(Ok(n)) => {
+            unsafe { *out_written = n };
+            IROH_OK
+        }
+        Ok(Err(e)) => fail(IROH_ERR_CLOSED, format!("write: {e}")),
+        Err(_) if timeout_ms == 0 => IROH_ERR_AGAIN,
         Err(_) => fail(IROH_ERR_TIMEOUT, "write timed out"),
     }
 }

@@ -1,114 +1,155 @@
-# platform/host/linux: encoders
+# platform/host/linux
 
-The Linux host's video encoders behind the platform interface's `Encoder`
-([encoder.zig](encoder.zig)), with the same low-latency settings and long-term-reference
-recovery as the Windows and macOS hosts. Capture (PipeWire), audio and input come from the
-other Phase 7 workstreams and are wired up with these in the Linux host.
+The Linux host's capture and audio: [host.zig](host.zig) implements the platform
+interface's `Capture` and `AudioSource`. Like the Linux client, the OS APIs are called from
+small C files behind a narrow header ([mlh.h](mlh.h)) that translate-c reads; Zig never
+sees the system headers. The video encoders (VAAPI with long-term references, a libx264
+fallback) are described in [ENCODERS.md](ENCODERS.md). uinput injection is a separate
+workstream; the host bundle is put together where those meet.
 
-Like the Linux client, the OS libraries are called from small C files behind one narrow
-header ([mlh_enc.h](mlh_enc.h)) that translate-c reads; Zig never sees libva or libavcodec.
+| Object | How |
+| --- | --- |
+| `Capture` | The xdg-desktop-portal ScreenCast interface ([mlh_portal.c](mlh_portal.c), libdbus): `CreateSession`, `SelectSources` (monitors, cursor mode, persist mode, restore token), `Start`, `OpenPipeWireRemote`. Then a PipeWire video stream on the portal's node ([mlh_capture.c](mlh_capture.c)). |
+| `AudioSource` | A PipeWire capture stream with `stream.capture.sink = true`, so it records the default sink's monitor (what the machine plays), f32 at 48 kHz ([mlh_audio.c](mlh_audio.c)). The process callback appends to a 500 ms ring and notes the clock time of the newest frame (less the graph delay); `read` waits up to its timeout and returns the capture time of its first frame. A reader that falls a whole ring behind loses the oldest frames (counted). |
 
-| Backend | How | Recovery |
-| --- | --- | --- |
-| `vaapi` | libva loaded at run time ([enc_vaapi.c](enc_vaapi.c)): `dlopen("libva.so.2")`, so the host starts on machines without it. H.264 (High, Main or Constrained Baseline) and HEVC Main, `VAEntrypointEncSlice` or the low-power `EncSliceLP`. CBR (VBR when there is no CBR) with a one-frame HRD buffer, no B-frames, no lookahead, no periodic IDR, `slices` slices per frame; a new bitrate goes out as rate-control and HRD parameters with the next frame, without an IDR. | Long-term references when the driver takes packed sequence, picture and slice headers; IDR otherwise. |
-| `software` | libavcodec's libx264 (OpenH264 if that is all libavcodec has) ([enc_sw.c](enc_sw.c)): tune `zerolatency`, `keyint=infinite`, `scenecut=0`, no B-frames, VBV of one frame, parameter sets on every IDR, `slices` slices. A new bitrate goes through `x264_encoder_reconfig`, no keyframe. H.264 only. | IDR (`ltr = false`). |
-| `nvenc` | Reserved. The Linux NVENC backend is built on the NVENC core shared with the Windows host (its own PR on top of #15, compile-only: no NVIDIA hardware is planned) and joins this dispatch when both have landed. | |
-| `auto` | The first of `vaapi`, `nvenc`, `software` that opens. | |
+### Capture details
 
-## Long-term references on VAAPI
+- **Buffers.** With `Options.modifiers` set, the first format offered carries those DRM
+  modifiers (mandatory, don't-fixate) and asks for dma-buf; the second has none and asks
+  for memfd or shared memory. The compositor picks. A dma-buf frame has `Image.gpu` =
+  `*const mlh_dmabuf` (fourcc, modifier, planes' fds, offsets, strides), and also
+  `Image.cpu` when the buffer is linear and PipeWire mapped it (synced with
+  `DMA_BUF_IOCTL_SYNC`). A memory frame is `Image.cpu`, bgra8. RGB-ordered sources are
+  swizzled to BGR into a copy, so frames are always B, G, R, X/A. The VideoCrop metadata
+  is applied to memory frames. Options default to memory only until an encoder (7B) says
+  which modifiers it imports.
+- **Newest frame wins.** The process callback dequeues every buffer that came and keeps
+  only the newest; older ones go straight back to the compositor (counted as dropped).
+  The frame handed out is held until a newer one is taken, which is what `repeatLast`
+  returns, so at most two buffers are held and the stream asks for 4 to 16.
+- **Pacing.** Each buffer is time-stamped on arrival in the process callback.
+  `captured_us` is the buffer's header pts when it is on our clock (CLOCK_MONOTONIC, not
+  after arrival, within a second), else the arrival time. Screen streams are
+  damage-driven: a static screen sends nothing, so `acquire` times out and the app
+  keeps the stream alive with `repeatLast`, as on macOS.
+- **Cursor.** Without `cfg.cursor`, the portal is asked for the metadata cursor mode
+  (falling back to embedded when the portal lacks it). Each buffer's `SPA_META_Cursor`
+  updates the pointer: position and hotspot in frame pixels, and the bitmap (converted to
+  BGRA, `serial` changes with it) when it changed. `CapturedFrame.cursor` (a new optional
+  field in api.zig) carries it. Buffers with an empty chunk are cursor-only updates: they
+  wake `acquire`, which returns a repeat of the last picture with the new cursor.
+- **Displays.** The portal returns one stream per monitor the user chose
+  (`Options.multiple` lets them choose several); `CaptureConfig.display` indexes them
+  and anything past the end is the first. `Capture.displays` arrives with #37 and maps
+  onto the same list.
+- **Errors.** No session bus, no portal or no PipeWire: `error.Unsupported`. The user
+  cancelled: `error.Unsupported` (logged as cancelled). The session closed or the stream
+  ended (monitor unplugged, sharing revoked): `error.DeviceLost`, and `start` again
+  (silently, with a restore token).
 
-libavcodec's VAAPI encoders don't expose long-term references or per-frame reference
-control, so this goes to libva directly, where the application owns the reference
-structure. [h26x.c](h26x.c) has:
+### Unattended hosts: restore tokens
 
-- the planner (`refs_*`): two long-term slots, the previous frame and the current one. A
-  long-term reference is marked on the IDR, every 15 frames and on every refresh, into the
-  slot that does not hold the newest acked one. `Force.ltr_refresh` predicts from the newest
-  acked long-term reference; with none acked it is an IDR.
-- writers for the H.264 SPS/PPS/slice header (POC type 2, `gaps_in_frame_num_allowed`, the
-  reference picked with `ref_pic_list_modification`, marking by MMCO 1, 4 and 6) and the
-  HEVC VPS/SPS/PPS/slice header (an explicit short-term RPS per slice, long-term pictures by
-  POC with their MSB cycle, one active reference). These go to the driver as packed headers,
-  and the VA picture and slice parameters (`ReferenceFrames`, `RefPicList0`, the RPS flags)
-  say the same thing.
+With `Options.token_path` set (use `tokenPath(state_dir)`: `screencast.token` next to
+`identity.key` in `~/.config/moonsec`), `start` reads the token, passes it to
+`SelectSources` with persist mode 2 ("until revoked"), and stores the token the portal
+returns (mode 0600, written to a temporary file and renamed). The user approves once; a
+restarted host captures without a dialog until they revoke it in their desktop's
+settings. The spec makes tokens single use, so the latest is always stored.
+xdg-desktop-portal 1.18 hands the same one back each time.
 
-Without packed headers the driver writes its own and the caps say `ltr = false`. Block sizes
-and the HEVC tools a driver requires (`VAConfigAttribEncHEVCBlockSizes`/`Features`) are
-honoured. `EncoderCaps.ltr` is for the configured codec (H.264's before `configure`).
+ScreenCast version 4 (xdg-desktop-portal 1.12) added restore tokens. Which backends
+honour them (from the backends' docs and source; only the frontend's side is tested here):
 
-The writers and the planner can't run on a VAAPI encoder in CI, so
-[testenc.c](testenc.c) uses them to write pictures of PCM blocks and skipped blocks (H.264
-with CAVLC; HEVC with a small CABAC encoder). A skipped block copies the reference the
-planner chose, so libavcodec's decoder shows exactly which picture each frame predicted
-from: the tests decode a run with long-term marks, a lost burst that included a marked
-frame, a refresh against the newest acked reference and the frames after it, and compare
-every picture with the host's bit for bit, for both codecs.
+| Desktop | Portal backend | Restore tokens | Cursor metadata | dma-buf |
+| --- | --- | --- | --- | --- |
+| GNOME 42+ | xdg-desktop-portal-gnome | yes | yes | yes, with modifiers |
+| KDE Plasma 5.27+ / 6 | xdg-desktop-portal-kde | yes | yes | yes, with modifiers |
+| wlroots (sway, river) | xdg-desktop-portal-wlr 0.7+ | yes | no (embedded or hidden) | required by 0.7 |
+| Hyprland | xdg-desktop-portal-hyprland | yes | no | yes |
 
-Not yet: AV1 (`VAProfileAV1Profile0` encode needs our own sequence and frame header OBUs;
-caps report `av1 = false`), and the #36 format fields (10-bit, 4:4:4, HDR) until #36 merges.
+Without a restore token (older portals) every start shows the dialog; the host logs it.
 
-## Input
+### Virtual display (not built)
 
-`Image.gpu`, when set, is a `*const mlh_dmabuf` (fds, fourcc, modifier, planes): the frame
-Linux capture hands over. XRGB8888/ARGB8888 dma-bufs are imported as VA surfaces
-(`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`, cached by inode) and converted to NV12 by VA video
-processing (BT.709, limited range) with no copy; NV12 dma-bufs are encoded directly.
-Otherwise `Image.cpu` holds BGRA or NV12, uploaded through `vaDeriveImage`. The software
-encoder converts BGRA itself ([enc.c](enc.c) `mlh_bgra_to_i420`, BT.709 limited) and reads
-linear dma-bufs through a mapping (`DMA_BUF_IOCTL_SYNC`); tiled ones are refused.
+The design's Linux row is "compositor headless output". Not done here; the approach for
+later:
+
+- **GNOME**: Mutter's `org.gnome.Mutter.ScreenCast` session with `RecordVirtual`
+  (virtual monitor of a given size, cursor mode as above) returns a PipeWire node just
+  like a portal stream, so `mlh_capture` takes it as is. It needs a session D-Bus call
+  outside the portal (allowed for unsandboxed apps); gnome-remote-desktop does this for
+  headless logins.
+- **KDE**: KWin's `zkde_screencast_unstable_v1.stream_virtual_output` (Wayland protocol,
+  privileged) or the `org.kde.KWin.ScreenCast` portal extension's virtual output.
+- **wlroots**: `swaymsg create_output` adds a headless output (`HEADLESS-n`) on a running
+  sway, sized with `output HEADLESS-n mode WxH`; then the portal (or a restore token
+  that names it) captures it. Removal: `swaymsg output HEADLESS-n unplug`.
+
+The policy and size would come from `CaptureConfig.virtual_display` once #39 merges.
 
 ## Build and test
 
-Ubuntu 24.04 packages: `libavcodec-dev libavutil-dev libva-dev` (Ubuntu's libavcodec has
-libx264). The tests also use the Linux client's decoder, so its packages too (see
-[platform/client/linux](../../client/linux/README.md)).
+Ubuntu 24.04 packages: `libdbus-1-dev libpipewire-0.3-dev`; the tests also build the
+Linux client's audio sink (`libavcodec-dev libavutil-dev libva-dev libwayland-dev
+libegl-dev libgles-dev`), and run under `weston pipewire pipewire-bin wireplumber
+dbus-daemon xdg-desktop-portal`.
 
 ```sh
-zig build test-linux-enc                    # the tests below
-zig build linux-enc-check -- --help         # the hardware check (moonsec-enc-check)
+zig build test-linux-host                                   # skips what this machine lacks
+platform/host/linux/headless.sh zig build test-linux-host   # in a headless desktop
+MOONSEC_REQUIRE=portal,pipewire platform/host/linux/headless.sh zig build test-linux-host
 ```
 
-`test-linux-enc` runs anywhere with libavcodec:
+[headless.sh](headless.sh) runs Weston with its PipeWire backend (the output is a
+PipeWire video node; pixman renderer, no GPU) and the kiosk shell, PipeWire and
+WirePlumber with a null sink as the default, and a D-Bus session in which
+xdg-desktop-portal starts on first use. The portal's ScreenCast backend is the test's
+own ([testwin/testportal.c](testwin/testportal.c)): the real frontend routes to it, and it
+hands out Weston's output node without a dialog. So the host's portal client, the
+frontend's restore-token handling and the PipeWire stream are all the real ones.
+xdg-desktop-portal-wlr on a headless sway was the plan, but xdpw 0.7 refuses to cast
+without dma-buf and the container has no GPU.
 
-- H.264 and HEVC long-term marking, loss and refresh through the test encoders, bit exact;
-- the software encoder: a lossless round trip compared with `mlh_bgra_to_i420` bit for bit
-  (with two slices and keyframes on request), the loss scenario below at 640x360 (every
-  recovery an IDR, stamps read on every picture), a bitrate change without a keyframe, a
-  linear dma-buf (memfd), and the platform interface;
-- VAAPI: on a machine without a VAAPI encoder (Mesa has no software one, and CI has no GPU)
-  `create` says not found and `auto` lands on software; on a machine with one, the test runs
-  the hardware check on it instead;
-- NVENC: not available.
+What the tests check ([test.zig](test.zig)):
 
-`moonsec-enc-check` drives an encoder through losses the way the session does: desktop-like
-content (a page of noisy text, a sliding window, the test pattern), a burst lost every 47
-frames, the client frozen until the refresh one RTT later, acks one RTT after decode. The
-client decodes with libavcodec and reads every picture's stamp. It passes when no IDR
-follows the first, every refresh is marked as one, the largest refresh is at most half a
-steady-state IDR, no picture carries another frame's stamp and no recovery picture is
-unreadable (`--expect idr` for encoders without long-term references). Exit 0 pass, 1 fail,
-2 when the encoder can't be opened.
+- **Capture through the portal.** A fullscreen wl_shm window draws the measurement test
+  pattern stamped with the time at 60 fps; two seconds of captured frames must all
+  decode, with frame numbers in order and capture after draw. Weston's PipeWire output
+  runs at 30 fps: about 60 frames, every stamp read, draw to capture about 12 to 21 ms.
+  Then the window stops drawing: `acquire` times out and `repeatLast` gives the last
+  picture again.
+- **Restore token.** The token is stored, a second start passes it, and the frontend
+  hands the backend's restore data back (what lets a real backend skip its dialog),
+  with persist mode 2 and the metadata cursor mode asked for.
+- **Cursor and formats** (a PipeWire source the test drives, no portal): an RGBx picture
+  comes out as BGRX, the cursor metadata's position, hotspot and RGBA bitmap come out as
+  BGRA, and a cursor-only buffer gives a repeat with the new position.
+- **Audio.** A 440 Hz tone at 0.25 played into the null sink comes back from its monitor
+  at RMS 0.177, about 48 000 frames a second, time stamps on the clock and in order.
+
+Not covered without a GPU: dma-buf frames (the dma-buf format is offered and falls back
+to memory on Weston, which is tested; dma-buf buffers themselves are compile-only), and a
+real desktop's portal dialog.
 
 ## Hardware check for Jeff
 
-On a Linux machine with an Intel or AMD GPU (`vainfo` lists `VAEntrypointEncSlice` or
-`EncSliceLP` for H.264), in a checkout of this branch:
+On a GNOME or KDE desktop with a GPU (Wayland session), run this twice:
 
 ```sh
-zig build linux-enc-check -Doptimize=ReleaseSafe -- --kind vaapi && \
-zig build linux-enc-check -Doptimize=ReleaseSafe -- --kind vaapi --codec hevc --slices 4
+MOONSEC_HW=1 MOONSEC_HW_DMABUF=1 zig build test-linux-host
 ```
 
-Both should print `long-term refs: yes`, `IDRs after the first 0`, refreshes well under the
-steady-state IDR, and `result: PASS`. `long-term refs: no` means the driver took no packed
-headers; send the output and `vainfo` so we can look at the driver.
+The first run shows the portal's dialog (pick a monitor; the pattern window goes
+fullscreen on it); the second must not, and prints `had a restore token before` with a
+start time in milliseconds. Both print `hardware: ... N dma-buf (modifier 0x...)` and fail
+unless every frame was dma-buf. Move a window during the 3 s run to get frames.
 
 ## Files
 
-- `mlh_enc.h`: the Zig-facing C ABI. `enc_internal.h`: shared by the C files.
-- `enc.c`: dispatch, output buffer, splitting an access unit into slices, BGRA to I420.
-- `enc_vaapi.c`, `enc_sw.c`: the backends. `dmabuf.c`: CPU reads of linear dma-bufs.
-- `h26x.h`, `h26x.c`: bit writer, H.264/HEVC headers, the long-term-reference planner.
-- `testenc.c`: the PCM-and-skip test encoders.
-- `encoder.zig`: `Encoder` for the platform interface. `enc_check.zig`: the hardware check.
-- `test.zig`: `zig build test-linux-enc`. `build_enc.zig`: its build steps.
+- `mlh.h`: the Zig-facing C ABI. `mlh_internal.h`: helpers shared by the C files.
+- `mlh_portal.c`, `mlh_capture.c`, `mlh_audio.c`, `mlh_common.c`: see above.
+- `host.zig`: `Capture`, `AudioSource`, `tokenPath`, the clock.
+- `testwin/`: test-only helpers: a wl_shm window, the test portal backend and a
+  controllable PipeWire source.
+- `headless.sh`: the headless desktop. `build.zig`: `test-linux-host` and
+  `linuxHostModule`.

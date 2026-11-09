@@ -99,7 +99,7 @@ pub const Decoder = struct {
     pass_out: bool = false,
 
     pub fn caps(d: *Decoder) api.DecoderCaps {
-        return .{ .codecs = d.codecs, .gpu_output = true, .cpu_output = true };
+        return .{ .codecs = d.codecs, .gpu_output = true, .cpu_output = true, .coded = probeFormats(d.codecs, d.pass.formats) };
     }
 
     pub fn configure(d: *Decoder, cfg: api.DecoderConfig) api.Error!void {
@@ -113,6 +113,7 @@ pub const Decoder = struct {
             else => return error.Unsupported,
         };
         if (!d.codecs.has(cfg.codec)) return error.Unsupported;
+        if (!probeFormats(d.codecs, .{}).get(@intFromEnum(cfg.codec)).supports(cfg.format)) return error.Unsupported;
         var h: ?*c.mlc_decoder = null;
         try ok("mlc_decoder_create", c.mlc_decoder_create(codec, @intFromBool(d.hardware), if (d.va_device) |p| p.ptr else null, &h));
         d.dec = h;
@@ -148,7 +149,17 @@ pub const Decoder = struct {
         d.held = f;
         return .{
             .frame_id = @truncate(@as(u64, @bitCast(f.pts))),
-            .image = .{ .width = f.width, .height = f.height, .format = .nv12, .gpu = &d.held.? },
+            .image = .{
+                .width = f.width,
+                .height = f.height,
+                .format = switch (f.kind) {
+                    c.MLC_FRAME_I444 => if (f.bit_depth > 8) .i444_16 else .i444,
+                    c.MLC_FRAME_P010 => .p010,
+                    else => if (f.bit_depth > 8) .p010 else .nv12,
+                },
+                .color = if (f.transfer == c.MLC_TRANSFER_PQ) .hdr10 else .sdr_bt709,
+                .gpu = &d.held.?,
+            },
             .decoded_us = nowUs(),
         };
     }
@@ -177,6 +188,17 @@ pub const Decoder = struct {
         d.pass.deinit();
     }
 };
+
+/// The coded formats per codec libavcodec decodes and the presenter draws (4:4:4 and
+/// 10-bit, HDR10 tone-mapped to SDR), and the synthetic decoder's for passthrough.
+pub fn probeFormats(codecs: api.CodecSet, passthrough: api.Formats) api.FormatCaps {
+    var f: api.FormatCaps = .{};
+    if (codecs.h264) f.h264 = @bitCast(@as(u8, @truncate(c.mlc_decoder_formats(c.MLC_CODEC_H264))));
+    if (codecs.hevc) f.hevc = @bitCast(@as(u8, @truncate(c.mlc_decoder_formats(c.MLC_CODEC_HEVC))));
+    if (codecs.av1) f.av1 = @bitCast(@as(u8, @truncate(c.mlc_decoder_formats(c.MLC_CODEC_AV1))));
+    if (codecs.passthrough) f.passthrough = passthrough;
+    return f;
+}
 
 /// The codecs this libavcodec can decode, plus passthrough.
 pub fn probeCodecs() api.CodecSet {
@@ -468,6 +490,9 @@ pub const Client = struct {
             .presenter = api.bind(api.Presenter, Presenter, &cl.presenter),
             .audio = api.bind(api.AudioSink, AudioSink, &cl.audio),
             .input = api.bind(api.InputSource, InputSource, &cl.input),
+            // SDR: the presenter tone-maps HDR10. Showing PQ as is needs the Wayland
+            // colour-management protocol (wp_color_manager_v1) and a 10-bit surface.
+            .display = .{},
             .deinit_ptr = cl,
             .deinitFn = &deinitOpaque,
         };

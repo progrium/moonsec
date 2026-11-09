@@ -1,7 +1,7 @@
 //! Build steps for the Linux host encoders (platform/host/linux, mlh_enc.h), kept out of
 //! the root build.zig. The root calls `add`.
 //!
-//!   test-linux-enc     the encoder tests (Linux; see test.zig for what they need)
+//!   test-linux-enc     the encoder tests (Linux; see enc_test.zig for what they need)
 //!   linux-enc-check    zig-out/bin/moonsec-enc-check, the hardware check (enc_check.zig)
 const std = @import("std");
 const client_build = @import("../../client/build.zig");
@@ -55,7 +55,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     };
 
     const tm = b.createModule(.{
-        .root_source_file = b.path("platform/host/linux/test.zig"),
+        .root_source_file = b.path("platform/host/linux/enc_test.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,

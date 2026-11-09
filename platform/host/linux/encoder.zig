@@ -106,6 +106,8 @@ pub const Encoder = struct {
             .av1 => c.MLH_CODEC_AV1,
             else => return error.Unsupported,
         };
+        // 8-bit 4:2:0 SDR only (caps.coded is empty, so that's all negotiation offers).
+        if (!api.Formats.baseline.supports(cfg.format)) return error.Unsupported;
         const cc: c.mlh_enc_config = .{
             .codec = codec,
             .width = cfg.width,

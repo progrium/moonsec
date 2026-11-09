@@ -1,381 +1,432 @@
-//! Linux host encoder tests (`zig build test-linux-enc`). They need libavcodec with libx264
-//! (Ubuntu's has it) and run anywhere; there is no GPU in CI or the cloud, so:
+//! Linux host capture and audio tests (`zig build test-linux-host`). Run them inside
+//! platform/host/linux/headless.sh: a headless sway with xdg-desktop-portal-wlr (chooser
+//! off, so the portal picks the one output without a dialog) and PipeWire with a null
+//! sink. A fullscreen wl_shm window shows the measurement test pattern with the current
+//! time; the capture test reads the stamps back out of the captured frames.
 //!
-//!   - the long-term-reference machinery the VAAPI encoder relies on (the planner and the
-//!     H.264/HEVC parameter sets and slice headers in h26x.c) is checked through the
-//!     PCM-and-skip test encoders (testenc.c) and libavcodec's decoders, picture for
-//!     picture, through losses and recovery;
-//!   - the software encoder runs end to end: a lossless round trip compared bit for bit,
-//!     and the loss/recovery scenario of enc_check.zig at a real bitrate;
-//!   - VAAPI and NVENC are built, and their "not available" paths are tested. On a machine
-//!     with a VAAPI encoder the VAAPI test runs the enc_check scenario on it instead.
+//! Without a portal, a compositor or PipeWire a test skips and says so, unless
+//! MOONSEC_REQUIRE=portal,pipewire names it: then it fails. The dma-buf path needs a GPU
+//! (llvmpipe and the pixman renderer have no modifiers), so it is compile-only here.
+
 const std = @import("std");
 const api = @import("platform");
-const enc_mod = @import("host_linux_enc");
+const host = @import("host_linux");
 const client = @import("client_linux");
-const check = @import("enc_check.zig");
-const c = enc_mod.c;
-const mlc = client.c;
+const tw = @import("testwin_c");
+const c = host.c;
+const pattern = api.pattern;
 
 const testing = std.testing;
-const gpa = testing.allocator;
 
-// ---------------------------------------------------------------------------
-// Test encoders: the VAAPI headers and planner through a real decoder
+fn required(what: []const u8) bool {
+    const v = std.c.getenv("MOONSEC_REQUIRE") orelse return false;
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
+    while (it.next()) |w| if (std.mem.eql(u8, w, what)) return true;
+    return false;
+}
 
-const Picture = struct {
-    w: u32,
-    h: u32,
-    y: []u8,
-    u: []u8,
-    v: []u8,
+fn skip(what: []const u8, why: []const u8) error{ SkipZigTest, TestUnexpectedResult } {
+    if (required(what)) {
+        std.debug.print("{s} required but unavailable: {s}\n", .{ what, why });
+        return error.TestUnexpectedResult;
+    }
+    std.debug.print("no {s} ({s}): skipping\n", .{ what, why });
+    return error.SkipZigTest;
+}
 
-    fn init(w: u32, h: u32) !Picture {
-        const y = try gpa.alloc(u8, w * h);
-        errdefer gpa.free(y);
-        const u = try gpa.alloc(u8, w * h / 4);
-        errdefer gpa.free(u);
-        return .{ .w = w, .h = h, .y = y, .u = u, .v = try gpa.alloc(u8, w * h / 4) };
+fn sleepUs(us: i64) void {
+    const ts: std.c.timespec = .{ .sec = @intCast(@divTrunc(us, 1_000_000)), .nsec = @intCast(@mod(us, 1_000_000) * 1000) };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+/// The headless desktop's size, from headless.sh (MOONSEC_HEADLESS_SIZE=WxH).
+fn headlessSize() ?api.Size {
+    const v = std.mem.span(std.c.getenv("MOONSEC_HEADLESS_SIZE") orelse return null);
+    const x = std.mem.indexOfScalar(u8, v, 'x') orelse return null;
+    return .{
+        .width = std.fmt.parseInt(u32, v[0..x], 10) catch return null,
+        .height = std.fmt.parseInt(u32, v[x + 1 ..], 10) catch return null,
+    };
+}
+
+/// Draws the test pattern, stamped with the time, into a fullscreen window at ~60 fps on
+/// its own thread until `stop` is set.
+const PatternWindow = struct {
+    win: *tw.mlh_testwin,
+    width: u32,
+    height: u32,
+    stop: std.atomic.Value(bool) = .init(false),
+    paused: std.atomic.Value(bool) = .init(false),
+    drawn: std.atomic.Value(u32) = .init(0),
+    thread: ?std.Thread = null,
+
+    fn open() !*PatternWindow {
+        var w: u32 = 0;
+        var h: u32 = 0;
+        var win: ?*tw.mlh_testwin = null;
+        const rc = tw.mlh_testwin_create("moonsec-test", &w, &h, &win);
+        if (rc != 0) return error.NoWindow;
+        const self = try testing.allocator.create(PatternWindow);
+        self.* = .{ .win = win.?, .width = w, .height = h };
+        // Draw once before capture starts so the first frame has the pattern.
+        self.draw();
+        _ = tw.mlh_testwin_dispatch(self.win, 50);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
     }
-    fn deinit(p: *Picture) void {
-        gpa.free(p.y);
-        gpa.free(p.u);
-        gpa.free(p.v);
+
+    fn draw(self: *PatternWindow) void {
+        var stride: u32 = 0;
+        const px = tw.mlh_testwin_buffer(self.win, &stride) orelse return;
+        const n = self.drawn.load(.monotonic) + 1;
+        pattern.render(px[0 .. @as(usize, stride) * self.height], self.width, self.height, stride, .{ .time_us = @intCast(host.nowUs()), .frame = n });
+        if (tw.mlh_testwin_commit(self.win) == 0) self.drawn.store(n, .monotonic);
     }
-    fn copyFrom(p: *Picture, o: *const Picture) void {
-        @memcpy(p.y, o.y);
-        @memcpy(p.u, o.u);
-        @memcpy(p.v, o.v);
-    }
-    /// New random content in 16x16 block (bx, by).
-    fn paint(p: *Picture, rnd: std.Random, bx: u32, by: u32) void {
-        for (0..16) |r| rnd.bytes(p.y[(by * 16 + r) * p.w + bx * 16 ..][0..16]);
-        for (0..8) |r| {
-            rnd.bytes(p.u[(by * 8 + r) * (p.w / 2) + bx * 8 ..][0..8]);
-            rnd.bytes(p.v[(by * 8 + r) * (p.w / 2) + bx * 8 ..][0..8]);
+
+    fn run(self: *PatternWindow) void {
+        var next = host.nowUs();
+        while (!self.stop.load(.monotonic)) {
+            if (!self.paused.load(.monotonic)) self.draw();
+            next += 16_667;
+            while (true) {
+                const left = next - host.nowUs();
+                if (left <= 0) break;
+                if (tw.mlh_testwin_dispatch(self.win, @intCast(@divTrunc(left, 1000) + 1)) < 0) return;
+            }
         }
     }
-    fn matches(p: *const Picture, f: *const mlc.mlc_frame) bool {
-        if (f.width != p.w or f.height != p.h or f.kind != mlc.MLC_FRAME_I420) return false;
-        for (0..p.h) |r| if (!std.mem.eql(u8, f.planes[0][r * f.strides[0] ..][0..p.w], p.y[r * p.w ..][0..p.w])) return false;
-        for (0..p.h / 2) |r| {
-            if (!std.mem.eql(u8, f.planes[1][r * f.strides[1] ..][0 .. p.w / 2], p.u[r * p.w / 2 ..][0 .. p.w / 2])) return false;
-            if (!std.mem.eql(u8, f.planes[2][r * f.strides[2] ..][0 .. p.w / 2], p.v[r * p.w / 2 ..][0 .. p.w / 2])) return false;
-        }
-        return true;
+
+    fn close(self: *PatternWindow) void {
+        self.stop.store(true, .monotonic);
+        if (self.thread) |t| t.join();
+        tw.mlh_testwin_destroy(self.win);
+        testing.allocator.destroy(self);
     }
 };
 
-/// 60 frames, one or two blocks change per frame; long-term marks every 15 frames. Frames
-/// 29-31 are lost (30 was marked long-term); the client acks what it decodes two frames
-/// later and the host refreshes at 33 against the newest acked reference (frame 15), then
-/// carries on. Every picture the client decodes must equal the host's, bit for bit.
-fn ltrScenario(codec: u32) !void {
-    const w = 64;
-    const h = 48;
-    const bw = w / 16;
-    const bh = h / 16;
-    var t: ?*c.mlh_testenc = null;
-    try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_create(codec, w, h, 1, &t));
-    defer c.mlh_testenc_destroy(t);
-    var dec: ?*mlc.mlc_decoder = null;
-    try testing.expectEqual(@as(c_int, 0), mlc.mlc_decoder_create(if (codec == c.MLH_CODEC_HEVC) mlc.MLC_CODEC_HEVC else mlc.MLC_CODEC_H264, 0, null, &dec));
-    defer mlc.mlc_decoder_destroy(dec);
+fn haveDisplay() bool {
+    return std.c.getenv("WAYLAND_DISPLAY") != null;
+}
 
-    var prng = std.Random.DefaultPrng.init(codec);
-    const rnd = prng.random();
-    var host = try Picture.init(w, h);
-    defer host.deinit();
-    // Pictures of frames marked long-term, by token.
-    var marked: std.AutoHashMap(u64, Picture) = .init(gpa);
-    defer {
-        var it = marked.valueIterator();
-        while (it.next()) |p| p.deinit();
-        marked.deinit();
+fn envU32(name: [*:0]const u8) ?u32 {
+    const v = std.c.getenv(name) orelse return null;
+    return std.fmt.parseInt(u32, std.mem.span(v), 10) catch null;
+}
+
+/// Under headless.sh, serves the portal's ScreenCast backend (testwin/testportal.c) with
+/// Weston's output node; elsewhere the desktop's own portal answers (and may ask).
+fn usingTestPortal() bool {
+    return std.c.getenv("MOONSEC_TEST_PORTAL") != null;
+}
+
+/// Starts capture, or skips the test when there is no portal.
+fn startCapture(cap: *host.Capture, cfg: api.CaptureConfig) !api.Size {
+    if (std.c.getenv("DBUS_SESSION_BUS_ADDRESS") == null) return skip("portal", "no session bus");
+    if (usingTestPortal()) {
+        const node = envU32("MOONSEC_HEADLESS_NODE") orelse return error.NoHeadlessNode;
+        const sz = headlessSize() orelse return error.NoHeadlessSize;
+        const all = c.MLH_CURSOR_HIDDEN | c.MLH_CURSOR_EMBEDDED | c.MLH_CURSOR_METADATA;
+        if (tw.mlh_testportal_start(node, sz.width, sz.height, all) != 0) return error.TestPortal;
     }
-    for (0..bh) |by| for (0..bw) |bx| host.paint(rnd, @intCast(bx), @intCast(by));
+    return cap.start(cfg) catch |e| switch (e) {
+        error.Unsupported => skip("portal", host.lastError()),
+        else => e,
+    };
+}
 
-    var pending: std.ArrayList(struct { at: u32, token: u64 }) = .empty;
-    defer pending.deinit(gpa);
-    var acked: std.ArrayList(u64) = .empty;
-    defer acked.deinit(gpa);
-    var newest_acked: u64 = 0;
-    var marks: u32 = 0;
-    var refresh_ref: u64 = 0;
+fn tokenFile(buf: []u8) ![:0]const u8 {
+    const dir = std.mem.span(std.c.getenv("XDG_RUNTIME_DIR") orelse "/tmp");
+    // Fixed, so a second run on a real desktop restores the first run's choice.
+    return std.fmt.bufPrintSentinel(buf, "{s}/moonsec-host-test/screencast.token", .{dir}, 0);
+}
 
-    var n: u32 = 0;
-    while (n < 60) : (n += 1) {
-        var changed = [_]u8{0} ** (bw * bh);
-        const force: u32 = if (n == 33) c.MLH_FORCE_LTR_REFRESH else c.MLH_FORCE_NONE;
-        if (force == c.MLH_FORCE_LTR_REFRESH) {
-            // The refresh predicts from the newest acked picture: the host's picture is
-            // that one plus this frame's changes.
-            host.copyFrom(marked.getPtr(newest_acked).?);
-            refresh_ref = newest_acked;
+fn loadToken(path: [:0]const u8, buf: []u8) ?[]const u8 {
+    if (c.mlh_token_load(path.ptr, buf.ptr, buf.len) != c.MLH_OK) return null;
+    return std.mem.sliceTo(buf, 0);
+}
+
+test "capture: the test pattern through the ScreenCast portal" {
+    if (!haveDisplay()) return skip("portal", "no Wayland display");
+    var win = PatternWindow.open() catch return skip("portal", "no test window (compositor lacks wl_shm or xdg-shell)");
+    defer win.close();
+
+    var path_buf: [512]u8 = undefined;
+    const token_path = try tokenFile(&path_buf);
+    var cap = host.Capture.init(.{ .token_path = token_path });
+    defer cap.deinit();
+    const size = try startCapture(&cap, .{ .fps = 60 });
+    std.debug.print("capture: portal v{d}, node {d}, {d}x{d}, cursor mode {d}\n", .{ cap.portalVersion(), cap.streamInfo().node_id, size.width, size.height, cap.cursorMode() });
+    if (headlessSize()) |hs| {
+        try testing.expectEqual(hs.width, size.width);
+        try testing.expectEqual(hs.height, size.height);
+    }
+    try testing.expectEqual(win.width, size.width);
+
+    // Two seconds of frames: every one must carry a readable stamp drawn before it was
+    // captured, frame numbers must not go back, seq must go up.
+    var frames: u32 = 0;
+    var readable: u32 = 0;
+    var last_seq: u64 = 0;
+    var last_frame: u32 = 0;
+    var lat: [256]i64 = undefined;
+    var n_lat: usize = 0;
+    const until = host.nowUs() + 2_000_000;
+    while (host.nowUs() < until) {
+        const f = (try cap.acquire(200_000)) orelse continue;
+        defer cap.release(&f);
+        if (f.repeat) continue; // a cursor-only update
+        frames += 1;
+        try testing.expect(f.seq > last_seq);
+        last_seq = f.seq;
+        try testing.expect(f.capture_start_us <= f.captured_us or f.captured_us <= host.nowUs());
+        const cpu = f.image.cpu orelse return error.NoPixels;
+        try testing.expectEqual(api.PixelFormat.bgra8, f.image.format);
+        const s = pattern.read(cpu.data, f.image.width, f.image.height, cpu.stride) orelse continue;
+        readable += 1;
+        try testing.expect(s.frame >= last_frame);
+        last_frame = s.frame;
+        const l = f.captured_us - @as(i64, @intCast(s.time_us));
+        try testing.expect(l >= 0);
+        if (n_lat < lat.len) {
+            lat[n_lat] = l;
+            n_lat += 1;
         }
-        if (n > 0) {
-            const k = (n * 5) % (bw * bh);
-            changed[k] = 1;
-            host.paint(rnd, @intCast(k % bw), @intCast(k / bw));
-            if (n % 3 == 0) {
-                const k2 = (k + 7) % (bw * bh);
-                changed[k2] = 1;
-                host.paint(rnd, @intCast(k2 % bw), @intCast(k2 / bw));
+    }
+    const st = cap.stats();
+    std.mem.sort(i64, lat[0..n_lat], {}, std.sort.asc(i64));
+    std.debug.print("capture: {d} frames in 2 s, {d} stamps read, {d} drawn; dropped {d}, cursor-only {d}, {s}; draw->capture median {d} us, max {d} us\n", .{
+        frames,                                readable,                              win.drawn.load(.monotonic),
+        st.dropped,                            st.cursor_only,                        if (st.dmabuf != 0) "dma-buf" else "memory",
+        if (n_lat > 0) lat[n_lat / 2] else -1, if (n_lat > 0) lat[n_lat - 1] else -1,
+    });
+    try testing.expect(frames >= 30);
+    try testing.expect(readable * 10 >= frames * 9);
+    try testing.expect(n_lat > 0 and lat[n_lat / 2] < 200_000);
+
+    // A static screen: the compositor sends nothing, and repeatLast keeps the picture.
+    win.paused.store(true, .monotonic);
+    sleepUs(300_000);
+    while (try cap.acquire(0)) |f| cap.release(&f);
+    var quiet: u32 = 0;
+    for (0..5) |_| {
+        if (try cap.acquire(100_000)) |f| {
+            cap.release(&f);
+        } else quiet += 1;
+    }
+    std.debug.print("capture: static screen, {d} of 5 waits had no frame\n", .{quiet});
+    const r = (try cap.repeatLast()) orelse return error.NoRepeat;
+    defer cap.release(&r);
+    try testing.expect(r.repeat);
+    const rs = pattern.read(r.image.cpu.?.data, r.image.width, r.image.height, r.image.cpu.?.stride) orelse return error.RepeatUnreadable;
+    try testing.expect(rs.frame >= last_frame);
+}
+
+test "capture: a restore token is stored and works for the next start" {
+    if (!haveDisplay()) return skip("portal", "no Wayland display");
+    var path_buf: [512]u8 = undefined;
+    const token_path = try tokenFile(&path_buf);
+    var t1_buf: [512]u8 = undefined;
+    var t2_buf: [512]u8 = undefined;
+
+    var cap = host.Capture.init(.{ .token_path = token_path });
+    defer cap.deinit();
+    _ = try startCapture(&cap, .{});
+    if (cap.portalVersion() < 4) return skip("portal", "ScreenCast before version 4 has no restore tokens");
+    const t1 = loadToken(token_path, &t1_buf) orelse return skip("portal", "this portal backend gives no restore token");
+    cap.stop();
+
+    // Restarted: the stored token goes back to the portal. The spec calls tokens single
+    // use; xdg-desktop-portal 1.18 hands the same one back, others may give a new one.
+    _ = try startCapture(&cap, .{});
+    const t2 = loadToken(token_path, &t2_buf) orelse return error.TokenGone;
+    std.debug.print("restore token: {s} then {s}\n", .{ t1, t2 });
+    if (usingTestPortal()) {
+        // The frontend turned the token back into the backend's restore data, which is
+        // what lets a real backend skip its dialog; and it asked for "until revoked".
+        var starts: u32 = 0;
+        var restored: u32 = 0;
+        var cursor: u32 = 0;
+        var persist: u32 = 0;
+        tw.mlh_testportal_counts(&starts, &restored, &cursor, &persist);
+        std.debug.print("test portal: {d} starts, {d} restored, cursor mode {d}, persist mode {d}\n", .{ starts, restored, cursor, persist });
+        try testing.expect(restored >= 1);
+        try testing.expectEqual(@as(u32, c.MLH_PERSIST_PERMANENT), persist);
+        try testing.expectEqual(@as(u32, c.MLH_CURSOR_METADATA), cursor);
+    }
+    const f = (try cap.acquire(1_000_000)) orelse (try cap.repeatLast()) orelse return error.NoFrame;
+    cap.release(&f);
+}
+
+test "audio: a tone played into the default sink comes back from its monitor" {
+    var src = host.AudioSource.init(.{});
+    _ = src.iface().start(.{}) catch |e| switch (e) {
+        error.Unsupported => return skip("pipewire", host.lastError()),
+        else => return e,
+    };
+    defer src.stop();
+    var sink: client.AudioSink = .{ .ring_ms = 200, .quantum = 256 };
+    _ = sink.start(.{}) catch return skip("pipewire", "no playback stream");
+    defer sink.stop();
+
+    // 440 Hz at amplitude 0.25 for 1.5 s; read the monitor meanwhile.
+    var tone: [480 * 2]f32 = undefined;
+    var phase: f32 = 0;
+    var buf: [1024 * 2]f32 = undefined;
+    var got: usize = 0;
+    var sum_sq: f64 = 0;
+    var counted: usize = 0;
+    var last_time: i64 = 0;
+    var pending: []const f32 = &.{};
+    const t0 = host.nowUs();
+    while (host.nowUs() - t0 < 1_500_000) {
+        // Keep the sink's ring topped up.
+        while (true) {
+            if (pending.len == 0) {
+                for (0..480) |i| {
+                    const v: f32 = 0.25 * @sin(phase);
+                    tone[2 * i] = v;
+                    tone[2 * i + 1] = v;
+                    phase += 2 * std.math.pi * 440.0 / 48_000.0;
+                    if (phase > 2 * std.math.pi) phase -= 2 * std.math.pi;
+                }
+                pending = &tone;
             }
+            const n = try sink.write(pending);
+            if (n == 0) break;
+            pending = pending[n * 2 ..];
         }
-        acked.clearRetainingCapacity();
-        var i: usize = 0;
-        while (i < pending.items.len) {
-            if (pending.items[i].at <= n) {
-                try acked.append(gpa, pending.items[i].token);
-                newest_acked = @max(newest_acked, pending.items[i].token);
-                _ = pending.swapRemove(i);
-            } else i += 1;
+        const ch = try src.iface().read(&buf, 20_000);
+        if (ch.frames == 0) continue;
+        const now = host.nowUs();
+        try testing.expect(ch.time_us <= now);
+        try testing.expect(now - ch.time_us < 1_000_000);
+        if (last_time != 0) try testing.expect(ch.time_us + 2_000 >= last_time);
+        last_time = ch.time_us;
+        got += ch.frames;
+        // Skip the first half second (the links come up, silence before the tone).
+        if (now - t0 > 500_000) {
+            for (buf[0 .. ch.frames * 2]) |v| sum_sq += v * v;
+            counted += ch.frames * 2;
         }
-        const p: c.mlh_enc_params = .{
-            .force = force,
-            .bitrate_bps = 0,
-            .acked_ltr_tokens = if (acked.items.len > 0) acked.items.ptr else null,
-            .acked_ltr_count = @intCast(acked.items.len),
-        };
-        var out: c.mlh_enc_output = undefined;
-        try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_encode(t, host.y.ptr, host.u.ptr, host.v.ptr, &changed, &p, &out));
-        try testing.expectEqual(n == 0, out.keyframe != 0); // never an IDR after the first
-        try testing.expectEqual(n == 33, out.ltr_refresh != 0);
-        if (out.has_ltr_token != 0) {
-            marks += 1;
-            var snap = try Picture.init(w, h);
-            snap.copyFrom(&host);
-            try marked.put(out.ltr_token, snap);
+    }
+    const info = src.info().?;
+    const rms = if (counted > 0) @sqrt(sum_sq / @as(f64, @floatFromInt(counted))) else 0;
+    std.debug.print("audio: {d} frames in 1.5 s, quantum {d}, overruns {d}, rms {d:.3} (tone 0.177)\n", .{ got, info.quantum, info.overruns, rms });
+    if (got == 0) return skip("pipewire", "the capture stream got no data (no sink to monitor?)");
+    try testing.expect(got > 48_000); // most of 1.5 s at 48 kHz
+    try testing.expect(rms > 0.12 and rms < 0.24);
+}
+
+test "capture: cursor metadata, cursor-only updates and RGB swizzle (PipeWire test source)" {
+    // A source we drive, captured without the portal: what a compositor in the portal's
+    // metadata cursor mode sends (Weston's PipeWire output has no cursor metadata).
+    var src: ?*tw.mlh_testsource = null;
+    var node: u32 = 0;
+    if (tw.mlh_testsource_create(64, 48, &src, &node) != 0) return skip("pipewire", "no PipeWire daemon");
+    defer tw.mlh_testsource_destroy(src);
+    const cc: c.mlh_capture_config = .{ .fd = -1, .node_id = node, .fps = 60, .modifiers = null, .n_modifiers = 0, .cursor_meta = 1, .timeout_ms = 5000 };
+    var cap: ?*c.mlh_capture = null;
+    if (c.mlh_capture_start(&cc, &cap) != c.MLH_OK) return error.CaptureStart;
+    defer c.mlh_capture_destroy(cap);
+    if (tw.mlh_testsource_wait_streaming(src, 5000) != 0) return error.NotStreaming;
+
+    var f: c.mlh_frame = undefined;
+    // Pushes until the capture side sees something (the first buffers can race the link).
+    const Push = struct {
+        fn untilFrame(s: ?*tw.mlh_testsource, h: ?*c.mlh_capture, out: *c.mlh_frame, picture: bool, rgb: [3]u8, x: i32, y: i32, serial: u32) !void {
+            for (0..20) |_| {
+                _ = tw.mlh_testsource_push(s, @intFromBool(picture), rgb[0], rgb[1], rgb[2], x, y, serial);
+                const rc = c.mlh_capture_acquire(h, 200_000, out);
+                if (rc == c.MLH_OK) return;
+                if (rc != c.MLH_TIMEOUT) return error.Acquire;
+            }
+            return error.NoFrame;
         }
-        if (n >= 29 and n <= 32) continue; // lost (29-31), and 32 waits for the refresh
-        var f: mlc.mlc_frame = undefined;
-        var got: c_int = 0;
-        try testing.expectEqual(@as(c_int, 0), mlc.mlc_decoder_decode(dec, out.data, out.len, n, &f, &got));
-        try testing.expect(got != 0);
-        defer mlc.mlc_decoder_release_frame(dec, &f);
-        if (!host.matches(&f)) {
-            std.debug.print("frame {d}: decoded picture differs from the host's\n", .{n});
-            return error.TestUnexpectedResult;
-        }
-        if (out.has_ltr_token != 0) try pending.append(gpa, .{ .at = n + 2, .token = out.ltr_token });
+    };
+
+    // A red picture (RGBx from the source) with the cursor at (10, 20) and a bitmap.
+    try Push.untilFrame(src, cap, &f, true, .{ 255, 0, 0 }, 10, 20, 1);
+    try testing.expectEqual(@as(u32, c.MLH_FRAME_MEMORY), f.kind);
+    try testing.expectEqual(@as(u8, 0), f.repeat);
+    try testing.expectEqual(@as(u32, 64), f.width);
+    try testing.expectEqual(@as(u32, c.MLH_FOURCC_XRGB8888), f.fourcc); // swizzled to B, G, R
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255 }, f.data[0..3]);
+    try testing.expect(f.pts_us <= f.arrived_us);
+    try testing.expectEqual(@as(u8, 1), f.has_cursor);
+    try testing.expectEqual(@as(u8, 1), f.cursor.visible);
+    try testing.expectEqual(@as(i32, 10), f.cursor.x);
+    try testing.expectEqual(@as(i32, 20), f.cursor.y);
+    try testing.expectEqual(@as(i32, 2), f.cursor.hot_x);
+    try testing.expectEqual(@as(i32, 3), f.cursor.hot_y);
+    try testing.expectEqual(@as(u32, 16), f.cursor.width);
+    const bm = f.cursor.bitmap orelse return error.NoBitmap;
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, bm[0..4]); // RGBA red -> BGRA
+    try testing.expectEqual(@as(u8, 0), bm[15 * 16 * 4 + 3]); // transparent bottom half
+    const serial = f.cursor.serial;
+    const seq = f.seq;
+    c.mlh_capture_release(cap, &f);
+
+    // The pointer moved, the picture did not: a repeat with the new position, same bitmap.
+    try Push.untilFrame(src, cap, &f, false, .{ 0, 0, 0 }, 30, 40, 1);
+    try testing.expectEqual(@as(u8, 1), f.repeat);
+    try testing.expectEqual(seq, f.seq);
+    try testing.expectEqual(@as(i32, 30), f.cursor.x);
+    try testing.expectEqual(@as(i32, 40), f.cursor.y);
+    try testing.expectEqual(serial, f.cursor.serial);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 255 }, f.data[0..3]);
+    c.mlh_capture_release(cap, &f);
+
+    // A green picture: a new frame.
+    try Push.untilFrame(src, cap, &f, true, .{ 0, 255, 0 }, 30, 40, 1);
+    try testing.expectEqual(@as(u8, 0), f.repeat);
+    try testing.expect(f.seq > seq);
+    try testing.expectEqualSlices(u8, &.{ 0, 255, 0 }, f.data[0..3]);
+    c.mlh_capture_release(cap, &f);
+
+    var st: c.mlh_capture_stats = undefined;
+    c.mlh_capture_get_stats(cap, &st);
+    std.debug.print("test source: {d} frames, {d} cursor-only, {d} dropped\n", .{ st.frames, st.cursor_only, st.dropped });
+    try testing.expect(st.cursor_only >= 1);
+}
+
+test "capture: dma-buf on a GPU desktop (MOONSEC_HW=1)" {
+    // The hardware check (README): on GNOME or KDE with a GPU. The first run shows the
+    // portal's dialog; the second must not (the restore token from the first).
+    if (std.c.getenv("MOONSEC_HW") == null) return error.SkipZigTest;
+    var path_buf: [512]u8 = undefined;
+    const token_path = try tokenFile(&path_buf);
+    var tok_buf: [512]u8 = undefined;
+    const had_token = loadToken(token_path, &tok_buf) != null;
+    var cap = host.Capture.init(.{ .token_path = token_path, .modifiers = &.{ c.MLH_MOD_LINEAR, c.MLH_MOD_INVALID } });
+    defer cap.deinit();
+    const t0 = host.nowUs();
+    const size = try startCapture(&cap, .{ .fps = 60 });
+    const start_ms = @divTrunc(host.nowUs() - t0, 1000);
+    var frames: u32 = 0;
+    var dmabuf: u32 = 0;
+    var cursors: u32 = 0;
+    var late_max: i64 = 0;
+    const until = host.nowUs() + 3_000_000;
+    while (host.nowUs() < until) {
+        const f = (try cap.acquire(100_000)) orelse continue;
+        defer cap.release(&f);
+        frames += 1;
+        if (f.image.gpu != null) dmabuf += 1;
+        if (f.cursor != null) cursors += 1;
+        late_max = @max(late_max, f.capture_start_us - f.captured_us);
     }
-    try testing.expectEqual(@as(u64, 16), refresh_ref); // frame 15 (token 16): frame 30's mark was lost
-    try testing.expect(marks >= 5); // frames 0, 15, 30, 33 (the refresh), 48
+    const st = cap.stats();
+    std.debug.print(
+        \\hardware: portal v{d}, {d}x{d}, start took {d} ms ({s} restore token before), cursor mode {d}
+        \\hardware: {d} frames in 3 s (move a window to make some), {d} dma-buf (modifier 0x{x}), {d} with cursor metadata, dropped {d}
+        \\
+    , .{ cap.portalVersion(), size.width, size.height, start_ms, if (had_token) "had a" else "no", cap.cursorMode(), frames, dmabuf, st.modifier, cursors, st.dropped });
+    try testing.expect(frames > 0);
+    if (std.c.getenv("MOONSEC_HW_DMABUF") != null) try testing.expect(dmabuf == frames);
 }
 
-test "H.264 headers and planner: long-term marking, loss, refresh, bit exact through libavcodec" {
-    try ltrScenario(c.MLH_CODEC_H264);
-}
-
-test "HEVC headers and planner: long-term RPS, loss, refresh, bit exact through libavcodec" {
-    try ltrScenario(c.MLH_CODEC_HEVC);
-}
-
-test "H.264 test encoder without long-term references: a refresh is an IDR" {
-    var t: ?*c.mlh_testenc = null;
-    try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_create(c.MLH_CODEC_H264, 32, 32, 0, &t));
-    defer c.mlh_testenc_destroy(t);
-    var pic = try Picture.init(32, 32);
-    defer pic.deinit();
-    @memset(pic.y, 100);
-    @memset(pic.u, 128);
-    @memset(pic.v, 128);
-    const changed = [_]u8{0} ** 4;
-    var out: c.mlh_enc_output = undefined;
-    for (0..4) |n| {
-        const p: c.mlh_enc_params = .{ .force = if (n == 2) c.MLH_FORCE_LTR_REFRESH else c.MLH_FORCE_NONE, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
-        try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_encode(t, pic.y.ptr, pic.u.ptr, pic.v.ptr, &changed, &p, &out));
-        try testing.expectEqual(n == 0 or n == 2, out.keyframe != 0);
-        try testing.expectEqual(@as(u32, 0), out.has_ltr_token);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Software encoder
-
-fn decoder(codec: u32) !*mlc.mlc_decoder {
-    var dec: ?*mlc.mlc_decoder = null;
-    try testing.expectEqual(@as(c_int, 0), mlc.mlc_decoder_create(codec, 0, null, &dec));
-    return dec.?;
-}
-
-test "software encoder: lossless round trip is bit exact, slices, keyframes on request" {
-    const w = 128;
-    const h = 96;
-    var e: ?*c.mlh_enc = null;
-    try testing.expectEqual(@as(c_int, 0), c.mlh_enc_create(c.MLH_ENC_SOFTWARE, null, &e));
-    defer c.mlh_enc_destroy(e);
-    std.debug.print("{s}\n", .{c.mlh_enc_describe(e)});
-    var caps: c.mlh_enc_caps = undefined;
-    c.mlh_enc_caps_get(e, &caps);
-    try testing.expectEqual(@as(u32, 0), caps.ltr);
-    const cfg: c.mlh_enc_config = .{ .codec = c.MLH_CODEC_H264, .width = w, .height = h, .fps = 60, .bitrate_bps = 2_000_000, .slices = 2, .ltr = 1, .lossless = 1 };
-    try testing.expectEqual(@as(c_int, 0), c.mlh_enc_configure(e, &cfg));
-    const dec = try decoder(mlc.MLC_CODEC_H264);
-    defer mlc.mlc_decoder_destroy(dec);
-
-    var bgra: [w * h * 4]u8 = undefined;
-    var want = try Picture.init(w, h);
-    defer want.deinit();
-    for (0..12) |n| {
-        api.pattern.render(&bgra, w, h, w * 4, .{ .time_us = 5_000_000 + n * 16_667, .frame = @intCast(n) });
-        c.mlh_bgra_to_i420(&bgra, w * 4, w, h, want.y.ptr, want.u.ptr, want.v.ptr);
-        const in: c.mlh_enc_input = .{ .dmabuf = null, .data = &bgra, .stride = w * 4, .format = c.MLH_FMT_BGRA, .width = w, .height = h };
-        const force: u32 = switch (n) {
-            5 => c.MLH_FORCE_IDR,
-            8 => c.MLH_FORCE_LTR_REFRESH, // no long-term references: an IDR
-            else => c.MLH_FORCE_NONE,
-        };
-        const p: c.mlh_enc_params = .{ .force = force, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
-        var out: c.mlh_enc_output = undefined;
-        try testing.expectEqual(@as(c_int, 0), c.mlh_enc_encode(e, &in, 0, &p, &out));
-        try testing.expectEqual(@as(u32, 0), out.dropped); // zerolatency: every frame comes out of its own call
-        try testing.expectEqual(n == 0 or n == 5 or n == 8, out.keyframe != 0);
-        try testing.expectEqual(@as(u32, 2), out.num_slices);
-        try testing.expectEqual(@as(u32, 0), out.has_ltr_token);
-        var f: mlc.mlc_frame = undefined;
-        var got: c_int = 0;
-        try testing.expectEqual(@as(c_int, 0), mlc.mlc_decoder_decode(dec, out.data, out.len, @intCast(n), &f, &got));
-        try testing.expect(got != 0);
-        defer mlc.mlc_decoder_release_frame(dec, &f);
-        try testing.expect(want.matches(&f));
-    }
-}
-
-test "software encoder: loss and IDR recovery at a real bitrate, stamps decode on every picture" {
-    var enc = try enc_mod.Encoder.create(.{ .kind = .software });
-    defer enc.deinit();
-    const o: check.Options = .{ .kind = .software, .width = 640, .height = 360, .bitrate_bps = 6_000_000, .frames = 120, .loss_every = 37, .expect = .idr };
-    const r = try check.run(gpa, &enc, o);
-    r.print(o);
-    try testing.expect(r.passed(o));
-    try testing.expectEqual(@as(u32, 3), r.losses);
-    try testing.expectEqual(r.losses, r.idrs_after_first);
-}
-
-test "software encoder: a bitrate change takes effect without a keyframe" {
-    var enc = try enc_mod.Encoder.create(.{ .kind = .software });
-    defer enc.deinit();
-    const w = 640;
-    const h = 360;
-    try enc.configure(.{ .codec = .h264, .width = w, .height = h, .bitrate_bps = 4_000_000 });
-    var content = try check.Content.init(gpa, w, h);
-    defer content.deinit(gpa);
-    var before: usize = 0;
-    var after: usize = 0;
-    for (0..80) |n| {
-        content.draw(@intCast(n), .{ .time_us = n * 16_667, .frame = @intCast(n) });
-        const frame: api.CapturedFrame = .{ .image = .{ .width = w, .height = h, .cpu = .{ .data = content.px, .stride = w * 4 } }, .seq = n, .capture_start_us = 0, .captured_us = 0 };
-        const ef = (try enc.encode(&frame, .{ .bitrate_bps = if (n == 40) 500_000 else 0 })).?;
-        try testing.expectEqual(n == 0, ef.keyframe);
-        var size: usize = 0;
-        for (ef.slices) |s| size += s.len;
-        if (n >= 20 and n < 40) before += size;
-        if (n >= 60) after += size;
-    }
-    std.debug.print("mean frame: {d} B at 4 Mb/s, {d} B at 500 kb/s\n", .{ before / 20, after / 20 });
-    try testing.expect(after * 3 < before);
-}
-
-test "software encoder: a linear dma-buf (memfd) is read like the same pixels in memory" {
-    const w = 256;
-    const h = 128;
-    var bgra: [w * h * 4]u8 = undefined;
-    api.pattern.render(&bgra, w, h, w * 4, .{ .time_us = 42, .frame = 7 });
-    var want = try Picture.init(w, h);
-    defer want.deinit();
-    c.mlh_bgra_to_i420(&bgra, w * 4, w, h, want.y.ptr, want.u.ptr, want.v.ptr);
-    const linux = std.os.linux;
-    const rc_fd = linux.memfd_create("moonsec-test", 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc_fd));
-    const fd: i32 = @intCast(rc_fd);
-    defer _ = linux.close(fd);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, bgra.len)));
-    try testing.expectEqual(@as(usize, bgra.len), linux.pwrite(fd, &bgra, bgra.len, 0));
-
-    var e: ?*c.mlh_enc = null;
-    try testing.expectEqual(@as(c_int, 0), c.mlh_enc_create(c.MLH_ENC_SOFTWARE, null, &e));
-    defer c.mlh_enc_destroy(e);
-    const cfg: c.mlh_enc_config = .{ .codec = c.MLH_CODEC_H264, .width = w, .height = h, .fps = 60, .bitrate_bps = 2_000_000, .slices = 1, .ltr = 0, .lossless = 1 };
-    try testing.expectEqual(@as(c_int, 0), c.mlh_enc_configure(e, &cfg));
-    var dma: c.mlh_dmabuf = std.mem.zeroes(c.mlh_dmabuf);
-    dma.width = w;
-    dma.height = h;
-    dma.fourcc = 0x34325258; // XRGB8888 ('XR24')
-    dma.modifier = 0; // linear
-    dma.num_planes = 1;
-    dma.fd[0] = fd;
-    dma.pitch[0] = w * 4;
-    const in: c.mlh_enc_input = .{ .dmabuf = &dma, .data = null, .stride = 0, .format = 0, .width = w, .height = h };
-    const p: c.mlh_enc_params = .{ .force = 0, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
-    var out: c.mlh_enc_output = undefined;
-    try testing.expectEqual(@as(c_int, 0), c.mlh_enc_encode(e, &in, 0, &p, &out));
-    const dec = try decoder(mlc.MLC_CODEC_H264);
-    defer mlc.mlc_decoder_destroy(dec);
-    var f: mlc.mlc_frame = undefined;
-    var got: c_int = 0;
-    try testing.expectEqual(@as(c_int, 0), mlc.mlc_decoder_decode(dec, out.data, out.len, 0, &f, &got));
-    try testing.expect(got != 0);
-    defer mlc.mlc_decoder_release_frame(dec, &f);
-    try testing.expect(want.matches(&f));
-
-    // A tiled buffer is the GPU encoders' to import, not this one's to read.
-    dma.modifier = 0x0100000000000001; // I915_FORMAT_MOD_X_TILED
-    try testing.expectEqual(@as(c_int, c.MLH_E_UNSUPPORTED), c.mlh_enc_encode(e, &in, 0, &p, &out));
-}
-
-test "software encoder through the platform interface" {
-    var storage: enc_mod.Encoder = undefined;
-    const e = try enc_mod.open(&storage, .{ .kind = .software });
-    defer e.deinit();
-    const caps = e.caps();
-    try testing.expect(caps.codecs.h264 and !caps.ltr and caps.cpu_input);
-    try testing.expectError(error.Unsupported, e.configure(.{ .codec = .hevc, .width = 128, .height = 64, .bitrate_bps = 1_000_000 }));
-    try e.configure(.{ .codec = .h264, .width = 128, .height = 64, .bitrate_bps = 1_000_000, .slices = 2 });
-    var px: [128 * 64 * 4]u8 = undefined;
-    api.pattern.render(&px, 128, 64, 128 * 4, .{ .time_us = 1, .frame = 1 });
-    const frame: api.CapturedFrame = .{ .image = .{ .width = 128, .height = 64, .cpu = .{ .data = &px, .stride = 128 * 4 } }, .seq = 1, .capture_start_us = 0, .captured_us = 0 };
-    const ef = (try e.encode(&frame, .{})).?;
-    try testing.expect(ef.keyframe);
-    try testing.expectEqual(@as(usize, 2), ef.slices.len);
-    try testing.expect(ef.encoded_us >= ef.encode_start_us);
-}
-
-// ---------------------------------------------------------------------------
-// VAAPI and NVENC
-
-test "VAAPI: not available without a GPU, or the recovery scenario on one" {
-    var e: ?*c.mlh_enc = null;
-    const rc = c.mlh_enc_create(c.MLH_ENC_VAAPI, null, &e);
-    if (rc != c.MLH_OK) {
-        // No libva, no render node, or no encode entrypoint (Mesa has no software
-        // VAAPI encoder): a clean "not found" so `auto` falls through to software.
-        try testing.expectEqual(@as(c_int, c.MLH_E_NOTFOUND), rc);
-        try testing.expect(e == null);
-        std.debug.print("VAAPI not available: {s}\n", .{c.mlh_last_error()});
-        var auto = try enc_mod.Encoder.create(.{ .kind = .auto });
-        defer auto.deinit();
-        try testing.expectEqual(enc_mod.Kind.software, auto.kind);
-        return;
-    }
-    c.mlh_enc_destroy(e);
-    // A VAAPI encoder is here (a GPU machine): run the hardware check on it.
-    var enc = try enc_mod.Encoder.create(.{ .kind = .vaapi });
-    defer enc.deinit();
-    const o: check.Options = .{ .kind = .vaapi, .frames = 150, .expect = if (enc.caps().ltr) .ltr else .idr };
-    const r = try check.run(gpa, &enc, o);
-    r.print(o);
-    try testing.expect(r.passed(o));
-}
-
-test "VAAPI: a missing render node is not found" {
-    var e: ?*c.mlh_enc = null;
-    try testing.expectEqual(@as(c_int, c.MLH_E_NOTFOUND), c.mlh_enc_create(c.MLH_ENC_VAAPI, "/dev/dri/does-not-exist", &e));
-}
-
-test "NVENC: not available here" {
-    var e: ?*c.mlh_enc = null;
-    try testing.expectEqual(@as(c_int, c.MLH_E_NOTFOUND), c.mlh_enc_create(c.MLH_ENC_NVENC, null, &e));
-    try testing.expectError(error.Unsupported, enc_mod.Encoder.create(.{ .kind = .nvenc }));
+test "token path" {
+    const p = try host.tokenPath(testing.allocator, "/home/u/.config/moonsec");
+    defer testing.allocator.free(p);
+    try testing.expectEqualStrings("/home/u/.config/moonsec/screencast.token", p);
 }
