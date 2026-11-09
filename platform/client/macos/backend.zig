@@ -11,7 +11,9 @@
 //!               Without a window: an offscreen texture (tests, headless).
 //!   AudioSink   CoreAudio AUHAL default output, f32, small device I/O buffer,
 //!               fed from a lock-free ring.
-//!   InputSource NSEvent keyboard, mouse and scroll from the window's view.
+//!   InputSource NSEvent keyboard, mouse and scroll from the window's view;
+//!               gamepads through GameController.framework
+//!               (platform/client/gamepad/gamecontroller.zig).
 //!
 //! AppKit runs on the main thread. `open` may be called from any thread, but then
 //! the main thread must run its run loop ([NSApp run]) or call `pumpEvents`, and
@@ -21,6 +23,8 @@ const std = @import("std");
 const api = @import("platform");
 const overlay = @import("client_overlay");
 const nsinput = @import("nsinput.zig");
+
+pub const gamepad = @import("client_gamepad");
 
 pub const c = @import("macc_c");
 
@@ -37,6 +41,8 @@ pub const Options = struct {
     offscreen: bool = false,
     /// Keep drawables readable for `macc_presenter_read_pixel` (tests).
     readback: bool = false,
+    /// Gamepads through GameController.framework.
+    gamepads: bool = true,
     /// Audio ring size in frames (rounded up to a power of two).
     audio_ring_frames: u32 = 1024,
     overlay_style: overlay.Style = .{},
@@ -280,8 +286,17 @@ pub const InputSource = struct {
     /// Events translated from a record that did not fit in the caller's buffer.
     pending: [nsinput.max_events]api.InputEvent = undefined,
     pending_n: usize = 0,
+    /// GameController pads; with `Options.gamepads` off it reports none.
+    pads: gamepad.gamecontroller.Source = .{ .clock = clock },
 
     pub fn poll(s: *InputSource, out: []api.InputEvent) api.Error!usize {
+        var n = try s.pollWindow(out);
+        // Pads keep their own queue, so whatever does not fit waits for the next poll.
+        if (n < out.len) n += try s.pads.poll(out[n..]);
+        return n;
+    }
+
+    fn pollWindow(s: *InputSource, out: []api.InputEvent) api.Error!usize {
         var n: usize = 0;
         while (n < out.len and s.pending_n > 0) {
             out[n] = s.pending[0];
@@ -357,6 +372,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(cl: *Client) void {
+        cl.input.pads.close();
         cl.audio.stop();
         cl.decoder.deinit();
         c.macc_presenter_destroy(cl.presenter.pr);
@@ -415,7 +431,10 @@ pub fn open(gpa: std.mem.Allocator, opts: Options) OpenError!*Client {
             .canvas_h = ch,
         },
         .audio = .{ .ring_frames = opts.audio_ring_frames },
-        .input = .{ .window = w },
+        .input = .{
+            .window = w,
+            .pads = if (opts.gamepads) gamepad.gamecontroller.Source.open(clock) catch .{ .clock = clock } else .{ .clock = clock },
+        },
     };
     return cl;
 }

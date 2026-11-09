@@ -1,11 +1,11 @@
 //! The Linux host's `HostBackend` (platform/api.zig) for `moonsec ... host --host linux`:
 //! `open` puts the pieces together.
 //!
-//!   Capture       synthetic test pattern. 7A's ScreenCast capture (host.zig) is wired in
-//!                 with 7B's encoders: the synthetic encoder only carries the pattern.
-//!   Encoder       chosen in order VAAPI, NVENC, software (7B); synthetic passthrough
-//!                 until they land, so the host streams to any client today.
-//!   AudioSource   synthetic tone; 7A's PipeWire source joins with the capture.
+//!   Capture       synthetic test pattern for now; the ScreenCast capture (host.zig) is
+//!                 wired in together with the encoders (encoder.zig), since the synthetic
+//!                 encoder only carries the pattern.
+//!   Encoder       synthetic passthrough for now; `.auto` will try VAAPI, then libx264.
+//!   AudioSource   synthetic tone for now; host.zig's PipeWire source joins with capture.
 //!   InputInjector uinput keyboard, mouse, absolute pointer and gamepads (input.zig).
 //!   Clock         CLOCK_MONOTONIC.
 //!
@@ -25,18 +25,18 @@ pub const clock = host.clock;
 
 /// Screen capture backends, best first.
 pub const CaptureKind = enum {
-    // portal (7A, host.zig's Capture): joins with 7B's encoders.
+    // portal (host.zig's Capture): next, with the encoders.
     synthetic,
 };
 
 /// Encoders, in the order `.auto` tries them.
 pub const EncoderKind = enum {
     auto,
-    // vaapi, nvenc, software (7B).
+    // vaapi, software (encoder.zig): next.
     synthetic,
 };
 
-/// `.auto`'s order. 7B puts VAAPI, NVENC and the software encoder ahead of synthetic.
+/// `.auto`'s order. VAAPI and the software encoder go ahead of synthetic when wired in.
 pub const encoder_order = [_]EncoderKind{.synthetic};
 
 pub const Options = struct {

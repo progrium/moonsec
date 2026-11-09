@@ -4,13 +4,15 @@ The Linux host: [host.zig](host.zig) implements the platform interface's `Captur
 `AudioSource`, [input.zig](input.zig) its `InputInjector`, and [backend.zig](backend.zig)
 puts a `HostBackend` together for `moonsec ... host --host linux` (in `moonsec-linux`
 builds). Like the Linux client, the OS APIs are called from small C files behind a narrow
-header ([mlh.h](mlh.h)) that translate-c reads; Zig never sees the system headers.
+header ([mlh.h](mlh.h)) that translate-c reads; Zig never sees the system headers. The
+video encoders (VAAPI with long-term references, a libx264 fallback) are described in
+[ENCODERS.md](ENCODERS.md).
 
 `--host linux` uses the uinput injector with the synthetic capture, encoder and audio for
-now: the synthetic encoder only carries the test pattern, so the ScreenCast capture and
-PipeWire audio here are wired into the bundle together with the encoders (7B, VAAPI then
-NVENC then software). The capture is wrapped so its `start` tells the injector the
-captured output's size, so absolute positions land on the captured pixels.
+now. Wiring the ScreenCast capture, PipeWire audio and the encoders into `backend.zig` is
+the next step (`CaptureKind` and `EncoderKind` mark where). The capture is wrapped so its
+`start` tells the injector the captured output's size, so absolute positions land on the
+captured pixels.
 
 | Object | How |
 | --- | --- |
@@ -243,7 +245,7 @@ key script arrives on the uinput keyboard in order. Don't run the last command i
 desktop session you are using: it types into the focused window.
 
 The full check, a Linux GPU machine streaming its desktop to the Mac and Windows clients
-while playing with a gamepad, needs 7A's capture, 7B's encoders, and `--client` options
+while playing with a gamepad, needs the capture and encoders wired into `--host linux`, and `--client` options
 for the Mac and Windows backends in `moonsec`; it follows them.
 
 ## Files

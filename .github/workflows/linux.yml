@@ -50,6 +50,8 @@ jobs:
         env:
           MOONSEC_REQUIRE: wayland,pipewire,uinput
         run: platform/client/linux/headless.sh zig build test-linux --summary all
+      - name: Host encoder tests (software end to end; VAAPI and NVENC not-available paths)
+        run: zig build test-linux-enc --summary all
       - name: End to end against the synthetic host (sim LAN)
         run: platform/client/linux/headless.sh zig-out/bin/moonsec-linux run sim --client linux --uinput-script --seconds 10
       - name: End to end against the synthetic host (sim WAN)

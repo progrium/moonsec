@@ -20,7 +20,10 @@
 //!       Device identity and pairing; see app/pair_cmd.zig. `peer iroh` with --state-dir
 //!       uses the device key, and the host admits only paired clients.
 //!
-//! Options: --fps N, --bitrate BPS, --size WxH, --slices N; sim and soak also take
+//! Options: --fps N, --bitrate BPS, --size WxH, --slices N. `peer sim host` also takes
+//! --fixture FILE.h264|FILE.h265: replay that Annex B stream instead of the synthetic codec
+//! (platform/synthetic/fixture.zig), for clients with real decoders such as the web client
+//! (web/README.md); --size should match the stream. Sim and soak also take
 //! --outage-at-ms T --outage-ms D (drop everything host to client for D ms at T), and a
 //! scripted path (app/pathsim.zig): --flaps T:D,T:D,... (direct-path outages at T ms for
 //! D ms), --drops T:D,... (connection drops), --idle-ms N (path idle timeout, default 300),
@@ -72,6 +75,7 @@ const Args = struct {
     sized: bool = false,
     slices: u8 = 4,
     hub_port: u16 = 0,
+    fixture: []const u8 = "",
     ticket_file: []const u8 = "",
     relay: bool = false,
     rate_control: bool = false,
@@ -134,7 +138,7 @@ fn usage() error{Usage} {
         \\usage: moonsec sim [--profile lan|wan|longhaul|clean] [--seconds N] [--seed N] [opts]
         \\       moonsec soak [--seconds 3600] [--profile lan] [--seed N] [opts]
         \\       moonsec run [sim|iroh|all] [--seconds N] [--seed N] [opts]
-        \\       moonsec peer sim host|client --hub PORT [opts]
+        \\       moonsec peer sim host|client --hub PORT [--fixture FILE.h264|FILE.h265] [opts]
         \\       moonsec peer iroh host|client --ticket-file PATH [--relay] [opts]
         \\       moonsec pattern --out FILE.ppm [--time-us N] [--frame N] [--size WxH]
         \\       moonsec id [--state-dir D]
@@ -151,7 +155,7 @@ fn usage() error{Usage} {
         \\sim:   --flaps T:D,.. --drops T:D,.. --idle-ms N --repunch-ms N --relay-delay-ms N --no-stall-pause
         \\client: --client synthetic|linux (moonsec-linux: Wayland/EGL, libavcodec, PipeWire, evdev)
         \\       --uinput-script (type the host's key script on a uinput keyboard) --no-audio
-        \\host:  --host synthetic|linux (moonsec-linux: uinput input; synthetic capture and encoder until 7A/7B)
+        \\host:  --host synthetic|linux (moonsec-linux: uinput input; synthetic capture and encoder for now)
         \\       --verify-input (read injected keys back from evdev and check them against the key script)
         \\iroh:  --relay-url URL --relay-ca PEM --bind IP:PORT --path-idle-ms N --conn-idle-ms N --min-presented PCT
         \\       --clipboard (sync the system clipboard over the control channel; default: a scripted check)
@@ -222,7 +226,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
             const eq = std.mem.eql;
             if (eq(u8, s, "--seed")) a.seed = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--seconds")) a.seconds = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--profile")) {
                 a.profile = std.meta.stringToEnum(simrun.Profile, v) orelse return usage();
-            } else if (eq(u8, s, "--fps")) a.fps = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--bitrate")) a.bitrate = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--slices")) a.slices = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--hub")) a.hub_port = try std.fmt.parseInt(u16, v, 10) else if (eq(u8, s, "--ticket-file")) a.ticket_file = v else if (eq(u8, s, "--out")) a.out = v else if (eq(u8, s, "--time-us")) a.time_us = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--frame")) a.frame = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--outage-at-ms")) a.outage_at_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--outage-ms")) a.outage_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--flaps")) {
+            } else if (eq(u8, s, "--fps")) a.fps = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--bitrate")) a.bitrate = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--slices")) a.slices = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--hub")) a.hub_port = try std.fmt.parseInt(u16, v, 10) else if (eq(u8, s, "--fixture")) a.fixture = v else if (eq(u8, s, "--ticket-file")) a.ticket_file = v else if (eq(u8, s, "--out")) a.out = v else if (eq(u8, s, "--time-us")) a.time_us = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--frame")) a.frame = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--outage-at-ms")) a.outage_at_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--outage-ms")) a.outage_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--flaps")) {
                 a.n_flaps = try parseOutages(v, &a.flaps);
             } else if (eq(u8, s, "--drops")) {
                 a.n_drops = try parseOutages(v, &a.drops);
@@ -659,9 +663,24 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             ok = try peerLinuxHost(gpa, io, a, p, &w);
         } else {
             const sh = try synthetic.openHost(gpa, .{ .clock = clock, .sleeper = wallSleep, .width = a.width, .height = a.height });
-            const hb = sh.backend();
+            var hb = sh.backend();
             defer hb.deinit();
-            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .yuv444 = a.yuv444, .ten_bit = a.ten_bit, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
+            // --fixture: a recorded H.264/HEVC stream stands in for the encoder.
+            var codec: api.Codec = .passthrough;
+            var fx: synthetic.fixture.Encoder = undefined;
+            var units: []synthetic.fixture.AccessUnit = &.{};
+            defer gpa.free(units);
+            var fixture_data: []u8 = &.{};
+            defer gpa.free(fixture_data);
+            if (a.fixture.len > 0) {
+                codec = if (std.mem.endsWith(u8, a.fixture, ".h265") or std.mem.endsWith(u8, a.fixture, ".hevc")) .hevc else .h264;
+                fixture_data = try Io.Dir.cwd().readFileAlloc(io, a.fixture, gpa, .limited(64 << 20));
+                units = try gpa.alloc(synthetic.fixture.AccessUnit, 1 << 16);
+                const split = try synthetic.fixture.split(codec, fixture_data, units);
+                fx = .init(clock, codec, fixture_data, split);
+                hb.encoder = api.bind(api.Encoder, synthetic.fixture.Encoder, &fx);
+            }
+            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .codec = codec, .pause_on_stall = !a.no_stall_pause, .yuv444 = a.yuv444, .ten_bit = a.ten_bit, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
             defer app.deinit();
             try app.runThreaded(io);
             try app.s.report(&w);
@@ -670,7 +689,11 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             if (app.audio) |au| try w.print("  audio: {d} frames encoded, {d} datagrams, {d} errors; source skipped {d} frames\n", .{ au.stats.frames, au.stats.datagrams, au.stats.errors, sh.audio.stats.skipped });
             // Keys older than the sender's 500 ms window are dropped by design (an outage);
             // the injector's script check then reads the rest as out of order.
-            ok = app.s.end == .client_bye and (sh.injector.wrong == 0 or lost_input > 0) and sh.injector.keys > 0 and app.s.stats.frames > 0;
+            if (a.fixture.len > 0) {
+                try w.print("  fixture: {d} frames ({d} keyframes, {d} skipped for recovery), {d} bytes\n", .{ fx.stats.frames, fx.stats.keyframes, fx.stats.skipped, fx.stats.bytes });
+                // A real client's input is whatever its user typed, not the scripted keys.
+                ok = app.s.end == .client_bye and app.s.stats.frames > 0;
+            } else ok = app.s.end == .client_bye and (sh.injector.wrong == 0 or lost_input > 0) and sh.injector.keys > 0 and app.s.stats.frames > 0;
             if (ctl_stream != null) {
                 const cs = app.s.control.stats;
                 const clip_ok = !scripted or clip.got(client_copy);
@@ -722,8 +745,8 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
     return ok;
 }
 
-/// The Linux host backend against any client: uinput injection, and (until 7A and 7B
-/// land) the synthetic capture, encoder and audio. With --verify-input the injected keys
+/// The Linux host backend against any client: uinput injection, and (until the capture and
+/// encoders are wired in) the synthetic capture, encoder and audio. With --verify-input the injected keys
 /// are read back from the uinput keyboard's event node, as the compositor reads them, and
 /// checked against the synthetic client's key script.
 fn peerLinuxHost(gpa: std.mem.Allocator, io: Io, a: Args, p: pipe_mod.PacketPipe, w: *Io.Writer) !bool {

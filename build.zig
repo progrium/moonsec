@@ -63,6 +63,8 @@ pub fn build(b: *std.Build) void {
     @import("platform/host/linux/build.zig").add(b, target, optimize, host_linux_mods, test_step);
     // macOS host backend (platform/host/macos/build.zig): test-mac, check-mac.
     @import("platform/host/macos/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
+    // Linux host encoders (platform/host/linux/build_enc.zig): test-linux-enc, linux-enc-check.
+    @import("platform/host/linux/build_enc.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod, .linux_uinput = linux_uinput_mod });
 
     // PacketPipe (transport/pipe.zig): the core's view of a transport, shared by the
     // sim (transport/sim.zig) and iroh (transport/iroh_pipe.zig) implementations.
@@ -87,9 +89,37 @@ pub fn build(b: *std.Build) void {
     }) });
     wasm_step.dependOn(&wasm_tests.step);
 
+    // Loadable browser modules (web/): the core's wasm ABI for the web client, and the
+    // input receiver the browser test harness's stub host decodes with (web/e2e).
+    const wasm_free = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const web_step = b.step("web-wasm", "Build the browser wasm modules into zig-out/web");
+    const web_core = b.addExecutable(.{
+        .name = "moonsec-core",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("core/wasm.zig"),
+            .target = wasm_free,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    web_core.entry = .disabled;
+    web_core.rdynamic = true;
+    web_step.dependOn(&b.addInstallArtifact(web_core, .{ .dest_dir = .{ .override = .{ .custom = "web" } } }).step);
+    const web_host_stub = b.addExecutable(.{
+        .name = "moonsec-host-stub",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("web/e2e/host_stub.zig"),
+            .target = wasm_free,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{ .name = "core", .module = b.createModule(.{ .root_source_file = b.path("core/root.zig"), .target = wasm_free, .optimize = .ReleaseSmall }) }},
+        }),
+    });
+    web_host_stub.entry = .disabled;
+    web_host_stub.rdynamic = true;
+    web_step.dependOn(&b.addInstallArtifact(web_host_stub, .{ .dest_dir = .{ .override = .{ .custom = "web" } } }).step);
+    wasm_step.dependOn(web_step);
+
     // Browser pairing (shim-web/pair/pair.zig): core/pair as a small wasm module that the
     // browser transport (shim-web/) drives. `zig build web-pair` -> zig-out/web/moonsec-pair.wasm.
-    const wasm_free = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const web_pair = b.addExecutable(.{
         .name = "moonsec-pair",
         .root_module = b.createModule(.{
@@ -337,10 +367,40 @@ pub fn build(b: *std.Build) void {
             if (b.args == null) run.addArgs(&.{ "sim", "--seconds", "10" });
             b.step("moonsec-sim", "Run the moonsec tool without the shim (sim, soak, run sim, pattern)").dependOn(&run.step);
             b.installArtifact(exe);
+            b.step("web-host", "Install zig-out/bin/moonsec-sim, the host the web client's tests stream from (web/README.md)").dependOn(&b.addInstallArtifact(exe, .{}).step);
             const soak = b.addRunArtifact(exe);
             soak.addArgs(if (b.args) |a| a else &.{ "soak", "--seconds", "3600" });
             b.step("soak", "One hour of streaming over the simulated LAN in virtual time (args override)").dependOn(&soak.step);
         }
+    }
+
+    // Web client media pipeline (web/README.md): the client session and the Opus stage for
+    // the browser (app/web.zig on wasm32-wasi), installed by `web-wasm` as
+    // zig-out/web/moonsec-client.wasm. The host its tests stream from is `web-host` below.
+    {
+        const web_opt = b.option(std.builtin.OptimizeMode, "web-optimize", "Optimize mode of the web client's wasm (default: ReleaseSafe)") orelse .ReleaseSafe;
+        const w_core = b.createModule(.{ .root_source_file = b.path("core/root.zig"), .target = wasm_wasi, .optimize = web_opt });
+        const w_platform = b.createModule(.{ .root_source_file = b.path("platform/api.zig"), .target = wasm_wasi, .optimize = web_opt, .imports = &.{.{ .name = "core", .module = w_core }} });
+        const w_pipe = b.createModule(.{ .root_source_file = b.path("transport/pipe.zig"), .target = wasm_wasi, .optimize = web_opt });
+        const w_opus = addOpus(b, wasm_wasi, web_opt);
+        const w_stage = b.createModule(.{ .root_source_file = b.path("codec/opus/stage.zig"), .target = wasm_wasi, .optimize = web_opt, .imports = &.{ .{ .name = "core", .module = w_core }, .{ .name = "opus", .module = w_opus.module } } });
+        const web_wasm = b.addExecutable(.{ .name = "moonsec-client", .root_module = b.createModule(.{
+            .root_source_file = b.path("app/web.zig"),
+            .target = wasm_wasi,
+            .optimize = web_opt,
+            .strip = true,
+            .imports = &.{
+                .{ .name = "core", .module = w_core },
+                .{ .name = "platform", .module = w_platform },
+                .{ .name = "pipe", .module = w_pipe },
+                .{ .name = "audio_stage", .module = w_stage },
+            },
+        }) });
+        web_wasm.entry = .disabled;
+        web_wasm.rdynamic = true;
+        web_wasm.wasi_exec_model = .reactor;
+        const install_wasm = b.addInstallArtifact(web_wasm, .{ .dest_dir = .{ .override = .{ .custom = "web" } } });
+        web_step.dependOn(&install_wasm.step);
     }
 
     // `moonsec-linux`: moonsec-sim plus the Linux client backend (platform/client/linux),
