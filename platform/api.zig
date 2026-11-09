@@ -177,6 +177,24 @@ pub const CapturedFrame = struct {
     captured_us: Micros,
     /// Returned by `repeatLast`: the same picture as before.
     repeat: bool = false,
+    /// The pointer, when the backend captures it apart from the picture (`cfg.cursor` off
+    /// and the OS gives it as metadata, as PipeWire does). Valid until `release`.
+    cursor: ?Cursor = null,
+};
+
+/// The pointer as capture saw it, for the client to draw over the picture.
+pub const Cursor = struct {
+    visible: bool,
+    /// The hotspot's position in frame pixels (may be outside the frame).
+    x: i32,
+    y: i32,
+    /// The hotspot within the bitmap.
+    hot_x: i32 = 0,
+    hot_y: i32 = 0,
+    /// Changes whenever the bitmap does, so a sender can skip unchanged ones.
+    serial: u32 = 0,
+    /// bgra8 in memory, straight alpha; null until the backend has seen one.
+    bitmap: ?Image = null,
 };
 
 /// Screen capture. Used from the capture thread.

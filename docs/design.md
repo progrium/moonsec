@@ -457,7 +457,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 ### Phase 7: Linux host and hardening (about 5 weeks)
 
-- Linux host: PipeWire capture, VAAPI/NVENC, uinput.
+- Linux host: PipeWire capture, VAAPI/NVENC, uinput. Capture and audio built in [platform/host/linux](../platform/host/linux/README.md): the ScreenCast portal with restore tokens (approve once, then unattended), a PipeWire stream with dma-buf or memfd buffers and cursor metadata, and the default sink's monitor for audio. Tested headless against Weston's PipeWire output behind the real portal frontend; dma-buf is untested without a GPU.
 - Fuzzing of every parser; external security review of pairing and the shim boundary.
 - Packaging, code signing, driver signing, notices; public C ABI frozen as 1.0.
 
