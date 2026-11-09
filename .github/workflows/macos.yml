@@ -4,7 +4,9 @@ name: macos
 # Recording or Accessibility permission, so the capture, audio and injection tests skip;
 # the VideoToolbox tests run on whatever encoder the VM has, and print which (hardware or
 # software, low-latency and LTR or not) in the log and the job summary.
-# Linux type-checks the same code for aarch64 and x86_64 macOS.
+# The client backend tests (platform/client/macos) run decode and Metal present on the
+# VM's paravirtual GPU; window and audio tests skip without a window server or device.
+# Linux type-checks host and client for aarch64 and x86_64 macOS.
 
 on:
   push:
@@ -33,6 +35,9 @@ jobs:
       - name: macOS host backend tests
         run: ./zig-out/mac-test/mac-host-test 2>&1 | tee test-mac.log; exit ${PIPESTATUS[0]}
         shell: bash
+      - name: macOS client backend tests
+        if: always()
+        run: zig build test-mac-client --summary all
       - name: VideoToolbox on this runner
         if: always()
         shell: bash
@@ -55,6 +60,6 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: zig fmt
-        run: zig fmt --check platform/host/macos
+        run: zig fmt --check platform/host/macos platform/client/macos
       - name: Type-check for aarch64 and x86_64 macOS
         run: zig build check-mac --summary all
