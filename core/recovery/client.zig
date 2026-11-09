@@ -110,6 +110,22 @@ pub const Client = struct {
         }
     }
 
+    /// The stream starts again in another format (the host's `config` changed): frames
+    /// before the next IDR are in the old one, so they are dropped, and the references
+    /// acked so far are gone with the old decoder. The host sends that IDR unasked, so this
+    /// counts as a request made now: if the IDR does not come within the retry timeout (or
+    /// came before the config and failed to decode), it is asked for.
+    pub fn restart(self: *Client, now_us: u64) void {
+        self.state = .awaiting_keyframe;
+        self.gap_start = self.expected orelse 0;
+        self.want_idr = true;
+        self.request_due = false;
+        self.have_requested = true;
+        self.last_request_us = now_us;
+        self.acks_len = 0;
+        self.acks_dirty = false;
+    }
+
     /// Reassembly gave up on `frame_id` (FEC and retransmission could not complete it).
     pub fn onFrameLost(self: *Client, frame_id: FrameId, now_us: u64) void {
         if (self.expected) |exp| {
@@ -296,4 +312,32 @@ test "acks repeat the most recent entries" {
     try testing.expectEqual(@as(u8, 3), a.len);
     try testing.expectEqual(@as(FrameId, 2), a.slice()[0].frame_id);
     try testing.expectEqual(@as(FrameId, 4), a.slice()[2].frame_id);
+}
+
+test "restart: old-format frames are dropped until the next IDR, and old acks forgotten" {
+    var c = Client.init(.{});
+    try testing.expectEqual(Verdict.decode, c.onFrame(.{ .frame_id = 0, .keyframe = true, .ltr_token = 1 }, 0));
+    c.onDecoded(.{ .frame_id = 0, .keyframe = true, .ltr_token = 1 }, true, 0);
+    _ = c.poll(0);
+    c.restart(1);
+    try testing.expectEqual(Verdict.drop, c.onFrame(.{ .frame_id = 1 }, 1));
+    try testing.expectEqual(Verdict.drop, c.onFrame(.{ .frame_id = 2, .ltr_token = 2, .refresh = true }, 2));
+    // No request: the host sends the IDR on its own.
+    try testing.expectEqual(@as(?types.Ack, null), c.poll(2));
+    try testing.expectEqual(Verdict.decode, c.onFrame(.{ .frame_id = 3, .keyframe = true, .ltr_token = 3 }, 3));
+    c.onDecoded(.{ .frame_id = 3, .keyframe = true, .ltr_token = 3 }, true, 3);
+    const a = c.poll(3).?;
+    try testing.expectEqual(@as(u8, 1), a.len);
+    try testing.expectEqual(@as(FrameId, 3), a.entries[0].frame_id);
+    try testing.expectEqual(@as(?types.RecoveryRequest, null), a.recovery);
+    try testing.expectEqual(@as(u64, 0), c.stats.freezes);
+
+    // The IDR never comes (it came before the config, in the new format, and failed): the
+    // request goes out after the retry timeout, for an IDR.
+    c.restart(100_000);
+    try testing.expectEqual(Verdict.drop, c.onFrame(.{ .frame_id = 4 }, 100_000));
+    try testing.expectEqual(@as(?types.RecoveryRequest, null), pollRequest(&c, 100_000 + c.retryTimeout() - 1));
+    const r = pollRequest(&c, 100_000 + c.retryTimeout()).?;
+    try testing.expect(r.want_idr);
+    try testing.expectEqual(@as(FrameId, 4), r.first_missing);
 }

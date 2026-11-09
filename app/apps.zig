@@ -264,6 +264,7 @@ pub const ClientApp = struct {
     s: ClientSession,
     opts: ClientOptions,
     configured: bool = false,
+    configured_seq: u32 = 0,
     quit: bool = false,
     overlay: api.Overlay = .{ .telemetry = .{} },
     next_overlay: Micros = 0,
@@ -322,9 +323,10 @@ pub const ClientApp = struct {
         if (a.audio) |au| if (a.s.state == .streaming) au.render(a.be.clock.now());
     }
 
-    /// Configure the decoder and presenter once the host's config is in.
+    /// Configure the decoder and presenter once the host's config is in, and again when
+    /// it changes the stream (a multi-user host re-picking the format).
     fn configure(a: *ClientApp) bool {
-        if (a.configured) return true;
+        if (a.configured and a.configured_seq == a.s.config_seq) return true;
         const c = a.s.config orelse return false;
         a.be.decoder.configure(.{ .codec = c.codec, .width = c.width, .height = c.height, .format = c.format }) catch {
             a.s.close(a.be.clock.now());
@@ -335,6 +337,7 @@ pub const ClientApp = struct {
             return false;
         };
         a.configured = true;
+        a.configured_seq = a.s.config_seq;
         return true;
     }
 

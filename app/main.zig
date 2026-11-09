@@ -20,7 +20,10 @@
 //!       Device identity and pairing; see app/pair_cmd.zig. `peer iroh` with --state-dir
 //!       uses the device key, and the host admits only paired clients.
 //!
-//! Options: --fps N, --bitrate BPS, --size WxH, --slices N; sim and soak also take
+//! Options: --fps N, --bitrate BPS, --size WxH, --slices N. `peer sim host` also takes
+//! --fixture FILE.h264|FILE.h265: replay that Annex B stream instead of the synthetic codec
+//! (platform/synthetic/fixture.zig), for clients with real decoders such as the web client
+//! (web/README.md); --size should match the stream. Sim and soak also take
 //! --outage-at-ms T --outage-ms D (drop everything host to client for D ms at T), and a
 //! scripted path (app/pathsim.zig): --flaps T:D,T:D,... (direct-path outages at T ms for
 //! D ms), --drops T:D,... (connection drops), --idle-ms N (path idle timeout, default 300),
@@ -47,12 +50,16 @@ const clipboard = @import("clipboard");
 /// The Linux client backend (platform/client/linux), in `moonsec-linux` builds.
 const client_linux = if (options.linux_client) @import("client_linux") else struct {};
 const UinputDevice = if (options.linux_client) client_linux.uinput.Device else void;
+/// The Linux host backend (platform/host/linux), in `moonsec-linux` builds.
+const host_linux = if (options.linux_host) @import("host_linux") else struct {};
+const linux_uinput = if (options.linux_host) host_linux.uinput else struct {};
 
 const Io = std.Io;
 const Micros = i64;
 const alpn = pair_cmd.alpn;
 
 const ClientKind = enum { synthetic, linux };
+const HostKind = enum { synthetic, linux };
 
 const Args = struct {
     cmd: []const u8 = "",
@@ -68,6 +75,7 @@ const Args = struct {
     sized: bool = false,
     slices: u8 = 4,
     hub_port: u16 = 0,
+    fixture: []const u8 = "",
     ticket_file: []const u8 = "",
     relay: bool = false,
     rate_control: bool = false,
@@ -99,8 +107,13 @@ const Args = struct {
     /// Linux client: type the synthetic host's key script on a uinput keyboard, so the
     /// host's injector check runs through evdev (needs /dev/uinput).
     uinput_script: bool = false,
-    /// Linux client: no PipeWire stream.
+    /// Linux client: no PipeWire stream. Linux host: no audio source.
     no_audio: bool = false,
+    /// Host backend: the synthetic one, or the OS backend (`--host linux`).
+    host: HostKind = .synthetic,
+    /// Linux host: read the injected keys back from the uinput keyboard's event node and
+    /// check them against the synthetic client's key script (needs /dev/uinput).
+    verify_input: bool = false,
     /// Host format preferences (platform/format.zig): 4:4:4 and 10-bit when the client has them.
     yuv444: bool = false,
     ten_bit: bool = false,
@@ -125,7 +138,7 @@ fn usage() error{Usage} {
         \\usage: moonsec sim [--profile lan|wan|longhaul|clean] [--seconds N] [--seed N] [opts]
         \\       moonsec soak [--seconds 3600] [--profile lan] [--seed N] [opts]
         \\       moonsec run [sim|iroh|all] [--seconds N] [--seed N] [opts]
-        \\       moonsec peer sim host|client --hub PORT [opts]
+        \\       moonsec peer sim host|client --hub PORT [--fixture FILE.h264|FILE.h265] [opts]
         \\       moonsec peer iroh host|client --ticket-file PATH [--relay] [opts]
         \\       moonsec pattern --out FILE.ppm [--time-us N] [--frame N] [--size WxH]
         \\       moonsec id [--state-dir D]
@@ -142,6 +155,8 @@ fn usage() error{Usage} {
         \\sim:   --flaps T:D,.. --drops T:D,.. --idle-ms N --repunch-ms N --relay-delay-ms N --no-stall-pause
         \\client: --client synthetic|linux (moonsec-linux: Wayland/EGL, libavcodec, PipeWire, evdev)
         \\       --uinput-script (type the host's key script on a uinput keyboard) --no-audio
+        \\host:  --host synthetic|linux (moonsec-linux: uinput input; synthetic capture and encoder for now)
+        \\       --verify-input (read injected keys back from evdev and check them against the key script)
         \\iroh:  --relay-url URL --relay-ca PEM --bind IP:PORT --path-idle-ms N --conn-idle-ms N --min-presented PCT
         \\       --clipboard (sync the system clipboard over the control channel; default: a scripted check)
         \\
@@ -180,6 +195,10 @@ fn parseArgs(args: []const [:0]const u8) !Args {
             a.uinput_script = true;
             continue;
         }
+        if (std.mem.eql(u8, s, "--verify-input")) {
+            a.verify_input = true;
+            continue;
+        }
         if (std.mem.eql(u8, s, "--no-audio")) {
             a.no_audio = true;
             continue;
@@ -207,12 +226,14 @@ fn parseArgs(args: []const [:0]const u8) !Args {
             const eq = std.mem.eql;
             if (eq(u8, s, "--seed")) a.seed = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--seconds")) a.seconds = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--profile")) {
                 a.profile = std.meta.stringToEnum(simrun.Profile, v) orelse return usage();
-            } else if (eq(u8, s, "--fps")) a.fps = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--bitrate")) a.bitrate = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--slices")) a.slices = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--hub")) a.hub_port = try std.fmt.parseInt(u16, v, 10) else if (eq(u8, s, "--ticket-file")) a.ticket_file = v else if (eq(u8, s, "--out")) a.out = v else if (eq(u8, s, "--time-us")) a.time_us = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--frame")) a.frame = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--outage-at-ms")) a.outage_at_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--outage-ms")) a.outage_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--flaps")) {
+            } else if (eq(u8, s, "--fps")) a.fps = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--bitrate")) a.bitrate = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--slices")) a.slices = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--hub")) a.hub_port = try std.fmt.parseInt(u16, v, 10) else if (eq(u8, s, "--fixture")) a.fixture = v else if (eq(u8, s, "--ticket-file")) a.ticket_file = v else if (eq(u8, s, "--out")) a.out = v else if (eq(u8, s, "--time-us")) a.time_us = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--frame")) a.frame = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--outage-at-ms")) a.outage_at_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--outage-ms")) a.outage_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--flaps")) {
                 a.n_flaps = try parseOutages(v, &a.flaps);
             } else if (eq(u8, s, "--drops")) {
                 a.n_drops = try parseOutages(v, &a.drops);
             } else if (eq(u8, s, "--idle-ms")) a.idle_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--repunch-ms")) a.repunch_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--relay-delay-ms")) a.relay_delay_ms = try std.fmt.parseInt(i64, v, 10) else if (eq(u8, s, "--path-idle-ms")) a.path_idle_ms = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--relay-url")) a.relay_url = v else if (eq(u8, s, "--relay-ca")) a.relay_ca = v else if (eq(u8, s, "--bind")) a.bind = v else if (eq(u8, s, "--conn-idle-ms")) a.conn_idle_ms = try std.fmt.parseInt(u32, v, 10) else if (eq(u8, s, "--min-presented")) a.min_presented_pct = try std.fmt.parseInt(u64, v, 10) else if (eq(u8, s, "--client")) {
                 a.client = std.meta.stringToEnum(ClientKind, v) orelse return usage();
+            } else if (eq(u8, s, "--host")) {
+                a.host = std.meta.stringToEnum(HostKind, v) orelse return usage();
             } else if (eq(u8, s, "--state-dir")) a.p.state_dir = v else if (eq(u8, s, "--name")) a.p.name = v else if (eq(u8, s, "--ticket")) a.p.ticket = v else if (eq(u8, s, "--pin")) a.p.pin = v else if (eq(u8, s, "--pin-file")) a.p.pin_file = v else if (eq(u8, s, "--qr-svg")) a.p.qr_svg = v else if (eq(u8, s, "--pairings")) a.p.pairings = try std.fmt.parseInt(u8, v, 10) else if (eq(u8, s, "--size")) {
                 const x = std.mem.indexOfScalar(u8, v, 'x') orelse return usage();
                 a.width = try std.fmt.parseInt(u32, v[0..x], 10);
@@ -357,7 +378,7 @@ fn exitedOk(t: std.process.Child.Term) bool {
 /// The argv tail every peer gets.
 const PeerArgs = struct {
     buf: [6][24]u8 = undefined,
-    list: [20][]const u8 = undefined,
+    list: [28][]const u8 = undefined,
     n: usize = 0,
 
     fn add(p: *PeerArgs, k: []const u8, comptime fmt: []const u8, v: anytype) void {
@@ -381,8 +402,17 @@ const PeerArgs = struct {
             p.list[p.n + 1] = @tagName(a.client);
             p.n += 2;
         }
+        if (a.host != .synthetic) {
+            p.list[p.n] = "--host";
+            p.list[p.n + 1] = @tagName(a.host);
+            p.n += 2;
+        }
         if (a.uinput_script) {
             p.list[p.n] = "--uinput-script";
+            p.n += 1;
+        }
+        if (a.verify_input) {
+            p.list[p.n] = "--verify-input";
             p.n += 1;
         }
         if (a.no_audio) {
@@ -458,7 +488,7 @@ fn runSim(gpa: std.mem.Allocator, io: Io, self_exe: []const u8, a: Args) !bool {
     const port = try std.fmt.bufPrint(&port_buf, "{d}", .{hub.port()});
     var pa: PeerArgs = .{};
     pa.fill(a);
-    var argv: [24][]const u8 = undefined;
+    var argv: [32][]const u8 = undefined;
     const base = [_][]const u8{ self_exe, "peer", "sim", "host", "--hub", port };
     @memcpy(argv[0..base.len], &base);
     @memcpy(argv[base.len..][0..pa.n], pa.list[0..pa.n]);
@@ -499,7 +529,7 @@ fn runIroh(io: Io, self_exe: []const u8, a: Args) !bool {
     defer Io.Dir.cwd().deleteFile(io, ticket_file) catch {};
     var pa: PeerArgs = .{};
     pa.fill(a);
-    var argv: [24][]const u8 = undefined;
+    var argv: [32][]const u8 = undefined;
     const base = [_][]const u8{ self_exe, "peer", "iroh", "host", "--ticket-file", ticket_file };
     @memcpy(argv[0..base.len], &base);
     @memcpy(argv[base.len..][0..pa.n], pa.list[0..pa.n]);
@@ -625,11 +655,32 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
     var w = Io.Writer.fixed(&buf);
     var ok = false;
     switch (role) {
-        .host => {
+        .host => if (a.host == .linux) {
+            if (!options.linux_host) {
+                std.debug.print("moonsec: built without the Linux host; use `zig build moonsec-linux`\n", .{});
+                return false;
+            }
+            ok = try peerLinuxHost(gpa, io, a, p, &w);
+        } else {
             const sh = try synthetic.openHost(gpa, .{ .clock = clock, .sleeper = wallSleep, .width = a.width, .height = a.height });
-            const hb = sh.backend();
+            var hb = sh.backend();
             defer hb.deinit();
-            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .yuv444 = a.yuv444, .ten_bit = a.ten_bit, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
+            // --fixture: a recorded H.264/HEVC stream stands in for the encoder.
+            var codec: api.Codec = .passthrough;
+            var fx: synthetic.fixture.Encoder = undefined;
+            var units: []synthetic.fixture.AccessUnit = &.{};
+            defer gpa.free(units);
+            var fixture_data: []u8 = &.{};
+            defer gpa.free(fixture_data);
+            if (a.fixture.len > 0) {
+                codec = if (std.mem.endsWith(u8, a.fixture, ".h265") or std.mem.endsWith(u8, a.fixture, ".hevc")) .hevc else .h264;
+                fixture_data = try Io.Dir.cwd().readFileAlloc(io, a.fixture, gpa, .limited(64 << 20));
+                units = try gpa.alloc(synthetic.fixture.AccessUnit, 1 << 16);
+                const split = try synthetic.fixture.split(codec, fixture_data, units);
+                fx = .init(clock, codec, fixture_data, split);
+                hb.encoder = api.bind(api.Encoder, synthetic.fixture.Encoder, &fx);
+            }
+            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .codec = codec, .pause_on_stall = !a.no_stall_pause, .yuv444 = a.yuv444, .ten_bit = a.ten_bit, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt }, p);
             defer app.deinit();
             try app.runThreaded(io);
             try app.s.report(&w);
@@ -638,7 +689,11 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             if (app.audio) |au| try w.print("  audio: {d} frames encoded, {d} datagrams, {d} errors; source skipped {d} frames\n", .{ au.stats.frames, au.stats.datagrams, au.stats.errors, sh.audio.stats.skipped });
             // Keys older than the sender's 500 ms window are dropped by design (an outage);
             // the injector's script check then reads the rest as out of order.
-            ok = app.s.end == .client_bye and (sh.injector.wrong == 0 or lost_input > 0) and sh.injector.keys > 0 and app.s.stats.frames > 0;
+            if (a.fixture.len > 0) {
+                try w.print("  fixture: {d} frames ({d} keyframes, {d} skipped for recovery), {d} bytes\n", .{ fx.stats.frames, fx.stats.keyframes, fx.stats.skipped, fx.stats.bytes });
+                // A real client's input is whatever its user typed, not the scripted keys.
+                ok = app.s.end == .client_bye and app.s.stats.frames > 0;
+            } else ok = app.s.end == .client_bye and (sh.injector.wrong == 0 or lost_input > 0) and sh.injector.keys > 0 and app.s.stats.frames > 0;
             if (ctl_stream != null) {
                 const cs = app.s.control.stats;
                 const clip_ok = !scripted or clip.got(client_copy);
@@ -689,6 +744,85 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
     std.debug.print("{s}", .{w.buffered()});
     return ok;
 }
+
+/// The Linux host backend against any client: uinput injection, and (until the capture and
+/// encoders are wired in) the synthetic capture, encoder and audio. With --verify-input the injected keys
+/// are read back from the uinput keyboard's event node, as the compositor reads them, and
+/// checked against the synthetic client's key script.
+fn peerLinuxHost(gpa: std.mem.Allocator, io: Io, a: Args, p: pipe_mod.PacketPipe, w: *Io.Writer) !bool {
+    if (!options.linux_host) unreachable;
+    const h = host_linux.backend.open(gpa, .{ .width = a.width, .height = a.height, .audio = !a.no_audio, .sleeper = wallSleep, .require_input = a.verify_input }) catch |e| {
+        std.debug.print("linux host: {s}\n", .{@errorName(e)});
+        return false;
+    };
+    const hb = h.backend();
+    defer hb.deinit();
+    try w.writeAll("  linux host: ");
+    try h.describe(w);
+    try w.writeAll("\n");
+    if (h.injector != null and !a.verify_input)
+        std.debug.print("linux host: injecting the client's input into this session's desktop\n", .{});
+    var check: KeyCheck = .{};
+    if (a.verify_input) {
+        const node = h.injector.?.keyboard.node orelse {
+            std.debug.print("linux host: the uinput keyboard has no event node\n", .{});
+            return false;
+        };
+        check.reader = linux_uinput.Reader.open(node, 3000) orelse {
+            std.debug.print("linux host: cannot read /dev/input/event{d} (needs read access to input devices)\n", .{node});
+            return false;
+        };
+    }
+    defer if (check.reader) |r| r.close();
+    var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .session = .{ .rate_control = a.rate_control } }, p);
+    defer app.deinit();
+    var reading: ?Io.Future(Io.Cancelable!void) = if (check.reader != null) try io.concurrent(KeyCheck.run, .{ &check, io }) else null;
+    defer if (reading) |*f| f.cancel(io) catch {};
+    try app.runThreaded(io);
+    if (reading) |*f| {
+        // Let the last reports through, then stop reading.
+        io.sleep(.fromMilliseconds(100), .awake) catch {};
+        f.cancel(io) catch {};
+        reading = null;
+    }
+    try app.s.report(w);
+    const lost_input = app.s.input_rx.stats.lost_events;
+    if (h.injector) |j| {
+        const st = j.stats;
+        try w.print("  uinput: keys {d}, buttons {d}, motions {d}, scrolls {d}, absolute {d}, pad reports {d} ({d} pads); unmapped {d}, write errors {d}, device errors {d}; inject errors {d}\n", .{ st.keys, st.buttons, st.motions, st.scrolls, st.abs, st.pad_reports, st.pads_connected, st.unmapped, st.write_errors, st.device_errors, app.stats.inject_errors });
+    }
+    if (check.reader != null) try w.print("  evdev read back: {d} keys ({d} out of script order)\n", .{ check.keys, check.wrong });
+    if (app.audio) |au| try w.print("  audio: {d} frames encoded, {d} datagrams, {d} errors\n", .{ au.stats.frames, au.stats.datagrams, au.stats.errors });
+    var ok = app.s.end == .client_bye and app.s.stats.frames > 0;
+    if (h.injector) |j| ok = ok and j.stats.write_errors == 0 and (a.client != .synthetic or j.stats.keys > 0);
+    // As for the synthetic host: keys past the sender's 500 ms window are dropped by
+    // design (an outage), and the script check then reads the rest as out of order.
+    if (check.reader != null) ok = ok and check.keys > 0 and (check.wrong == 0 or lost_input > 0);
+    return ok;
+}
+
+/// Reads a uinput keyboard's event node and checks the keys against
+/// `synthetic.scriptKey(0, 1, ...)`, as the synthetic host's injector does.
+const KeyCheck = struct {
+    reader: if (options.linux_host) ?linux_uinput.Reader else ?void = null,
+    keys: u64 = 0,
+    wrong: u64 = 0,
+
+    fn run(c: *KeyCheck, io: Io) Io.Cancelable!void {
+        if (!options.linux_host) unreachable;
+        var buf: [64]linux_uinput.Event = undefined;
+        while (true) {
+            const got = c.reader.?.read(&buf);
+            for (got) |e| {
+                if (e.type != linux_uinput.EV_KEY) continue;
+                const want = synthetic.scriptKey(c.keys);
+                if (linux_uinput.hidUsage(e.code) != want.code or (e.value != 0) != want.down) c.wrong += 1;
+                c.keys += 1;
+            }
+            if (got.len == 0) try io.sleep(.fromMilliseconds(2), .awake);
+        }
+    }
+};
 
 /// The client on the Linux backend against the synthetic host: every presented picture
 /// is read back from the GL back buffer and its pattern stamp decoded (so a freeze or a

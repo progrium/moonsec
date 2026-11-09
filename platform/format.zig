@@ -296,6 +296,36 @@ pub fn negotiate(p: Preference, enc: FormatCaps, dec: FormatCaps, display: Displ
     return best;
 }
 
+/// What one client of a shared stream (a multi-user session) can take: its decoder's
+/// formats per codec and its display.
+pub const Member = struct {
+    dec: FormatCaps,
+    display: DisplayCaps = .{},
+};
+
+/// What every member can take: the decoders' formats intersected codec by codec, and an
+/// HDR display only when every display is one (the lowest peak). Null for no members.
+pub fn common(members: []const Member) ?Member {
+    if (members.len == 0) return null;
+    var c = members[0];
+    for (members[1..]) |m| {
+        inline for (.{ "h264", "hevc", "av1", "passthrough" }) |f| {
+            @field(c.dec, f) = @field(c.dec, f).intersect(@field(m.dec, f));
+        }
+        c.display.hdr10 = c.display.hdr10 and m.display.hdr10;
+        c.display.peak_nits = @min(c.display.peak_nits, m.display.peak_nits);
+    }
+    return c;
+}
+
+/// One codec and format for a shared encoder: the best one every member decodes
+/// (`negotiate` over `common`). Null when there are no members or no codec all of them
+/// and the encoder have.
+pub fn negotiateCommon(p: Preference, enc: FormatCaps, members: []const Member) ?Choice {
+    const c = common(members) orelse return null;
+    return negotiate(p, enc, c.dec, c.display);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 
@@ -431,4 +461,36 @@ test "negotiate: every combination yields a format both ends support" {
             };
         }
     }
+}
+
+test "negotiateCommon: the best format every member has, re-picked as members change" {
+    const pref: Preference = .{ .codecs = .of(&.{ 2, 1, 3 }), .yuv444 = true, .ten_bit = true, .source_is_hdr = true };
+    const enc: FormatCaps = .{ .h264 = Formats.all, .hevc = Formats.all, .av1 = Formats.all };
+    const full: Member = .{ .dec = .{ .hevc = Formats.all, .h264 = Formats.all }, .display = .{ .hdr10 = true, .peak_nits = 1000 } };
+    const no444: Member = .{ .dec = .{ .hevc = .{ .yuv420_8 = true, .yuv420_10 = true, .hdr10 = true } }, .display = .{ .hdr10 = true, .peak_nits = 600 } };
+    const sdr_only: Member = .{ .dec = .{ .hevc = .{ .yuv420_8 = true, .yuv444_8 = true } } };
+    const av1_only: Member = .{ .dec = .{ .av1 = Formats.all } };
+
+    try testing.expectEqual(@as(?Choice, null), negotiateCommon(pref, enc, &.{}));
+    // Alone, a member gets what `negotiate` gives it.
+    const one = negotiateCommon(pref, enc, &.{full}).?;
+    try testing.expectEqual(negotiate(pref, enc, full.dec, full.display).?, one);
+    try testing.expectEqual(ColorSpace.hdr10, one.format.color);
+    try testing.expectEqual(Chroma.yuv444, one.format.chroma);
+    // A member without 4:4:4: HDR10 4:2:0 for both.
+    const two = negotiateCommon(pref, enc, &.{ full, no444 }).?;
+    try testing.expectEqual(@as(u8, 2), two.codec);
+    try testing.expectEqual(Chroma.yuv420, two.format.chroma);
+    try testing.expectEqual(ColorSpace.hdr10, two.format.color);
+    try testing.expectEqual(@as(u16, 600), common(&.{ full, no444 }).?.display.peak_nits);
+    // A member with an SDR display and 8-bit only: SDR; the only feature left in common
+    // with the first is 4:4:4 8-bit.
+    const three = negotiateCommon(pref, enc, &.{ full, sdr_only }).?;
+    try testing.expect(three.format.eql(.{ .chroma = .yuv444 }));
+    // All three: baseline HEVC.
+    try testing.expect(negotiateCommon(pref, enc, &.{ full, no444, sdr_only }).?.format.eql(.{}));
+    // Nothing in common.
+    try testing.expectEqual(@as(?Choice, null), negotiateCommon(pref, enc, &.{ full, av1_only }));
+    // Order does not matter.
+    try testing.expectEqual(negotiateCommon(pref, enc, &.{ no444, full }).?, two);
 }

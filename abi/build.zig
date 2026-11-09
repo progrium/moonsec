@@ -90,6 +90,7 @@ fn libraries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         const opts = b.addOptions();
         opts.addOption(bool, "iroh", with_iroh);
         opts.addOption(bool, "linux_client", false);
+        opts.addOption(bool, "linux_host", false);
         const m = b.createModule(.{
             .root_source_file = b.path("app/abi.zig"),
             .target = target,
