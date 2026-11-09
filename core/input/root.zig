@@ -64,14 +64,43 @@ pub const Motion = struct {
 };
 
 pub const Gamepad = struct {
-    /// Button bits (layout is the platform's; XInput order recommended).
+    /// Button bits, `Gamepad.Button` (XInput's wButtons order, plus guide).
     buttons: u32 = 0,
+    /// Sticks: -32768..32767, right and up positive (XInput's convention).
     lx: i16 = 0,
     ly: i16 = 0,
     rx: i16 = 0,
     ry: i16 = 0,
+    /// Triggers: 0 released .. 65535 fully pressed.
     lt: u16 = 0,
     rt: u16 = 0,
+
+    /// Bits of `buttons`. Every client backend reports this layout and every host
+    /// injector reads it, so a pad on any client drives a pad on any host.
+    pub const Button = struct {
+        pub const dpad_up: u32 = 0x0001;
+        pub const dpad_down: u32 = 0x0002;
+        pub const dpad_left: u32 = 0x0004;
+        pub const dpad_right: u32 = 0x0008;
+        /// Start / Menu / Options.
+        pub const start: u32 = 0x0010;
+        /// Back / View / Share.
+        pub const back: u32 = 0x0020;
+        pub const left_thumb: u32 = 0x0040;
+        pub const right_thumb: u32 = 0x0080;
+        pub const left_shoulder: u32 = 0x0100;
+        pub const right_shoulder: u32 = 0x0200;
+        /// Xbox / PS / Home.
+        pub const guide: u32 = 0x0400;
+        /// Bottom face button (Xbox A, PlayStation cross).
+        pub const a: u32 = 0x1000;
+        /// Right face button (Xbox B, PlayStation circle).
+        pub const b: u32 = 0x2000;
+        /// Left face button (Xbox X, PlayStation square).
+        pub const x: u32 = 0x4000;
+        /// Top face button (Xbox Y, PlayStation triangle).
+        pub const y: u32 = 0x8000;
+    };
 };
 
 pub const EventKind = enum(u8) {

@@ -9,7 +9,8 @@
 //!               the latency overlay drawn on the CPU (platform/client/common).
 //!   AudioSink   WASAPI shared mode, f32; IAudioClient3's smallest period when the
 //!               mix format allows it.
-//!   InputSource Raw Input keyboard and mouse from the window's own thread.
+//!   InputSource Raw Input keyboard and mouse from the window's own thread; gamepads
+//!               through XInput (platform/client/gamepad/xinput.zig).
 //!
 //! Decoder and presenter share one D3D11 device (multithread-protected), so decoded
 //! textures go to the presenter without a copy.
@@ -19,6 +20,7 @@ const api = @import("platform");
 const win = @import("win");
 const overlay = @import("client_overlay");
 const rawinput = @import("rawinput.zig");
+pub const gamepad = @import("client_gamepad");
 
 pub const c = @import("mswc_c");
 
@@ -36,6 +38,8 @@ pub const Options = struct {
     raw_input: bool = true,
     /// Raw Input while the window is in the background too (tests use it).
     input_sink: bool = false,
+    /// Gamepads through XInput.
+    gamepads: bool = true,
     overlay_style: overlay.Style = .{},
     /// How often the overlay image is redrawn from the latest snapshot.
     overlay_interval_us: api.Micros = 100_000,
@@ -332,6 +336,8 @@ pub const InputSource = struct {
     /// Events translated from a record that did not fit in the caller's buffer.
     pending: [rawinput.max_mouse_events]api.InputEvent = undefined,
     pending_n: usize = 0,
+    /// XInput pads; without XInput (or with `Options.gamepads` off) it reports none.
+    pads: gamepad.xinput.Source = .{ .clock = clock },
 
     pub fn poll(s: *InputSource, out: []api.InputEvent) api.Error!usize {
         var n: usize = 0;
@@ -360,6 +366,8 @@ pub const InputSource = struct {
                 }
             }
         }
+        // Pads keep their own queue, so whatever does not fit waits for the next poll.
+        if (n < out.len) n += try s.pads.poll(out[n..]);
         return n;
     }
 };
@@ -483,7 +491,10 @@ pub fn open(gpa: std.mem.Allocator, opts: Options) !*Client {
             .canvas_w = cw,
             .canvas_h = ch,
         },
-        .input = .{ .window = w.? },
+        .input = .{
+            .window = w.?,
+            .pads = if (opts.gamepads) gamepad.xinput.Source.open(clock) else .{ .clock = clock },
+        },
     };
     return cl;
 }

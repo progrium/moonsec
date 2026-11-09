@@ -82,8 +82,8 @@ pub fn build(b: *std.Build) void {
 
     // Loadable browser modules (web/): the core's wasm ABI for the web client, and the
     // input receiver the browser test harness's stub host decodes with (web/e2e).
-    const web_step = b.step("web-wasm", "Build the browser wasm modules into zig-out/web");
     const wasm_free = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const web_step = b.step("web-wasm", "Build the browser wasm modules into zig-out/web");
     const web_core = b.addExecutable(.{
         .name = "moonsec-core",
         .root_module = b.createModule(.{
