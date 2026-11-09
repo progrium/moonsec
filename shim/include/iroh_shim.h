@@ -1,7 +1,13 @@
 /* moonsec iroh shim C ABI (v0.2).
  * Status codes: 0 = ok, negative = error; iroh_last_error() has the message (thread-local).
  * The caller owns all buffers. Handles are opaque and freed with their *_free call.
- * See shim/README.md for the design behind each call. */
+ * See shim/README.md for the design behind each call.
+ *
+ * Threading (docs/security-review.md): every call may come from any thread, and calls on one
+ * handle may overlap, but a handle must not be freed while another thread is still inside a
+ * call on it, nor used after its *_free. Blocking calls must not be made from the
+ * IrohThreadStartFn hook (it runs on the shim's own thread, which they wait on). The
+ * iroh_last_error() pointer is valid until the calling thread's next shim call. */
 #ifndef MOONSEC_IROH_SHIM_H
 #define MOONSEC_IROH_SHIM_H
 

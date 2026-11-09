@@ -36,7 +36,7 @@ it. The text uses only QR alphanumeric characters. Decoders ignore case and whit
 | Size | Field | Meaning |
 | ---: | --- | --- |
 | 1 | `version` | `1`. Anything else: unsupported. |
-| 1 | `flags` | bit 0: a secret follows. Other bits 0. |
+| 1 | `flags` | bit 0: a secret follows. Other bits 0; decoders refuse a ticket with others set. |
 | 32 | `host_id` | the host's endpoint ID |
 | 16 | `secret` | only when flag bit 0 is set |
 | 8 | `expires` | unix seconds after which the host refuses the secret; 0 = none (u64 LE) |
@@ -139,15 +139,17 @@ Text, one device per line; `#` lines and blank lines are ignored:
 Names are sanitized on the way in: control characters and tabs become `?`, invalid UTF-8
 bytes become `?`, and names are cut to 64 bytes at a character boundary. Addresses contain
 no whitespace. The host keeps `paired-clients` (its allowlist); the client keeps
-`paired-hosts` (with each host's address).
+`paired-hosts` (with each host's address). Both are written like key files: 0600 on POSIX,
+through a temporary file and a rename.
 
 ## Key storage
 
 `KeyStore` loads, stores and removes named 32-byte keys. The device key is `identity`.
 
 - `FileKeyStore`: `<state dir>/<name>.key`, holding the line `moonsec secret key v0`, then 64
-  hex digits. On POSIX it is created 0600 in a 0700 directory, and loading refuses a key file
-  that group or others can read. Writes go through a temporary file and a rename.
+  hex digits. On POSIX it is created 0600 in a 0700 directory, loading refuses a key file
+  that group or others can read, and opening refuses a state directory that group or others
+  can write (whoever can write it can replace the allowlist). Writes go through a temporary file and a rename.
 - On Windows the file inherits the state directory's ACL (under `%APPDATA%`, the user's).
   A DPAPI store (Windows) and a Keychain store (macOS) come later behind the same interface.
 
@@ -159,4 +161,5 @@ Support/moonsec` (macOS), `%APPDATA%\moonsec` (Windows).
 
 - LAN discovery (mDNS), so a PIN alone finds the host without an address ticket.
 - Revocation beyond `moonsec unpair`, and per-client permissions.
-- An external security review (Phase 7).
+- An external security review (Phase 7): threat model in [docs/security.md](../docs/security.md),
+  reviewer packet and our findings in [docs/security-review.md](../docs/security-review.md).

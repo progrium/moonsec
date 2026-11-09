@@ -469,10 +469,13 @@ pub unsafe extern "C" fn iroh_endpoint_connect(
         endpoint.connect_with_opts(addr, &alpn, opts).await.map_err(|e| e.to_string())?.await.map_err(|e| e.to_string())
     };
     match block_on_timeout(timeout_ms, fut) {
-        Ok(Ok(conn)) => {
-            unsafe { *out = wrap_conn(conn, cfg, knob, factory) };
-            IROH_OK
-        }
+        Ok(Ok(conn)) => match wrap_conn(conn, cfg, knob, factory) {
+            Ok(c) => {
+                unsafe { *out = c };
+                IROH_OK
+            }
+            Err(e) => fail(IROH_ERR_INTERNAL, format!("connect: {e}")),
+        },
         Ok(Err(e)) => fail(IROH_ERR_INTERNAL, format!("connect: {e}")),
         Err(_) => fail(IROH_ERR_TIMEOUT, "connect timed out"),
     }
@@ -515,10 +518,13 @@ pub unsafe extern "C" fn iroh_endpoint_accept(ep: *const IrohEndpoint, timeout_m
         }
     };
     match run(fut) {
-        Ok(conn) => {
-            unsafe { *out = wrap_conn(conn, cfg, knob, factory) };
-            IROH_OK
-        }
+        Ok(conn) => match wrap_conn(conn, cfg, knob, factory) {
+            Ok(c) => {
+                unsafe { *out = c };
+                IROH_OK
+            }
+            Err(e) => fail(IROH_ERR_INTERNAL, format!("accept: {e}")),
+        },
         Err((code, msg)) => fail(code, msg),
     }
 }
@@ -751,13 +757,28 @@ impl Shared {
     }
 }
 
-fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Arc<AppRateFactory>) -> *mut IrohConn {
+/// Wraps an established connection. Fails (closing the connection) only if the wakeup socket
+/// pair cannot be made, e.g. when the process is out of file descriptors: with
+/// `panic = "abort"` a panic here would let a peer that opens connections end the process.
+fn wrap_conn(
+    conn: Connection,
+    cfg: ConnConfig,
+    knob: Arc<RateKnob>,
+    factory: Arc<AppRateFactory>,
+) -> Result<*mut IrohConn, String> {
+    let wake = match Wakeup::new() {
+        Ok(w) => w,
+        Err(e) => {
+            conn.close(0u32.into(), b"");
+            return Err(format!("wakeup socket: {e}"));
+        }
+    };
     let (tx, rx): (SyncSender<Bytes>, _) = std::sync::mpsc::sync_channel(cfg.recv_queue);
     let sh = Arc::new(Shared {
         knob,
         factory,
         cfg,
-        wake: Wakeup::new().expect("wakeup socket"),
+        wake,
         paths: Mutex::new(HashMap::new()),
         selected_path: AtomicU32::new(IROH_PATH_NONE),
         selections: AtomicU32::new(0),
@@ -891,7 +912,7 @@ fn wrap_conn(conn: Connection, cfg: ConnConfig, knob: Arc<RateKnob>, factory: Ar
         );
     }
 
-    Box::into_raw(Box::new(IrohConn { conn, sh, rx: Mutex::new(rx), tasks }))
+    Ok(Box::into_raw(Box::new(IrohConn { conn, sh, rx: Mutex::new(rx), tasks })))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -966,7 +987,11 @@ pub unsafe extern "C" fn iroh_conn_recv_datagram(
     if d.len() > cap || (buf.is_null() && !d.is_empty()) {
         return fail(IROH_ERR_TOO_SMALL, "datagram larger than buffer");
     }
-    unsafe { std::ptr::copy_nonoverlapping(d.as_ptr(), buf, d.len()) };
+    // `copy_nonoverlapping` needs non-null pointers even for zero bytes, and a peer can send
+    // an empty datagram into a NULL buffer.
+    if !d.is_empty() {
+        unsafe { std::ptr::copy_nonoverlapping(d.as_ptr(), buf, d.len()) };
+    }
     IROH_OK
 }
 
@@ -1369,4 +1394,138 @@ pub unsafe extern "C" fn iroh_stream_free(s: *mut IrohStream, error_code: u32) {
         }
         drop(s);
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Boundary tests that need no runtime or sockets, so they also run under Miri:
+//   cargo +nightly miri test --lib
+// The calls that drive iroh are covered by the ASan fuzzer (fuzz/) and transport/iroh_test.zig.
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn last_error() -> String {
+        unsafe { CStr::from_ptr(iroh_last_error()) }.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn write_cstr_stays_inside_the_buffer() {
+        let mut buf = [0x55u8; 8];
+        let mut n = 0usize;
+        // Exactly fits: 5 bytes + NUL, guard bytes untouched.
+        let r = unsafe { write_cstr("hello", buf.as_mut_ptr() as *mut c_char, 6, &mut n) };
+        assert_eq!(r, IROH_OK);
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..6], b"hello\0");
+        assert_eq!(&buf[6..], &[0x55, 0x55]);
+        // One short: refused, nothing written, required length reported.
+        let mut buf = [0x55u8; 8];
+        let r = unsafe { write_cstr("hello", buf.as_mut_ptr() as *mut c_char, 5, &mut n) };
+        assert_eq!(r, IROH_ERR_TOO_SMALL);
+        assert_eq!(n, 5);
+        assert_eq!(buf, [0x55u8; 8]);
+        // NULL buffer and NULL out_len.
+        let r = unsafe { write_cstr("x", std::ptr::null_mut(), 100, std::ptr::null_mut()) };
+        assert_eq!(r, IROH_ERR_TOO_SMALL);
+    }
+
+    #[test]
+    fn null_and_empty_arguments() {
+        assert!(unsafe { bytes_arg(std::ptr::null(), 10) }.is_empty());
+        let b = [1u8, 2];
+        assert!(unsafe { bytes_arg(b.as_ptr(), 0) }.is_empty());
+        assert_eq!(unsafe { opt_str(std::ptr::null()) }, Ok(None));
+        let bad = [0xffu8, 0];
+        assert!(unsafe { opt_str(bad.as_ptr() as *const c_char) }.is_err());
+
+        let mut out: *mut IrohEndpoint = std::ptr::null_mut();
+        assert_eq!(unsafe { iroh_endpoint_bind(std::ptr::null(), &mut out) }, IROH_ERR_INVALID);
+        assert_eq!(unsafe { iroh_endpoint_online(std::ptr::null(), 0) }, IROH_ERR_INVALID);
+        assert_eq!(unsafe { iroh_endpoint_id(std::ptr::null(), std::ptr::null_mut(), 0) }, IROH_ERR_INVALID);
+        let mut conn: *mut IrohConn = std::ptr::null_mut();
+        assert_eq!(unsafe { iroh_endpoint_accept(std::ptr::null(), 0, &mut conn) }, IROH_ERR_INVALID);
+        assert_eq!(unsafe { iroh_conn_send_datagram(std::ptr::null(), b.as_ptr(), 2) }, IROH_ERR_INVALID);
+        let mut n = 0usize;
+        assert_eq!(
+            unsafe { iroh_conn_recv_datagram(std::ptr::null(), std::ptr::null_mut(), 0, 0, &mut n) },
+            IROH_ERR_INVALID
+        );
+        assert_eq!(unsafe { iroh_conn_max_datagram_size(std::ptr::null()) }, 0);
+        assert_eq!(unsafe { iroh_conn_wakeup_handle(std::ptr::null()) }, -1);
+        let mut s: *mut IrohStream = std::ptr::null_mut();
+        assert_eq!(unsafe { iroh_conn_open_bi(std::ptr::null(), 0, &mut s) }, IROH_ERR_INVALID);
+        assert_eq!(
+            unsafe { iroh_stream_read(std::ptr::null(), std::ptr::null_mut(), 0, 0, &mut n) },
+            IROH_ERR_INVALID
+        );
+        assert_eq!(unsafe { iroh_stream_finish(std::ptr::null()) }, IROH_ERR_INVALID);
+        // Frees of NULL are no-ops.
+        unsafe {
+            iroh_endpoint_free(std::ptr::null_mut());
+            iroh_conn_free(std::ptr::null_mut(), 0);
+            iroh_stream_free(std::ptr::null_mut(), 0);
+        }
+        assert!(!last_error().is_empty());
+    }
+
+    fn zeroed_opts() -> IrohBindOpts {
+        IrohBindOpts {
+            secret_key: std::ptr::null(),
+            alpn: std::ptr::null(),
+            alpn_len: 0,
+            relay_mode: 0,
+            relay_urls: std::ptr::null(),
+            bind_addr: std::ptr::null(),
+            datagram_send_buffer: 0,
+            datagram_recv_buffer: 0,
+            recv_queue_len: 0,
+            path_idle_timeout_ms: 0,
+            path_keepalive_ms: 0,
+            conn_idle_timeout_ms: 0,
+            initial_target_bps: 0,
+            burst_us: 0,
+            no_ack_progress_ms: 0,
+            relay_ca_pem: std::ptr::null(),
+        }
+    }
+
+    #[test]
+    fn bind_options_are_validated_before_anything_starts() {
+        let c = ConnConfig::from_opts(&zeroed_opts()).unwrap();
+        assert_eq!(c.send_buffer, DEFAULT_SEND_BUFFER);
+        assert_eq!(c.burst_us, DEFAULT_BURST_US as u64);
+        let mut o = zeroed_opts();
+        o.path_idle_timeout_ms = 100;
+        o.path_keepalive_ms = 100;
+        assert!(ConnConfig::from_opts(&o).is_err());
+        let mut o = zeroed_opts();
+        o.datagram_send_buffer = 4095;
+        assert!(ConnConfig::from_opts(&o).is_err());
+        let mut o = zeroed_opts();
+        o.burst_us = IROH_BURST_OFF;
+        o.no_ack_progress_ms = IROH_NO_ACK_OFF;
+        let c = ConnConfig::from_opts(&o).unwrap();
+        assert_eq!(c.burst_us, 0);
+        assert_eq!(c.no_ack_us, None);
+        // A bad option fails in iroh_endpoint_bind without starting the runtime.
+        let mut o = zeroed_opts();
+        o.path_keepalive_ms = 5000;
+        let mut out: *mut IrohEndpoint = std::ptr::null_mut();
+        assert_eq!(unsafe { iroh_endpoint_bind(&o, &mut out) }, IROH_ERR_INVALID);
+        assert!(out.is_null());
+        assert!(last_error().contains("keep-alive"));
+    }
+
+    #[test]
+    fn event_addresses_are_truncated_and_terminated() {
+        let long = format!("https://{}.example/", "r".repeat(200));
+        let ev = IrohEvent::new(1, 0, 0).with_addr(&TransportAddr::Relay(RelayUrl::from_str(&long).unwrap()));
+        assert_eq!(ev.remote_addr[95], 0);
+        assert_eq!(ev.is_relay, 1);
+        let s = unsafe { CStr::from_ptr(ev.remote_addr.as_ptr()) }.to_str().unwrap();
+        assert_eq!(s.len(), 95);
+        assert!(long.starts_with(s));
+    }
 }

@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const options = @import("app_options");
 const core = @import("core");
 const pairing = @import("pairing.zig");
+const keystore = @import("keystore.zig");
 const iroh = if (options.iroh) @import("iroh") else struct {};
 
 const Io = std.Io;
@@ -60,6 +61,7 @@ fn openState(c: Ctx) !pairing.State {
     const path = owned orelse c.p.state_dir;
     return pairing.State.open(c.gpa, c.io, path) catch |e| {
         std.debug.print("moonsec: cannot open state directory {s}: {t}\n", .{ path, e });
+        if (e == error.InsecurePermissions) std.debug.print("moonsec: group or others can write it; run `chmod go-w {s}`\n", .{path});
         return e;
     };
 }
@@ -202,11 +204,16 @@ pub fn remoteId(conn: iroh.Conn) !pair.Id {
     return pair.id.parseHex(try conn.remoteId(&b)) orelse error.BadRemoteId;
 }
 
+/// Writes a file the host hands to a script (`--ticket-file`, `--pin-file`, `--qr-svg`). The
+/// QR ticket, its SVG and the PIN are pairing secrets, so the file is private (0600 on
+/// POSIX) and goes through an exclusive, randomly named temporary file in the same
+/// directory: another local user can neither read it nor plant a symlink at a guessable
+/// temporary name to redirect the write.
 fn writeFileAtomic(c: Ctx, path: []const u8, data: []const u8) !void {
-    var tb: [512]u8 = undefined;
-    const tmp = try std.fmt.bufPrint(&tb, "{s}.tmp", .{path});
-    try Io.Dir.cwd().writeFile(c.io, .{ .sub_path = tmp, .data = data });
-    try Io.Dir.rename(.cwd(), tmp, .cwd(), path, c.io);
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    var dir = try Io.Dir.cwd().openDir(c.io, dir_path, .{});
+    defer dir.close(c.io);
+    try keystore.writeFileAtomic(c.io, dir, std.fs.path.basename(path), data, true);
 }
 
 pub fn cmdPairHost(c: Ctx, w: *Io.Writer) !bool {

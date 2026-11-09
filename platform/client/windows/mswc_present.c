@@ -167,7 +167,9 @@ static HRESULT compile(d3dcompile_fn fn, const char *entry, const char *target, 
 }
 
 static HRESULT setup_shader(mswc_presenter *p) {
-    HMODULE lib = LoadLibraryW(L"d3dcompiler_47.dll");
+    /* System32 only: a plain LoadLibraryW also searches the exe's and the current
+     * directory, where a planted d3dcompiler_47.dll would run in the client. */
+    HMODULE lib = LoadLibraryExW(L"d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!lib) return HRESULT_FROM_WIN32(GetLastError());
     d3dcompile_fn fn;
     FARPROC proc = GetProcAddress(lib, "D3DCompile");
