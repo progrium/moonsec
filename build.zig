@@ -335,6 +335,14 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // The public C ABI (include/moonsec.h, app/abi.zig, abi/build.zig).
+    @import("abi/build.zig").add(b, target, optimize, .{
+        .app_imports = &app_imports,
+        .iroh = iroh_mod,
+        .iroh_pipe = iroh_pipe_mod,
+        .shim_archive = if (shim_link == .static and !(target.result.os.tag == .windows and target.result.abi == .msvc)) shim.lib_dir.path(b, "libiroh_shim.a") else null,
+    }, test_step);
+
     // `moonsec-linux`: moonsec-sim plus the Linux client backend (platform/client/linux),
     // `--client linux` on the client peer. Needs the libraries in platform/client/build.zig.
     {

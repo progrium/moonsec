@@ -206,14 +206,19 @@ pub const HostApp = struct {
     /// Network thread here, capture+encode on its own thread, until the session ends.
     pub fn runThreaded(a: *HostApp, io: Io) !void {
         var mu: Io.Mutex = .init;
-        const lock: Lock = .{ .mu = &mu, .io = io };
+        return a.runThreadedWith(io, .{ .mu = &mu, .io = io }, null);
+    }
+
+    /// `runThreaded` under the caller's lock, which the caller also takes around its own
+    /// calls into the session, with `hook` run under it after every network step.
+    pub fn runThreadedWith(a: *HostApp, io: Io, lock: Lock, hook: ?Hook) !void {
         var stop: std.atomic.Value(bool) = .init(false);
         var media = try io.concurrent(hostMedia, .{ a, lock, &stop });
         defer {
             stop.store(true, .release);
             media.await(io);
         }
-        netLoop(HostApp, a, io, lock);
+        netLoop(HostApp, a, io, lock, hook);
     }
 
     fn hostMedia(a: *HostApp, lock: Lock, stop: *std.atomic.Value(bool)) void {
@@ -383,14 +388,18 @@ pub const ClientApp = struct {
 
     pub fn runThreaded(a: *ClientApp, io: Io) !void {
         var mu: Io.Mutex = .init;
-        const lock: Lock = .{ .mu = &mu, .io = io };
+        return a.runThreadedWith(io, .{ .mu = &mu, .io = io }, null);
+    }
+
+    /// As `HostApp.runThreadedWith`.
+    pub fn runThreadedWith(a: *ClientApp, io: Io, lock: Lock, hook: ?Hook) !void {
         var stop: std.atomic.Value(bool) = .init(false);
         var media = try io.concurrent(clientMedia, .{ a, lock, &stop });
         defer {
             stop.store(true, .release);
             media.await(io);
         }
-        netLoop(ClientApp, a, io, lock);
+        netLoop(ClientApp, a, io, lock, hook);
     }
 
     fn clientMedia(a: *ClientApp, lock: Lock, stop: *std.atomic.Value(bool)) void {
@@ -532,6 +541,12 @@ pub const ClientAudio = struct {
     }
 };
 
+/// Called under the session lock after each network step (the C ABI's event checks).
+pub const Hook = struct {
+    ctx: *anyopaque,
+    f: *const fn (ctx: *anyopaque) void,
+};
+
 pub const Lock = struct {
     mu: *Io.Mutex,
     io: Io,
@@ -546,10 +561,11 @@ pub const Lock = struct {
 
 /// The network thread: step the session, sleep until it next has work (at most 1 ms, since
 /// datagrams can arrive any time and the pipes have no wakeup handle yet).
-fn netLoop(comptime App: type, a: *App, io: Io, lock: Lock) void {
+fn netLoop(comptime App: type, a: *App, io: Io, lock: Lock, hook: ?Hook) void {
     while (true) {
         lock.lock();
         a.network(a.be.clock.now());
+        if (hook) |h| h.f(h.ctx);
         const done = a.s.ended();
         const now = a.be.clock.now();
         const wait = a.s.nextWake(now) - now;
