@@ -110,13 +110,23 @@ pub const Sample = struct {
 };
 
 /// One round trip as a sample, or null if the timestamps are impossible
-/// (negative rtt or host time going backwards).
+/// (negative rtt, host time going backwards, or values that do not fit in a
+/// Micros). t2 and t3 come from the network, so the arithmetic is done wide.
 pub fn sampleOf(pong: Pong, t4: Micros) ?Sample {
     if (pong.t3 < pong.t2 or t4 < pong.t1) return null;
-    const rtt = (t4 - pong.t1) - (pong.t3 - pong.t2);
+    const t1: i128 = pong.t1;
+    const t2: i128 = pong.t2;
+    const t3: i128 = pong.t3;
+    const t4w: i128 = t4;
+    const rtt = (t4w - t1) - (t3 - t2);
     if (rtt < 0) return null;
-    const offset = @divFloor((pong.t2 - pong.t1) + (pong.t3 - t4), 2);
-    return .{ .at = pong.t1 + @divFloor(t4 - pong.t1, 2), .offset = offset, .rtt = rtt };
+    const offset = @divFloor((t2 - t1) + (t3 - t4w), 2);
+    const at = t1 + @divFloor(t4w - t1, 2);
+    return .{
+        .at = std.math.cast(Micros, at) orelse return null,
+        .offset = std.math.cast(Micros, offset) orelse return null,
+        .rtt = std.math.cast(Micros, rtt) orelse return null,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +474,13 @@ test "sample math on a symmetric path" {
 test "impossible samples are rejected" {
     try testing.expect(sampleOf(.{ .seq = 0, .t1 = 100, .t2 = 50, .t3 = 40 }, 200) == null);
     try testing.expect(sampleOf(.{ .seq = 0, .t1 = 100, .t2 = 0, .t3 = 500 }, 200) == null);
+}
+
+test "extreme host timestamps are dropped, not overflowed" {
+    const max = std.math.maxInt(Micros);
+    const min = std.math.minInt(Micros);
+    try std.testing.expect(sampleOf(.{ .seq = 0, .t1 = 0, .t2 = min, .t3 = max }, 10) == null);
+    try std.testing.expect(sampleOf(.{ .seq = 0, .t1 = min, .t2 = max, .t3 = max }, max) == null);
 }
 
 test "wire round trip" {

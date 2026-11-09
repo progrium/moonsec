@@ -389,8 +389,12 @@ pub const Decoder = struct {
         if (cfg.codec != .passthrough) return error.Unsupported;
         if (!d.formats.supports(cfg.format)) return error.Unsupported;
         if (cfg.width < pattern.min_width or cfg.height < pattern.min_height) return error.Unsupported;
+        // The dimensions come from the host: refuse a frame whose size (or row stride)
+        // does not fit in a u32 instead of overflowing.
+        const size = std.math.mul(u32, cfg.width, 4) catch return error.Unsupported;
+        const total = std.math.mul(u32, size, cfg.height) catch return error.Unsupported;
         d.freeBufs();
-        d.buf = d.gpa.alloc(u8, cfg.width * cfg.height * 4) catch return error.OutOfMemory;
+        d.buf = d.gpa.alloc(u8, total) catch return error.OutOfMemory;
         d.check = d.gpa.alloc(u8, 64 * 1024) catch return error.OutOfMemory;
         d.cfg = cfg;
         d.last_seq = null;

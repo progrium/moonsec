@@ -9,8 +9,9 @@ publish = false
 
 [lib]
 name = "iroh_shim"
-# staticlib is the primary artifact; cdylib is the S1 fallback ("ship the shim as a DLL/dylib/so").
-crate-type = ["staticlib", "cdylib"]
+# staticlib is the primary artifact; cdylib is the S1 fallback ("ship the shim as a DLL/dylib/so");
+# rlib lets the cargo-fuzz target in fuzz/ call the C ABI directly.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 # Default features off (drops metrics); add back only what we need.
