@@ -1,8 +1,9 @@
 //! Build steps for the Linux host backend, kept out of the root build.zig so the per-OS
 //! threads don't collide there. The root calls `add`.
 //!
-//!   zig build test-linux-host   the capture and audio tests (Linux; the portal and
-//!                               PipeWire tests skip without them, see test.zig)
+//!   zig build test-linux-host   the capture, audio and uinput tests (Linux; the portal,
+//!                               PipeWire and uinput tests skip without them, see test.zig)
+//!   zig build test              includes the injector's pure tests (input.zig)
 //!
 //! `linuxHostModule` is what an app imports as "host_linux".
 
@@ -13,6 +14,8 @@ pub const Modules = struct {
     core: *std.Build.Module,
     platform: *std.Build.Module,
     synthetic: *std.Build.Module,
+    /// platform/linux/uinput.zig, shared with the client.
+    linux_uinput: *std.Build.Module,
 };
 
 /// System libraries the Linux host links (found with pkg-config): libdbus (the portal)
@@ -32,6 +35,9 @@ pub fn linuxHostModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize
         .link_libc = true,
         .imports = &.{
             .{ .name = "platform", .module = m.platform },
+            .{ .name = "core", .module = m.core },
+            .{ .name = "synthetic", .module = m.synthetic },
+            .{ .name = "linux_uinput", .module = m.linux_uinput },
             .{ .name = "mlh_c", .module = tc.createModule() },
         },
     });
@@ -45,8 +51,22 @@ pub fn linuxHostModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize
     return mod;
 }
 
-pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: Modules) void {
-    const step = b.step("test-linux-host", "Run the Linux host capture and audio tests (Linux host; portal and PipeWire tests skip without them)");
+pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: Modules, test_step: *std.Build.Step) void {
+    const step = b.step("test-linux-host", "Run the Linux host capture, audio and uinput tests (Linux host; portal, PipeWire and uinput tests skip without them)");
+    if (target.result.os.tag == .linux) {
+        // The injector's translation, devices replaced by pipes: no /dev/uinput, no libraries.
+        const input_mod = b.createModule(.{
+            .root_source_file = b.path("platform/host/linux/input.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "platform", .module = m.platform },
+                .{ .name = "core", .module = m.core },
+                .{ .name = "linux_uinput", .module = m.linux_uinput },
+            },
+        });
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "host-linux-input-test", .root_module = input_mod })).step);
+    }
     if (target.result.os.tag != .linux) {
         step.dependOn(&b.addFail("test-linux-host needs a Linux host").step);
         return;
@@ -65,7 +85,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .{ .name = "host_linux", .module = host },
             .{ .name = "platform", .module = m.platform },
             .{ .name = "testwin_c", .module = tw.createModule() },
-            .{ .name = "client_linux", .module = client_build.linuxClientModule(b, target, optimize, .{ .core = m.core, .platform = m.platform, .synthetic = m.synthetic }) },
+            .{ .name = "client_linux", .module = client_build.linuxClientModule(b, target, optimize, .{ .core = m.core, .platform = m.platform, .synthetic = m.synthetic, .linux_uinput = m.linux_uinput }) },
         },
     });
     // xdg-shell's interface tables come with client_linux (its protocol/ code).
@@ -75,6 +95,6 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     tm.linkSystemLibrary("libpipewire-0.3", .{});
     const t = b.addTest(.{ .name = "host-linux-test", .root_module = tm });
     const run = b.addRunArtifact(t);
-    run.has_side_effects = true; // depends on the portal, the compositor and PipeWire
+    run.has_side_effects = true; // depends on the portal, the compositor, PipeWire and /dev/uinput
     step.dependOn(&run.step);
 }

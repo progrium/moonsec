@@ -22,32 +22,33 @@ const api = @import("platform");
 const linux = std.os.linux;
 
 // ---------------------------------------------------------------------------
-// input-event-codes.h
+// input-event-codes.h and the key table, shared with the Linux host (platform/linux).
 
-pub const EV_SYN = 0x00;
-pub const EV_KEY = 0x01;
-pub const EV_REL = 0x02;
-pub const SYN_REPORT = 0;
-pub const SYN_DROPPED = 3;
-pub const REL_X = 0x00;
-pub const REL_Y = 0x01;
-pub const REL_HWHEEL = 0x06;
-pub const REL_WHEEL = 0x08;
-pub const REL_WHEEL_HI_RES = 0x0b;
-pub const REL_HWHEEL_HI_RES = 0x0c;
-pub const KEY_A = 30;
-pub const KEY_SPACE = 57;
-pub const BTN_LEFT = 0x110;
-pub const BTN_RIGHT = 0x111;
-pub const BTN_MIDDLE = 0x112;
-pub const BTN_SIDE = 0x113;
-pub const BTN_EXTRA = 0x114;
-pub const BTN_FORWARD = 0x115;
-pub const BTN_BACK = 0x116;
+const shared = @import("linux_uinput");
+pub const EV_SYN = shared.EV_SYN;
+pub const EV_KEY = shared.EV_KEY;
+pub const EV_REL = shared.EV_REL;
+pub const SYN_REPORT = shared.SYN_REPORT;
+pub const SYN_DROPPED = shared.SYN_DROPPED;
+pub const REL_X = shared.REL_X;
+pub const REL_Y = shared.REL_Y;
+pub const REL_HWHEEL = shared.REL_HWHEEL;
+pub const REL_WHEEL = shared.REL_WHEEL;
+pub const REL_WHEEL_HI_RES = shared.REL_WHEEL_HI_RES;
+pub const REL_HWHEEL_HI_RES = shared.REL_HWHEEL_HI_RES;
+pub const KEY_A = shared.KEY_A;
+pub const KEY_SPACE = shared.KEY_SPACE;
+pub const BTN_LEFT = shared.BTN_LEFT;
+pub const BTN_RIGHT = shared.BTN_RIGHT;
+pub const BTN_MIDDLE = shared.BTN_MIDDLE;
+pub const BTN_SIDE = shared.BTN_SIDE;
+pub const BTN_EXTRA = shared.BTN_EXTRA;
+pub const BTN_FORWARD = shared.BTN_FORWARD;
+pub const BTN_BACK = shared.BTN_BACK;
 /// A gamepad's south face button: such nodes belong to the gamepad source.
-pub const BTN_SOUTH = 0x130;
-pub const KEY_MAX = 0x2ff;
-pub const REL_MAX = 0x0f;
+pub const BTN_SOUTH = shared.BTN_SOUTH;
+pub const KEY_MAX = shared.KEY_MAX;
+pub const REL_MAX = shared.REL_MAX;
 
 /// `struct input_event` on 64-bit Linux.
 pub const RawEvent = extern struct {
@@ -63,38 +64,7 @@ pub const RawEvent = extern struct {
 };
 
 /// Linux KEY_* code to USB HID keyboard usage; 0 when there is none.
-pub fn hidUsage(code: u16) u16 {
-    if (code < key_table.len) return key_table[code];
-    if (code >= 183 and code <= 194) return 0x68 + (code - 183); // F13..F24
-    return 0;
-}
-
-const key_table = blk: {
-    var t = [_]u16{0} ** 128;
-    const pairs = [_][2]u16{
-        .{ 1, 0x29 }, // ESC
-        .{ 2, 0x1E }, .{ 3, 0x1F }, .{ 4, 0x20 }, .{ 5, 0x21 }, .{ 6, 0x22 }, .{ 7, 0x23 }, .{ 8, 0x24 }, .{ 9, 0x25 }, .{ 10, 0x26 }, .{ 11, 0x27 }, // 1..0
-        .{ 12, 0x2D }, .{ 13, 0x2E }, .{ 14, 0x2A }, .{ 15, 0x2B }, // - = BACKSPACE TAB
-        .{ 16, 0x14 }, .{ 17, 0x1A }, .{ 18, 0x08 }, .{ 19, 0x15 }, .{ 20, 0x17 }, .{ 21, 0x1C }, .{ 22, 0x18 }, .{ 23, 0x0C }, .{ 24, 0x12 }, .{ 25, 0x13 }, // Q..P
-        .{ 26, 0x2F }, .{ 27, 0x30 }, .{ 28, 0x28 }, .{ 29, 0xE0 }, // [ ] ENTER LCTRL
-        .{ 30, 0x04 }, .{ 31, 0x16 }, .{ 32, 0x07 }, .{ 33, 0x09 }, .{ 34, 0x0A }, .{ 35, 0x0B }, .{ 36, 0x0D }, .{ 37, 0x0E }, .{ 38, 0x0F }, // A..L
-        .{ 39, 0x33 }, .{ 40, 0x34 }, .{ 41, 0x35 }, .{ 42, 0xE1 }, .{ 43, 0x31 }, // ; ' ` LSHIFT backslash
-        .{ 44, 0x1D }, .{ 45, 0x1B }, .{ 46, 0x06 }, .{ 47, 0x19 }, .{ 48, 0x05 }, .{ 49, 0x11 }, .{ 50, 0x10 }, // Z..M
-        .{ 51, 0x36 }, .{ 52, 0x37 }, .{ 53, 0x38 }, .{ 54, 0xE5 }, .{ 55, 0x55 }, .{ 56, 0xE2 }, .{ 57, 0x2C }, .{ 58, 0x39 }, // , . / RSHIFT KP* LALT SPACE CAPS
-        .{ 59, 0x3A }, .{ 60, 0x3B }, .{ 61, 0x3C }, .{ 62, 0x3D }, .{ 63, 0x3E }, .{ 64, 0x3F }, .{ 65, 0x40 }, .{ 66, 0x41 }, .{ 67, 0x42 }, .{ 68, 0x43 }, // F1..F10
-        .{ 69, 0x53 }, .{ 70, 0x47 }, // NUMLOCK SCROLLLOCK
-        .{ 71, 0x5F }, .{ 72, 0x60 }, .{ 73, 0x61 }, .{ 74, 0x56 }, .{ 75, 0x5C }, .{ 76, 0x5D }, .{ 77, 0x5E }, .{ 78, 0x57 }, // KP7 KP8 KP9 KP- KP4 KP5 KP6 KP+
-        .{ 79, 0x59 }, .{ 80, 0x5A }, .{ 81, 0x5B }, .{ 82, 0x62 }, .{ 83, 0x63 }, // KP1 KP2 KP3 KP0 KP.
-        .{ 85, 0x94 }, .{ 86, 0x64 }, .{ 87, 0x44 }, .{ 88, 0x45 }, // ZENKAKUHANKAKU 102ND F11 F12
-        .{ 89, 0x87 }, .{ 90, 0x92 }, .{ 91, 0x93 }, .{ 92, 0x8A }, .{ 93, 0x88 }, .{ 94, 0x8B }, .{ 95, 0x8C }, // RO KATAKANA HIRAGANA HENKAN KATAKANAHIRAGANA MUHENKAN KPJPCOMMA
-        .{ 96, 0x58 }, .{ 97, 0xE4 }, .{ 98, 0x54 }, .{ 99, 0x46 }, .{ 100, 0xE6 }, // KPENTER RCTRL KP/ SYSRQ RALT
-        .{ 102, 0x4A }, .{ 103, 0x52 }, .{ 104, 0x4B }, .{ 105, 0x50 }, .{ 106, 0x4F }, .{ 107, 0x4D }, .{ 108, 0x51 }, .{ 109, 0x4E }, .{ 110, 0x49 }, .{ 111, 0x4C }, // HOME UP PGUP LEFT RIGHT END DOWN PGDN INS DEL
-        .{ 113, 0x7F }, .{ 114, 0x81 }, .{ 115, 0x80 }, .{ 116, 0x66 }, .{ 117, 0x67 }, .{ 119, 0x48 }, // MUTE VOL- VOL+ POWER KP= PAUSE
-        .{ 121, 0x85 }, .{ 122, 0x90 }, .{ 123, 0x91 }, .{ 124, 0x89 }, .{ 125, 0xE3 }, .{ 126, 0xE7 }, .{ 127, 0x65 }, // KPCOMMA HANGEUL HANJA YEN LMETA RMETA COMPOSE
-    };
-    for (pairs) |p| t[p[0]] = p[1];
-    break :blk t;
-};
+pub const hidUsage = shared.hidUsage;
 
 /// BTN_* to the platform's 1-based mouse button; 0 when it is not a mouse button.
 pub fn mouseButton(code: u16) u16 {
@@ -266,6 +236,7 @@ fn eviocgname(len: u32) u32 {
 }
 const eviocsclockid = ioc(ioc_write, 0xa0, @sizeOf(c_int));
 const eviocgrab = ioc(ioc_write, 0x90, @sizeOf(c_int));
+const eviocgid = ioc(ioc_read, 0x02, 8);
 
 fn testBit(bits: []const u8, bit: usize) bool {
     return bit / 8 < bits.len and bits[bit / 8] & (@as(u8, 1) << @intCast(bit % 8)) != 0;
@@ -339,6 +310,14 @@ pub const Devices = struct {
                 else => continue, // no such node (yet)
             }
             const fd: i32 = @intCast(rc);
+            // The Linux host's own injection devices: a client on the same machine would
+            // read its injected input back and send it again.
+            var id: [4]u16 = @splat(0); // bustype, vendor, product, version
+            if (sysOk(linux.ioctl(fd, eviocgid, @intFromPtr(&id))) and shared.isHostDevice(id[1], id[2])) {
+                _ = linux.close(fd);
+                d.skip |= bit;
+                continue;
+            }
             var ev_bits: [4]u8 = @splat(0);
             var key_bits: [(KEY_MAX + 8) / 8]u8 = @splat(0);
             var rel_bits: [(REL_MAX + 8) / 8]u8 = @splat(0);

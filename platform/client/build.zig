@@ -10,6 +10,8 @@ const root = @import("../../build.zig");
 pub const Modules = struct {
     core: *std.Build.Module,
     platform: *std.Build.Module,
+    /// platform/linux/uinput.zig: event codes, key table, uinput devices (Linux only).
+    linux_uinput: ?*std.Build.Module = null,
 };
 
 fn overlayModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: Modules) *std.Build.Module {
@@ -82,7 +84,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .root_source_file = b.path("platform/client/linux/evdev.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "platform", .module = m.platform }},
+            .imports = &.{ .{ .name = "platform", .module = m.platform }, .{ .name = "linux_uinput", .module = m.linux_uinput.? } },
         });
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "client-evdev-test", .root_module = evdev_mod })).step);
     }
@@ -97,6 +99,7 @@ pub const LinuxModules = struct {
     core: *std.Build.Module,
     platform: *std.Build.Module,
     synthetic: *std.Build.Module,
+    linux_uinput: *std.Build.Module,
 };
 
 /// The Linux client backend ("client_linux", platform/client/linux/backend.zig) with its
@@ -113,6 +116,7 @@ pub fn linuxClientModule(b: *std.Build, target: std.Build.ResolvedTarget, optimi
             .{ .name = "platform", .module = m.platform },
             .{ .name = "core", .module = m.core },
             .{ .name = "synthetic", .module = m.synthetic },
+            .{ .name = "linux_uinput", .module = m.linux_uinput },
             .{ .name = "client_overlay", .module = overlayModule(b, target, optimize, .{ .core = m.core, .platform = m.platform }) },
             .{ .name = "mlc_c", .module = tc.createModule() },
             .{ .name = "client_gamepad", .module = gamepadModule(b, target, optimize, .{ .core = m.core, .platform = m.platform }) },

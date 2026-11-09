@@ -335,3 +335,13 @@ pub const AudioSource = struct {
         return api.bind(api.AudioSource, AudioSource, s);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Input injection and the HostBackend bundle
+
+/// uinput keyboard, mouse, absolute pointer and gamepads (input.zig).
+pub const input = @import("input.zig");
+/// Event codes, the key table and uinput devices (platform/linux/uinput.zig).
+pub const uinput = @import("linux_uinput");
+/// The `HostBackend` for `--host linux` (backend.zig).
+pub const backend = @import("backend.zig");
