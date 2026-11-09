@@ -21,7 +21,42 @@ fn overlayModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     });
 }
 
+/// Set by `add` from -Drequire-uinput; read by `gamepadModule`.
+var require_uinput: bool = false;
+
+/// Gamepad capture for every client OS (platform/client/gamepad): XInput,
+/// GameController (gc.m, linked on macOS targets only) and evdev.
+pub fn gamepadModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: Modules) *std.Build.Module {
+    const opts = b.addOptions();
+    opts.addOption(bool, "require_uinput", require_uinput);
+    const mod = b.createModule(.{
+        .root_source_file = b.path("platform/client/gamepad/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = m.core },
+            .{ .name = "platform", .module = m.platform },
+            .{ .name = "gamepad_options", .module = opts.createModule() },
+        },
+    });
+    if (target.result.os.tag == .macos) {
+        mod.link_libc = true;
+        mod.addCSourceFile(.{ .file = b.path("platform/client/gamepad/gc.m"), .flags = &.{ "-fobjc-arc", "-Wall", "-Werror" } });
+        mod.addIncludePath(b.path("platform/client/gamepad"));
+        mod.linkFramework("GameController", .{});
+        mod.linkFramework("Foundation", .{});
+        mod.linkSystemLibrary("objc", .{});
+    }
+    return mod;
+}
+
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: Modules, test_step: *std.Build.Step) void {
+    require_uinput = b.option(bool, "require-uinput", "Fail, not skip, the gamepad uinput tests when /dev/uinput is unavailable") orelse false;
+    const gamepad_tests = b.addRunArtifact(b.addTest(.{ .name = "client-gamepad-test", .root_module = gamepadModule(b, target, optimize, m) }));
+    test_step.dependOn(&gamepad_tests.step);
+    const test_gamepad = b.step("test-gamepad", "Gamepad capture tests (on Linux, with a uinput virtual pad when /dev/uinput is writable)");
+    test_gamepad.dependOn(&gamepad_tests.step);
+
     const overlay_mod = overlayModule(b, target, optimize, m);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "client-overlay-test", .root_module = overlay_mod })).step);
 
@@ -140,6 +175,7 @@ pub fn windowsClientModule(b: *std.Build, target: std.Build.ResolvedTarget, opti
             .{ .name = "core", .module = core },
             .{ .name = "win", .module = root.windowsModule(b, target, optimize) },
             .{ .name = "client_overlay", .module = overlayModule(b, target, optimize, .{ .core = core, .platform = platform }) },
+            .{ .name = "client_gamepad", .module = gamepadModule(b, target, optimize, .{ .core = core, .platform = platform }) },
             .{ .name = "mswc_c", .module = tc.createModule() },
         },
     });

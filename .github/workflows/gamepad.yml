@@ -1,0 +1,44 @@
+name: gamepad
+
+# Client gamepad capture (platform/client/gamepad). The unit tests run on every OS in
+# core.yml; this job runs the evdev source against a real kernel device: a uinput
+# virtual pad that is plugged in, pressed and unplugged. -Drequire-uinput makes a
+# missing /dev/uinput fail the job instead of skipping the test.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  uinput:
+    name: evdev + uinput (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Enable uinput for the runner user
+        run: |
+          sudo modprobe uinput
+          # Desktop sessions get pads through udev's uaccess tag; the runner has no
+          # seat, so open /dev/uinput and the event nodes it creates to everyone.
+          printf '%s\n' \
+            'KERNEL=="uinput", MODE="0666"' \
+            'SUBSYSTEM=="input", KERNEL=="event*", MODE="0666"' \
+            | sudo tee /etc/udev/rules.d/99-moonsec-gamepad-test.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --subsystem-match=misc --subsystem-match=input
+          sudo udevadm settle
+          sudo chmod 0666 /dev/uinput
+          ls -l /dev/uinput /dev/input
+      - name: Gamepad tests with a virtual pad
+        run: zig build test-gamepad -Drequire-uinput=true --summary all
