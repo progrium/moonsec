@@ -1,0 +1,12 @@
+{
+  "name": "moonsec-shim-web-test",
+  "private": true,
+  "type": "module",
+  "description": "shim-web end-to-end test: headless browsers through a local iroh-relay to native moonsec",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}

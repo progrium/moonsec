@@ -1,0 +1,105 @@
+name: fuzz
+
+# Fuzz every parser (tools/fuzz/run.sh, Zig's built-in fuzzer) and the shim's C ABI
+# (cargo-fuzz under AddressSanitizer) for up to 6 hours on one runner. Corpora are kept
+# in the Actions cache between runs, so repeated runs continue one campaign. Crashes are
+# uploaded as artifacts, with minimized copies ready to commit under fuzz/corpus/.
+# See docs/fuzzing.md.
+
+# Manual only: run it from the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes to fuzz (each job; at most 340)
+        default: "60"
+      harnesses:
+        description: Zig harnesses (space-separated; empty = all)
+        default: ""
+      shim:
+        description: Also fuzz the shim C ABI
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  zig:
+    name: zig harnesses
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Restore corpora
+        uses: actions/cache/restore@v4
+        with:
+          path: .fuzz/cache/f
+          key: fuzz-zig-${{ github.run_id }}
+          restore-keys: fuzz-zig-
+      - name: Replay saved corpora (regressions)
+        run: zig build fuzz --summary all
+      - name: Fuzz
+        id: fuzz
+        run: |
+          m=${{ inputs.minutes }}
+          [ "$m" -gt 340 ] && m=340
+          tools/fuzz/run.sh -t $((m * 60)) ${{ inputs.harnesses }}
+      - name: Save corpora
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .fuzz/cache/f
+          key: fuzz-zig-${{ github.run_id }}
+      - name: Upload crashes and minimized regressions
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zig-fuzz-crashes
+          path: |
+            .fuzz/crashes
+            .fuzz/log
+            fuzz/corpus
+
+  shim:
+    name: shim C ABI (ASan)
+    if: inputs.shim
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nightly Rust (cargo-fuzz needs -Zsanitizer)
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: shim/fuzz/corpus
+          key: fuzz-shim-${{ github.run_id }}
+          restore-keys: fuzz-shim-
+      - name: Fuzz
+        working-directory: shim
+        run: |
+          m=${{ inputs.minutes }}
+          [ "$m" -gt 340 ] && m=340
+          cargo +nightly fuzz run c_abi -O -- -max_total_time=$((m * 60)) -timeout=30 -rss_limit_mb=4096
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: shim/fuzz/corpus
+          key: fuzz-shim-${{ github.run_id }}
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-fuzz-crashes
+          path: shim/fuzz/artifacts
