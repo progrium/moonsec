@@ -5,11 +5,9 @@ name: shim
 # sizes. Tags `shim-v*` publish a release; shim/pin-release.sh then pins it in
 # build.zig.zon, and the `prebuilt` job builds from those pinned archives without Rust.
 
+# Automatic triggers are off (turned off on request); run it from the Actions tab.
+# To publish a shim release, run it on the shim-v* tag.
 on:
-  # Every branch push runs the matrix (also covers PR branches in this repo).
-  push:
-    branches: ["**"]
-    tags: ["shim-v*"]
   workflow_dispatch:
 
 permissions:

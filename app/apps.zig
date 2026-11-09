@@ -33,7 +33,14 @@ pub const HostOptions = struct {
     fps: u32 = 60,
     bitrate_bps: u64 = 10_000_000,
     slices: u8 = 4,
+    /// The codec the host prefers. A client without it gets the next one both ends have
+    /// (HEVC, H.264, AV1, in that order), as `negotiate` picks.
     codec: api.Codec = .passthrough,
+    /// Prefer 4:4:4 (sharp coloured text) and 10-bit when the client decodes them; send
+    /// HDR10 when the display is in HDR mode and the client's display is too.
+    yuv444: bool = false,
+    ten_bit: bool = false,
+    hdr: bool = true,
     display: u32 = 0,
     width: u32 = 0,
     height: u32 = 0,
@@ -58,19 +65,37 @@ pub const HostApp = struct {
     s: HostSession,
     opts: HostOptions,
     size: api.Size,
+    slices: u8,
+    ltr: bool,
     last_frame_us: ?Micros = null,
     audio: ?*HostAudio = null,
     clip: ?clipsync.Sync = null,
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: HostOptions, p: pipe_mod.PacketPipe) !HostApp {
-        const size = try be.capture.start(.{ .display = o.display, .fps = o.fps, .width = o.width, .height = o.height });
+        const size = try be.capture.start(.{ .display = o.display, .fps = o.fps, .width = o.width, .height = o.height, .hdr = o.hdr });
         errdefer be.capture.stop();
         const caps = be.encoder.caps();
         if (!caps.codecs.has(o.codec)) return error.Unsupported;
         const slices = @min(o.slices, caps.max_slices);
         try be.encoder.configure(.{ .codec = o.codec, .width = size.width, .height = size.height, .fps = o.fps, .bitrate_bps = o.bitrate_bps, .slices = slices, .ltr = caps.ltr });
+        var order: api.format.Order = .{};
+        for ([_]api.Codec{ o.codec, .hevc, .h264, .av1, .passthrough }) |c| {
+            if (caps.codecs.has(c)) order.add(@intFromEnum(c));
+        }
+        var app: HostApp = .{ .be = be, .s = undefined, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr };
         const s = try HostSession.init(gpa, .{
+            .negotiate = .{
+                .encoder = api.effectiveFormats(caps.codecs, caps.coded),
+                .preference = .{
+                    .codecs = order,
+                    .yuv444 = o.yuv444,
+                    .ten_bit = o.ten_bit,
+                    .hdr = o.hdr,
+                    .source_is_hdr = size.color == .hdr10,
+                    .source_hdr = size.hdr,
+                },
+            },
             .codec = o.codec,
             .width = size.width,
             .height = size.height,
@@ -84,7 +109,7 @@ pub const HostApp = struct {
             .loss_policy = o.session.loss_policy,
             .pause_on_stall = o.pause_on_stall,
         }, p);
-        var app: HostApp = .{ .be = be, .s = s, .opts = o, .size = size };
+        app.s = s;
         errdefer app.s.deinit();
         if (o.control_stream) |cs| try app.s.control.attach(cs);
         if (o.clipboard) |cb| app.clip = .{ .cb = cb, .interval_us = o.clipboard_poll_us };
@@ -125,9 +150,28 @@ pub const HostApp = struct {
     fn encodeOne(a: *HostApp, f: *const api.CapturedFrame, lock: ?Lock) void {
         if (lock) |l| l.lock();
         const live = a.s.streaming();
+        const change = if (live) a.s.takeFormat() else null;
+        const bitrate = a.s.bitrate_bps;
         const params = if (live) a.s.encodeParams() else api.EncodeParams{};
         if (lock) |l| l.unlock();
         if (!live) return;
+        if (change) |c| a.be.encoder.configure(.{
+            .codec = c.codec,
+            .format = c.format,
+            .width = f.image.width,
+            .height = f.image.height,
+            .fps = a.opts.fps,
+            .bitrate_bps = bitrate,
+            .slices = a.slices,
+            .ltr = a.ltr,
+        }) catch {
+            if (lock) |l| l.lock();
+            defer if (lock) |l| l.unlock();
+            a.stats.encode_errors += 1;
+            a.s.onEncodeDropped();
+            a.s.abort("the encoder rejected the negotiated codec or format");
+            return;
+        };
         const r = a.be.encoder.encode(f, params);
         if (lock) |l| l.lock();
         defer if (lock) |l| l.unlock();
@@ -234,7 +278,10 @@ pub const ClientApp = struct {
 
     pub fn init(gpa: std.mem.Allocator, be: api.ClientBackend, o: ClientOptions, p: pipe_mod.PacketPipe) !ClientApp {
         var cfg = o.session;
-        cfg.codecs = be.decoder.caps().codecs;
+        const caps = be.decoder.caps();
+        cfg.codecs = caps.codecs;
+        cfg.formats = api.effectiveFormats(caps.codecs, caps.coded);
+        cfg.display = be.display;
         var au: ?*ClientAudio = null;
         if (o.audio) if (be.audio) |sink| {
             au = try ClientAudio.init(gpa, sink);
@@ -274,11 +321,11 @@ pub const ClientApp = struct {
     fn configure(a: *ClientApp) bool {
         if (a.configured) return true;
         const c = a.s.config orelse return false;
-        a.be.decoder.configure(.{ .codec = c.codec, .width = c.width, .height = c.height }) catch {
+        a.be.decoder.configure(.{ .codec = c.codec, .width = c.width, .height = c.height, .format = c.format }) catch {
             a.s.close(a.be.clock.now());
             return false;
         };
-        a.be.presenter.configure(.{ .width = c.width, .height = c.height, .mode = a.opts.mode, .windowed = a.opts.windowed }) catch {
+        a.be.presenter.configure(.{ .width = c.width, .height = c.height, .mode = a.opts.mode, .windowed = a.opts.windowed, .format = c.format }) catch {
             a.s.close(a.be.clock.now());
             return false;
         };
@@ -431,7 +478,7 @@ pub const ClientAudio = struct {
     stage: audio_stage.ClientAudio,
     channels: u8,
     /// One rendered frame (up to 60 ms stereo), and how much of it the sink has taken.
-    buf: [2880 * 2]f32 = undefined,
+    buf: [audio_stage.ClientAudio.max_frame_samples * 2]f32 = undefined,
     pending: []const f32 = &.{},
     stats: struct { rendered: u64 = 0, errors: u64 = 0 } = .{},
 
