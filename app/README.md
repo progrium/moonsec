@@ -44,7 +44,7 @@ zig build moonsec-sim -- run sim         # two processes over the sim hub, wall 
 zig build moonsec -- run all             # ...and over iroh on loopback (builds the shim)
 zig build moonsec-linux                  # with the Linux client backend (platform/client/linux):
 zig-out/bin/moonsec-linux run sim --client linux --uinput-script
-zig build install-moonsec                # then, on two machines:
+zig build install-moonsec                # then, on two machines, pair once (below) and:
 zig-out/bin/moonsec peer iroh host --ticket-file t --relay --seconds 60
 zig-out/bin/moonsec peer iroh client --ticket-file t --relay --seconds 60   # copy t over first
 ```
@@ -58,12 +58,16 @@ moonsec pair client --ticket MOONSEC1:...          # QR ticket: pairs with no PI
 moonsec pair client --ticket MOONSEC1:... --pin 123456   # address ticket plus the PIN
 moonsec paired                           # this device's ID and both paired-device lists
 moonsec unpair a1b2c3d4                  # remove a device by ID prefix
-moonsec peer iroh host --state-dir D ... # device key; admits only paired clients
+moonsec peer iroh host ...              # device key; admits only paired clients
 ```
 
 Each device keeps its key and lists in a state directory (`--state-dir`, else
-`$MOONSEC_STATE_DIR`, else the per-user config directory). `peer iroh` without
-`--state-dir` keeps the old behaviour (fresh key, no admission) for the gate tooling.
+`$MOONSEC_STATE_DIR`, else the per-user config directory). `peer iroh` always enforces
+pairing: the host runs admission on every connection it accepts, including a client's
+reconnect, and a newcomer can replace a live session's connection only if it comes from the
+same device. The client connects only to hosts on its own list, and checks again on every
+redial. `--insecure-no-pairing` turns this off (fresh key, anyone with the ticket gets a
+session); only the lab runs use it (`run iroh`, `tools/netlab`).
 
 The freeze detector ([core/telemetry/freeze.zig](../core/telemetry/freeze.zig)) counts a freeze
 whenever no new picture reaches the screen for 200 ms (nothing presented, or old content

@@ -82,16 +82,19 @@ export fn mp_ticket_addr() i32 {
 // --- the client exchange -------------------------------------------------------------------
 
 /// Starts a pairing with the decoded ticket. `mp_in` holds, in order: the client's ID (32),
-/// a fresh random nonce (16), the PIN text (`pin_len` bytes; 0 = use the ticket's secret),
+/// a fresh random nonce (16), 32 fresh secret random bytes (the PIN method's CPace scalar),
+/// the PIN text (`pin_len` bytes; 0 = use the ticket's secret),
 /// then the client's name (`name_len` bytes). Writes the framed `hello` to `mp_out` and
 /// returns its length. -1 no ticket, -2 bad PIN, -3 the ticket has no secret and no PIN.
 export fn mp_client_start(pin_len: usize, name_len: usize) i32 {
     const t = ticket orelse return -1;
-    if (48 + pin_len + name_len > io_len) return -2;
+    if (80 + pin_len + name_len > io_len) return -2;
     const client_id: pair.Id = in_buf[0..32].*;
     const nonce: ex.Nonce = in_buf[32..48].*;
-    const pin_text = in_buf[48..][0..pin_len];
-    const name = in_buf[48 + pin_len ..][0..name_len];
+    const seed: ex.Seed = in_buf[48..80].*;
+    @memset(in_buf[48..80], 0);
+    const pin_text = in_buf[80..][0..pin_len];
+    const name = in_buf[80 + pin_len ..][0..name_len];
     const cred: ex.Credential = if (pin_len > 0)
         .{ .pin = pair.pin.parse(pin_text) orelse return -2 }
     else if (t.secret) |s|
@@ -102,7 +105,7 @@ export fn mp_client_start(pin_len: usize, name_len: usize) i32 {
     reason = 0;
     attempts_left = -1;
     paired_name_len = 0;
-    client = ex.Client.init(t.host_id, client_id, nonce, cred, name);
+    client = ex.Client.init(t.host_id, client_id, nonce, seed, cred, name);
     return out(client.start());
 }
 

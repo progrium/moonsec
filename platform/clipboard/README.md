@@ -41,7 +41,8 @@ skips when no clipboard is reachable.
 ## Hardware check (Jeff)
 
 Copy and paste both ways between the Mac and the Windows box, over iroh with the synthetic
-video stream. On the Mac (host):
+video stream. Pair the two once (`moonsec pair host --relay` on the Mac, then the
+`moonsec pair client ...` line it prints on Windows). On the Mac (host):
 
     zig build install-moonsec
     zig-out/bin/moonsec peer iroh host --ticket-file ticket.txt --relay --clipboard --seconds 300

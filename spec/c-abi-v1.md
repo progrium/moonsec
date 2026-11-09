@@ -159,9 +159,9 @@ sessions). Releasing a session drops its queued events.
   `fps`, start `bitrate_bps`, `display`, a capture size hint, and flags:
   `YUV444`, `TEN_BIT`, `NO_HDR` (format preferences for the per-client negotiation of
   [platform/format.zig](../platform/format.zig)), `RATE_CONTROL`, `LOSS_POLICY`,
-  `NO_AUDIO`, `APP_INPUT`, `REQUIRE_PAIRED`.
+  `NO_AUDIO`, `APP_INPUT`, `INSECURE_NO_PAIRING`.
 - **Client settings**: the `codecs` to offer (mask; 0: all the decoder has), a maximum
-  size, `NO_AUDIO`, `NO_OS_INPUT`, `FULLSCREEN`, `REQUIRE_PAIRED`, and the `on_frame`
+  size, `NO_AUDIO`, `NO_OS_INPUT`, `FULLSCREEN`, `INSECURE_NO_PAIRING`, and the `on_frame`
   callback.
 
 ## Transports
@@ -171,9 +171,10 @@ sessions). Releasing a session drops its queued events.
 its iroh address). `moonsec_client_connect(ticket)` dials, checks the host's ID against
 the ticket, asks for admission ([pairing-v0.md](pairing-v0.md), "Admission"), and starts
 the session. A bare iroh ticket also works (no ID check). Every connection goes through
-admission; a host with `REQUIRE_PAIRED` admits only clients on its allowlist, others get
-`MOONSEC_ERR_REFUSED` and the host a `REFUSED` event. A client with `REQUIRE_PAIRED`
-connects only to hosts it paired with.
+admission; a host admits only clients on its allowlist, others get `MOONSEC_ERR_REFUSED`
+and the host a `REFUSED` event, and a client connects only to hosts it paired with. The
+`INSECURE_NO_PAIRING` flags turn this off on either side, for tests and labs only.
+(`REQUIRE_PAIRED`, which used to opt in, is still accepted and now means the default.)
 
 **Loopback** (`MOONSEC_FEATURE_LOOPBACK`). `moonsec_loopback_create` makes an in-process
 simulated network ([transport/sim.zig](../transport/sim.zig)) with a profile (`CLEAN`,
@@ -273,7 +274,7 @@ mid-session will be a new function in 1.x.
 | Host and client on the synthetic backend | done |
 | System backends (`MOONSEC_BACKEND_SYSTEM`) | done: built in with `-Dabi-system` (default on for Windows and macOS). Linux runs end to end in `zig build test-abi-system` under a headless Weston (portal capture, libx264, software decode, EGL window); Windows cross-compiles; macOS is untested here (no SDK) |
 | Loopback transport | done |
-| iroh: listen, ticket, connect, admission, `REQUIRE_PAIRED` | done |
+| iroh: listen, ticket, connect, admission (pairing required unless `INSECURE_NO_PAIRING`) | done |
 | Pairing (QR and PIN), key store in `state_dir` | done |
 | Reconnect after a dropped connection | not yet: an iroh session runs on one connection, and a drop ends it (the `moonsec` tool's `IrohLink` redials, but admission would have to run on each new connection) |
 | Events, notify, frame callback | done |

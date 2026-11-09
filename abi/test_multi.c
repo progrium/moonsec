@@ -104,6 +104,7 @@ static void new_client(client *cl, const char *name) {
     cc.struct_size = sizeof cc;
     cc.state_dir = "";
     cc.name = name;
+    cc.flags = MOONSEC_CLIENT_INSECURE_NO_PAIRING;
     cc.clipboard = MOONSEC_CLIPBOARD_APP;
     memset(cl, 0, sizeof *cl);
     OK(moonsec_client_create(&cc, &cl->c));
@@ -137,7 +138,7 @@ int main(void) {
     hc.state_dir = "";
     hc.name = "abi multi host";
     hc.max_clients = 2;
-    hc.flags = MOONSEC_HOST_APP_INPUT;
+    hc.flags = MOONSEC_HOST_APP_INPUT | MOONSEC_HOST_INSECURE_NO_PAIRING; /* no pairing in this test */
     hc.clipboard = MOONSEC_CLIPBOARD_APP;
     hc.width = 320;
     hc.height = 180;

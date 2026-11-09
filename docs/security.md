@@ -35,7 +35,7 @@ do to either side?**
 | **Relay operator** (n0's public relays with `--relay`, or a self-hosted relay) | Everything the on-path attacker can, plus the endpoint IDs of both sides and when they talk. Refuse or delay service. | Decrypt: relayed packets are the same end-to-end QUIC. |
 | **Unpaired peer** (anyone who can reach the host's endpoint: has its address ticket, or finds it via discovery) | Complete a QUIC handshake, open streams, send any bytes to the pairing/admission parser, guess the PIN while a window is open (5 tries per window), tie up the accept loop. | Start a session, send datagrams the session acts on, or pair without the secret. |
 | **Paired but malicious client** | Everything a session allows: watch the screen, inject input (under the multi-user input policy), read and set the clipboard if enabled, send malformed media feedback, control messages and input to every session parser. | Escape the session's message parsers into memory corruption, or affect other clients beyond what the input policy allows. |
-| **Malicious host** (a host the user paired with, or one the user was tricked into dialing) | Show anything; receive everything the client types; send malformed media, audio and control traffic to the client's parsers and decoders. | Learn the client's key; for a host the user only *tried* to pair with, learn the PIN (see finding O2 in the review: today it can, offline). |
+| **Malicious host** (a host the user paired with, or one the user was tricked into dialing) | Show anything; receive everything the client types; send malformed media, audio and control traffic to the client's parsers and decoders. | Learn the client's key; for a host the user only *tried* to pair with, learn the PIN (the PIN method is a PAKE, so it can test one guess per run, online). |
 | **Local unprivileged user on the host or client** | Read world-readable files, see other users' command lines, plant files in shared directories. | Read the device key or lists (0600 in a 0700 directory), change the allowlist. |
 
 Out of scope: an attacker who is already the host's or client's logged-in user or root (they
@@ -79,8 +79,8 @@ physical attacks.
 ## Security properties we claim
 
 1. **Only paired devices stream.** A host admits a session only from a connection whose
-   authenticated endpoint ID is on its allowlist. *Today only `peer iroh --state-dir`
-   enforces this; without `--state-dir` anyone with the address ticket is admitted (O1).*
+   authenticated endpoint ID is on its allowlist, on every connection: the first and each
+   reconnect. Only lab runs opt out, with `--insecure-no-pairing`.
 2. **Pairing needs the secret the host shows**, and each wrong guess costs one of the
    window's five attempts whatever connection it arrives on: a PIN guesser wins with
    probability 5 × 10⁻⁶ per window. A QR secret is 128 bits.

@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
     hc.backend = MOONSEC_BACKEND_SYSTEM;
     hc.state_dir = ""; /* key in memory */
     hc.name = "abi system host";
-    hc.flags = MOONSEC_HOST_APP_INPUT;
+    hc.flags = MOONSEC_HOST_APP_INPUT | MOONSEC_HOST_INSECURE_NO_PAIRING; /* no pairing in this test */
     hc.relay_mode = MOONSEC_RELAY_DISABLED;
     hc.fps = 30;
     hc.bitrate_bps = 4000000;
@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
     cc.backend = MOONSEC_BACKEND_SYSTEM;
     cc.state_dir = "";
     cc.name = "abi system client";
-    cc.flags = MOONSEC_CLIENT_NO_OS_INPUT;
+    cc.flags = MOONSEC_CLIENT_NO_OS_INPUT | MOONSEC_CLIENT_INSECURE_NO_PAIRING;
     cc.on_frame = on_frame;
     moonsec_client *c = NULL;
     OK(moonsec_client_create(&cc, &c));

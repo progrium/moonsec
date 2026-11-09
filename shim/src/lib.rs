@@ -81,6 +81,11 @@ const DEFAULT_NO_ACK_MS: u32 = 150;
 const EVENT_QUEUE: usize = 256;
 /// Bound on an accepted connection's handshake (see `iroh_endpoint_accept`).
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Incoming handshakes in progress at once; a newcomer past it aborts the oldest, so peers
+/// that start handshakes and stall cannot keep a real client out.
+const MAX_HANDSHAKES: usize = 16;
+/// Connections whose handshake completed, waiting for `iroh_endpoint_accept`.
+const ACCEPTED_QUEUE: usize = 8;
 const MONITOR_TICK: Duration = Duration::from_millis(5);
 /// Bytes of bookkeeping noq charges per queued datagram (`size_of::<frame::Datagram>()`).
 const DGRAM_OVERHEAD: usize = std::mem::size_of::<Bytes>();
@@ -305,6 +310,54 @@ pub struct IrohEndpoint {
     ep: Endpoint,
     alpn: Vec<u8>,
     cfg: ConnConfig,
+    /// Started by the first `iroh_endpoint_accept`.
+    acceptor: Mutex<Option<Acceptor>>,
+}
+
+/// A handshake that completed, with the rate knob its transport config was built with.
+type Accepted = (Connection, Arc<RateKnob>, Arc<AppRateFactory>);
+
+/// Accepts incoming connections in the background and runs each handshake on its own task
+/// (at most `MAX_HANDSHAKES`, each bounded by `ACCEPT_HANDSHAKE_TIMEOUT`), queueing the ones
+/// that complete for `iroh_endpoint_accept`. So one peer that stalls its handshake holds
+/// neither the caller nor anyone else's handshake.
+struct Acceptor {
+    rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Accepted>>>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Acceptor {
+    fn start(endpoint: Endpoint, alpn: Vec<u8>, cfg: ConnConfig) -> Acceptor {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Accepted>(ACCEPTED_QUEUE);
+        let task = runtime().spawn(async move {
+            let mut running: VecDeque<tokio::task::AbortHandle> = VecDeque::new();
+            while let Some(incoming) = endpoint.accept().await {
+                running.retain(|h| !h.is_finished());
+                if running.len() >= MAX_HANDSHAKES {
+                    if let Some(oldest) = running.pop_front() {
+                        oldest.abort();
+                    }
+                }
+                let knob = Arc::new(RateKnob::new(cfg.target_bps, cfg.burst_us));
+                let factory = AppRateFactory::new(knob.clone());
+                let Ok(tc) = cfg.transport(factory.clone()) else { continue };
+                let sc = endpoint.create_server_config_builder(vec![alpn.clone()]).set_transport_config(tc).build();
+                let Ok(accepting) = incoming.accept_with(Arc::new(sc)) else { continue };
+                let tx = tx.clone();
+                let h = tokio::spawn(async move {
+                    if let Ok(Ok(conn)) = tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT, accepting).await {
+                        // Waits while the queue is full: the caller is slow to accept.
+                        let _ = tx.send((conn, knob, factory)).await;
+                    }
+                });
+                running.push_back(h.abort_handle());
+            }
+            for h in running {
+                h.abort();
+            }
+        });
+        Acceptor { rx: Arc::new(tokio::sync::Mutex::new(rx)), task: task.abort_handle() }
+    }
 }
 
 unsafe fn opt_str<'a>(p: *const c_char) -> Result<Option<&'a str>, String> {
@@ -378,7 +431,7 @@ pub unsafe extern "C" fn iroh_endpoint_bind(opts: *const IrohBindOpts, out: *mut
     })();
     match built {
         Ok(ep) => {
-            unsafe { *out = Box::into_raw(Box::new(IrohEndpoint { ep, alpn, cfg })) };
+            unsafe { *out = Box::into_raw(Box::new(IrohEndpoint { ep, alpn, cfg, acceptor: Mutex::new(None) })) };
             IROH_OK
         }
         Err(e) => fail(IROH_ERR_INTERNAL, e),
@@ -481,7 +534,9 @@ pub unsafe extern "C" fn iroh_endpoint_connect(
     }
 }
 
-/// Waits up to timeout_ms for an incoming connection and completes its handshake.
+/// Waits up to timeout_ms for an incoming connection whose handshake has completed.
+/// Handshakes run in the background from the first call on (see `Acceptor`), each bounded
+/// on its own, so the timeout bounds only the wait.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn iroh_endpoint_accept(ep: *const IrohEndpoint, timeout_ms: u32, out: *mut *mut IrohConn) -> i32 {
     let Some(ep) = (unsafe { ep.as_ref() }) else { return fail(IROH_ERR_INVALID, "null endpoint") };
@@ -491,41 +546,28 @@ pub unsafe extern "C" fn iroh_endpoint_accept(ep: *const IrohEndpoint, timeout_m
     if ep.alpn.is_empty() {
         return fail(IROH_ERR_INVALID, "endpoint was bound without an ALPN (dial-only)");
     }
+    if let Err(e) = ep.cfg.transport(AppRateFactory::new(Arc::new(RateKnob::new(ep.cfg.target_bps, ep.cfg.burst_us)))) {
+        return fail(IROH_ERR_INVALID, e);
+    }
+    let rx = {
+        let mut a = ep.acceptor.lock().unwrap();
+        a.get_or_insert_with(|| Acceptor::start(ep.ep.clone(), ep.alpn.clone(), ep.cfg)).rx.clone()
+    };
     let cfg = ep.cfg;
-    let knob = Arc::new(RateKnob::new(cfg.target_bps, cfg.burst_us));
-    let factory = AppRateFactory::new(knob.clone());
-    let tc = match cfg.transport(factory.clone()) {
-        Ok(tc) => tc,
-        Err(e) => return fail(IROH_ERR_INVALID, e),
-    };
-    let endpoint = ep.ep.clone();
-    let alpn = ep.alpn.clone();
-    // The timeout bounds the wait for an incoming connection, not its handshake: dropping a
-    // half-done handshake would close a connection the dialer already counts as up (a relayed
-    // handshake takes a few RTTs). The handshake gets its own bound.
     let fut = async move {
-        let d = Duration::from_millis(timeout_ms as u64);
-        let incoming = match tokio::time::timeout(d, endpoint.accept()).await {
-            Err(_) => return Err((IROH_ERR_TIMEOUT, "accept timed out".to_string())),
-            Ok(None) => return Err((IROH_ERR_CLOSED, "endpoint closed".to_string())),
-            Ok(Some(i)) => i,
-        };
-        let sc = endpoint.create_server_config_builder(vec![alpn]).set_transport_config(tc).build();
-        let accepting = incoming.accept_with(Arc::new(sc)).map_err(|e| (IROH_ERR_INTERNAL, format!("accept: {e}")))?;
-        match tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT.max(d), accepting).await {
-            Err(_) => Err((IROH_ERR_TIMEOUT, "accept: handshake timed out".to_string())),
-            Ok(r) => r.map_err(|e| (IROH_ERR_INTERNAL, format!("accept: {e}"))),
-        }
+        let mut rx = rx.lock().await;
+        rx.recv().await
     };
-    match run(fut) {
-        Ok(conn) => match wrap_conn(conn, cfg, knob, factory) {
+    match block_on_timeout(timeout_ms, fut) {
+        Err(_) => fail(IROH_ERR_TIMEOUT, "accept timed out"),
+        Ok(None) => fail(IROH_ERR_CLOSED, "endpoint closed"),
+        Ok(Some((conn, knob, factory))) => match wrap_conn(conn, cfg, knob, factory) {
             Ok(c) => {
                 unsafe { *out = c };
                 IROH_OK
             }
             Err(e) => fail(IROH_ERR_INTERNAL, format!("accept: {e}")),
         },
-        Err((code, msg)) => fail(code, msg),
     }
 }
 
@@ -546,6 +588,9 @@ pub unsafe extern "C" fn iroh_endpoint_free(ep: *mut IrohEndpoint) {
         return;
     }
     let ep = unsafe { Box::from_raw(ep) };
+    if let Some(a) = ep.acceptor.lock().unwrap().take() {
+        a.task.abort();
+    }
     run(async move { ep.ep.close().await });
 }
 

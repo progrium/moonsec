@@ -41,14 +41,54 @@ pub const Outcome = union(enum) {
     failed: ex.Reason,
 };
 
+/// Serializes a host's exchanges that share one window (each connection on its own task).
+/// `enter` locks and returns false if the window this exchange started on is gone (closed
+/// or replaced); `leave` unlocks, whatever `enter` returned.
+pub const Guard = struct {
+    ctx: *anyopaque,
+    enter: *const fn (ctx: *anyopaque) bool,
+    leave: *const fn (ctx: *anyopaque) void,
+
+    /// A guard over one mutex, for a window that lives as long as the exchanges.
+    pub const Simple = struct {
+        io: Io,
+        mu: *Io.Mutex,
+
+        pub fn guard(g: *Simple) Guard {
+            return .{ .ctx = g, .enter = enterFn, .leave = leaveFn };
+        }
+        fn enterFn(ctx: *anyopaque) bool {
+            const g: *Simple = @ptrCast(@alignCast(ctx));
+            g.mu.lockUncancelable(g.io);
+            return true;
+        }
+        fn leaveFn(ctx: *anyopaque) void {
+            const g: *Simple = @ptrCast(@alignCast(ctx));
+            g.mu.unlock(g.io);
+        }
+    };
+};
+
 /// Host side, after the first message (the client's hello) was read from `s`.
-/// `now` is the clock the window's deadline uses.
-pub fn serveHost(s: Stream, f: *ex.Framer, h: *ex.Host, first: []const u8, nowUs: *const fn () i64) !Outcome {
+/// `now` is the clock the window's deadline uses. With a `guard`, every step that touches
+/// the shared window runs inside it.
+pub fn serveHost(s: Stream, f: *ex.Framer, h: *ex.Host, first: []const u8, nowUs: *const fn () i64, guard: ?Guard) !Outcome {
     var msg_buf: [ex.max_message]u8 = undefined;
     var msg: []const u8 = first;
-    errdefer h.abort();
+    errdefer abortGuarded(h, guard);
     while (true) {
-        const step = h.onMessage(msg, nowUs());
+        const step = blk: {
+            if (guard) |g| {
+                defer g.leave(g.ctx);
+                if (!g.enter(g.ctx)) {
+                    // The window went away mid-exchange; its counters no longer matter.
+                    h.window = null;
+                    h.state = .done;
+                    return .{ .failed = .expired };
+                }
+            }
+            break :blk h.onMessage(msg, nowUs());
+        };
         switch (step) {
             .more => |r| if (r) |b| try s.write(b),
             .paired => |p| {
@@ -61,10 +101,21 @@ pub fn serveHost(s: Stream, f: *ex.Framer, h: *ex.Host, first: []const u8, nowUs
             },
         }
         msg = (try readMessage(s, f, &msg_buf)) orelse {
-            h.abort();
+            abortGuarded(h, guard);
             return .{ .failed = .protocol };
         };
     }
+}
+
+fn abortGuarded(h: *ex.Host, guard: ?Guard) void {
+    if (guard) |g| {
+        defer g.leave(g.ctx);
+        if (!g.enter(g.ctx)) {
+            h.state = .done;
+            return;
+        }
+    }
+    h.abort();
 }
 
 /// Client side: runs the whole exchange on `s`.
@@ -256,8 +307,8 @@ fn hostSide(end: *End, w: *ex.Window, out: *Outcome) anyerror!void {
     @memcpy(first_copy[0..first.len], first);
     switch (ex.classify(first)) {
         .pair => {
-            var h = ex.Host.init(w, host_id, client_id, [_]u8{3} ** 16, "desk");
-            out.* = try serveHost(end.stream(), &f, &h, first_copy[0..first.len], &zeroClock);
+            var h = ex.Host.init(w, host_id, client_id, [_]u8{3} ** 16, [_]u8{5} ** 32, "desk");
+            out.* = try serveHost(end.stream(), &f, &h, first_copy[0..first.len], &zeroClock, null);
         },
         .admit => {
             var o: ex.Out = .{};
@@ -281,7 +332,7 @@ test "the exchange over a byte stream: PIN pairs, then admission is refused for 
     var w: ex.Window = .{ .pin = "424242".*, .deadline_us = 1 };
     var host_out: Outcome = undefined;
     var task = try testing.io.concurrent(hostSide, .{ &ends[0], &w, &host_out });
-    var c = ex.Client.init(host_id, client_id, [_]u8{4} ** 16, .{ .pin = "424242".* }, "laptop");
+    var c = ex.Client.init(host_id, client_id, [_]u8{4} ** 16, [_]u8{6} ** 32, .{ .pin = "424242".* }, "laptop");
     const r = try runClient(ends[1].stream(), &c);
     ends[1].finish();
     try task.await(testing.io);
@@ -305,7 +356,7 @@ test "the exchange over a byte stream: a wrong PIN fails on both sides" {
     var w: ex.Window = .{ .pin = "424242".*, .deadline_us = 1 };
     var host_out: Outcome = undefined;
     var task = try testing.io.concurrent(hostSide, .{ &ends[0], &w, &host_out });
-    var c = ex.Client.init(host_id, client_id, [_]u8{4} ** 16, .{ .pin = "000000".* }, "laptop");
+    var c = ex.Client.init(host_id, client_id, [_]u8{4} ** 16, [_]u8{6} ** 32, .{ .pin = "000000".* }, "laptop");
     const r = try runClient(ends[1].stream(), &c);
     ends[1].finish();
     try task.await(testing.io);
