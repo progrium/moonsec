@@ -12,7 +12,7 @@ header ([mlh_enc.h](mlh_enc.h)) that translate-c reads; Zig never sees libva or 
 | --- | --- | --- |
 | `vaapi` | libva loaded at run time ([enc_vaapi.c](enc_vaapi.c)): `dlopen("libva.so.2")`, so the host starts on machines without it. H.264 (High, Main or Constrained Baseline) and HEVC Main, `VAEntrypointEncSlice` or the low-power `EncSliceLP`. CBR (VBR when there is no CBR) with a one-frame HRD buffer, no B-frames, no lookahead, no periodic IDR, `slices` slices per frame; a new bitrate goes out as rate-control and HRD parameters with the next frame, without an IDR. | Long-term references when the driver takes packed sequence, picture and slice headers; IDR otherwise. |
 | `software` | libavcodec's libx264 (OpenH264 if that is all libavcodec has) ([enc_sw.c](enc_sw.c)): tune `zerolatency`, `keyint=infinite`, `scenecut=0`, no B-frames, VBV of one frame, parameter sets on every IDR, `slices` slices. A new bitrate goes through `x264_encoder_reconfig`, no keyframe. H.264 only. | IDR (`ltr = false`). |
-| `nvenc` | Reserved. The Linux NVENC backend is built on the NVENC core shared with the Windows host (its own PR on top of #15, compile-only: no NVIDIA hardware is planned) and joins this dispatch when both have landed. | |
+| `nvenc` | libcuda and libnvidia-encode loaded at run time ([enc_nv.c](enc_nv.c) over [enc_nvenc.c](enc_nvenc.c)), on the NVENC core shared with the Windows host (`platform/nvenc`). H.264 and HEVC, the same low-latency settings as Windows. A dma-buf goes to CUDA with `cuImportExternalMemory`; when CUDA refuses it (a buffer another driver exported) frames are mapped and uploaded from then on. `--device` / `Options.device` is a CUDA ordinal. Compile-only: no NVIDIA hardware is planned. | Long-term references when the GPU has them; IDR otherwise. |
 | `auto` | The first of `vaapi`, `nvenc`, `software` that opens. | |
 
 ## Long-term references on VAAPI
@@ -78,7 +78,8 @@ zig build linux-enc-check -- --help         # the hardware check (moonsec-enc-ch
 - VAAPI: on a machine without a VAAPI encoder (Mesa has no software one, and CI has no GPU)
   `create` says not found and `auto` lands on software; on a machine with one, the test runs
   the hardware check on it instead;
-- NVENC: not available.
+- NVENC: without an NVIDIA driver `create` says not found and `auto` moves on; with one,
+  the test runs the hardware check on it.
 
 `moonsec-enc-check` drives an encoder through losses the way the session does: desktop-like
 content (a page of noisy text, a sliding window, the test pattern), a burst lost every 47

@@ -1,4 +1,4 @@
-/* Encoder dispatch: one mlh_enc API over the VAAPI and software backends, plus the pieces
+/* Encoder dispatch: one mlh_enc API over the VAAPI, NVENC and software backends, plus the pieces
  * they share (output buffer, slice split, error reporting, BGRA to I420). */
 #include <stdarg.h>
 #include <stdio.h>
@@ -35,10 +35,7 @@ int mlh_enc_create(uint32_t kind, const char *device, mlh_enc **out) {
     switch (kind) {
     case MLH_ENC_VAAPI: return mlh_enc_vaapi_create(device, out);
     case MLH_ENC_SOFTWARE: return mlh_enc_sw_create(out);
-    case MLH_ENC_NVENC:
-        /* The Linux NVENC backend is built on the shared NVENC core (platform/nvenc) and
-         * joins this dispatch once that lands next to this file. */
-        return mlh_fail(MLH_E_NOTFOUND, "NVENC: not built into this host");
+    case MLH_ENC_NVENC: return mlh_enc_nvenc_create(device, out);
     default: return mlh_fail(MLH_E_UNSUPPORTED, "encoder kind %u", kind);
     }
 }

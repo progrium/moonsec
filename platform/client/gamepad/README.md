@@ -30,7 +30,7 @@ target OS.
 | --- | --- | --- |
 | `xinput.Source` | `open(clock)`, never fails | Empty user slots are re-checked every 500 ms, since XInput is slow on them. GameInput (non-XInput pads) is a later addition. |
 | `gamecontroller.Source` | `open(clock)` | `GCController.controllers` is updated on the main run loop, which the macOS client runs; values are read from the input thread. Background monitoring is on (macOS 11.3+). |
-| `evdev.Source` | `open(clock, .{})` | Watches `/dev/input`; reads need the uaccess ACL desktops give pads. Times are the kernel's, on CLOCK_MONOTONIC. Microsoft pads (xpad) swap BTN_NORTH/WEST back to X/Y. |
+| `evdev.Source` | `open(clock, .{})` | Watches `/dev/input`; reads need the uaccess ACL desktops give pads. Times are the kernel's, on CLOCK_MONOTONIC. Microsoft pads (xpad) swap BTN_NORTH/WEST back to X/Y. Skips the Linux host's own uinput pads ("moonsec pad N"), so a client on the host machine doesn't feed them back (`skip_host_pads = false` to read them). |
 
 Build: `zig build test` runs the unit tests on any OS; `zig build test-gamepad`
 runs only these. On Linux the uinput tests skip without a writable
