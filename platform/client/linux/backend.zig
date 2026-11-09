@@ -15,8 +15,9 @@
 //!               smooth: swap interval 1. The latency overlay is drawn on top.
 //!   AudioSink   PipeWire playback stream, f32, fed from a ring (mlc_audio.c).
 //!   InputSource Keyboard and mouse from evdev (evdev.zig), only while the window has
-//!               keyboard focus (held keys are released when it loses it); the window's
-//!               close button is `.quit`.
+//!               keyboard focus (held keys are released when it loses it); gamepads
+//!               from platform/client/gamepad/evdev.zig, which takes the BTN_SOUTH nodes
+//!               the keyboard/mouse side skips; the window's close button is `.quit`.
 //!
 //! The clock is CLOCK_MONOTONIC.
 
@@ -26,6 +27,7 @@ const overlay = @import("client_overlay");
 const synthetic = @import("synthetic");
 pub const evdev = @import("evdev.zig");
 pub const uinput = @import("uinput.zig");
+pub const gamepad = @import("client_gamepad");
 
 pub const c = @import("mlc_c");
 
@@ -45,6 +47,8 @@ pub const Options = struct {
     /// Take the evdev devices exclusively while the window has focus (EVIOCGRAB), so the
     /// desktop doesn't also act on the keys. Off for a windowed client.
     grab: bool = false,
+    /// Gamepads through evdev (platform/client/gamepad/evdev.zig).
+    gamepads: bool = true,
     /// Read every presented picture back from the GL back buffer and decode the test
     /// pattern from it (synthetic host only): the end-to-end check in CI.
     verify_pattern: bool = false,
@@ -401,6 +405,9 @@ pub const InputSource = struct {
     window: *c.mlc_window,
     devices: ?evdev.Devices,
     grab: bool,
+    /// Gamepads; null with `Options.gamepads` off. Pad events are not gated on focus:
+    /// the pad source has no focus of its own, as on Windows.
+    pads: ?gamepad.evdev.Source = null,
     held: evdev.Held = .{},
     focused: bool = true,
     quit_sent: bool = false,
@@ -427,7 +434,7 @@ pub const InputSource = struct {
             s.pending_n -= 1;
             n += 1;
         }
-        const devs = if (s.devices) |*d| d else return n;
+        const devs = if (s.devices) |*d| d else return n + try s.pollPads(out[n..]);
         if (now >= s.next_scan) {
             _ = devs.scan();
             s.next_scan = now + scan_interval_us;
@@ -438,7 +445,10 @@ pub const InputSource = struct {
             if (s.grab) devs.setGrabAll(focused);
             if (!focused) s.pending_n += s.held.releaseAll(now, s.pending[s.pending_n..]);
         }
-        if (s.pending_n > 0) return n + s.drainPending(out[n..]);
+        if (s.pending_n > 0) {
+            n += s.drainPending(out[n..]);
+            return n + try s.pollPads(out[n..]);
+        }
         var buf: [64]api.InputEvent = undefined;
         const k = devs.read(&buf);
         for (buf[0..k]) |e| {
@@ -456,7 +466,14 @@ pub const InputSource = struct {
                 s.pending_n += 1;
             }
         }
-        return n;
+        return n + try s.pollPads(out[n..]);
+    }
+
+    /// The pad source keeps its own queue, so what does not fit waits for the next poll.
+    fn pollPads(s: *InputSource, out: []api.InputEvent) api.Error!usize {
+        const p = if (s.pads) |*p| p else return 0;
+        if (out.len == 0) return 0;
+        return p.poll(out);
     }
 
     fn drainPending(s: *InputSource, out: []api.InputEvent) usize {
@@ -469,6 +486,7 @@ pub const InputSource = struct {
 
     pub fn deinit(s: *InputSource) void {
         if (s.devices) |*d| d.deinit();
+        if (s.pads) |*p| p.close();
     }
 };
 
@@ -536,6 +554,13 @@ pub fn open(gpa: std.mem.Allocator, opts: Options) !*Client {
         if (n == 0) log.info("evdev: no keyboard or mouse yet (rescanning every {d} s)", .{InputSource.scan_interval_us / 1_000_000});
     }
 
+    var pads: ?gamepad.evdev.Source = null;
+    if (opts.gamepads) pads = gamepad.evdev.Source.open(clock, .{}) catch |e| blk: {
+        log.warn("gamepads: {s}", .{@errorName(e)});
+        break :blk null;
+    };
+    errdefer if (pads) |*p| p.close();
+
     const cl = try gpa.create(Client);
     cl.* = .{
         .gpa = gpa,
@@ -557,7 +582,7 @@ pub fn open(gpa: std.mem.Allocator, opts: Options) !*Client {
             .verify = opts.verify_pattern,
         },
         .audio = .{ .ring_ms = opts.audio_ring_ms, .quantum = opts.audio_quantum },
-        .input = .{ .window = w.?, .devices = devices, .grab = opts.grab },
+        .input = .{ .window = w.?, .devices = devices, .grab = opts.grab, .pads = pads },
     };
     return cl;
 }
