@@ -95,7 +95,11 @@ static uint32_t env_u32(const char *name) {
     return v ? (uint32_t)strtoul(v, NULL, 10) : 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    /* "multi": the same on a multi-user host (max_clients 2), the shared capture and
+     * encode. One capture per run: headless.sh's Weston does not survive a capture after a
+     * finished session, so each mode runs under its own. */
+    int multi = argc > 1 && strcmp(argv[1], "multi") == 0;
     uint32_t f = moonsec_features();
     if (!(f & MOONSEC_FEATURE_SYSTEM_BACKEND) || !(f & MOONSEC_FEATURE_IROH)) {
         fprintf(stderr, "abi system test: this library has no system backend or no iroh (build with -Dabi-system=true)\n");
@@ -119,10 +123,11 @@ int main(void) {
     hc.backend = MOONSEC_BACKEND_SYSTEM;
     hc.state_dir = ""; /* key in memory */
     hc.name = "abi system host";
-    hc.flags = MOONSEC_HOST_APP_INPUT;
+    hc.flags = MOONSEC_HOST_APP_INPUT | MOONSEC_HOST_INSECURE_NO_PAIRING; /* no pairing in this test */
     hc.relay_mode = MOONSEC_RELAY_DISABLED;
     hc.fps = 30;
     hc.bitrate_bps = 4000000;
+    hc.max_clients = multi ? 2 : 0;
     moonsec_host *h = NULL;
     OK(moonsec_host_create(&hc, &h));
 
@@ -132,7 +137,7 @@ int main(void) {
     cc.backend = MOONSEC_BACKEND_SYSTEM;
     cc.state_dir = "";
     cc.name = "abi system client";
-    cc.flags = MOONSEC_CLIENT_NO_OS_INPUT;
+    cc.flags = MOONSEC_CLIENT_NO_OS_INPUT | MOONSEC_CLIENT_INSECURE_NO_PAIRING;
     cc.on_frame = on_frame;
     moonsec_client *c = NULL;
     OK(moonsec_client_create(&cc, &c));
@@ -184,8 +189,8 @@ int main(void) {
     CHECK(t.stages[MOONSEC_STAGE_DECODE].count > 0);
     CHECK(frames_seen > 20 && frames_with_image == frames_seen);
     CHECK(frame_w == w && frame_h == hgt);
-    printf("system: %ux%u codec %u, client presented %llu frames (lost %llu, freezes %llu), decode p50 %.2f ms, glass-to-glass p50 %.2f ms p99 %.2f ms\n",
-           w, hgt, codec, (unsigned long long)t.frames, (unsigned long long)t.frames_lost, (unsigned long long)t.freezes,
+    printf("system%s: %ux%u codec %u, client presented %llu frames (lost %llu, freezes %llu), decode p50 %.2f ms, glass-to-glass p50 %.2f ms p99 %.2f ms\n",
+           multi ? " (multi-user host)" : "", w, hgt, codec, (unsigned long long)t.frames, (unsigned long long)t.frames_lost, (unsigned long long)t.freezes,
            t.stages[MOONSEC_STAGE_DECODE].p50_us / 1000.0, t.stages[MOONSEC_STAGE_TOTAL].p50_us / 1000.0,
            t.stages[MOONSEC_STAGE_TOTAL].p99_us / 1000.0);
 
@@ -200,6 +205,6 @@ int main(void) {
         fprintf(stderr, "abi system test: %d failures\n", failures);
         return 1;
     }
-    printf("abi system test: ok\n");
+    printf("abi system test%s: ok\n", multi ? " (multi-user host)" : "");
     return 0;
 }

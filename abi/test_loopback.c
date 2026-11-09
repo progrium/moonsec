@@ -137,8 +137,12 @@ static void test_basics(void) {
     hc.backend = MOONSEC_BACKEND_SYSTEM;
     CHECK(moonsec_host_create(&hc, &h) == MOONSEC_ERR_UNSUPPORTED);
     hc.backend = MOONSEC_BACKEND_SYNTHETIC;
-    hc.max_clients = 2;
-    CHECK(moonsec_host_create(&hc, &h) == MOONSEC_ERR_UNSUPPORTED);
+    hc.max_clients = 2; /* multi-user hosts run over iroh only */
+    if (moonsec_features() & MOONSEC_FEATURE_MULTI_USER) {
+        OK(moonsec_host_create(&hc, &h));
+        moonsec_host_destroy(h);
+    } else
+        CHECK(moonsec_host_create(&hc, &h) == MOONSEC_ERR_UNSUPPORTED);
     hc.max_clients = 0;
     hc.relay_mode = MOONSEC_RELAY_CUSTOM; /* without relay_url */
     CHECK(moonsec_host_create(&hc, &h) == MOONSEC_ERR_INVALID);
