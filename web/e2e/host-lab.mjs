@@ -21,7 +21,7 @@ export const playwright = createRequire(join(web, "package.json"))("playwright")
 export const args = Object.fromEntries(process.argv.slice(2).reduce((a, v, i, all) => (v.startsWith("--") ? [...a, [v.slice(2), all[i + 1]?.startsWith("--") ? "1" : (all[i + 1] ?? "1")]] : a), []));
 
 const procs = [];
-function start(name, cmd, argv, opts = {}) {
+export function start(name, cmd, argv, opts = {}) {
   const p = spawn(cmd, argv, { stdio: ["ignore", "pipe", "pipe"], ...opts });
   p.log = "";
   const tee = (d) => {
@@ -59,6 +59,12 @@ export async function startLab() {
       return false;
     }
   });
+  return serveWeb();
+}
+
+/** Serves web/, with shim-web/pkg at /pkg/ and zig-out/web's wasm in /dist/, on loopback
+ * (port 0: any free one); resolves to { base, server }. */
+export async function serveWeb(port = 0) {
   const types = { ".html": "text/html", ".js": "text/javascript", ".wasm": "application/wasm", ".json": "application/json", ".map": "application/json" };
   const server = createServer((req, res) => {
     const p = decodeURIComponent(new URL(req.url, "http://x").pathname);
@@ -70,7 +76,7 @@ export async function startLab() {
     if (!existsSync(file)) return res.writeHead(404).end();
     res.writeHead(200, { "content-type": types[extname(file)] ?? "application/octet-stream", "cache-control": "no-store" }).end(readFileSync(file));
   });
-  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  await new Promise((r) => server.listen(port, "127.0.0.1", r));
   return { base: `http://127.0.0.1:${server.address().port}`, server };
 }
 

@@ -1,0 +1,9 @@
+# iroh-relay 1.4.1 config for a relay on this machine only (web/e2e/local.mjs): plain HTTP
+# on loopback, so a browser page and a native host reach it with no certificate. Not for a
+# network: there is no TLS. Clients use http://127.0.0.1:3340.
+
+http_bind_addr = "127.0.0.1:3340"
+enable_relay = true
+enable_quic_addr_discovery = false
+enable_metrics = false
+access = "everyone"

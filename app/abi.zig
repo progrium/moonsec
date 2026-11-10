@@ -1689,8 +1689,11 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
     };
     switch (ex.classify(first)) {
         .pair => {
-            defer s.close();
+            // Deferred in this order so the stream closes first: `close` waits for the
+            // client to finish its side, so the last message gets there and the client
+            // sees the end of the stream, not a closed connection.
             defer conn.deinit(0);
+            defer s.close();
             var nonce: ex.Nonce = undefined;
             io().random(&nonce);
             var seed: ex.Seed = undefined;

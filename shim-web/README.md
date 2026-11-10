@@ -87,6 +87,11 @@ zig build install install-moonsec -Doptimize=ReleaseSafe   # native peers: shim-
 node shim-web/test/run.mjs --browsers chromium,firefox,webkit
 ```
 
+`ring` compiles C for wasm32, which Apple's clang can't target. On macOS, point it at
+Homebrew's LLVM: `brew install llvm`, then `CC_wasm32_unknown_unknown=$(brew --prefix
+llvm)/bin/clang AR_wasm32_unknown_unknown=$(brew --prefix llvm)/bin/llvm-ar shim-web/build.sh`.
+iroh-relay 1.4.1 needs Rust 1.91 or newer (`rustup update stable`).
+
 `run.mjs` starts `iroh-relay` with `relay/lab.toml` and a lab CA, serves the test page, runs
 `shim-echo serve` (datagram and stream echo, plus throughput commands) and, per browser:
 
