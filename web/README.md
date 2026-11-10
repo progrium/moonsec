@@ -141,6 +141,28 @@ Not done here: HEVC and AV1 codec strings are parsed but untested (no browser he
 decodes HEVC; AV1 has no fixture). Draw time is when `drawImage` returns, not when the
 compositor shows the frame (about one to two frames more, per the design).
 
+## A native host in the browser
+
+A native host (`moonsec-example-host`, on the C ABI) and this client on one machine, through
+a relay on loopback. `npm run local` starts `iroh-relay` with [relay/local.toml](../relay/local.toml)
+(plain HTTP on 127.0.0.1:3340: no certificate for the browser or the host to trust, and only
+for this machine) and serves the client on http://127.0.0.1:8790. The host's `--relay-url`
+puts it on that relay, and it prints the client links.
+
+```sh
+zig build web-wasm examples        # Linux: add -Dabi-system=true for --system
+shim-web/build.sh                  # macOS: needs a clang with wasm32, see shim-web/README.md
+cd web && npm ci && npm run build && npm run local     # leave it running
+# in another terminal, from the repo root:
+zig-out/bin/moonsec-example-host --system --pair --relay-url http://127.0.0.1:3340 --seconds 3600
+```
+
+Open the host's "pairs, then connects" link within 120 s and click **Connect**: the browser
+pairs (QR ticket, no PIN) and streams the screen. Later, with the browser paired, start the
+host without `--pair` and use its "once paired" link. `--system` matters: without it the
+host streams the test pattern in a codec only native clients decode, and the browser gets no
+session. Tested on Linux (the Linux host in headless Weston, Chromium); not yet on macOS.
+
 ## Hardware checks for Jeff
 
 On a real machine with a mouse, keyboard and controller, against the harness:

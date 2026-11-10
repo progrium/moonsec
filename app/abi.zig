@@ -479,6 +479,9 @@ fn pollEvent(e: *Endpoint, ev: ?*c.moonsec_event, timeout_ms: u32) i32 {
             return 1;
         }
         if (wallNow() >= deadline) return 0;
+        // macOS: a caller on the main thread is the one that runs AppKit there, so
+        // waiting here handles the client window's events and lets its run loop commit.
+        system.pumpMain();
         io().sleep(.fromMilliseconds(1), .awake) catch {};
     }
 }
@@ -1686,8 +1689,11 @@ fn handleConn(e: *Endpoint, conn: iroh.Conn) !void {
     };
     switch (ex.classify(first)) {
         .pair => {
-            defer s.close();
+            // Deferred in this order so the stream closes first: `close` waits for the
+            // client to finish its side, so the last message gets there and the client
+            // sees the end of the stream, not a closed connection.
             defer conn.deinit(0);
+            defer s.close();
             var nonce: ex.Nonce = undefined;
             io().random(&nonce);
             var seed: ex.Seed = undefined;

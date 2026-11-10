@@ -12,7 +12,7 @@
 //!   macOS    host: ScreenCaptureKit, VideoToolbox, CGEvent (platform/host/macos); client:
 //!            VideoToolbox, a Metal window, CoreAudio, GameController
 //!            (platform/client/macos). The window is created on the main thread, which
-//!            must run its run loop.
+//!            must run its run loop, or call `pumpMain` (moonsec_*_poll_event does).
 const std = @import("std");
 const builtin = @import("builtin");
 const options = @import("app_options");
@@ -100,6 +100,13 @@ pub fn openClient(gpa: std.mem.Allocator, cfg: ClientConfig) Error!api.ClientBac
         .macos => return client_mod.openClient(gpa, .{ .width = cfg.width, .height = cfg.height, .title = cfg.title, .gamepads = cfg.input }) catch |e| mapErr(e),
         else => return error.Unsupported,
     }
+}
+
+/// macOS: handles AppKit's pending events when called on the main thread, which also
+/// runs the main run loop once, so the client window shows and draws, and work queued
+/// for the main thread runs. Does nothing on another thread or another OS.
+pub fn pumpMain() void {
+    if (available and builtin.os.tag == .macos) client_mod.pumpEvents();
 }
 
 fn mapErr(e: anyerror) Error {
