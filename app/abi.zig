@@ -479,6 +479,9 @@ fn pollEvent(e: *Endpoint, ev: ?*c.moonsec_event, timeout_ms: u32) i32 {
             return 1;
         }
         if (wallNow() >= deadline) return 0;
+        // macOS: a caller on the main thread is the one that runs AppKit there, so
+        // waiting here handles the client window's events and lets its run loop commit.
+        system.pumpMain();
         io().sleep(.fromMilliseconds(1), .awake) catch {};
     }
 }

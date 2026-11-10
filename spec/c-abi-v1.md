@@ -142,7 +142,7 @@ sessions). Releasing a session drops its queued events.
   | --- | --- | --- |
   | Linux | ScreenCast portal + PipeWire capture, VAAPI then libx264 (NVENC when the Linux NVENC backend joins the picker), PipeWire audio, uinput | libavcodec (VAAPI, software), a Wayland + EGL window, PipeWire, evdev |
   | Windows | Desktop Duplication, NVENC then Media Foundation, WASAPI loopback, SendInput | Media Foundation / D3D11VA, a flip-model swapchain, WASAPI, Raw Input and XInput |
-  | macOS | ScreenCaptureKit, VideoToolbox, CGEvent | VideoToolbox, a Metal window (made on the main thread, which must run its run loop), CoreAudio, GameController |
+  | macOS | ScreenCaptureKit, VideoToolbox, CGEvent | VideoToolbox, a Metal window (made on the main thread, which must run its run loop, or poll events there: `moonsec_client_poll_event` on the main thread handles AppKit's events while it waits), CoreAudio, GameController |
 
   A Linux host with a state directory keeps the portal's restore token there
   (`screencast.token`), so the user approves screen sharing once. Audio is left out when

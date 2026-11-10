@@ -462,7 +462,9 @@ typedef struct moonsec_event {
 
 /* Take the oldest event: 1 if `*event` was filled, 0 if the queue is empty,
  * <0 on error. `timeout_ms` > 0 waits that long for one (not in loopback
- * mode, where events come only from moonsec_loopback_advance). */
+ * mode, where events come only from moonsec_loopback_advance). On macOS, a
+ * call on the main thread handles AppKit's events while it waits, so a
+ * MOONSEC_BACKEND_SYSTEM client's window shows and draws without [NSApp run]. */
 MOONSEC_API int32_t moonsec_host_poll_event(moonsec_host *host, moonsec_event *event, uint32_t timeout_ms);
 MOONSEC_API int32_t moonsec_client_poll_event(moonsec_client *client, moonsec_event *event, uint32_t timeout_ms);
 
