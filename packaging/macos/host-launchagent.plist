@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Starts the moonsec host in every user's login session (installed to
+     /Library/LaunchAgents by the .pkg). launchd doesn't expand $HOME, so a shell does,
+     then execs the app's binary, which stays the process TCC sees for Screen Recording
+     and Accessibility. Each run serves one session; KeepAlive starts the next. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.github.progrium.moonsec.host</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>d="$HOME/Library/Application Support/moonsec"; mkdir -p "$d" &amp;&amp; exec "/Applications/moonsec Host.app/Contents/MacOS/moonsec" peer iroh host --relay --state-dir "$d" --ticket-file "$d/host-ticket" &gt;&gt;"$d/host.log" 2&gt;&amp;1</string>
+	</array>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>2</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>

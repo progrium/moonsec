@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hardened runtime entitlements for the client: none beyond the defaults (it decodes
+     with VideoToolbox, plays with Core Audio and reads input in its own window). -->
+<plist version="1.0">
+<dict/>
+</plist>

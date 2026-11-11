@@ -1,0 +1,22 @@
+# moonsec host, per user: `systemctl --user enable --now moonsec-host`.
+# Capture (PipeWire portal) and input (uinput) need the user's graphical session, so
+# this is a user unit started with it, not a system service.
+[Unit]
+Description=moonsec host (low-latency desktop streaming)
+Documentation=https://github.com/progrium/moonsec
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+Wants=pipewire.service
+# Keep restarting: each run serves one session (see moonsec-host).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=-%E/moonsec/host.env
+ExecStart=/usr/lib/moonsec/moonsec-host
+Restart=always
+RestartSec=1
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

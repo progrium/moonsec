@@ -1,0 +1,5 @@
+# moonsec host input (7C): virtual keyboard, mouse and gamepads through /dev/uinput.
+# Gives the user at the active seat access to /dev/uinput (systemd-logind's uaccess
+# tag), the way Steam's rules do for controllers. static_node creates the node before
+# the module is loaded; packaging/linux/moonsec-uinput.conf loads it at boot.
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"
