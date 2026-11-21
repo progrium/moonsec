@@ -2,9 +2,11 @@
 //! CGEvent input, behind the platform interface (platform/api.zig). The Objective-C side
 //! is in the .m files next to this one; Zig sees only mh.h.
 //!
-//!   Capture        SCStream on a display, newest-frame mailbox. `Image.gpu` is the
-//!                  frame's CVPixelBufferRef (IOSurface-backed), NV12 by default.
-//!                  captured_us is SCK's display time, never later than arrival.
+//!   Capture        SCStream on a display, or on one window (`CaptureConfig.window`, a
+//!                  CGWindowID from `listWindows`), newest-frame mailbox. `Image.gpu` is
+//!                  the frame's CVPixelBufferRef (IOSurface-backed), NV12 by default.
+//!                  captured_us is SCK's display time, never later than arrival. A
+//!                  window captured at its own size is followed when it is resized.
 //!   Encoder        VideoToolbox. Default: the low-latency encoder with long-term
 //!                  references, RealTime on, ExpectedFrameRate 1000 (S7b). Falls back to
 //!                  the regular encoder (no LTR) when the low-latency one is missing.
@@ -91,8 +93,10 @@ pub const Capture = struct {
     /// Restarts after the stream stopped under us.
     restarts: u32 = 0,
     /// The bundle's injector, pointed at each display capture starts on so absolute
-    /// moves land on the streamed display.
+    /// moves land on the streamed display (or window).
     input: ?*c.mh_input = null,
+    /// A window captured at its own size: when to look at its size next.
+    next_window_check_us: api.Micros = 0,
 
     pub fn create(format: api.PixelFormat) api.Error!Capture {
         _ = try fmtToC(format);
@@ -108,6 +112,11 @@ pub const Capture = struct {
 
     pub fn start(self: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
         self.stop();
+        // Windows by id only: no picker (yet), and CGWindowIDs are 32-bit.
+        if (cfg.window > std.math.maxInt(u32)) {
+            log.err("window {d}: macOS shares a window by its id from the window list", .{cfg.window});
+            return error.Unsupported;
+        }
         const cc: c.mh_capture_config = .{
             .display = cfg.display,
             .fps = cfg.fps,
@@ -116,6 +125,7 @@ pub const Capture = struct {
             .cursor = @intFromBool(cfg.cursor),
             .format = try fmtToC(self.format),
             .queue_depth = self.queue_depth,
+            .window = @intCast(cfg.window),
         };
         var w: u32 = 0;
         var h: u32 = 0;
@@ -126,8 +136,33 @@ pub const Capture = struct {
         self.cfg = cfg;
         self.started = true;
         self.size = .{ .width = w, .height = h };
-        if (self.input) |in| c.mh_input_set_display(in, cfg.display);
+        if (self.input) |in| {
+            c.mh_input_set_display(in, cfg.display);
+            c.mh_input_set_window(in, @intCast(cfg.window));
+        }
+        self.next_window_check_us = nowUs() + window_check_us;
         return self.size;
+    }
+
+    const window_check_us = 250_000;
+
+    /// A window captured at its own size: when it has been resized, ask SCK for frames
+    /// of its new size (the app sees a new frame size and reconfigures the encoder).
+    fn followWindow(self: *Capture) void {
+        if (self.cfg.window == 0 or self.cfg.width != 0 or self.cfg.height != 0) return;
+        const now = nowUs();
+        if (now < self.next_window_check_us) return;
+        self.next_window_check_us = now + window_check_us;
+        var w: u32 = 0;
+        var h: u32 = 0;
+        // Gone: the stream stops too, and acquire reports that.
+        if (c.mh_window_pixels(@intCast(self.cfg.window), &w, &h) != c.MH_OK) return;
+        if (w == self.size.width and h == self.size.height) return;
+        if (c.mh_capture_update(self.cap, w, h, 0) != c.MH_OK) {
+            log.warn("window resized to {d}x{d}; capture kept {d}x{d}: {s}", .{ w, h, self.size.width, self.size.height, lastError() });
+            return;
+        }
+        self.size = .{ .width = w, .height = h };
     }
 
     /// The active displays (`CaptureConfig.display` is the index in this list, 0 = main).
@@ -137,6 +172,7 @@ pub const Capture = struct {
 
     pub fn acquire(self: *Capture, timeout_us: api.Micros) api.Error!?api.CapturedFrame {
         if (!self.started) return error.Closed;
+        self.followWindow();
         const start_us = nowUs();
         var f: c.mh_frame = undefined;
         const rc = c.mh_capture_acquire(self.cap, timeout_us, &f);
@@ -211,6 +247,33 @@ pub fn listDisplays(out: []api.DisplayInfo) api.Error!usize {
     const n = @min(total, buf.len, out.len);
     for (buf[0..n], out[0..n]) |*m, *o| o.* = displayInfo(m);
     return n;
+}
+
+/// The windows ScreenCaptureKit can capture: normal on-screen windows of other apps, in
+/// SCK's order. Ids are CGWindowIDs (what `CaptureConfig.window` takes); frames are in
+/// points on the global display space. Needs Screen Recording permission.
+pub fn listWindows(out: []api.WindowInfo) api.Error!usize {
+    var buf: [256]c.mh_window_info = undefined;
+    var total: u32 = 0;
+    try check("window list", c.mh_windows(&buf, buf.len, &total));
+    const n = @min(total, buf.len, out.len);
+    for (buf[0..n], out[0..n]) |*m, *o| o.* = windowInfo(m);
+    return n;
+}
+
+pub fn windowInfo(m: *const c.mh_window_info) api.WindowInfo {
+    var w: api.WindowInfo = .{
+        .id = m.id,
+        .pid = m.pid,
+        .x = m.x,
+        .y = m.y,
+        .width = m.width,
+        .height = m.height,
+        .on_screen = m.on_screen != 0,
+    };
+    w.setApp(std.mem.sliceTo(&m.app, 0));
+    w.setTitle(std.mem.sliceTo(&m.title, 0));
+    return w;
 }
 
 pub fn displayInfo(m: *const c.mh_display_info) api.DisplayInfo {

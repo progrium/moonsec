@@ -100,6 +100,11 @@ int main(int argc, char **argv) {
      * encode. One capture per run: headless.sh's Weston does not survive a capture after a
      * finished session, so each mode runs under its own. */
     int multi = argc > 1 && strcmp(argv[1], "multi") == 0;
+    /* "window": share one window instead of the display (Linux: the portal's dialog
+     * offers windows, which the test portal answers with its node as a window; macOS: the
+     * first window in moonsec_host_windows). */
+    int window = argc > 1 && strcmp(argv[1], "window") == 0;
+    const char *mode = multi ? " (multi-user host)" : window ? " (one window)" : "";
     uint32_t f = moonsec_features();
     if (!(f & MOONSEC_FEATURE_SYSTEM_BACKEND) || !(f & MOONSEC_FEATURE_IROH)) {
         fprintf(stderr, "abi system test: this library has no system backend or no iroh (build with -Dabi-system=true)\n");
@@ -129,6 +134,34 @@ int main(int argc, char **argv) {
     hc.bitrate_bps = 4000000;
     hc.max_clients = multi ? 2 : 0;
     moonsec_host *h = NULL;
+    if (window) {
+        if (!(f & MOONSEC_FEATURE_WINDOWS)) {
+            hc.window = MOONSEC_WINDOW_PICK;
+            CHECK(moonsec_host_create(&hc, &h) == MOONSEC_ERR_UNSUPPORTED);
+            printf("abi system test (one window): this OS shares displays only\n");
+            return failures ? 1 : 0;
+        }
+        OK(moonsec_host_create(&hc, &h));
+        moonsec_window_info wi[16];
+        size_t nw = 0;
+        moonsec_status st = moonsec_host_windows(h, wi, 16, &nw);
+#ifdef __APPLE__
+        OK(st);
+        if (nw == 0) {
+            printf("abi system test (one window): no shareable window, skipped\n");
+            return failures ? 1 : 0;
+        }
+        printf("window: %s \"%s\" %ux%u\n", wi[0].app, wi[0].title, wi[0].width, wi[0].height);
+        hc.window = wi[0].id;
+        CHECK(wi[0].id != 0 && wi[0].width > 0);
+#else
+        /* No list: the user picks in the portal's dialog. */
+        CHECK(st == MOONSEC_ERR_UNSUPPORTED && nw == 0);
+        hc.window = MOONSEC_WINDOW_PICK;
+#endif
+        moonsec_host_destroy(h);
+        h = NULL;
+    }
     OK(moonsec_host_create(&hc, &h));
 
     moonsec_client_config cc;
@@ -190,7 +223,7 @@ int main(int argc, char **argv) {
     CHECK(frames_seen > 20 && frames_with_image == frames_seen);
     CHECK(frame_w == w && frame_h == hgt);
     printf("system%s: %ux%u codec %u, client presented %llu frames (lost %llu, freezes %llu), decode p50 %.2f ms, glass-to-glass p50 %.2f ms p99 %.2f ms\n",
-           multi ? " (multi-user host)" : "", w, hgt, codec, (unsigned long long)t.frames, (unsigned long long)t.frames_lost, (unsigned long long)t.freezes,
+           mode, w, hgt, codec, (unsigned long long)t.frames, (unsigned long long)t.frames_lost, (unsigned long long)t.freezes,
            t.stages[MOONSEC_STAGE_DECODE].p50_us / 1000.0, t.stages[MOONSEC_STAGE_TOTAL].p50_us / 1000.0,
            t.stages[MOONSEC_STAGE_TOTAL].p99_us / 1000.0);
 
@@ -205,6 +238,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "abi system test: %d failures\n", failures);
         return 1;
     }
-    printf("abi system test%s: ok\n", multi ? " (multi-user host)" : "");
+    printf("abi system test%s: ok\n", mode);
     return 0;
 }

@@ -50,6 +50,9 @@ pub const HostOptions = struct {
     ten_bit: bool = false,
     hdr: bool = true,
     display: u32 = 0,
+    /// Share one window instead of the display (`api.CaptureConfig.window`); 0: the display.
+    /// A client's select of another display leaves the window for that display.
+    window: u64 = 0,
     width: u32 = 0,
     height: u32 = 0,
     /// Re-send the last picture when the screen has not changed for this long, so a
@@ -86,13 +89,17 @@ pub const HostApp = struct {
     /// What capture runs at now: display, frame rate, and whether at the display's own
     /// size (the top of the ladder) or scaled. `cap` is the client's latest size and rate cap.
     display: u32,
+    /// The window capture runs on (0: the display), and its size when captured at its
+    /// own size (the ladder's top), which stands in for the display's size.
+    window: u64 = 0,
+    window_size: ?api.Size = null,
     fps: u32,
     cap: struct { width: u32 = 0, height: u32 = 0, fps: u32 = 0 } = .{},
     next_display_poll: Micros = 0,
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0, reconfigure_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: HostOptions, p: pipe_mod.PacketPipe) !HostApp {
-        const size = try be.capture.start(.{ .display = o.display, .fps = o.fps, .width = o.width, .height = o.height, .hdr = o.hdr });
+        const size = try be.capture.start(.{ .display = o.display, .window = o.window, .fps = o.fps, .width = o.width, .height = o.height, .hdr = o.hdr });
         errdefer be.capture.stop();
         const caps = be.encoder.caps();
         if (!caps.codecs.has(o.codec)) return error.Unsupported;
@@ -102,7 +109,8 @@ pub const HostApp = struct {
         for ([_]api.Codec{ o.codec, .hevc, .h264, .av1, .passthrough }) |c| {
             if (caps.codecs.has(c)) order.add(@intFromEnum(c));
         }
-        var app: HostApp = .{ .be = be, .s = undefined, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr, .display = o.display, .fps = o.fps };
+        var app: HostApp = .{ .be = be, .s = undefined, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr, .display = o.display, .fps = o.fps, .window = o.window };
+        if (o.window != 0 and o.width == 0 and o.height == 0) app.window_size = size;
         var s = try HostSession.init(gpa, .{
             .negotiate = .{
                 .encoder = api.effectiveFormats(caps.codecs, caps.coded),
@@ -176,6 +184,8 @@ pub const HostApp = struct {
             // The display changed mode under the capture: encode at the new size from here.
             const sz: api.Size = .{ .width = f.image.width, .height = f.image.height };
             if (a.configureEncoder(sz, a.fps)) {
+                // A window captured at its own size was resized: that is its size now.
+                if (a.window_size != null) a.window_size = sz;
                 a.size = sz;
                 if (lock) |l| l.lock();
                 a.s.onReconfigured(.{ .width = sz.width, .height = sz.height, .fps = a.fps, .display = a.display, .why = .mode }, a.be.clock.now());
@@ -230,22 +240,31 @@ pub const HostApp = struct {
     /// Restart capture on `display` at `width`×`height` (0: its own size) and `fps`, and
     /// configure the encoder for what capture delivers. On failure, capture goes back to
     /// what it was.
+    /// A window being shared stays shared while `display` is the current one; another
+    /// display leaves it.
     fn restart(a: *HostApp, display: u32, width: u32, height: u32, fps: u32) api.Error!api.Size {
         a.be.capture.stop();
-        const sz = a.be.capture.start(.{ .display = display, .fps = fps, .width = width, .height = height, .hdr = a.opts.hdr }) catch |e| {
-            a.size = a.be.capture.start(.{ .display = a.display, .fps = a.fps, .hdr = a.opts.hdr }) catch return e;
+        const window = if (display == a.display) a.window else 0;
+        const sz = a.be.capture.start(.{ .display = display, .window = window, .fps = fps, .width = width, .height = height, .hdr = a.opts.hdr }) catch |e| {
+            a.size = a.be.capture.start(.{ .display = a.display, .window = a.window, .fps = a.fps, .hdr = a.opts.hdr }) catch return e;
             return e;
         };
         try a.configureEncoder(sz, fps);
         a.size = sz;
+        if (window == 0) {
+            a.window_size = null;
+        } else if (width == 0 and height == 0) a.window_size = sz;
+        a.window = window;
         a.display = display;
         a.fps = fps;
         a.last_frame_us = null;
         return sz;
     }
 
-    /// The display's own size, if listed.
+    /// The display's own size, if listed; for the current display while a window is
+    /// shared, the window's.
     fn displaySize(a: *HostApp, id: u32) ?api.Size {
+        if (a.window != 0 and id == a.display) return a.window_size orelse a.size;
         var dl: [core.display.DisplayList.max_displays]api.DisplayInfo = undefined;
         const n = a.be.capture.displays(&dl) catch return if (id == a.display) a.size else null;
         for (dl[0..n]) |d| if (d.id == id) return .{ .width = d.width, .height = d.height };

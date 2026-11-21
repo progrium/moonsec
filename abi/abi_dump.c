@@ -79,6 +79,7 @@ static void dump(void) {
     F(moonsec_host_config, bind_addr);
     F(moonsec_host_config, notify);
     F(moonsec_host_config, notify_ctx);
+    F(moonsec_host_config, window);
     S(moonsec_pair_config);
     F(moonsec_pair_config, struct_size);
     F(moonsec_pair_config, seconds);
@@ -98,6 +99,17 @@ static void dump(void) {
     F(moonsec_display_info, primary);
     F(moonsec_display_info, hdr);
     F(moonsec_display_info, name);
+
+    S(moonsec_window_info);
+    F(moonsec_window_info, id);
+    F(moonsec_window_info, pid);
+    F(moonsec_window_info, x);
+    F(moonsec_window_info, y);
+    F(moonsec_window_info, width);
+    F(moonsec_window_info, height);
+    F(moonsec_window_info, on_screen);
+    F(moonsec_window_info, app);
+    F(moonsec_window_info, title);
     S(moonsec_frame);
     F(moonsec_frame, struct_size);
     F(moonsec_frame, frame_id);
@@ -188,6 +200,8 @@ static void dump(void) {
     K(MOONSEC_FEATURE_SYSTEM_BACKEND);
     K(MOONSEC_FEATURE_MULTI_USER);
     K(MOONSEC_FEATURE_DISPLAYS);
+    K(MOONSEC_FEATURE_WINDOWS);
+    K(MOONSEC_WINDOW_PICK);
     K(MOONSEC_OK);
     K(MOONSEC_ERR_INVALID);
     K(MOONSEC_ERR_UNSUPPORTED);
@@ -300,6 +314,7 @@ static void dump(void) {
     FN(moonsec_host_listen_loopback);
     FN(moonsec_host_give_input);
     FN(moonsec_host_displays);
+    FN(moonsec_host_windows);
     FN(moonsec_client_create);
     FN(moonsec_client_destroy);
     FN(moonsec_client_id);

@@ -652,3 +652,47 @@ test "displays: the shared monitors, and switching between them keeps the portal
     tw.mlh_testportal_counts(&after, &restored, &cursor, &persist);
     try testing.expectEqual(starts + 1, after);
 }
+
+test "windows: a window share asks the portal for windows and keeps the token file" {
+    if (!haveDisplay()) return skip("portal", "no Wayland display");
+    var path_buf: [512]u8 = undefined;
+    const token_path = try tokenFile(&path_buf);
+    var tok_before: [512]u8 = undefined;
+    var tok_after: [512]u8 = undefined;
+    var cap = host.Capture.init(.{ .token_path = token_path });
+    defer cap.deinit();
+    // A monitor session first, so the token file holds the monitor choice.
+    _ = try startCapture(&cap, .{});
+    const before = loadToken(token_path, &tok_before);
+    var starts: u32 = 0;
+    var restored: u32 = 0;
+    var cursor: u32 = 0;
+    var persist: u32 = 0;
+    if (usingTestPortal()) tw.mlh_testportal_counts(&starts, &restored, &cursor, &persist);
+
+    // Switching to a window needs a new session, which offers windows only.
+    const size = try startCapture(&cap, .{ .window = api.CaptureConfig.pick_window });
+    std.debug.print("window: portal v{d}, {d}x{d}, source type {d}\n", .{ cap.portalVersion(), size.width, size.height, cap.streamInfo().source_type });
+    try testing.expect(size.width > 0 and size.height > 0);
+    const f = (try cap.acquire(1_000_000)) orelse (try cap.repeatLast()) orelse return error.NoFrame;
+    cap.release(&f);
+    var out: [4]api.DisplayInfo = undefined;
+    const n = try cap.iface().displays(&out);
+    try testing.expect(n >= 1);
+    if (usingTestPortal()) {
+        var after: u32 = 0;
+        tw.mlh_testportal_counts(&after, &restored, &cursor, &persist);
+        try testing.expectEqual(starts + 1, after);
+        try testing.expectEqual(@as(u32, c.MLH_SOURCE_WINDOW), tw.mlh_testportal_last_types());
+        try testing.expectEqual(@as(u32, c.MLH_SOURCE_WINDOW), cap.streamInfo().source_type);
+        try testing.expect(persist <= c.MLH_PERSIST_TRANSIENT);
+        try testing.expectEqualStrings("Window 1", out[0].name());
+    }
+    // The monitor choice in the token file is untouched.
+    const after_tok = loadToken(token_path, &tok_after);
+    if (before) |b| try testing.expectEqualStrings(b, after_tok orelse return error.TokenGone);
+
+    // Back to the display: a new session, offering monitors again.
+    _ = try startCapture(&cap, .{});
+    if (usingTestPortal()) try testing.expectEqual(@as(u32, c.MLH_SOURCE_MONITOR), tw.mlh_testportal_last_types());
+}

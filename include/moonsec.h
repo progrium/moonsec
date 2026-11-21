@@ -61,6 +61,7 @@ MOONSEC_API const char *moonsec_version_string(void);
 #define MOONSEC_FEATURE_SYSTEM_BACKEND 0x0004u /* the OS capture/encode/decode/present backend */
 #define MOONSEC_FEATURE_MULTI_USER 0x0008u     /* more than one client per host */
 #define MOONSEC_FEATURE_DISPLAYS 0x0010u       /* display listing and switching */
+#define MOONSEC_FEATURE_WINDOWS 0x0020u        /* sharing one window (moonsec_host_config.window) */
 MOONSEC_API uint32_t moonsec_features(void);
 
 /* ------------------------------------------------------------------------- */
@@ -197,7 +198,15 @@ typedef struct moonsec_host_config {
      * non-empty; drain it with moonsec_host_poll_event. May be NULL. */
     void (*notify)(void *ctx);
     void *notify_ctx;
+    /* Share one window instead of a display (MOONSEC_FEATURE_WINDOWS): an id from
+     * moonsec_host_windows, or MOONSEC_WINDOW_PICK to let the OS's own picker choose.
+     * 0: share `display`. Added after 1.0: a 1.0-sized struct leaves it 0. */
+    uint64_t window;
 } moonsec_host_config;
+
+/* moonsec_host_config.window: ask the user in the OS's picker (Linux: the ScreenCast
+ * portal's dialog, offering windows instead of monitors). */
+#define MOONSEC_WINDOW_PICK 0xFFFFFFFFFFFFFFFFull
 
 MOONSEC_API moonsec_status moonsec_host_create(const moonsec_host_config *config, moonsec_host **out);
 /* Ends every session (the clients are told), stops the threads, frees the
@@ -273,6 +282,25 @@ typedef struct moonsec_display_info {
  * streams: its capture's list; otherwise the backend's, if it can list without
  * streaming (MOONSEC_ERR_UNSUPPORTED if not). */
 MOONSEC_API moonsec_status moonsec_host_displays(moonsec_host *host, moonsec_display_info *out, size_t cap, size_t *count);
+
+/* Windows (MOONSEC_FEATURE_WINDOWS). Frozen layout. */
+typedef struct moonsec_window_info {
+    uint64_t id;     /* the value moonsec_host_config.window takes (macOS: the CGWindowID) */
+    uint32_t pid;    /* the owning process */
+    int32_t x;       /* frame in the desktop's coordinates (macOS: points, top-left origin) */
+    int32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t on_screen; /* 1 when visible now */
+    char app[64];       /* the owning application's name, UTF-8 */
+    char title[128];    /* the window's title, UTF-8; "" when the OS does not say */
+} moonsec_window_info;
+/* The windows a host can share, front to back: fills up to `cap` entries; `*count` is
+ * the number of windows. The system backend on macOS lists the shareable on-screen
+ * windows (it needs Screen Recording permission). MOONSEC_ERR_UNSUPPORTED elsewhere:
+ * Linux picks the window in the portal's dialog (MOONSEC_WINDOW_PICK), and Windows and
+ * the synthetic backend share displays only. */
+MOONSEC_API moonsec_status moonsec_host_windows(moonsec_host *host, moonsec_window_info *out, size_t cap, size_t *count);
 
 /* ------------------------------------------------------------------------- */
 /* Client                                                                    */

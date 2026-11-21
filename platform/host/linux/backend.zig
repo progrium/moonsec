@@ -98,7 +98,10 @@ pub const Host = struct {
 
         pub fn start(c: *OutputCapture, cfg: api.CaptureConfig) api.Error!api.Size {
             const size = try c.inner.start(cfg);
-            if (c.host.injector) |*j| j.setOutput(size);
+            if (c.host.injector) |*j| {
+                j.setOutput(size);
+                j.setWindow(cfg.window != 0);
+            }
             return size;
         }
         pub fn acquire(c: *OutputCapture, timeout_us: api.Micros) api.Error!?api.CapturedFrame {

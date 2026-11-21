@@ -5,6 +5,7 @@
 #import <CoreVideo/CoreVideo.h>
 #include <mach/mach_time.h>
 #include <sys/sysctl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,6 +133,52 @@ uint32_t mh_displays(mh_display_info *out, uint32_t cap) {
         d->refresh_mhz = hz > 0 ? (uint32_t)(hz * 1000.0 + 0.5) : 0;
     }
     return n;
+}
+
+int mh_window_frame(uint32_t id, double *x, double *y, double *w, double *h, double *scale) {
+    CGRect r = CGRectNull;
+    CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, (CGWindowID)id);
+    if (list) {
+        if (CFArrayGetCount(list) > 0) {
+            CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(list, 0);
+            CFDictionaryRef bounds = (CFDictionaryRef)CFDictionaryGetValue(info, kCGWindowBounds);
+            if (bounds && !CGRectMakeWithDictionaryRepresentation(bounds, &r)) r = CGRectNull;
+        }
+        CFRelease(list);
+    }
+    if (CGRectIsNull(r) || r.size.width <= 0 || r.size.height <= 0) return mh_fail(MH_ERR_DEVICE_LOST, "window %u is gone", id);
+    *x = r.origin.x;
+    *y = r.origin.y;
+    *w = r.size.width;
+    *h = r.size.height;
+    if (scale) {
+        // The display under the window's centre (else the main one): its mode's pixels
+        // per point.
+        CGDirectDisplayID did = CGMainDisplayID();
+        uint32_t n = 0;
+        CGDirectDisplayID under;
+        if (CGGetDisplaysWithPoint(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 1, &under, &n) == kCGErrorSuccess && n > 0) did = under;
+        double s = 1;
+        CGDisplayModeRef m = CGDisplayCopyDisplayMode(did);
+        CGRect b = CGDisplayBounds(did);
+        if (m) {
+            if (b.size.width > 0) s = (double)CGDisplayModeGetPixelWidth(m) / b.size.width;
+            CGDisplayModeRelease(m);
+        }
+        *scale = s >= 1 ? s : 1;
+    }
+    return MH_OK;
+}
+
+int mh_window_pixels(uint32_t id, uint32_t *w, uint32_t *h) {
+    double x, y, pw, ph, s;
+    int rc = mh_window_frame(id, &x, &y, &pw, &ph, &s);
+    if (rc != MH_OK) return rc;
+    *w = (uint32_t)lround(pw * s) & ~1u;
+    *h = (uint32_t)lround(ph * s) & ~1u;
+    if (*w < 2) *w = 2;
+    if (*h < 2) *h = 2;
+    return MH_OK;
 }
 
 uint32_t mh_fmt_to_cv(uint32_t fmt) {

@@ -17,7 +17,9 @@
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#include <math.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include "mh_internal.h"
 
@@ -38,17 +40,13 @@ int mh_sc_fail(NSError *err, const char *what) {
     return mh_fail(code, "%s: %s", what, err ? err.description.UTF8String : "timed out");
 }
 
-SCDisplay *mh_sc_display(uint32_t index, int *rc) {
+// What ScreenCaptureKit can capture now, fetched synchronously (up to 5 s).
+static SCShareableContent *sc_content(BOOL exclude_desktop, int *rc) {
     init_window_server();
-    CGDirectDisplayID want = mh_display_id(index);
-    if (!want) {
-        *rc = mh_fail(MH_ERR_UNSUPPORTED, "no display %u", index);
-        return nil;
-    }
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     __block SCShareableContent *content = nil;
     __block NSError *error = nil;
-    [SCShareableContent getShareableContentExcludingDesktopWindows:NO
+    [SCShareableContent getShareableContentExcludingDesktopWindows:exclude_desktop
                                                onScreenWindowsOnly:YES
                                                  completionHandler:^(SCShareableContent *c, NSError *e) {
                                                      content = c;
@@ -59,10 +57,79 @@ SCDisplay *mh_sc_display(uint32_t index, int *rc) {
         *rc = mh_sc_fail(error, "SCShareableContent");
         return nil;
     }
+    return content;
+}
+
+SCDisplay *mh_sc_display(uint32_t index, int *rc) {
+    CGDirectDisplayID want = mh_display_id(index);
+    if (!want) {
+        *rc = mh_fail(MH_ERR_UNSUPPORTED, "no display %u", index);
+        return nil;
+    }
+    SCShareableContent *content = sc_content(NO, rc);
+    if (!content) return nil;
     for (SCDisplay *d in content.displays)
         if (d.displayID == want) return d;
     *rc = mh_fail(MH_ERR_UNSUPPORTED, "display %u (id %u) not in shareable content", index, want);
     return nil;
+}
+
+static SCWindow *sc_window(uint32_t id, int *rc) {
+    SCShareableContent *content = sc_content(YES, rc);
+    if (!content) return nil;
+    for (SCWindow *w in content.windows)
+        if (w.windowID == id) return w;
+    *rc = mh_fail(MH_ERR_UNSUPPORTED, "window %u is not shareable (gone, minimized or off screen)", id);
+    return nil;
+}
+
+static void copy_utf8(char *dst, size_t cap, NSString *s) {
+    dst[0] = 0;
+    if (!s || ![s getCString:dst maxLength:cap encoding:NSUTF8StringEncoding]) {
+        // Too long: cut at a character boundary that fits.
+        if (!s) return;
+        NSUInteger n = s.length;
+        while (n > 0) {
+            n = [s rangeOfComposedCharacterSequenceAtIndex:n - 1].location;
+            if ([[s substringToIndex:n] getCString:dst maxLength:cap encoding:NSUTF8StringEncoding]) return;
+        }
+        dst[0] = 0;
+    }
+}
+
+int mh_windows(mh_window_info *out, uint32_t cap, uint32_t *count) {
+    @autoreleasepool {
+        mh_clear_error();
+        *count = 0;
+        int rc = MH_OK;
+        SCShareableContent *content = sc_content(YES, &rc);
+        if (!content) return rc;
+        pid_t self = getpid();
+        uint32_t n = 0;
+        for (SCWindow *w in content.windows) {
+            SCRunningApplication *app = w.owningApplication;
+            // Normal windows of other apps, big enough to be one (not a status item or a
+            // tooltip).
+            if (!app || app.processID == self || w.windowLayer != 0) continue;
+            if (w.frame.size.width < 40 || w.frame.size.height < 40) continue;
+            if (n < cap) {
+                mh_window_info *o = &out[n];
+                memset(o, 0, sizeof *o);
+                o->id = w.windowID;
+                o->pid = (uint32_t)app.processID;
+                o->x = (int32_t)lround(w.frame.origin.x);
+                o->y = (int32_t)lround(w.frame.origin.y);
+                o->width = (uint32_t)lround(w.frame.size.width);
+                o->height = (uint32_t)lround(w.frame.size.height);
+                o->on_screen = w.onScreen ? 1 : 0;
+                copy_utf8(o->app, sizeof o->app, app.applicationName);
+                copy_utf8(o->title, sizeof o->title, w.title);
+            }
+            n++;
+        }
+        *count = n;
+        return MH_OK;
+    }
 }
 
 struct mh_capture;
@@ -184,16 +251,28 @@ int mh_capture_start(mh_capture *c, const mh_capture_config *cfg, uint32_t *widt
         mh_clear_error();
         mh_capture_stop(c);
         int rc = MH_OK;
-        SCDisplay *display = mh_sc_display(cfg->display, &rc);
-        if (!display) return rc;
         uint32_t w = cfg->width, h = cfg->height;
-        if (!w || !h) {
-            rc = mh_display_pixels(cfg->display, &w, &h);
-            if (rc != MH_OK) return rc;
+        SCContentFilter *filter = nil;
+        if (cfg->window) {
+            // One window, wherever it is and whatever covers it.
+            SCWindow *window = sc_window(cfg->window, &rc);
+            if (!window) return rc;
+            if (!w || !h) {
+                rc = mh_window_pixels(cfg->window, &w, &h);
+                if (rc != MH_OK) return rc;
+            }
+            filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:window];
+        } else {
+            SCDisplay *display = mh_sc_display(cfg->display, &rc);
+            if (!display) return rc;
+            if (!w || !h) {
+                rc = mh_display_pixels(cfg->display, &w, &h);
+                if (rc != MH_OK) return rc;
+            }
+            filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
         }
         w &= ~1u; // even sizes for 4:2:0
         h &= ~1u;
-        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
         SCStreamConfiguration *sc = make_config(cfg, w, h);
         MHVideoOut *o = [MHVideoOut new];
         o.cap = c;

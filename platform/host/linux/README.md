@@ -55,6 +55,14 @@ captured output's size, so absolute positions land on the captured pixels.
   shows an app no outputs outside the portal, so there is no list before the first
   `start`. A `start` while the portal session is open reuses it, so switching between
   the chosen monitors shows no dialog; `stop` ends the session.
+- **One window.** A non-zero `CaptureConfig.window` asks `SelectSources` for windows
+  instead of monitors, so the dialog offers windows and the stream is the one the user
+  picks (the portal gives apps no window ids, so the value only means "a window"). Its
+  frames follow the window's size. Switching between a window and a monitor needs a new
+  portal session. The token file keeps the monitor choice: a window session neither
+  reads nor writes it, and persists at most while the process runs. The portal gives no
+  window position, so the injector drops absolute pointer moves while a window is
+  shared (`setWindow`).
 - **Errors.** No session bus, no portal or no PipeWire: `error.Unsupported`. The user
   cancelled: `error.Unsupported` (logged as cancelled). The session closed or the stream
   ended (monitor unplugged, sharing revoked): `error.DeviceLost`, and `start` again

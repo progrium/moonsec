@@ -198,7 +198,7 @@ pub const Capture = struct {
     }
 
     pub fn start(c: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
-        if (cfg.display >= c.n_displays) return error.Unsupported;
+        if (cfg.display >= c.n_displays or cfg.window != 0) return error.Unsupported;
         const d = c.display_list[cfg.display];
         c.display = cfg.display;
         c.native = cfg.width == 0 or cfg.height == 0;

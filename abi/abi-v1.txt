@@ -18,7 +18,7 @@ struct moonsec_input size 48 align 8
   moonsec_input.pad_rt offset 34 size 2
   moonsec_input.reserved offset 36 size 4
   moonsec_input.time_us offset 40 size 8
-struct moonsec_host_config size 112 align 8
+struct moonsec_host_config size 120 align 8
   moonsec_host_config.struct_size offset 0 size 4
   moonsec_host_config.backend offset 4 size 4
   moonsec_host_config.state_dir offset 8 size 8
@@ -39,6 +39,7 @@ struct moonsec_host_config size 112 align 8
   moonsec_host_config.bind_addr offset 88 size 8
   moonsec_host_config.notify offset 96 size 8
   moonsec_host_config.notify_ctx offset 104 size 8
+  moonsec_host_config.window offset 112 size 8
 struct moonsec_pair_config size 16 align 4
   moonsec_pair_config.struct_size offset 0 size 4
   moonsec_pair_config.seconds offset 4 size 4
@@ -58,6 +59,16 @@ struct moonsec_display_info size 88 align 4
   moonsec_display_info.primary offset 16 size 4
   moonsec_display_info.hdr offset 20 size 4
   moonsec_display_info.name offset 24 size 64
+struct moonsec_window_info size 224 align 8
+  moonsec_window_info.id offset 0 size 8
+  moonsec_window_info.pid offset 8 size 4
+  moonsec_window_info.x offset 12 size 4
+  moonsec_window_info.y offset 16 size 4
+  moonsec_window_info.width offset 20 size 4
+  moonsec_window_info.height offset 24 size 4
+  moonsec_window_info.on_screen offset 28 size 4
+  moonsec_window_info.app offset 32 size 64
+  moonsec_window_info.title offset 96 size 128
 struct moonsec_frame size 64 align 8
   moonsec_frame.struct_size offset 0 size 4
   moonsec_frame.frame_id offset 4 size 4
@@ -147,6 +158,8 @@ const MOONSEC_FEATURE_IROH 2
 const MOONSEC_FEATURE_SYSTEM_BACKEND 4
 const MOONSEC_FEATURE_MULTI_USER 8
 const MOONSEC_FEATURE_DISPLAYS 16
+const MOONSEC_FEATURE_WINDOWS 32
+const MOONSEC_WINDOW_PICK -1
 const MOONSEC_OK 0
 const MOONSEC_ERR_INVALID -1
 const MOONSEC_ERR_UNSUPPORTED -2
@@ -258,6 +271,7 @@ fn moonsec_host_set_permissions
 fn moonsec_host_listen_loopback
 fn moonsec_host_give_input
 fn moonsec_host_displays
+fn moonsec_host_windows
 fn moonsec_client_create
 fn moonsec_client_destroy
 fn moonsec_client_id

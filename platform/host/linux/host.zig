@@ -105,6 +105,9 @@ pub const Capture = struct {
     next_poll_us: api.Micros = 0,
     /// The cursor setting the portal session was opened with (a new one needs a new session).
     portal_cursor: bool = false,
+    /// Whether the portal session offered windows (`cfg.window`) rather than monitors; a
+    /// change needs a new session.
+    portal_window: bool = false,
     /// Each stream's size in pixels once it has been captured (the portal gives logical
     /// sizes, which differ under scaling), for `displays`. Cleared with the session.
     pixels: [max_streams]api.Size = @splat(.{ .width = 0, .height = 0 }),
@@ -122,11 +125,16 @@ pub const Capture = struct {
     /// Starts capturing stream `cfg.display` of the portal session. A session that is
     /// still open is kept (another of the monitors the user picked, or a new size or
     /// rate, needs no dialog); `stop` ends it, and the next start opens a new one.
+    ///
+    /// `cfg.window` (any non-zero value: the portal has no window ids to give) makes the
+    /// dialog offer windows instead of monitors, and the stream is the window the user
+    /// picks; its frames follow the window's size. A window choice is not restored from
+    /// the token file (that holds the monitor choice), so each new session asks.
     pub fn start(self: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
         self.stopStream();
         errdefer self.stop();
         if (self.portal) |p| {
-            if (self.portal_cursor != cfg.cursor or c.mlh_portal_poll(p) < 0) self.closePortal();
+            if (self.portal_cursor != cfg.cursor or self.portal_window != (cfg.window != 0) or c.mlh_portal_poll(p) < 0) self.closePortal();
         }
         if (self.portal == null) try self.openPortal(cfg);
         const p = self.portal.?;
@@ -161,22 +169,28 @@ pub const Capture = struct {
     }
 
     fn openPortal(self: *Capture, cfg: api.CaptureConfig) api.Error!void {
+        const window = cfg.window != 0;
+        // The token file is the monitor choice's; a window session neither uses nor
+        // replaces it, and lasts while this process runs.
+        const token_path = if (window) null else self.opts.token_path;
         var token_buf: [512]u8 = undefined;
         var token: ?[*:0]const u8 = null;
-        if (self.opts.token_path) |p| {
+        if (token_path) |p| {
             if (c.mlh_token_load(p.ptr, &token_buf, token_buf.len) == c.MLH_OK) token = @ptrCast(&token_buf);
         }
         const po: c.mlh_portal_options = .{
             .restore_token = token,
-            .persist_mode = @intFromEnum(self.opts.persist),
+            .persist_mode = if (window) @min(@intFromEnum(self.opts.persist), c.MLH_PERSIST_TRANSIENT) else @intFromEnum(self.opts.persist),
             .cursor_mode = if (cfg.cursor) c.MLH_CURSOR_EMBEDDED else c.MLH_CURSOR_METADATA,
-            .multiple = @intFromBool(self.opts.multiple),
+            .multiple = @intFromBool(self.opts.multiple and !window),
             .timeout_ms = self.opts.dialog_timeout_ms,
+            .types = if (window) c.MLH_SOURCE_WINDOW else c.MLH_SOURCE_MONITOR,
         };
         var p: ?*c.mlh_portal = null;
         try check("ScreenCast portal", c.mlh_portal_open(&po, &p));
         self.portal = p;
-        if (self.opts.token_path) |path| {
+        self.portal_window = window;
+        if (token_path) |path| {
             if (c.mlh_portal_restore_token(p)) |t| {
                 if (c.mlh_token_store(path.ptr, t) < 0) log.warn("restore token not saved: {s}", .{lastError()});
             } else if (self.opts.persist != .none) {
