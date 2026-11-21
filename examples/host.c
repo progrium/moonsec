@@ -1,6 +1,6 @@
 /* A small moonsec host on the public C API.
  *
- *   moonsec-example-host [--system [--windows | --window ID|pick]]
+ *   moonsec-example-host [--system [--windows | --window ID|pick [--focus]]]
  *                        [--relay | --relay-url URL [--relay-ca PEM-FILE]] [--pair]
  *                        [--seconds N] [--state-dir DIR] [--web BASE]
  *
@@ -11,7 +11,8 @@
  * through the OS's capture and encoder (MOONSEC_BACKEND_SYSTEM, in libraries built with
  * it: MOONSEC_FEATURE_SYSTEM_BACKEND). --windows lists the windows it can share instead
  * (macOS), and --window shares one of them, by its id, or with `pick` the one the user
- * picks in the OS's dialog (Linux: the ScreenCast portal) (MOONSEC_FEATURE_WINDOWS).
+ * picks in the OS's dialog (Linux: the ScreenCast portal) (MOONSEC_FEATURE_WINDOWS);
+ * --focus brings it to the front when a session starts (macOS).
  *
  * --relay-url uses one self-hosted relay instead of n0's (MOONSEC_RELAY_CUSTOM), such as
  * `iroh-relay --dev` on http://127.0.0.1:3340, which browsers reach too: then the tickets
@@ -67,7 +68,7 @@ static const char *event_name(uint32_t type) {
 }
 
 int main(int argc, char **argv) {
-    int relay = 0, pair = 0, sys = 0, seconds = 60, list_windows = 0;
+    int relay = 0, pair = 0, sys = 0, seconds = 60, list_windows = 0, focus = 0;
     uint64_t window = 0;
     const char *state_dir = NULL; /* the per-user default */
     const char *relay_url = NULL, *relay_ca = NULL, *web = "http://127.0.0.1:8790";
@@ -81,11 +82,12 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--relay-ca") == 0 && i + 1 < argc) relay_ca = read_file(argv[++i]);
         else if (strcmp(argv[i], "--web") == 0 && i + 1 < argc) web = argv[++i];
         else if (strcmp(argv[i], "--windows") == 0) list_windows = 1;
+        else if (strcmp(argv[i], "--focus") == 0) focus = 1;
         else if (strcmp(argv[i], "--window") == 0 && i + 1 < argc) {
             i++;
             window = strcmp(argv[i], "pick") == 0 ? MOONSEC_WINDOW_PICK : strtoull(argv[i], NULL, 10);
         } else {
-            fprintf(stderr, "usage: %s [--system [--windows | --window ID|pick]] [--relay | --relay-url URL [--relay-ca PEM-FILE]] [--pair] [--seconds N] [--state-dir DIR] [--web BASE]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--system [--windows | --window ID|pick [--focus]]] [--relay | --relay-url URL [--relay-ca PEM-FILE]] [--pair] [--seconds N] [--state-dir DIR] [--web BASE]\n", argv[0]);
             return 2;
         }
     }
@@ -101,6 +103,7 @@ int main(int argc, char **argv) {
     cfg.relay_ca_pem = relay_ca;
     cfg.flags = MOONSEC_HOST_RATE_CONTROL | MOONSEC_HOST_LOSS_POLICY;
     cfg.window = window;
+    if (focus) cfg.flags |= MOONSEC_HOST_FOCUS_WINDOW;
     moonsec_host *host = NULL;
     moonsec_status st = moonsec_host_create(&cfg, &host);
     if (st != MOONSEC_OK) die("create", st);

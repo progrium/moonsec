@@ -300,6 +300,12 @@ after 1.0: a config whose `struct_size` ends before it is still taken, with `win
   unattended host asks each time it starts a session. The portal does not say where the
   window is, so absolute pointer moves are dropped while a window is shared; keys,
   buttons, wheel and relative motion still go to the desktop.
+- `MOONSEC_HOST_FOCUS_WINDOW` brings the shared window to the front when a session
+  starts (not on the capture restarts after it), so keys reach it: on macOS its app is
+  made frontmost and the window raised and made main through Accessibility (which input
+  injection needs anyway), falling back to activating the app with AppKit. A window that
+  will not come forward is logged, not an error. Linux ignores it: Wayland lets no app
+  focus another app's window.
 - Windows and the synthetic backend: `moonsec_host_create` returns `UNSUPPORTED` for a
   non-zero `window`.
 - A client's select of another display (when that is exposed) leaves the window for that

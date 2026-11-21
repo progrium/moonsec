@@ -1122,6 +1122,7 @@ fn hostOptions(cfg: c.moonsec_host_config, codec: api.Codec, ctl: ?pipe_mod.Byte
         .hdr = cfg.flags & c.MOONSEC_HOST_NO_HDR == 0,
         .display = cfg.display,
         .window = cfg.window,
+        .focus_window = cfg.window != 0 and cfg.flags & c.MOONSEC_HOST_FOCUS_WINDOW != 0,
         .width = cfg.width,
         .height = cfg.height,
         .audio = cfg.flags & c.MOONSEC_HOST_NO_AUDIO == 0,

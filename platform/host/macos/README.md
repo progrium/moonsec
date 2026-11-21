@@ -96,7 +96,10 @@ captured wherever it is and whatever covers it. With no size hint the frame size
 window's pixels (its frame times the backing scale of the display under it), and
 `acquire` checks the window's size about four times a second and updates the stream when
 it was resized; the app then sees frames of the new size. Absolute moves land on the
-window's frame where it is at that moment (`mh_input_set_window`).
+window's frame where it is at that moment (`mh_input_set_window`). With
+`CaptureConfig.focus_window` (the app sets it when a session starts), `start` brings the
+window forward (`mh_window_focus`): its app frontmost and the window raised and made main
+through Accessibility, or the app activated with AppKit when Accessibility is not granted.
 
 ## Displays
 

@@ -141,6 +141,7 @@ int main(int argc, char **argv) {
             printf("abi system test (one window): this OS shares displays only\n");
             return failures ? 1 : 0;
         }
+        hc.flags |= MOONSEC_HOST_FOCUS_WINDOW; /* macOS raises it; Linux logs that it cannot */
         OK(moonsec_host_create(&hc, &h));
         moonsec_window_info wi[16];
         size_t nw = 0;

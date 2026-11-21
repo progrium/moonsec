@@ -172,6 +172,7 @@ typedef struct moonsec_input {
 #define MOONSEC_HOST_APP_INPUT 0x0040u     /* deliver client input as MOONSEC_EVENT_INPUT instead of injecting it */
 #define MOONSEC_HOST_REQUIRE_PAIRED 0x0080u /* iroh: admit only paired clients; the default now, kept for source compatibility */
 #define MOONSEC_HOST_INSECURE_NO_PAIRING 0x0100u /* iroh: admit any client that reaches the endpoint (tests and labs only) */
+#define MOONSEC_HOST_FOCUS_WINDOW 0x0200u  /* with `window`: bring that window to the front when a session starts (macOS) */
 
 typedef struct moonsec_host_config {
     uint32_t struct_size; /* sizeof(moonsec_host_config) */

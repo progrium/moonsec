@@ -137,6 +137,8 @@ pub const Capture = struct {
             if (self.portal_cursor != cfg.cursor or self.portal_window != (cfg.window != 0) or c.mlh_portal_poll(p) < 0) self.closePortal();
         }
         if (self.portal == null) try self.openPortal(cfg);
+        if (cfg.window != 0 and cfg.focus_window)
+            log.info("the shared window is not brought to the front: Wayland lets no app focus another app's window", .{});
         const p = self.portal.?;
         const n = c.mlh_portal_stream_count(p);
         // One stream per chosen monitor; `display` indexes them (`displays`), and

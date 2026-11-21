@@ -140,6 +140,8 @@ pub const Capture = struct {
             c.mh_input_set_display(in, cfg.display);
             c.mh_input_set_window(in, @intCast(cfg.window));
         }
+        if (cfg.window != 0 and cfg.focus_window and c.mh_window_focus(@intCast(cfg.window)) != c.MH_OK)
+            log.warn("window {d} not brought to the front: {s}", .{ cfg.window, lastError() });
         self.next_window_check_us = nowUs() + window_check_us;
         return self.size;
     }

@@ -53,6 +53,8 @@ pub const HostOptions = struct {
     /// Share one window instead of the display (`api.CaptureConfig.window`); 0: the display.
     /// A client's select of another display leaves the window for that display.
     window: u64 = 0,
+    /// Bring `window` to the front when the session starts (`api.CaptureConfig.focus_window`).
+    focus_window: bool = false,
     width: u32 = 0,
     height: u32 = 0,
     /// Re-send the last picture when the screen has not changed for this long, so a
@@ -99,7 +101,7 @@ pub const HostApp = struct {
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0, reconfigure_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: HostOptions, p: pipe_mod.PacketPipe) !HostApp {
-        const size = try be.capture.start(.{ .display = o.display, .window = o.window, .fps = o.fps, .width = o.width, .height = o.height, .hdr = o.hdr });
+        const size = try be.capture.start(.{ .display = o.display, .window = o.window, .focus_window = o.focus_window, .fps = o.fps, .width = o.width, .height = o.height, .hdr = o.hdr });
         errdefer be.capture.stop();
         const caps = be.encoder.caps();
         if (!caps.codecs.has(o.codec)) return error.Unsupported;

@@ -175,6 +175,11 @@ pub const CaptureConfig = struct {
     /// no size hint the frames follow the window's size (a resize is a new frame size,
     /// as a display mode change is); the window's own size at `start` is what it returns.
     window: u64 = 0,
+    /// With `window`: bring it to the front (and give it keyboard focus) as capture
+    /// starts, so keys reach it. The app asks for it when a session starts, not on the
+    /// restarts after (a rate-ladder step must not steal focus back). Backends that
+    /// cannot focus another app's window ignore it.
+    focus_window: bool = false,
 
     /// `window`: let the user choose in the OS's picker (the ScreenCast portal's dialog).
     pub const pick_window: u64 = std.math.maxInt(u64);

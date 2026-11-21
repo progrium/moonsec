@@ -83,6 +83,11 @@ int mh_windows(mh_window_info *out, uint32_t cap, uint32_t *count);
 int mh_window_frame(uint32_t id, double *x, double *y, double *w, double *h, double *scale);
 /* Its size in pixels: the frame times the scale, even. */
 int mh_window_pixels(uint32_t id, uint32_t *w, uint32_t *h);
+/* Brings window `id` to the front with keyboard focus: its app frontmost and the window
+ * raised and made main (Accessibility, which input injection needs anyway), else the app
+ * activated through NSRunningApplication alone. MH_ERR_DEVICE_LOST when the window is
+ * gone, MH_ERR when nothing took. */
+int mh_window_focus(uint32_t id);
 
 /* CVPixelBuffer helpers (tests and the encoder's own scaling). Formats: */
 enum { MH_FMT_BGRA = 1, MH_FMT_NV12 = 2 };

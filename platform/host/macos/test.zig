@@ -518,6 +518,12 @@ test "window list and one window's capture" {
     var scale: f64 = 0;
     try ok(c.mh_window_frame(@intCast(w.id), &x, &y, &fw, &fh, &scale));
     try testing.expect(scale >= 1);
+    // Focusing needs Accessibility (or AppKit agreeing to activate it): either it takes or
+    // says why, and a gone window is DEVICE_LOST.
+    const frc = c.mh_window_focus(@intCast(w.id));
+    std.debug.print("window focus: {d} ({s}); accessibility {}\n", .{ frc, if (frc == c.MH_OK) "ok" else host.lastError(), host.postEventAllowed() });
+    try testing.expect(frc == c.MH_OK or frc == c.MH_ERR);
+    try testing.expectEqual(@as(c_int, c.MH_ERR_DEVICE_LOST), c.mh_window_focus(0x7fff_fff0));
 
     var cap = try host.Capture.create(.nv12);
     defer cap.destroy();
