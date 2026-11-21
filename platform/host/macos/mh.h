@@ -63,6 +63,32 @@ typedef struct {
  * many there are. Needs no Screen Recording permission. */
 uint32_t mh_displays(mh_display_info *out, uint32_t cap);
 
+/* One window ScreenCaptureKit can capture, for the host's window list. */
+typedef struct {
+    uint32_t id;            /* its CGWindowID: what mh_capture_config.window takes */
+    uint32_t pid;           /* the owning process */
+    int32_t x, y;           /* top-left in global display coordinates (points) */
+    uint32_t width, height; /* points */
+    uint32_t on_screen;
+    char app[64];           /* the owning application's name, UTF-8 */
+    char title[128];        /* the window's title, UTF-8 ("" when it has none) */
+} mh_window_info;
+/* The normal (layer 0) on-screen windows of other processes that ScreenCaptureKit can
+ * capture, in its order. Fills up to `cap` entries; *count is how many there are. Needs
+ * Screen Recording permission (MH_ERR_PERMISSION without it). Waits up to 5 s. */
+int mh_windows(mh_window_info *out, uint32_t cap, uint32_t *count);
+/* Window `id`'s frame now, in global display coordinates (points), and the backing
+ * scale of the display under its centre (pixels per point). MH_ERR_DEVICE_LOST when the
+ * window is gone. Needs no permission. */
+int mh_window_frame(uint32_t id, double *x, double *y, double *w, double *h, double *scale);
+/* Its size in pixels: the frame times the scale, even. */
+int mh_window_pixels(uint32_t id, uint32_t *w, uint32_t *h);
+/* Brings window `id` to the front with keyboard focus: its app frontmost and the window
+ * raised and made main (Accessibility, which input injection needs anyway), else the app
+ * activated through NSRunningApplication alone. MH_ERR_DEVICE_LOST when the window is
+ * gone, MH_ERR when nothing took. */
+int mh_window_focus(uint32_t id);
+
 /* CVPixelBuffer helpers (tests and the encoder's own scaling). Formats: */
 enum { MH_FMT_BGRA = 1, MH_FMT_NV12 = 2 };
 /* An IOSurface-backed CVPixelBuffer; release with mh_cf_release. */
@@ -84,6 +110,8 @@ typedef struct {
     uint32_t cursor;        /* draw the cursor into frames */
     uint32_t format;        /* MH_FMT_BGRA or MH_FMT_NV12 */
     uint32_t queue_depth;   /* SCStream queueDepth, 3..8 */
+    uint32_t window;        /* a CGWindowID to capture alone (mh_windows); 0 = the display.
+                             * width/height 0: the window's size in pixels at start */
 } mh_capture_config;
 
 typedef struct {
@@ -218,6 +246,9 @@ typedef struct mh_input mh_input;
 int mh_input_create(mh_input **out);
 /* Absolute moves land on this display (index, as mh_display_id). */
 void mh_input_set_display(mh_input *in, uint32_t display);
+/* ...or on this window's frame (a CGWindowID; 0 = back to the display), wherever it is
+ * when the move comes. */
+void mh_input_set_window(mh_input *in, uint32_t window);
 /* A macOS virtual key code (kVK_*); modifiers update the flags later events carry. */
 int mh_input_key(mh_input *in, uint16_t keycode, int down);
 /* 1 left, 2 right, 3 middle, 4 and 5 back and forward. */
@@ -225,7 +256,7 @@ int mh_input_button(mh_input *in, uint32_t button, int down);
 /* 120 per notch; dy > 0 scrolls up (away from the user), dx > 0 right. */
 int mh_input_scroll(mh_input *in, int32_t dx, int32_t dy);
 int mh_input_move_rel(mh_input *in, int32_t dx, int32_t dy);
-/* 0..65535 across the display. */
+/* 0..65535 across the display (or the window). */
 int mh_input_move_abs(mh_input *in, uint16_t x, uint16_t y);
 /* Where the cursor is, in global display coordinates. */
 void mh_input_cursor(double *x, double *y);

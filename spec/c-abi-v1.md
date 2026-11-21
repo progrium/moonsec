@@ -280,6 +280,37 @@ Not exposed yet (open questions on naming and events): the client's view of the 
 list and its display select, and an event when the list changes. Multi-user hosts refuse
 selects.
 
+## Windows
+
+`moonsec_host_config.window` shares one window instead of a display
+(`MOONSEC_FEATURE_WINDOWS`, set in builds whose system backend can on this OS). It came
+after 1.0: a config whose `struct_size` ends before it is still taken, with `window` 0.
+
+- macOS: an id from `moonsec_host_windows`, which lists the normal on-screen windows of
+  other apps that ScreenCaptureKit can capture (the id is the CGWindowID; frames in
+  points). Capture follows the window wherever it is and whatever covers it; at its own
+  size (no `width`/`height` hint) the stream follows its resizes, which reach the client
+  as a mid-stream size change, like a display mode change. Absolute pointer moves land
+  on the window's frame where it is at that moment. `MOONSEC_WINDOW_PICK` is
+  `UNSUPPORTED` (no picker yet). The list needs Screen Recording permission.
+- Linux: `MOONSEC_WINDOW_PICK` only. The ScreenCast portal's dialog offers windows
+  instead of monitors and the user picks one; Wayland gives apps no window ids, so
+  `moonsec_host_windows` is `UNSUPPORTED` and any other id is too. The window choice is
+  not saved as a restore token (the token file keeps the monitor choice), so an
+  unattended host asks each time it starts a session. The portal does not say where the
+  window is, so absolute pointer moves are dropped while a window is shared; keys,
+  buttons, wheel and relative motion still go to the desktop.
+- `MOONSEC_HOST_FOCUS_WINDOW` brings the shared window to the front when a session
+  starts (not on the capture restarts after it), so keys reach it: on macOS its app is
+  made frontmost and the window raised and made main through Accessibility (which input
+  injection needs anyway), falling back to activating the app with AppKit. A window that
+  will not come forward is logged, not an error. Linux ignores it: Wayland lets no app
+  focus another app's window.
+- Windows and the synthetic backend: `moonsec_host_create` returns `UNSUPPORTED` for a
+  non-zero `window`.
+- A client's select of another display (when that is exposed) leaves the window for that
+  display; the display list still describes the host's displays.
+
 ## Linking
 
 - `zig build abi` installs `include/moonsec.h`, `lib/libmoonsec.a` and the shared
@@ -314,6 +345,7 @@ selects.
 | Telemetry and per-stage latency | done |
 | Multi-user (#38) | done over iroh (owner policy, every member may control); `abi/test_multi.c`, and on the OS backends in `test-abi-system -- multi` |
 | Displays (#37) | listing: `moonsec_host_displays` (synthetic backend, and any backend that lists while streaming); selecting from the client is not exposed |
+| Windows | `moonsec_host_config.window`, `moonsec_host_windows`: macOS by id, Linux through the portal's picker (`test-abi-system -- window` under headless.sh); Windows not yet |
 
 ## Freeze
 

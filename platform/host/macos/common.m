@@ -1,10 +1,12 @@
 // Clock, errors, permissions, displays and pixel buffers for the macOS host backend.
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
+#import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreVideo/CoreVideo.h>
 #include <mach/mach_time.h>
 #include <sys/sysctl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,6 +134,123 @@ uint32_t mh_displays(mh_display_info *out, uint32_t cap) {
         d->refresh_mhz = hz > 0 ? (uint32_t)(hz * 1000.0 + 0.5) : 0;
     }
     return n;
+}
+
+int mh_window_frame(uint32_t id, double *x, double *y, double *w, double *h, double *scale) {
+    CGRect r = CGRectNull;
+    CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, (CGWindowID)id);
+    if (list) {
+        if (CFArrayGetCount(list) > 0) {
+            CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(list, 0);
+            CFDictionaryRef bounds = (CFDictionaryRef)CFDictionaryGetValue(info, kCGWindowBounds);
+            if (bounds && !CGRectMakeWithDictionaryRepresentation(bounds, &r)) r = CGRectNull;
+        }
+        CFRelease(list);
+    }
+    if (CGRectIsNull(r) || r.size.width <= 0 || r.size.height <= 0) return mh_fail(MH_ERR_DEVICE_LOST, "window %u is gone", id);
+    *x = r.origin.x;
+    *y = r.origin.y;
+    *w = r.size.width;
+    *h = r.size.height;
+    if (scale) {
+        // The display under the window's centre (else the main one): its mode's pixels
+        // per point.
+        CGDirectDisplayID did = CGMainDisplayID();
+        uint32_t n = 0;
+        CGDirectDisplayID under;
+        if (CGGetDisplaysWithPoint(CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r)), 1, &under, &n) == kCGErrorSuccess && n > 0) did = under;
+        double s = 1;
+        CGDisplayModeRef m = CGDisplayCopyDisplayMode(did);
+        CGRect b = CGDisplayBounds(did);
+        if (m) {
+            if (b.size.width > 0) s = (double)CGDisplayModeGetPixelWidth(m) / b.size.width;
+            CGDisplayModeRelease(m);
+        }
+        *scale = s >= 1 ? s : 1;
+    }
+    return MH_OK;
+}
+
+int mh_window_pixels(uint32_t id, uint32_t *w, uint32_t *h) {
+    double x, y, pw, ph, s;
+    int rc = mh_window_frame(id, &x, &y, &pw, &ph, &s);
+    if (rc != MH_OK) return rc;
+    *w = (uint32_t)lround(pw * s) & ~1u;
+    *h = (uint32_t)lround(ph * s) & ~1u;
+    if (*w < 2) *w = 2;
+    if (*h < 2) *h = 2;
+    return MH_OK;
+}
+
+// The window's owner and frame from the window server.
+static int window_owner(uint32_t id, pid_t *pid, CGRect *r) {
+    *pid = 0;
+    *r = CGRectNull;
+    CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, (CGWindowID)id);
+    if (list) {
+        if (CFArrayGetCount(list) > 0) {
+            CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(list, 0);
+            CFNumberRef owner = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowOwnerPID);
+            int p = 0;
+            if (owner && CFNumberGetValue(owner, kCFNumberIntType, &p)) *pid = (pid_t)p;
+            CFDictionaryRef bounds = (CFDictionaryRef)CFDictionaryGetValue(info, kCGWindowBounds);
+            if (bounds && !CGRectMakeWithDictionaryRepresentation(bounds, r)) *r = CGRectNull;
+        }
+        CFRelease(list);
+    }
+    return *pid > 0 ? MH_OK : mh_fail(MH_ERR_DEVICE_LOST, "window %u is gone", id);
+}
+
+// Raises the AX window of `app` whose frame is `r` (the window server's and AX's frames
+// are both points, top-left origin) and makes it main. 1 when one matched.
+static int ax_raise(AXUIElementRef app, CGRect r) {
+    CFArrayRef wins = NULL;
+    if (AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, (CFTypeRef *)&wins) != kAXErrorSuccess || !wins) return 0;
+    int raised = 0;
+    for (CFIndex i = 0; i < CFArrayGetCount(wins) && !raised; i++) {
+        AXUIElementRef w = (AXUIElementRef)CFArrayGetValueAtIndex(wins, i);
+        CFTypeRef pos = NULL, size = NULL;
+        CGPoint p = CGPointZero;
+        CGSize s = CGSizeZero;
+        int have = AXUIElementCopyAttributeValue(w, kAXPositionAttribute, &pos) == kAXErrorSuccess && pos &&
+                   AXValueGetValue((AXValueRef)pos, (AXValueType)kAXValueCGPointType, &p);
+        have = have && AXUIElementCopyAttributeValue(w, kAXSizeAttribute, &size) == kAXErrorSuccess && size &&
+               AXValueGetValue((AXValueRef)size, (AXValueType)kAXValueCGSizeType, &s);
+        if (pos) CFRelease(pos);
+        if (size) CFRelease(size);
+        if (!have || fabs(p.x - r.origin.x) > 2 || fabs(p.y - r.origin.y) > 2 || fabs(s.width - r.size.width) > 2 ||
+            fabs(s.height - r.size.height) > 2)
+            continue;
+        AXUIElementSetAttributeValue(w, kAXMainAttribute, kCFBooleanTrue);
+        raised = AXUIElementPerformAction(w, kAXRaiseAction) == kAXErrorSuccess;
+    }
+    CFRelease(wins);
+    return raised;
+}
+
+int mh_window_focus(uint32_t id) {
+    @autoreleasepool {
+        pid_t pid;
+        CGRect r;
+        int rc = window_owner(id, &pid, &r);
+        if (rc != MH_OK) return rc;
+        int front = 0, raised = 0;
+        if (AXIsProcessTrusted()) {
+            AXUIElementRef app = AXUIElementCreateApplication(pid);
+            if (app) {
+                front = AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue) == kAXErrorSuccess;
+                if (!CGRectIsNull(r)) raised = ax_raise(app, r);
+                CFRelease(app);
+            }
+        }
+        if (!front) {
+            // Without Accessibility: ask AppKit (macOS 14 may decline for a background caller).
+            NSRunningApplication *a = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+            front = a && [a activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+        }
+        if (!front && !raised) return mh_fail(MH_ERR, "window %u (pid %d) could not be brought to the front", id, (int)pid);
+        return MH_OK;
+    }
 }
 
 uint32_t mh_fmt_to_cv(uint32_t fmt) {

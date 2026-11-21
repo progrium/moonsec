@@ -553,7 +553,7 @@ pub const MultiHostApp = struct {
     };
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: apps.HostOptions, mo: Options) !MultiHostApp {
-        const size = try be.capture.start(.{ .display = o.display, .fps = o.fps, .width = o.width, .height = o.height, .hdr = o.hdr });
+        const size = try be.capture.start(.{ .display = o.display, .window = o.window, .focus_window = o.focus_window, .fps = o.fps, .width = o.width, .height = o.height, .hdr = o.hdr });
         errdefer be.capture.stop();
         const caps = be.encoder.caps();
         if (!caps.codecs.has(o.codec)) return error.Unsupported;

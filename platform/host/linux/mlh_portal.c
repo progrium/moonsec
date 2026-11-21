@@ -290,7 +290,7 @@ static void append_select(mlh_portal *p, DBusMessageIter *args, const char *toke
     DBusMessageIter d;
     dict_open(args, &d);
     dict_add_str(&d, "handle_token", token);
-    dict_add_u32(&d, "types", MLH_SOURCE_MONITOR);
+    dict_add_u32(&d, "types", o->types ? o->types : MLH_SOURCE_MONITOR);
     dict_add_bool(&d, "multiple", o->multiple);
     if (p->version >= 2 && p->cursor_mode) dict_add_u32(&d, "cursor_mode", p->cursor_mode);
     if (p->version >= 4) {

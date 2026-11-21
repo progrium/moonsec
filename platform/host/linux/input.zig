@@ -153,6 +153,8 @@ pub const Stats = struct {
     scrolls: u64 = 0,
     motions: u64 = 0,
     abs: u64 = 0,
+    /// Absolute moves dropped while a window is shared (`setWindow`).
+    abs_dropped: u64 = 0,
     pad_reports: u64 = 0,
     pads_connected: u64 = 0,
     /// Keys and buttons with no Linux code, pads past the fourth.
@@ -170,6 +172,9 @@ pub const Injector = struct {
     /// The captured output (the host sets it when capture starts); 0 until then, and the
     /// tablet spans 0..65535.
     output: api.Size = .{ .width = 0, .height = 0 },
+    /// Capture shares one window: the portal does not say where it is on the desktop, so
+    /// an absolute position in its picture has nowhere known to land, and is dropped.
+    window: bool = false,
     pads: [core.input.max_pads]?ui.Device = @splat(null),
     /// High-resolution wheel units not yet a whole notch (x, y).
     wheel_rem: [2]i32 = .{ 0, 0 },
@@ -201,6 +206,10 @@ pub const Injector = struct {
     /// The captured output's size: absolute positions map onto its pixels.
     pub fn setOutput(j: *Injector, size: api.Size) void {
         j.output = size;
+    }
+
+    pub fn setWindow(j: *Injector, on: bool) void {
+        j.window = on;
     }
 
     fn send(j: *Injector, d: ui.Device, events: []const ui.Event) api.Error!void {
@@ -260,6 +269,10 @@ pub const Injector = struct {
                 try j.send(j.mouse, &.{ .{ .type = ui.EV_REL, .code = ui.REL_X, .value = m.dx }, .{ .type = ui.EV_REL, .code = ui.REL_Y, .value = m.dy }, ui.syn });
             },
             .abs => |p| {
+                if (j.window) {
+                    j.stats.abs_dropped += 1;
+                    return;
+                }
                 const size: api.Size = if (j.output.width > 1 and j.output.height > 1) j.output else .{ .width = 65536, .height = 65536 };
                 const t = try j.tabletFor(size);
                 j.stats.abs += 1;
@@ -490,6 +503,24 @@ test "the wheels: high resolution, and notches accumulated from it" {
         .{ ui.EV_REL, ui.REL_WHEEL_HI_RES, -60 }, .{ ui.EV_REL, ui.REL_HWHEEL_HI_RES, -240 },
         .{ ui.EV_REL, ui.REL_HWHEEL, -2 },        SYN,
     }, po.drain(.mouse, 0, &buf));
+}
+
+test "a shared window drops absolute positions and keeps relative motion" {
+    var po: PipeOpener = .{};
+    var j = try Injector.init(po.opener());
+    defer j.deinit();
+    var buf: [64]ui.Event = undefined;
+    j.setOutput(.{ .width = 800, .height = 600 });
+    j.setWindow(true);
+    try j.inject(.{ .abs = .{ .x = 100, .y = 100 } });
+    try testing.expectEqual(@as(?i32, null), po.read[2]); // no tablet made
+    try testing.expectEqual(@as(u64, 1), j.stats.abs_dropped);
+    try j.inject(.{ .motion = .{ .dx = 3, .dy = -2 } });
+    try expectEvents(&.{ .{ ui.EV_REL, ui.REL_X, 3 }, .{ ui.EV_REL, ui.REL_Y, -2 }, SYN }, po.drain(.mouse, 0, &buf));
+    // Back on a display, absolute positions land again.
+    j.setWindow(false);
+    try j.inject(.{ .abs = .{ .x = 0, .y = 0 } });
+    try expectEvents(&.{ .{ ui.EV_ABS, ui.ABS_X, 0 }, .{ ui.EV_ABS, ui.ABS_Y, 0 }, SYN }, po.drain(.tablet, 0, &buf));
 }
 
 test "absolute positions map onto the output's pixels through a tablet" {

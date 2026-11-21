@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 
 static int failures = 0;
@@ -167,7 +168,20 @@ static void test_basics(void) {
     CHECK(nd == 1 && di[0].index == 0 && di[0].width == 320 && di[0].height == 180);
     CHECK(di[0].primary == 1 && di[0].refresh_mhz == 60000 && di[0].hdr == 0 && strcmp(di[0].name, "Synthetic 1") == 0);
     CHECK(moonsec_host_displays(h, NULL, 4, &nd) == MOONSEC_ERR_INVALID);
+    /* Windows: the synthetic backend shares its display only. */
+    size_t nw = 99;
+    CHECK(moonsec_host_windows(h, NULL, 0, &nw) == MOONSEC_ERR_UNSUPPORTED && nw == 0);
     moonsec_host_destroy(h);
+    hc.window = 42;
+    CHECK(moonsec_host_create(&hc, &h) == MOONSEC_ERR_UNSUPPORTED);
+    hc.window = MOONSEC_WINDOW_PICK;
+    CHECK(moonsec_host_create(&hc, &h) == MOONSEC_ERR_UNSUPPORTED);
+    hc.window = 0;
+    /* A 1.0-sized config (no `window`) is still taken. */
+    hc.struct_size = (uint32_t)offsetof(moonsec_host_config, window);
+    OK(moonsec_host_create(&hc, &h));
+    moonsec_host_destroy(h);
+    hc.struct_size = sizeof hc;
 }
 
 static void test_stream(uint32_t profile) {

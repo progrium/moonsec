@@ -12,5 +12,7 @@ int mlh_testportal_start(uint32_t node, uint32_t width, uint32_t height, uint32_
 /* Start calls served, how many of them came with restore data from a restore token,
  * and the last session's cursor and persist modes. */
 void mlh_testportal_counts(uint32_t *starts, uint32_t *restored_starts, uint32_t *cursor_mode, uint32_t *persist_mode);
+/* The source types (MLH_SOURCE_* bits) the last started session asked for. */
+uint32_t mlh_testportal_last_types(void);
 
 #endif

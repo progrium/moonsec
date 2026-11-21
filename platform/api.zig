@@ -169,6 +169,56 @@ pub const CaptureConfig = struct {
     /// Capture in HDR when the display is in an HDR mode (rgba16f or rgb10a2 frames tagged
     /// `.hdr10`); off, or on an SDR display, frames are 8-bit SDR as before.
     hdr: bool = false,
+    /// Capture one window instead of `display`: an id from the backend's window list
+    /// (`WindowInfo.id`), or `pick_window` for the OS's own picker. 0: the display.
+    /// Backends that capture displays only fail `start` with `error.Unsupported`. With
+    /// no size hint the frames follow the window's size (a resize is a new frame size,
+    /// as a display mode change is); the window's own size at `start` is what it returns.
+    window: u64 = 0,
+    /// With `window`: bring it to the front (and give it keyboard focus) as capture
+    /// starts, so keys reach it. The app asks for it when a session starts, not on the
+    /// restarts after (a rate-ladder step must not steal focus back). Backends that
+    /// cannot focus another app's window ignore it.
+    focus_window: bool = false,
+
+    /// `window`: let the user choose in the OS's picker (the ScreenCast portal's dialog).
+    pub const pick_window: u64 = std.math.maxInt(u64);
+};
+
+/// One window the host can capture (`CaptureConfig.window`).
+pub const WindowInfo = struct {
+    id: u64,
+    pid: u32 = 0,
+    /// Frame in the desktop's coordinates (macOS: points, top-left origin).
+    x: i32 = 0,
+    y: i32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    on_screen: bool = true,
+    app_buf: [64]u8 = @splat(0),
+    title_buf: [128]u8 = @splat(0),
+
+    pub fn app(w: *const WindowInfo) []const u8 {
+        return std.mem.sliceTo(&w.app_buf, 0);
+    }
+    pub fn title(w: *const WindowInfo) []const u8 {
+        return std.mem.sliceTo(&w.title_buf, 0);
+    }
+    /// Copies `s`, cut at a UTF-8 boundary to fit with its terminator.
+    pub fn setApp(w: *WindowInfo, s: []const u8) void {
+        setStr(&w.app_buf, s);
+    }
+    pub fn setTitle(w: *WindowInfo, s: []const u8) void {
+        setStr(&w.title_buf, s);
+    }
+
+    fn setStr(buf: []u8, s: []const u8) void {
+        var n = @min(s.len, buf.len - 1);
+        // Back off continuation bytes so a multi-byte character is not cut in half.
+        while (n > 0 and n < s.len and s[n] & 0xC0 == 0x80) n -= 1;
+        @memset(buf, 0);
+        @memcpy(buf[0..n], s[0..n]);
+    }
 };
 
 /// A frame's size can differ from what `start` returned: the display's mode changed
@@ -813,4 +863,17 @@ pub const pattern = @import("pattern.zig");
 test {
     _ = pattern;
     _ = format;
+}
+
+test "window info strings are cut at a character boundary" {
+    var w: WindowInfo = .{ .id = 7 };
+    w.setApp("Finder");
+    try std.testing.expectEqualStrings("Finder", w.app());
+    // 62 ASCII bytes then a 3-byte character: 65 bytes do not fit in 63, and the cut
+    // must not leave the character's first byte behind.
+    const long = "a" ** 62 ++ "\u{20AC}";
+    w.setApp(long);
+    try std.testing.expectEqualStrings("a" ** 62, w.app());
+    w.setTitle("");
+    try std.testing.expectEqualStrings("", w.title());
 }

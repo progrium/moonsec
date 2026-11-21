@@ -64,6 +64,8 @@ typedef struct mlh_portal_options {
     int multiple;
     /* How long to wait for the user to answer the dialog; 0 = 5 minutes. */
     uint32_t timeout_ms;
+    /* What the dialog offers (MLH_SOURCE_* bits); 0 = monitors. */
+    uint32_t types;
 } mlh_portal_options;
 
 #define MLH_SOURCE_MONITOR 1u

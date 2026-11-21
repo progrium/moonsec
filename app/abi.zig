@@ -91,10 +91,14 @@ fn outStr(s: []const u8, buf: ?[*]u8, cap: usize, len: ?*usize) Status {
 }
 
 /// A caller's struct, zero-extended from its `struct_size`. Null if it is missing or older
-/// than 1.0's layout (every struct is 1.0's now; later fields will be optional).
+/// than 1.0's layout (`min_size`: fields after it came later and read as zero).
 fn readIn(comptime T: type, p: ?*const T) ?T {
+    return readInMin(T, p, @sizeOf(T));
+}
+
+fn readInMin(comptime T: type, p: ?*const T, min_size: usize) ?T {
     const src = p orelse return null;
-    if (src.struct_size < @sizeOf(T)) return null;
+    if (src.struct_size < min_size) return null;
     var v: T = std.mem.zeroes(T);
     const n = @min(src.struct_size, @sizeOf(T));
     @memcpy(std.mem.asBytes(&v)[0..n], std.mem.asBytes(src)[0..n]);
@@ -138,6 +142,7 @@ export fn moonsec_features() u32 {
     var f: u32 = c.MOONSEC_FEATURE_LOOPBACK;
     if (options.iroh) f |= c.MOONSEC_FEATURE_IROH | c.MOONSEC_FEATURE_MULTI_USER;
     f |= c.MOONSEC_FEATURE_DISPLAYS;
+    if (system.windows_supported) f |= c.MOONSEC_FEATURE_WINDOWS;
     if (system.available) f |= c.MOONSEC_FEATURE_SYSTEM_BACKEND;
     return f;
 }
@@ -368,9 +373,14 @@ fn checkCommon(backend: u32, clip: u32, relay: u32, relay_url: [*c]const u8) Sta
 export fn moonsec_host_create(config: ?*const c.moonsec_host_config, out: ?*?*c.moonsec_host) Status {
     const o = out orelse return invalid("out is NULL");
     o.* = null;
-    const cfg = readIn(c.moonsec_host_config, config) orelse return invalid("config is NULL or struct_size is too small");
+    // 1.0's layout ends at notify_ctx; `window` came after.
+    const cfg = readInMin(c.moonsec_host_config, config, @offsetOf(c.moonsec_host_config, "window")) orelse return invalid("config is NULL or struct_size is too small");
     const st = checkCommon(cfg.backend, cfg.clipboard, cfg.relay_mode, cfg.relay_url);
     if (st != ok) return st;
+    if (cfg.window != 0) {
+        if (cfg.backend != c.MOONSEC_BACKEND_SYSTEM) return fail(c.MOONSEC_ERR_UNSUPPORTED, "the synthetic backend has no windows", .{});
+        if (system.windowSupport(cfg.window)) |why| return fail(c.MOONSEC_ERR_UNSUPPORTED, "{s}", .{why});
+    }
     if (cfg.max_clients > core.multi.max_members) return invalid("max_clients is more than 32");
     if (cfg.max_clients > 1 and !options.iroh) return fail(c.MOONSEC_ERR_UNSUPPORTED, "multi-user hosts need iroh (MOONSEC_FEATURE_MULTI_USER)", .{});
     if (cfg.codec != 0 and (cfg.codec > 255 or !api.CodecSet.has(.{ .h264 = true, .hevc = true, .av1 = true, .passthrough = true }, @enumFromInt(@as(u8, @intCast(cfg.codec))))))
@@ -536,6 +546,37 @@ export fn moonsec_host_displays(h: ?*c.moonsec_host, out: ?[*]c.moonsec_display_
     }
     return ok;
 }
+
+export fn moonsec_host_windows(h: ?*c.moonsec_host, out: ?[*]c.moonsec_window_info, cap: usize, count: ?*usize) Status {
+    const e = hostOf(h) orelse return invalid("not a host");
+    if (count) |n| n.* = 0;
+    if (cap > 0 and out == null) return invalid("out is NULL");
+    if (e.hc.backend != c.MOONSEC_BACKEND_SYSTEM) return fail(c.MOONSEC_ERR_UNSUPPORTED, "the synthetic backend has no windows", .{});
+    var list: [max_windows]api.WindowInfo = undefined;
+    const n = system.hostWindows(&list) catch |err| return switch (err) {
+        error.Unsupported => fail(c.MOONSEC_ERR_UNSUPPORTED, "no window list on this OS (Linux: the user picks in the portal's dialog, MOONSEC_WINDOW_PICK), or Screen Recording is not allowed (macOS)", .{}),
+        error.OutOfMemory => fail(c.MOONSEC_ERR_NO_MEMORY, "out of memory", .{}),
+        else => fail(c.MOONSEC_ERR_BACKEND, "listing windows failed", .{}),
+    };
+    if (count) |p| p.* = n;
+    for (list[0..@min(n, cap)], 0..) |w, i| {
+        var o = std.mem.zeroes(c.moonsec_window_info);
+        o.id = w.id;
+        o.pid = w.pid;
+        o.x = w.x;
+        o.y = w.y;
+        o.width = w.width;
+        o.height = w.height;
+        o.on_screen = @intFromBool(w.on_screen);
+        fixedStr(&o.app, w.app());
+        fixedStr(&o.title, w.title());
+        out.?[i] = o;
+    }
+    return ok;
+}
+
+/// The most windows `moonsec_host_windows` reports.
+const max_windows = 256;
 
 /// The host's displays: the list a streaming session last got from its capture (it
 /// polls about once a second), or with none streaming, the OS's list (system backend;
@@ -1080,6 +1121,8 @@ fn hostOptions(cfg: c.moonsec_host_config, codec: api.Codec, ctl: ?pipe_mod.Byte
         .ten_bit = cfg.flags & c.MOONSEC_HOST_TEN_BIT != 0,
         .hdr = cfg.flags & c.MOONSEC_HOST_NO_HDR == 0,
         .display = cfg.display,
+        .window = cfg.window,
+        .focus_window = cfg.window != 0 and cfg.flags & c.MOONSEC_HOST_FOCUS_WINDOW != 0,
         .width = cfg.width,
         .height = cfg.height,
         .audio = cfg.flags & c.MOONSEC_HOST_NO_AUDIO == 0,

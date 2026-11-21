@@ -16,6 +16,7 @@
 struct mh_input {
     CGEventSourceRef src;
     uint32_t display;
+    uint32_t window; // a CGWindowID while one window is shared, else 0
     CGEventFlags flags;
     uint32_t buttons; // bit (b - 1) for button b
     // Click counting.
@@ -40,6 +41,8 @@ int mh_input_create(mh_input **out) {
 }
 
 void mh_input_set_display(mh_input *in, uint32_t display) { in->display = display; }
+
+void mh_input_set_window(mh_input *in, uint32_t window) { in->window = window; }
 
 void mh_input_cursor(double *x, double *y) {
     CGEventRef e = CGEventCreate(NULL);
@@ -209,7 +212,8 @@ int mh_input_move_rel(mh_input *in, int32_t dx, int32_t dy) {
 
 int mh_input_move_abs(mh_input *in, uint16_t x, uint16_t y) {
     double bx, by, bw, bh;
-    int rc = mh_display_bounds(in->display, &bx, &by, &bw, &bh);
+    // A shared window's frame where it is now (it may have moved), else the display's.
+    int rc = in->window ? mh_window_frame(in->window, &bx, &by, &bw, &bh, NULL) : mh_display_bounds(in->display, &bx, &by, &bw, &bh);
     if (rc != MH_OK) return rc;
     CGPoint p = CGPointMake(bx + (double)x * (bw - 1) / 65535.0, by + (double)y * (bh - 1) / 65535.0);
     double cx, cy;

@@ -5,7 +5,7 @@ The macOS host backend (design doc, Phase 4): `openHost` in [host.zig](host.zig)
 
 | Object | macOS API | Notes |
 | --- | --- | --- |
-| `Capture` | ScreenCaptureKit (`SCStream` on a display) | NV12 by default; `Image.gpu` is a `CVPixelBufferRef` |
+| `Capture` | ScreenCaptureKit (`SCStream` on a display or one window) | NV12 by default; `Image.gpu` is a `CVPixelBufferRef` |
 | `Encoder` | VideoToolbox | low-latency encoder with LTR by default (S7b, S8) |
 | `AudioSource` | ScreenCaptureKit system audio | 48 kHz f32, this process excluded |
 | `InputInjector` | CGEvent | HID usages to virtual key codes in [keymap.zig](keymap.zig) |
@@ -85,6 +85,21 @@ turn motion into drags; repeated clicks in place within the double-click interva
 Relative motion sets the delta fields games read and moves the cursor, clamped to the
 displays. Absolute positions map 0..65535 onto the captured display (`Options.display`
 until capture starts).
+
+## Windows
+
+`listWindows` lists the normal (layer 0) on-screen windows of other apps that
+ScreenCaptureKit can capture (Screen Recording needed): ids are CGWindowIDs, what
+`CaptureConfig.window` takes; frames are points in the global display space. With a
+window, the stream's filter is `initWithDesktopIndependentWindow:`, so the window is
+captured wherever it is and whatever covers it. With no size hint the frame size is the
+window's pixels (its frame times the backing scale of the display under it), and
+`acquire` checks the window's size about four times a second and updates the stream when
+it was resized; the app then sees frames of the new size. Absolute moves land on the
+window's frame where it is at that moment (`mh_input_set_window`). With
+`CaptureConfig.focus_window` (the app sets it when a session starts), `start` brings the
+window forward (`mh_window_focus`): its app frontmost and the window raised and made main
+through Accessibility, or the app activated with AppKit when Accessibility is not granted.
 
 ## Displays
 

@@ -5,7 +5,9 @@
  *
  *   CreateSession, SelectSources   remember the session's persist mode and whether the
  *                                  frontend passed restore data (from a restore token)
- *   Start                          one monitor stream: the configured PipeWire node, and
+ *   Start                          one stream: the configured PipeWire node as a monitor,
+ *                                  or as a window (no position) when SelectSources
+ *                                  asked for windows only, and
  *                                  restore data when persisting, which the frontend turns
  *                                  into the restore token the app gets
  *   Session.Close, Request.Close   acknowledged
@@ -31,6 +33,7 @@ struct session {
     char path[256];
     uint32_t persist_mode;
     uint32_t cursor_mode;
+    uint32_t types;
     int restored;
 };
 
@@ -41,7 +44,7 @@ static struct {
     _Atomic int running;
     uint32_t node, width, height, cursor_modes;
     struct session sessions[16];
-    _Atomic uint32_t starts, restored_starts, last_cursor_mode, last_persist_mode;
+    _Atomic uint32_t starts, restored_starts, last_cursor_mode, last_persist_mode, last_types;
 } tp;
 
 static struct session *find_session(const char *path, int create) {
@@ -140,7 +143,7 @@ static void reply_empty(DBusMessage *m) {
 }
 
 static void append_prop(DBusMessageIter *it, const char *prop) {
-    uint32_t v = strcmp(prop, "AvailableSourceTypes") == 0 ? 1u : strcmp(prop, "AvailableCursorModes") == 0 ? tp.cursor_modes : 5u;
+    uint32_t v = strcmp(prop, "AvailableSourceTypes") == 0 ? 3u : strcmp(prop, "AvailableCursorModes") == 0 ? tp.cursor_modes : 5u;
     DBusMessageIter var;
     dbus_message_iter_open_container(it, DBUS_TYPE_VARIANT, "u", &var);
     dbus_message_iter_append_basic(&var, DBUS_TYPE_UINT32, &v);
@@ -155,9 +158,10 @@ static void fill_start(DBusMessageIter *dict, void *ctx) {
     dbus_message_iter_open_container(&arr, DBUS_TYPE_STRUCT, NULL, &st);
     dbus_message_iter_append_basic(&st, DBUS_TYPE_UINT32, &tp.node);
     dbus_message_iter_open_container(&st, DBUS_TYPE_ARRAY, "{sv}", &props);
-    add_pair(&props, "position", 0, 0);
+    uint32_t type = s && (s->types & 2u) && !(s->types & 1u) ? 2u : 1u;
+    if (type == 1u) add_pair(&props, "position", 0, 0);
     add_pair(&props, "size", (int32_t)tp.width, (int32_t)tp.height);
-    add_u32(&props, "source_type", 1);
+    add_u32(&props, "source_type", type);
     dbus_message_iter_close_container(&st, &props);
     dbus_message_iter_close_container(&arr, &st);
     dbus_message_iter_close_container(&v, &arr);
@@ -234,6 +238,7 @@ static void handle(DBusMessage *m) {
         if (strcmp(member, "SelectSources") == 0 && s) {
             s->persist_mode = opt_u32(&it, "persist_mode", 0);
             s->cursor_mode = opt_u32(&it, "cursor_mode", 1);
+            s->types = opt_u32(&it, "types", 1);
             DBusMessageIter v, st;
             s->restored = 0;
             if (find_key(&it, "restore_data", &v) && dbus_message_iter_get_arg_type(&v) == DBUS_TYPE_STRUCT) {
@@ -250,6 +255,7 @@ static void handle(DBusMessage *m) {
             if (s->restored) atomic_fetch_add(&tp.restored_starts, 1);
             atomic_store(&tp.last_cursor_mode, s->cursor_mode);
             atomic_store(&tp.last_persist_mode, s->persist_mode);
+            atomic_store(&tp.last_types, s->types);
             reply_response(m, fill_start, s);
             return;
         }
@@ -312,3 +318,5 @@ void mlh_testportal_counts(uint32_t *starts, uint32_t *restored_starts, uint32_t
     *cursor_mode = atomic_load(&tp.last_cursor_mode);
     *persist_mode = atomic_load(&tp.last_persist_mode);
 }
+
+uint32_t mlh_testportal_last_types(void) { return atomic_load(&tp.last_types); }

@@ -83,6 +83,32 @@ pub fn hostDisplays(out: []api.DisplayInfo) Error!usize {
     return r catch |e| mapErr(e);
 }
 
+/// Whether `openHost`'s capture can share window `window` (`api.CaptureConfig.window`):
+/// null when it can, else why not. macOS shares a window by its id from `hostWindows`;
+/// Linux has the user pick one in the ScreenCast portal's dialog (`pick_window`).
+pub fn windowSupport(window: u64) ?[]const u8 {
+    if (!available) return "this build has no system backend";
+    return switch (builtin.os.tag) {
+        .macos => if (window == api.CaptureConfig.pick_window) "macOS shares a window by its id from the window list; there is no picker yet" else null,
+        .linux => if (window == api.CaptureConfig.pick_window) null else "on Linux the user picks the window in the ScreenCast portal's dialog: use the picker",
+        else => "this OS's host shares whole displays only",
+    };
+}
+
+/// Whether `windowSupport` accepts some window on this OS.
+pub const windows_supported = available and (builtin.os.tag == .macos or builtin.os.tag == .linux);
+
+/// The windows `openHost`'s capture can share, front to back, without opening a bundle.
+/// macOS only (needs Screen Recording permission); `Unsupported` elsewhere.
+pub fn hostWindows(out: []api.WindowInfo) Error!usize {
+    if (!available) return error.Unsupported;
+    const r: api.Error!usize = switch (builtin.os.tag) {
+        .macos => host_mod.listWindows(out),
+        else => error.Unsupported,
+    };
+    return r catch |e| mapErr(e);
+}
+
 pub fn openClient(gpa: std.mem.Allocator, cfg: ClientConfig) Error!api.ClientBackend {
     if (!available) return error.Unsupported;
     switch (builtin.os.tag) {

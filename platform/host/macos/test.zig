@@ -501,3 +501,52 @@ test "display list: the active displays, main first" {
     try testing.expectEqual(w, out[0].width);
     try testing.expectEqual(h, out[0].height);
 }
+
+test "window list and one window's capture" {
+    if (!host.screenCaptureAllowed()) return skip("capture", "no Screen Recording permission");
+    var out: [64]api.WindowInfo = undefined;
+    const n = try host.listWindows(&out);
+    for (out[0..@min(n, 8)]) |w| std.debug.print("window {d}: {s} \"{s}\" pid {d}, {d}x{d} at {d},{d}\n", .{ w.id, w.app(), w.title(), w.pid, w.width, w.height, w.x, w.y });
+    if (n == 0) return skip("capture", "no shareable window (headless runner)");
+    const w = out[0];
+    try testing.expect(w.id != 0 and w.width >= 40 and w.height >= 40);
+    try testing.expect(w.app().len > 0);
+    var x: f64 = 0;
+    var y: f64 = 0;
+    var fw: f64 = 0;
+    var fh: f64 = 0;
+    var scale: f64 = 0;
+    try ok(c.mh_window_frame(@intCast(w.id), &x, &y, &fw, &fh, &scale));
+    try testing.expect(scale >= 1);
+    // Focusing needs Accessibility (or AppKit agreeing to activate it): either it takes or
+    // says why, and a gone window is DEVICE_LOST.
+    const frc = c.mh_window_focus(@intCast(w.id));
+    std.debug.print("window focus: {d} ({s}); accessibility {}\n", .{ frc, if (frc == c.MH_OK) "ok" else host.lastError(), host.postEventAllowed() });
+    try testing.expect(frc == c.MH_OK or frc == c.MH_ERR);
+    try testing.expectEqual(@as(c_int, c.MH_ERR_DEVICE_LOST), c.mh_window_focus(0x7fff_fff0));
+
+    var cap = try host.Capture.create(.nv12);
+    defer cap.destroy();
+    // At its own size: the window's pixels, even.
+    const size = try cap.start(.{ .window = w.id, .fps = 30 });
+    var pw: u32 = 0;
+    var ph: u32 = 0;
+    try ok(c.mh_window_pixels(@intCast(w.id), &pw, &ph));
+    std.debug.print("window capture: {d}x{d} (frame {d}x{d} points, scale {d})\n", .{ size.width, size.height, fw, fh, scale });
+    try testing.expectEqual(pw, size.width);
+    try testing.expectEqual(ph, size.height);
+    var frames: u32 = 0;
+    const deadline = host.nowUs() + 3_000_000;
+    while (frames < 2 and host.nowUs() < deadline) {
+        const f = (try cap.acquire(500_000)) orelse continue;
+        defer cap.release(&f);
+        try testing.expect(f.image.gpu != null);
+        try testing.expectEqual(size.width, f.image.width);
+        frames += 1;
+    }
+    // A window that is not drawing may give no frame; the stream itself must have run.
+    std.debug.print("window capture: {d} frames\n", .{frames});
+    cap.stop();
+    // A picker or an id that is not a CGWindowID is not supported.
+    try testing.expectError(error.Unsupported, cap.start(.{ .window = api.CaptureConfig.pick_window }));
+}
