@@ -1,6 +1,6 @@
 //! Windows host backend: Desktop Duplication capture, NVENC (loaded at run time) or the
-//! Media Foundation software H.264 encoder, WASAPI loopback audio and SendInput, behind
-//! the platform interface (platform/api.zig).
+//! Media Foundation software H.264 encoder, WASAPI loopback audio, SendInput and virtual
+//! gamepads on ViGEmBus, behind the platform interface (platform/api.zig).
 //!
 //! On a GPU-less machine (the windows-2022 CI runner) open with `.driver = .warp` and
 //! `.encoder = .mf_software`: capture then has no outputs to duplicate, and the encoder
@@ -382,6 +382,7 @@ pub const Injector = struct {
     /// Display rectangle for absolute moves (left, top, width, height); the captured
     /// output's when capture runs, else the primary display.
     capture: ?*const Capture = null,
+    pads: Pads = .{},
 
     pub fn inject(self: *Injector, action: core.input.Action) api.Error!void {
         const hr: i32 = switch (action) {
@@ -397,8 +398,10 @@ pub const Injector = struct {
                 if (r[2] <= 0) c.msw_input_primary_rect(&r[0], &r[1], &r[2], &r[3]);
                 break :blk c.msw_input_move_abs(a.x, a.y, r[0], r[1], r[2], r[3]);
             },
-            // A virtual gamepad needs a signed driver (docs/design.md); until then pads are dropped.
-            .pad => 0,
+            .pad => |p| {
+                self.pads.apply(p.index, if (p.connected) p.state else null);
+                return;
+            },
         };
         if (!ok(hr)) {
             // Unmapped keys and UIPI refusals (elevated window focused) are not fatal.
@@ -406,6 +409,111 @@ pub const Injector = struct {
         }
     }
 };
+
+/// Client pads as virtual wired Xbox 360 pads on the ViGEmBus driver, which the user
+/// installs once (https://github.com/nefarius/ViGEmBus/releases). The bus is opened on
+/// the first pad; without the driver pads are dropped, with one warning, and the bus is
+/// tried again on a later connect so installing it mid-session works.
+pub const Gamepad = core.input.Gamepad;
+
+pub const Pads = struct {
+    bus: ?*c.msw_vigem = null,
+    /// When opening the bus last failed.
+    open_failed_us: ?api.Micros = null,
+    warned: bool = false,
+    /// ViGEm serial of each client pad slot; 0 when not plugged in.
+    serials: [core.input.max_pads]u32 = @splat(0),
+    /// The last report sent per slot: snapshots repeat, the bus only hears changes.
+    last: [core.input.max_pads]c.msw_xusb_report = @splat(rest),
+
+    /// A new pad starts at rest, so an all-released snapshot needs no report.
+    const rest = std.mem.zeroes(c.msw_xusb_report);
+    /// How long a failed open is remembered before the next connect tries again.
+    const retry_us: api.Micros = 10 * std.time.us_per_s;
+
+    /// A pad snapshot for slot `index`, or null when it disconnected.
+    pub fn apply(self: *Pads, index: u8, state: ?core.input.Gamepad) void {
+        if (index >= self.serials.len) return;
+        const g = state orelse {
+            self.unplug(index);
+            return;
+        };
+        const bus = self.open() orelse return;
+        if (self.serials[index] == 0) {
+            var serial: u32 = 0;
+            const hr = c.msw_vigem_plug(bus, &serial);
+            if (!ok(hr)) {
+                log.warn("pad {d}: ViGEmBus plug-in failed: {f}", .{ index + 1, win.fmtHr(hr) });
+                return;
+            }
+            self.serials[index] = serial;
+            self.last[index] = rest;
+            log.info("pad {d} connected (virtual Xbox 360 pad)", .{index + 1});
+        }
+        const r = xusbReport(g);
+        if (std.meta.eql(r, self.last[index])) return;
+        const hr = c.msw_vigem_update(bus, self.serials[index], &r);
+        if (!ok(hr)) {
+            // The pad went away under us (removed in Device Manager): plug in a new one next time.
+            log.warn("pad {d}: report refused: {f}", .{ index + 1, win.fmtHr(hr) });
+            self.unplug(index);
+            return;
+        }
+        self.last[index] = r;
+    }
+
+    fn open(self: *Pads) ?*c.msw_vigem {
+        if (self.bus) |b| return b;
+        const now = nowUs();
+        if (self.open_failed_us) |t| if (now -% t < retry_us) return null;
+        var bus: ?*c.msw_vigem = null;
+        const hr = c.msw_vigem_open(&bus);
+        if (!ok(hr)) {
+            self.open_failed_us = now;
+            if (!self.warned) {
+                self.warned = true;
+                if (hr == c.MSW_E_VIGEM_NOT_INSTALLED) {
+                    log.warn("gamepads need the ViGEmBus driver (https://github.com/nefarius/ViGEmBus/releases); pads are dropped until it is installed", .{});
+                } else {
+                    log.warn("ViGEmBus: {f}; pads are dropped", .{win.fmtHr(hr)});
+                }
+            }
+            return null;
+        }
+        log.info("ViGEmBus opened: client pads appear as Xbox 360 pads", .{});
+        self.bus = bus;
+        self.open_failed_us = null;
+        return bus;
+    }
+
+    fn unplug(self: *Pads, index: usize) void {
+        if (self.serials[index] == 0) return;
+        if (self.bus) |b| _ = c.msw_vigem_unplug(b, self.serials[index]);
+        self.serials[index] = 0;
+        log.info("pad {d} disconnected", .{index + 1});
+    }
+
+    /// Unplugs every pad and closes the bus.
+    pub fn deinit(self: *Pads) void {
+        for (0..self.serials.len) |i| self.unplug(i);
+        if (self.bus) |b| c.msw_vigem_close(b);
+        self.* = .{};
+    }
+};
+
+/// A pad snapshot as an XInput report. `core.input.Gamepad` already uses XInput's
+/// button bits and stick convention; triggers go from 16 to 8 bits.
+pub fn xusbReport(g: Gamepad) c.msw_xusb_report {
+    return .{
+        .buttons = @truncate(g.buttons),
+        .left_trigger = @intCast(g.lt >> 8),
+        .right_trigger = @intCast(g.rt >> 8),
+        .lx = g.lx,
+        .ly = g.ly,
+        .rx = g.rx,
+        .ry = g.ry,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Bundle
@@ -423,6 +531,7 @@ pub const Host = struct {
         const self: *Host = @ptrCast(@alignCast(p.?));
         self.capture.stop();
         self.audio.stop();
+        self.injector.pads.deinit();
         self.encoder.deinit();
         self.d3d.destroy();
         self.com.deinit();

@@ -1,7 +1,7 @@
 //! Windows host backend tests (zig build test-win). They run on the GPU-less windows-2022
 //! runner: WARP for the device, Media Foundation's software encoder, and skips for
 //! hardware that is not there. Set MOONSEC_REQUIRE to a comma list (dup, mf, nvenc, audio,
-//! input) to turn those skips into failures; CI requires what its runner has.
+//! input, vigem) to turn those skips into failures; CI requires what its runner has.
 const std = @import("std");
 const api = @import("platform");
 const win = @import("win");
@@ -230,6 +230,41 @@ test "SendInput moves the pointer and holds a key" {
     try hrOk(c.msw_input_key(0xE1, 0));
     const released = GetAsyncKeyState(VK_LSHIFT) >= 0;
     try testing.expect(held and released);
+}
+
+test "pad snapshots become XInput reports" {
+    const B = host.Gamepad.Button;
+    const r = host.xusbReport(.{ .buttons = B.a | B.y | B.guide | B.dpad_up | B.left_shoulder, .lx = -32768, .ly = 32767, .rx = 123, .ry = -1, .lt = 65535, .rt = 255 });
+    // XINPUT_GAMEPAD_A | Y | (guide) | DPAD_UP | LEFT_SHOULDER
+    try testing.expectEqual(@as(u16, 0x1000 | 0x8000 | 0x0400 | 0x0001 | 0x0100), r.buttons);
+    try testing.expectEqual(@as(u8, 255), r.left_trigger);
+    try testing.expectEqual(@as(u8, 0), r.right_trigger);
+    try testing.expectEqual(@as(i16, -32768), r.lx);
+    try testing.expectEqual(@as(i16, 32767), r.ly);
+    try testing.expectEqual(@as(i16, 123), r.rx);
+    try testing.expectEqual(@as(i16, -1), r.ry);
+}
+
+test "ViGEmBus: a pad plugs in, takes reports and unplugs (driver installed only)" {
+    var bus: ?*c.msw_vigem = null;
+    const hr = c.msw_vigem_open(&bus);
+    if (hr == c.MSW_E_VIGEM_NOT_INSTALLED) return skip("vigem", "ViGEmBus is not installed", hr);
+    try hrOk(hr);
+    defer c.msw_vigem_close(bus);
+    var serial: u32 = 0;
+    try hrOk(c.msw_vigem_plug(bus, &serial));
+    try testing.expect(serial != 0);
+    const r = host.xusbReport(.{ .buttons = host.Gamepad.Button.a, .lx = 16000, .rt = 65535 });
+    try hrOk(c.msw_vigem_update(bus, serial, &r));
+    try hrOk(c.msw_vigem_unplug(bus, serial));
+
+    // Through the injector: connect, report, disconnect.
+    var pads: host.Pads = .{};
+    defer pads.deinit();
+    pads.apply(0, .{ .buttons = host.Gamepad.Button.b });
+    try testing.expect(pads.serials[0] != 0);
+    pads.apply(0, null);
+    try testing.expectEqual(@as(u32, 0), pads.serials[0]);
 }
 
 test "openHost on WARP: the bundle encodes through the platform interface" {

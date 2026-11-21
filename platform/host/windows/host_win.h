@@ -164,6 +164,31 @@ msw_hr msw_input_move_abs(uint16_t x, uint16_t y, int32_t left, int32_t top, int
 /* The primary display's rectangle in virtual-desktop pixels. */
 void msw_input_primary_rect(int32_t *left, int32_t *top, int32_t *width, int32_t *height);
 
+/* ---- Virtual gamepads through ViGEmBus (vigem.c) ----------------------------- */
+
+typedef struct msw_vigem msw_vigem;
+
+/* No ViGEmBus device: the driver is not installed. HRESULT_FROM_WIN32(ERROR_DEV_NOT_EXIST). */
+#define MSW_E_VIGEM_NOT_INSTALLED ((msw_hr)0x80070037u)
+/* The bus refused this client's protocol version. HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH). */
+#define MSW_E_VIGEM_VERSION ((msw_hr)0x8007051Au)
+
+/* One XInput report: XINPUT_GAMEPAD's fields. */
+typedef struct msw_xusb_report {
+    uint16_t buttons;
+    uint8_t left_trigger, right_trigger;
+    int16_t lx, ly, rx, ry;
+} msw_xusb_report;
+
+/* Opens the ViGEmBus device. MSW_E_VIGEM_NOT_INSTALLED when there is none. */
+msw_hr msw_vigem_open(msw_vigem **out);
+/* Unplugs every pad plugged through this handle. */
+void msw_vigem_close(msw_vigem *v);
+/* Plugs in a wired Xbox 360 pad and waits until it takes reports. *serial names it. */
+msw_hr msw_vigem_plug(msw_vigem *v, uint32_t *serial);
+msw_hr msw_vigem_unplug(msw_vigem *v, uint32_t serial);
+msw_hr msw_vigem_update(msw_vigem *v, uint32_t serial, const msw_xusb_report *r);
+
 #ifdef __cplusplus
 }
 #endif

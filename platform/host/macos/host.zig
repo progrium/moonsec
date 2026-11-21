@@ -506,7 +506,7 @@ pub const Injector = struct {
             .scroll => |s| c.mh_input_scroll(self.in, s.dx, s.dy),
             .motion => |m| c.mh_input_move_rel(self.in, m.dx, m.dy),
             .abs => |a| c.mh_input_move_abs(self.in, a.x, a.y),
-            // No virtual gamepad on macOS yet (design doc, Phase 4 gamepads); dropped.
+            // Dropped: a virtual HID pad needs an entitlement Apple must grant (README, Gamepads).
             .pad => c.MH_OK,
         };
         if (rc < 0) {
