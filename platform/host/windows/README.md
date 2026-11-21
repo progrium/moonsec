@@ -8,11 +8,34 @@ returns a `platform.HostBackend` (see [../../api.zig](../../api.zig)).
 | `Capture` | Desktop Duplication (`IDXGIOutputDuplication`), copied into our own BGRA texture and released at once | capture.c |
 | `Encoder` | NVENC through `nvEncodeAPI64.dll` loaded at run time; Media Foundation's software H.264 MFT as the fallback | enc_nvenc.c, enc_mf.c, enc.c |
 | `AudioSource` | WASAPI loopback of the default render endpoint, 48 kHz float, event driven | audio.c |
-| `InputInjector` | `SendInput`: keys by scan code from HID usages, buttons, wheel, relative and absolute motion | input.c |
+| `InputInjector` | `SendInput`: keys by scan code from HID usages, buttons, wheel, relative and absolute motion. Gamepads: a virtual wired Xbox 360 pad per client pad on ViGEmBus | input.c, vigem.c |
 | `Clock` | `QueryPerformanceCounter` | ../../windows/msw.c |
 
 C code follows [../../windows/README.md](../../windows/README.md): COM in C against Zig's
 bundled mingw-w64 headers, and Zig sees only [host_win.h](host_win.h).
+
+## Gamepads
+
+Client pads become virtual wired Xbox 360 pads (045E:028E) through the
+[ViGEmBus](https://github.com/nefarius/ViGEmBus) driver, so XInput, DirectInput,
+Windows.Gaming.Input and SDL games all see them. Moonsec does not ship or
+install the driver: users who want gamepads install its signed setup once from the
+[ViGEmBus releases](https://github.com/nefarius/ViGEmBus/releases) (Windows 10 and 11,
+x64 and ARM64). Sunshine and DS4Windows users usually have it already. The project is
+retired upstream but the signed driver still installs and works.
+
+[vigem.c](vigem.c) speaks the bus's IOCTL protocol directly (the Xbox 360 subset of
+ViGEmClient, MIT), so there is no C++ dependency. The bus is opened on the first pad
+connect. Without the driver the host logs one warning with the download link, drops pad
+input, and tries the bus again on a connect at least 10 s later, so installing it
+mid-session works. Each pad slot plugs in on its first snapshot, gets a report only when
+its state changes, and unplugs when the client pad disconnects or the host closes.
+Plugging in waits for the pad to be ready (bus v1.17+), which takes a moment on the input
+thread. Rumble is not sent back: the client pad protocol has no force feedback yet.
+
+A Windows client on the same machine as the host would see the host's virtual pads
+through XInput as ordinary Xbox pads; unlike the Linux host's pads they cannot be told
+apart by name.
 
 ## Displays
 
@@ -54,7 +77,7 @@ the encoder runs on textures the caller fills (`msw_texture_create` / `msw_textu
 
 `zig build test-win` runs [test.zig](test.zig). Tests for missing hardware print `skip`;
 `MOONSEC_REQUIRE=mf,input` (set in CI) turns the named skips into failures. The names are
-`dup`, `mf`, `nvenc`, `audio` and `input`.
+`dup`, `mf`, `nvenc`, `audio`, `input` and `vigem`.
 
 ## Not done yet
 
@@ -62,5 +85,4 @@ the encoder runs on textures the caller fills (`msw_texture_create` / `msw_textu
 - Cursor: the pointer position and shape are kept (`msw_dup_pointer_shape`), but the
   platform interface has no cursor channel yet.
 - Hardware Media Foundation encoders (async MFTs on D3D11 textures), AMF and oneVPL.
-- Virtual gamepads (they need a signed driver); `pad` actions are dropped.
 - Real timing: capture, encode and SendInput latency need a Windows GPU host (S6).

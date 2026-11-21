@@ -197,7 +197,7 @@ Each OS implements the same small host and client interfaces; frames stay on the
 | Capture | Desktop Duplication / Windows.Graphics.Capture (D3D11 textures) | ScreenCaptureKit (IOSurface); late-frame tail needs handling | PipeWire portal; KMS grab optional |
 | Encode | NVENC (runtime-loaded), AMF, oneVPL; Media Foundation fallback (all untested) | VideoToolbox: low-latency encoder with LTR, RealTime on, ExpectedFrameRate 1000 (S7b); HEVC preferred | VAAPI, NVENC; Vulkan Video later |
 | Audio capture | WASAPI loopback | ScreenCaptureKit audio | PipeWire |
-| Input injection | SendInput; virtual gamepad needs a signed driver | CGEvent (Accessibility permission); gamepad limited | uinput |
+| Input injection | SendInput; virtual Xbox 360 gamepads on the user-installed ViGEmBus driver | CGEvent (Accessibility permission); no gamepad (virtual HID needs an Apple-granted entitlement) | uinput |
 | Virtual display | IddCx driver (signing required) | CGVirtualDisplay (private API) | Compositor headless output |
 | Decode | D3D11VA | VideoToolbox | VAAPI; Vulkan Video later |
 | Present | Flip-model swapchain, waitable object, tearing allowed | CAMetalLayer | Wayland/EGL or Vulkan |
@@ -436,7 +436,7 @@ Phases run in order; Phase 2 (highlighted) is the first point where someone can 
 
 - Host: ScreenCaptureKit, VideoToolbox, CGEvent input.
 - Clients: macOS (VideoToolbox, Metal) and Linux (VAAPI, Wayland/EGL). Linux client built in [platform/client/linux](../platform/client/linux/README.md): libavcodec with VAAPI and a software fallback, Wayland/EGL (GLES 3, dma-buf import of VAAPI surfaces), PipeWire, evdev. CI runs it end to end against the synthetic host in headless Weston on llvmpipe; VAAPI decode and dma-buf import are untested without a GPU.
-- Gamepads on all clients; virtual gamepad on Windows host (driver path decided in Phase 3). (Client capture built: `platform/client/gamepad`, XInput on Windows, GameController on macOS, evdev on Linux, one `core.input.Gamepad.Button` layout; the Linux source is tested against a uinput virtual pad in CI. The Windows client polls it from `InputSource.poll`; the macOS and Linux client backends call theirs the same way once they land.)
+- Gamepads on all clients; virtual gamepad on Windows host (decided: ViGEmBus, installed by the user; built in platform/host/windows/vigem.c, untested without the driver). (Client capture built: `platform/client/gamepad`, XInput on Windows, GameController on macOS, evdev on Linux, one `core.input.Gamepad.Button` layout; the Linux source is tested against a uinput virtual pad in CI. The Windows client polls it from `InputSource.poll`; the macOS and Linux client backends call theirs the same way once they land.)
 
 **Gate:** every host/client pair in the target table streams with the Phase 2 latency bar.
 

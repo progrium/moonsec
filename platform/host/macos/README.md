@@ -93,7 +93,15 @@ active displays in `CGGetActiveDisplayList` order, main display first: ids are i
 that order, what `CaptureConfig.display` takes. Sizes are the mode's pixels, positions
 are points in the global display space, names are NSScreen's `localizedName`, and the
 refresh rate is the mode's (NSScreen's maximum for built-in panels, whose mode says 0).
-Gamepads are dropped for now.
+## Gamepads
+
+Gamepads are dropped. A virtual HID gamepad (`IOHIDUserDevice` or Core HID's
+`HIDVirtualDevice`) needs the `com.apple.developer.hid.virtual.device` entitlement, which
+Apple grants on request to a paid developer account and which has no development
+variant, so nothing without it can create one or test it. Apple also says the
+GameController framework ignores virtual HID devices, so games that read pads through
+GCController would not see one even then; SDL and IOKit HID readers might. This waits on
+Apple granting the entitlement.
 
 ## Permissions
 
