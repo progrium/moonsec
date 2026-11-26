@@ -15,6 +15,11 @@
  *     R8G8 chroma views of the NV12 texture) compiled at startup with
  *     d3dcompiler_47.dll, which ships with Windows 10 and later.
  *   - The overlay is a CopySubresourceRegion of a CPU-drawn BGRA image (opaque box).
+ *   - The tile layer (lossless tiles) is a BGRA texture of the stream's size, updated
+ *     with UpdateSubresource per tile and alpha-blended over the video's letterbox rect by
+ *     a small pixel shader, on either video path. That shader is compiled on the first
+ *     tile update, so a client without tiles never loads d3dcompiler on the
+ *     video-processor path.
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
@@ -28,6 +33,8 @@
 #define VIEW_CACHE 8
 #define OVERLAY_MAX_W 1024
 #define OVERLAY_MAX_H 512
+/* Tile clears upload zeros in bands of this many rows, so the zero buffer stays small. */
+#define TILES_BAND 64
 
 typedef struct view_entry {
     ID3D11Texture2D *tex; /* not owned: identity only */
@@ -79,6 +86,19 @@ struct mswc_presenter {
 
     ID3D11Texture2D *overlay;
     UINT overlay_w, overlay_h;
+
+    /* Tile layer: transparent except where tiles were put. */
+    ID3D11Texture2D *tiles;
+    ID3D11ShaderResourceView *tiles_srv;
+    UINT tiles_w, tiles_h;
+    int tiles_on;
+    ID3D11VertexShader *tiles_vs;
+    ID3D11PixelShader *tiles_ps;
+    ID3D11SamplerState *tiles_sampler;
+    ID3D11BlendState *tiles_blend;
+    /* TILES_BAND zero rows of the layer's width. */
+    uint8_t *zeros;
+    size_t zeros_len;
 
     ID3D11Texture2D *readback;
 };
@@ -152,12 +172,27 @@ static const char kShader[] =
     "  return float4(saturate(float3(dot(r, v), dot(g, v), dot(b, v))), 1);\n"
     "}\n";
 
+/* The tile layer over the video: the same full-viewport triangle, and the texture as it
+ * is. Cleared texels are all zero and put texels opaque, so the layer is premultiplied
+ * as it stands and is blended as such (ONE, INV_SRC_ALPHA): the linear filter then
+ * doesn't darken a tile's edge next to transparent texels when the picture is scaled. */
+static const char kTileShader[] =
+    "Texture2D<float4> T : register(t0);\n"
+    "SamplerState S : register(s0);\n"
+    "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "V vs(uint id : SV_VertexID) {\n"
+    "  float2 t = float2((id << 1) & 2, id & 2);\n"
+    "  V o; o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o;\n"
+    "}\n"
+    "float4 ps(V i) : SV_Target { return T.Sample(S, i.uv); }\n";
+
 typedef HRESULT(WINAPI *d3dcompile_fn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *, ID3DInclude *, LPCSTR,
                                        LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
 
-static HRESULT compile(d3dcompile_fn fn, const char *entry, const char *target, ID3DBlob **out) {
+static HRESULT compile(d3dcompile_fn fn, const char *src, size_t len, const char *entry, const char *target,
+                       ID3DBlob **out) {
     ID3DBlob *errs = NULL;
-    HRESULT hr = fn(kShader, sizeof kShader - 1, "mswc_present", NULL, NULL, entry, target,
+    HRESULT hr = fn(src, len, "mswc_present", NULL, NULL, entry, target,
                     1u << 15 /* D3DCOMPILE_OPTIMIZATION_LEVEL3 */, 0, out, &errs);
     if (errs) {
         if (FAILED(hr)) OutputDebugStringA((const char *)ID3D10Blob_GetBufferPointer(errs));
@@ -166,31 +201,40 @@ static HRESULT compile(d3dcompile_fn fn, const char *entry, const char *target, 
     return hr;
 }
 
-static HRESULT setup_shader(mswc_presenter *p) {
+static HRESULT load_compiler(d3dcompile_fn *out) {
     /* System32 only: a plain LoadLibraryW also searches the exe's and the current
      * directory, where a planted d3dcompiler_47.dll would run in the client. */
     HMODULE lib = LoadLibraryExW(L"d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!lib) return HRESULT_FROM_WIN32(GetLastError());
-    d3dcompile_fn fn;
     FARPROC proc = GetProcAddress(lib, "D3DCompile");
-    memcpy(&fn, &proc, sizeof fn);
-    HRESULT hr = fn ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    memcpy(out, &proc, sizeof *out);
+    return *out ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+}
+
+/* Linear and clamped, for the video and the tile layer alike. */
+static HRESULT create_sampler(mswc_presenter *p, ID3D11SamplerState **out) {
+    D3D11_SAMPLER_DESC sd;
+    memset(&sd, 0, sizeof sd);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    return ID3D11Device_CreateSamplerState(p->d3d->device, &sd, out);
+}
+
+static HRESULT setup_shader(mswc_presenter *p) {
+    d3dcompile_fn fn = NULL;
+    HRESULT hr = load_compiler(&fn);
     ID3DBlob *vsb = NULL, *psb = NULL;
     if (FAILED(hr)) goto done;
-    MSW_TRY(compile(fn, "vs", "vs_4_0", &vsb), done);
-    MSW_TRY(compile(fn, "ps", "ps_4_0", &psb), done);
+    MSW_TRY(compile(fn, kShader, sizeof kShader - 1, "vs", "vs_4_0", &vsb), done);
+    MSW_TRY(compile(fn, kShader, sizeof kShader - 1, "ps", "ps_4_0", &psb), done);
     MSW_TRY(ID3D11Device_CreateVertexShader(p->d3d->device, ID3D10Blob_GetBufferPointer(vsb),
                                             ID3D10Blob_GetBufferSize(vsb), NULL, &p->vs),
             done);
     MSW_TRY(ID3D11Device_CreatePixelShader(p->d3d->device, ID3D10Blob_GetBufferPointer(psb),
                                            ID3D10Blob_GetBufferSize(psb), NULL, &p->ps),
             done);
-    D3D11_SAMPLER_DESC sd;
-    memset(&sd, 0, sizeof sd);
-    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.MaxLOD = D3D11_FLOAT32_MAX;
-    MSW_TRY(ID3D11Device_CreateSamplerState(p->d3d->device, &sd, &p->sampler), done);
+    MSW_TRY(create_sampler(p, &p->sampler), done);
     D3D11_BUFFER_DESC bd;
     memset(&bd, 0, sizeof bd);
     bd.ByteWidth = sizeof(shader_consts);
@@ -289,6 +333,13 @@ void mswc_presenter_destroy(mswc_presenter *p) {
     MSW_RELEASE(p->ps);
     MSW_RELEASE(p->vs);
     MSW_RELEASE(p->overlay);
+    MSW_RELEASE(p->tiles_srv);
+    MSW_RELEASE(p->tiles);
+    MSW_RELEASE(p->tiles_blend);
+    MSW_RELEASE(p->tiles_sampler);
+    MSW_RELEASE(p->tiles_ps);
+    MSW_RELEASE(p->tiles_vs);
+    free(p->zeros);
     MSW_RELEASE(p->vc);
     MSW_RELEASE(p->vd);
     if (p->waitable) CloseHandle(p->waitable);
@@ -520,6 +571,26 @@ static HRESULT draw_shader(mswc_presenter *p, const mswc_frame *frame) {
     return S_OK;
 }
 
+static void draw_tiles(mswc_presenter *p, RECT dst) {
+    ID3D11DeviceContext *ctx = p->d3d->context;
+    D3D11_VIEWPORT vp = {(float)dst.left, (float)dst.top, (float)(dst.right - dst.left), (float)(dst.bottom - dst.top),
+                         0, 1};
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &p->rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(ctx, p->tiles_blend, NULL, 0xffffffffu);
+    ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(ctx, p->tiles_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(ctx, p->tiles_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &p->tiles_sampler);
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &p->tiles_srv);
+    ID3D11DeviceContext_Draw(ctx, 3, 0);
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
+    ID3D11DeviceContext_OMSetBlendState(ctx, NULL, NULL, 0xffffffffu);
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
+}
+
 msw_hr mswc_presenter_draw(mswc_presenter *p, const mswc_frame *frame) {
     HRESULT hr;
     MSW_TRY(get_targets(p), done);
@@ -531,6 +602,7 @@ msw_hr mswc_presenter_draw(mswc_presenter *p, const mswc_frame *frame) {
             MSW_TRY(draw_shader(p, frame), done);
         else
             MSW_TRY(draw_vp(p, frame), done);
+        if (p->tiles_on && p->tiles_srv) draw_tiles(p, letterbox(frame->width, frame->height, p->w, p->h));
     }
 
     if (p->overlay_w && p->overlay_h) {
@@ -591,3 +663,115 @@ msw_hr mswc_presenter_read_pixel(mswc_presenter *p, uint32_t x, uint32_t y, uint
 done:
     return hr;
 }
+
+/* ---- Tile layer --------------------------------------------------------------- */
+
+static HRESULT setup_tiles(mswc_presenter *p) {
+    if (p->tiles_ps) return S_OK;
+    d3dcompile_fn fn = NULL;
+    HRESULT hr = load_compiler(&fn);
+    ID3DBlob *vsb = NULL, *psb = NULL;
+    if (FAILED(hr)) goto done;
+    MSW_TRY(compile(fn, kTileShader, sizeof kTileShader - 1, "vs", "vs_4_0", &vsb), done);
+    MSW_TRY(compile(fn, kTileShader, sizeof kTileShader - 1, "ps", "ps_4_0", &psb), done);
+    MSW_TRY(ID3D11Device_CreateVertexShader(p->d3d->device, ID3D10Blob_GetBufferPointer(vsb),
+                                            ID3D10Blob_GetBufferSize(vsb), NULL, &p->tiles_vs),
+            done);
+    MSW_TRY(create_sampler(p, &p->tiles_sampler), done);
+    D3D11_BLEND_DESC bd;
+    memset(&bd, 0, sizeof bd);
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    MSW_TRY(ID3D11Device_CreateBlendState(p->d3d->device, &bd, &p->tiles_blend), done);
+    /* Last: tiles_ps set means the whole pipeline is there. */
+    MSW_TRY(ID3D11Device_CreatePixelShader(p->d3d->device, ID3D10Blob_GetBufferPointer(psb),
+                                           ID3D10Blob_GetBufferSize(psb), NULL, &p->tiles_ps),
+            done);
+done:
+    MSW_RELEASE(vsb);
+    MSW_RELEASE(psb);
+    if (FAILED(hr)) {
+        MSW_RELEASE(p->tiles_blend);
+        MSW_RELEASE(p->tiles_sampler);
+        MSW_RELEASE(p->tiles_vs);
+    }
+    return hr;
+}
+
+static void tiles_zero(mswc_presenter *p, UINT x, UINT y, UINT w, UINT h) {
+    for (UINT r = 0; r < h; r += TILES_BAND) {
+        UINT n = h - r < TILES_BAND ? h - r : TILES_BAND;
+        D3D11_BOX box = {x, y + r, 0, x + w, y + r + n, 1};
+        ID3D11DeviceContext_UpdateSubresource(p->d3d->context, (ID3D11Resource *)p->tiles, 0, &box, p->zeros, w * 4,
+                                              0);
+    }
+}
+
+msw_hr mswc_presenter_tiles_reset(mswc_presenter *p, uint32_t w, uint32_t h) {
+    HRESULT hr;
+    if (w == 0 || h == 0) {
+        MSW_RELEASE(p->tiles_srv);
+        MSW_RELEASE(p->tiles);
+        p->tiles_w = p->tiles_h = 0;
+        return S_OK;
+    }
+    MSW_TRY(setup_tiles(p), done);
+    size_t need = (size_t)w * 4 * TILES_BAND;
+    if (need > p->zeros_len) {
+        uint8_t *z = (uint8_t *)calloc(1, need);
+        if (!z) return E_OUTOFMEMORY;
+        free(p->zeros);
+        p->zeros = z;
+        p->zeros_len = need;
+    }
+    if (!p->tiles || w != p->tiles_w || h != p->tiles_h) {
+        MSW_RELEASE(p->tiles_srv);
+        MSW_RELEASE(p->tiles);
+        p->tiles_w = p->tiles_h = 0;
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        MSW_TRY(ID3D11Device_CreateTexture2D(p->d3d->device, &td, NULL, &p->tiles), done);
+        MSW_TRY(ID3D11Device_CreateShaderResourceView(p->d3d->device, (ID3D11Resource *)p->tiles, NULL, &p->tiles_srv),
+                fail);
+        p->tiles_w = w;
+        p->tiles_h = h;
+    }
+    /* A new texture without initial data is not guaranteed to be zero, so it is cleared
+     * like an old one. */
+    tiles_zero(p, 0, 0, w, h);
+    return S_OK;
+fail:
+    MSW_RELEASE(p->tiles);
+done:
+    return hr;
+}
+
+msw_hr mswc_presenter_tiles_put(mswc_presenter *p, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                const uint8_t *pixels, uint32_t stride) {
+    if (!p->tiles || x >= p->tiles_w || y >= p->tiles_h || w == 0 || h == 0) return S_OK;
+    if (w > p->tiles_w - x) w = p->tiles_w - x;
+    if (h > p->tiles_h - y) h = p->tiles_h - y;
+    if (!pixels) {
+        tiles_zero(p, x, y, w, h);
+        return S_OK;
+    }
+    D3D11_BOX box = {x, y, 0, x + w, y + h, 1};
+    ID3D11DeviceContext_UpdateSubresource(p->d3d->context, (ID3D11Resource *)p->tiles, 0, &box, pixels, stride, 0);
+    return S_OK;
+}
+
+void mswc_presenter_tiles_show(mswc_presenter *p, int on) { p->tiles_on = on; }

@@ -12,7 +12,8 @@
 //!               imported as dma-buf EGLImages (no copy); software planes are uploaded
 //!               as R8/RG8 textures; a shader does YUV -> RGB (BT.601/709, limited/full).
 //!               Lowest latency: swap interval 0 and the tearing-control async hint;
-//!               smooth: swap interval 1. The latency overlay is drawn on top.
+//!               smooth: swap interval 1. The lossless tile layer (`tiles`) is blended
+//!               over the video, and the latency overlay is drawn on top.
 //!   AudioSink   PipeWire playback stream, f32, fed from a ring (mlc_audio.c).
 //!   InputSource Keyboard and mouse from evdev (evdev.zig), only while the window has
 //!               keyboard focus (held keys are released when it loses it); gamepads
@@ -289,6 +290,20 @@ pub const Presenter = struct {
         p.countFrame(now);
         p.stats.presents += 1;
         return .{ .presented_us = now };
+    }
+
+    /// Lossless tiles (see `api.Presenter.VTable.tiles`): the ops go to the GL tile
+    /// layer as they come, and `mlc_window_draw` blends it over the next pictures.
+    pub fn tiles(p: *Presenter, u: *const api.TileUpdate) api.Error!void {
+        for (u.ops) |op| switch (op) {
+            .clear_all => try ok("tiles", c.mlc_window_tiles_reset(p.window, u.width, u.height)),
+            .clear => |r| try ok("tiles", c.mlc_window_tiles_put(p.window, r.x, r.y, r.w, r.h, null, 0)),
+            .put => |t| {
+                std.debug.assert(t.pixels.len >= @as(usize, t.rect.w) * t.rect.h * 4);
+                try ok("tiles", c.mlc_window_tiles_put(p.window, t.rect.x, t.rect.y, t.rect.w, t.rect.h, t.pixels.ptr, t.rect.w * 4));
+            },
+        };
+        c.mlc_window_tiles_show(p.window, @intFromBool(u.visible));
     }
 
     /// Reads the drawn picture back and decodes the stamp, when it was drawn 1:1.

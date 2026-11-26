@@ -230,6 +230,68 @@ test "EGL presenter on Wayland: software decode, YUV -> RGB, letterbox, overlay"
     try testing.expectEqual(@as(c_int, 0), c.mlc_window_present(win));
 }
 
+test "tile layer: put tiles blend over the scaled video, clears and hiding show it again" {
+    const win = try window(256, 192);
+    defer c.mlc_window_destroy(win);
+    var dec: ?*c.mlc_decoder = null;
+    try testing.expectEqual(@as(c_int, 0), c.mlc_decoder_create(c.MLC_CODEC_H264, 0, null, &dec));
+    defer c.mlc_decoder_destroy(dec);
+    var aus: [16][]const u8 = undefined;
+    _ = splitAccessUnits(solid_h264, false, &aus);
+    var f: c.mlc_frame = undefined;
+    var got: c_int = 0;
+    try testing.expectEqual(@as(c_int, 0), c.mlc_decoder_decode(dec, aus[0].ptr, aus[0].len, 0, &f, &got));
+    try testing.expect(got != 0);
+    defer c.mlc_decoder_release_frame(dec, &f);
+    _ = c.mlc_window_dispatch(win);
+    var ww: u32 = 0;
+    var wh: u32 = 0;
+    c.mlc_window_size(win, &ww, &wh);
+    if (ww != 256 or wh != 192) return skip("wayland", "the compositor chose another window size");
+
+    // Through the backend's `tiles`, as the client calls it (bind fills the vtable slot).
+    var pr: client.Presenter = .{ .gpa = testing.allocator, .window = win, .style = .{}, .overlay_interval_us = 0, .canvas = &.{}, .canvas_w = 0, .canvas_h = 0, .verify = false };
+    const p = api.bind(api.Presenter, client.Presenter, &pr);
+    try testing.expect(p.hasTiles());
+    // A 16x16 red tile at (32, 32) of the 128x96 stream: (64, 64)-(96, 96) in the 2x window.
+    const red: [16 * 16 * 4]u8 = @bitCast(@as([16 * 16][4]u8, @splat(.{ 0, 0, 0xFF, 0xFF })));
+    const put = [_]api.TileOp{ .clear_all, .{ .put = .{ .rect = .{ .x = 32, .y = 32, .w = 16, .h = 16 }, .pixels = &red } } };
+    try p.tiles(&.{ .width = 128, .height = 96, .ops = &put, .visible = true });
+
+    const Want = enum { tile, video };
+    const check = struct {
+        fn at(w: *c.mlc_window, fr: *const c.mlc_frame, want: Want) !void {
+            try testing.expectEqual(@as(c_int, 0), c.mlc_window_draw(w, fr));
+            // Lossless where the tile is: exactly its pixels, not the video's.
+            const mid = try readPixel(w, 80, 80);
+            switch (want) {
+                .tile => try testing.expectEqualSlices(u8, &.{ 0xFF, 0, 0 }, &mid),
+                .video => for (mid, solid_rgb) |g, v| try testing.expect(near(g, v, 6)),
+            }
+            // Around the tile the video shows through the transparent layer.
+            const out = try readPixel(w, 20, 150);
+            for (out, solid_rgb) |g, v| try testing.expect(near(g, v, 6));
+            try testing.expectEqual(@as(c_int, 0), c.mlc_window_present(w));
+        }
+    };
+    try check.at(win, &f, .tile);
+    // Hidden: the video alone, the tile kept for when it shows again.
+    try p.tiles(&.{ .width = 128, .height = 96, .ops = &.{}, .visible = false });
+    try check.at(win, &f, .video);
+    try p.tiles(&.{ .width = 128, .height = 96, .ops = &.{}, .visible = true });
+    try check.at(win, &f, .tile);
+    // A cleared cell is transparent again.
+    const clear = [_]api.TileOp{.{ .clear = .{ .x = 0, .y = 0, .w = 64, .h = 64 } }};
+    try p.tiles(&.{ .width = 128, .height = 96, .ops = &clear, .visible = true });
+    try check.at(win, &f, .video);
+    // Rectangles past the layer's edge are trimmed, not refused.
+    const edge = [_]api.TileOp{.{ .put = .{ .rect = .{ .x = 120, .y = 88, .w = 16, .h = 16 }, .pixels = &red } }};
+    try p.tiles(&.{ .width = 128, .height = 96, .ops = &edge, .visible = true });
+    try testing.expectEqual(@as(c_int, 0), c.mlc_window_draw(win, &f));
+    try testing.expectEqualSlices(u8, &.{ 0xFF, 0, 0 }, &(try readPixel(win, 250, 186)));
+    try testing.expectEqual(@as(c_int, 0), c.mlc_window_present(win));
+}
+
 test "presenter: the test pattern survives the GL path bit for bit enough to read" {
     const be = client.openClient(testing.allocator, .{ .width = 320, .height = 180, .evdev = false, .verify_pattern = true }) catch |e| {
         if (e == error.DeviceLost) return skip("wayland", std.mem.span(c.mlc_last_error()));
@@ -245,7 +307,8 @@ test "presenter: the test pattern survives the GL path bit for bit enough to rea
     var enc: synthetic.Encoder = .{ .gpa = testing.allocator, .clock = client.clock };
     defer enc.deinit();
     try enc.configure(.{ .codec = .passthrough, .width = 320, .height = 180, .bitrate_bps = 2_000_000 });
-    var cap: synthetic.Capture = .{ .gpa = testing.allocator, .clock = client.clock, .sleeper = null, .sleep_ctx = null, .default_size = .{ .width = 320, .height = 180 } };
+    var cap: synthetic.Capture = .{ .gpa = testing.allocator, .clock = client.clock, .sleeper = null, .sleep_ctx = null };
+    cap.initDisplays(&.{.{ .width = 320, .height = 180 }});
     _ = try cap.start(.{ .fps = 1000 });
     defer cap.stop();
     var tel = core.telemetry.Telemetry(64).init();

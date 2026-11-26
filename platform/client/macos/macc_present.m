@@ -5,6 +5,9 @@
 // to RGB (matrix and range from the buffer) into the target, letterboxed. The target
 // is the window's CAMetalLayer drawable, a detached CAMetalLayer's drawable, or an
 // offscreen texture. The overlay is a BGRA texture drawn 1:1 over the top-left corner.
+// The tile layer (lossless tiles) is a BGRA texture of the stream's size, transparent
+// except where tiles were put, alpha-blended over the video's letterboxed quad with the
+// video's sampler, between the video and the overlay.
 //
 // Latency: the layer keeps two drawables (the fewest Core Animation allows) and
 // nextDrawable is the wait for a free one, like DXGI's waitable object on Windows.
@@ -44,6 +47,10 @@ static NSString *const shader_source = @"#include <metal_stdlib>\n"
                                         "fragment float4 fs_overlay(VOut in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
                                         "                           sampler s [[sampler(0)]]) {\n"
                                         "  return float4(t.sample(s, in.uv).rgb, 1.0);\n"
+                                        "}\n"
+                                        "fragment float4 fs_tiles(VOut in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+                                        "                         sampler s [[sampler(0)]]) {\n"
+                                        "  return t.sample(s, in.uv);\n"
                                         "}\n";
 
 typedef struct {
@@ -77,7 +84,7 @@ static conv conversion(uint32_t matrix, int full_range) {
   @public
     id<MTLDevice> dev;
     id<MTLCommandQueue> queue;
-    id<MTLRenderPipelineState> nv12_ps, overlay_ps;
+    id<MTLRenderPipelineState> nv12_ps, overlay_ps, tiles_ps;
     id<MTLSamplerState> linear, nearest;
     CVMetalTextureCacheRef cache;
     macc_window *win;
@@ -93,6 +100,14 @@ static conv conversion(uint32_t matrix, int full_range) {
     id<MTLTexture> overlay_tex[2];
     int overlay_cur;
     uint32_t overlay_w, overlay_h;
+    // The tile layer: one texture, written only once the GPU is done with the last draw
+    // (see tiles_wait), since it lives on from picture to picture.
+    id<MTLTexture> tiles_tex;
+    uint32_t tiles_w, tiles_h;
+    int tiles_on;
+    // TILES_BAND zero rows of the layer's width, for clears.
+    uint8_t *zeros;
+    size_t zeros_len;
     char name[128];
 }
 @end
@@ -101,6 +116,7 @@ static conv conversion(uint32_t matrix, int full_range) {
 - (void)dealloc {
     if (last_cb) [last_cb waitUntilCompleted];
     if (cache) CFRelease(cache);
+    free(zeros);
 }
 @end
 
@@ -139,7 +155,17 @@ macc_status macc_presenter_create(macc_window *win, uint32_t w, uint32_t h, uint
         p->nv12_ps = [dev newRenderPipelineStateWithDescriptor:d error:&err];
         d.fragmentFunction = [lib newFunctionWithName:@"fs_overlay"];
         p->overlay_ps = [dev newRenderPipelineStateWithDescriptor:d error:&err];
-        if (!p->nv12_ps || !p->overlay_ps) {
+        // Cleared texels are all zero and put texels opaque, so the tile layer is
+        // premultiplied as it stands and is blended as such: the linear filter then
+        // doesn't darken a tile's edge next to transparent texels when scaled.
+        d.fragmentFunction = [lib newFunctionWithName:@"fs_tiles"];
+        MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[0];
+        ca.blendingEnabled = YES;
+        ca.rgbBlendOperation = ca.alphaBlendOperation = MTLBlendOperationAdd;
+        ca.sourceRGBBlendFactor = ca.sourceAlphaBlendFactor = MTLBlendFactorOne;
+        ca.destinationRGBBlendFactor = ca.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        p->tiles_ps = [dev newRenderPipelineStateWithDescriptor:d error:&err];
+        if (!p->nv12_ps || !p->overlay_ps || !p->tiles_ps) {
             NSLog(@"moonsec: Metal pipeline failed: %@", err);
             return MACC_E_METAL;
         }
@@ -253,6 +279,85 @@ macc_status macc_presenter_set_overlay(macc_presenter *pr, const uint32_t *pixel
     return MACC_OK;
 }
 
+// ---- Tile layer ---------------------------------------------------------------
+
+// Clears write zeros in bands of this many rows, so the zero buffer stays small.
+enum { TILES_BAND = 64 };
+
+// The layer persists across pictures, so unlike the overlay it can't alternate between
+// two textures without copying; instead a write waits for the last draw that may still
+// sample it. That draw was committed a present ago, so this is rarely a wait at all.
+static void tiles_wait(MaccPresenterObj *p) {
+    if (p->last_cb) [p->last_cb waitUntilCompleted];
+}
+
+static void tiles_zero(MaccPresenterObj *p, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    for (uint32_t r = 0; r < h; r += TILES_BAND) {
+        uint32_t n = h - r < TILES_BAND ? h - r : TILES_BAND;
+        [p->tiles_tex replaceRegion:MTLRegionMake2D(x, y + r, w, n)
+                        mipmapLevel:0
+                          withBytes:p->zeros
+                        bytesPerRow:(NSUInteger)w * 4];
+    }
+}
+
+macc_status macc_presenter_tiles_reset(macc_presenter *pr, uint32_t w, uint32_t h) {
+    MaccPresenterObj *p = P(pr);
+    @autoreleasepool {
+        tiles_wait(p);
+        if (w == 0 || h == 0) {
+            p->tiles_tex = nil;
+            p->tiles_w = p->tiles_h = 0;
+            return MACC_OK;
+        }
+        size_t need = (size_t)w * 4 * TILES_BAND;
+        if (need > p->zeros_len) {
+            uint8_t *z = calloc(1, need);
+            if (!z) return MACC_E_INVALID;
+            free(p->zeros);
+            p->zeros = z;
+            p->zeros_len = need;
+        }
+        if (!p->tiles_tex || w != p->tiles_w || h != p->tiles_h) {
+            // Managed, like the overlay: replaceRegion works on it on every Mac, where
+            // shared-storage textures need Apple silicon.
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                           width:w
+                                                                                          height:h
+                                                                                       mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModeManaged;
+            p->tiles_tex = [p->dev newTextureWithDescriptor:td];
+            p->tiles_w = p->tiles_h = 0;
+            if (!p->tiles_tex) return MACC_E_METAL;
+            p->tiles_w = w;
+            p->tiles_h = h;
+        }
+        // A new texture's contents are undefined, so it is cleared like an old one.
+        tiles_zero(p, 0, 0, w, h);
+        return MACC_OK;
+    }
+}
+
+macc_status macc_presenter_tiles_put(macc_presenter *pr, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                     const uint8_t *pixels, uint32_t stride) {
+    MaccPresenterObj *p = P(pr);
+    if (!p->tiles_tex || x >= p->tiles_w || y >= p->tiles_h || w == 0 || h == 0) return MACC_OK;
+    if (w > p->tiles_w - x) w = p->tiles_w - x;
+    if (h > p->tiles_h - y) h = p->tiles_h - y;
+    tiles_wait(p);
+    if (!pixels) {
+        tiles_zero(p, x, y, w, h);
+        return MACC_OK;
+    }
+    [p->tiles_tex replaceRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0 withBytes:pixels bytesPerRow:stride];
+    return MACC_OK;
+}
+
+void macc_presenter_tiles_show(macc_presenter *pr, int on) {
+    P(pr)->tiles_on = on;
+}
+
 static macc_status acquire_target(MaccPresenterObj *p) {
     if (p->target) return MACC_OK;
     if (p->offscreen) {
@@ -318,6 +423,15 @@ macc_status macc_presenter_draw(macc_presenter *pr, const macc_frame *frame, uin
             [enc setFragmentTexture:CVMetalTextureGetTexture(tex_uv) atIndex:1];
             [enc setFragmentSamplerState:p->linear atIndex:0];
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            if (p->tiles_on && p->tiles_tex) {
+                // Same viewport and sampler as the video, the whole texture.
+                [enc setRenderPipelineState:p->tiles_ps];
+                float whole[2] = {1.0f, 1.0f};
+                [enc setVertexBytes:whole length:sizeof whole atIndex:0];
+                [enc setFragmentTexture:p->tiles_tex atIndex:0];
+                [enc setFragmentSamplerState:p->linear atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            }
         }
         if (p->overlay_w && p->overlay_h) {
             double ow = fmin(p->overlay_w, tw), oh = fmin(p->overlay_h, th);

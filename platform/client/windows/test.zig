@@ -219,12 +219,53 @@ fn swapchainTest(flags: u32) !void {
         try checkHr("mswc_presenter_present", c.mswc_presenter_present(pr, if (i % 2 == 0) c.MSWC_PRESENT_LOWEST_LATENCY else c.MSWC_PRESENT_SMOOTH));
     }
 
+    try tileLayer(pr, dec, aus[0]);
+
     // Hiding the overlay.
     try win.check(c.mswc_presenter_set_overlay(pr, null, 0, 0, 0));
     try win.check(c.mswc_presenter_draw(pr, null));
     var px: u32 = 0;
     try win.check(c.mswc_presenter_read_pixel(pr, 2, 2, &px));
     try testing.expectEqual(@as(u32, 0), px & 0xFFFFFF); // cleared to black
+}
+
+/// The tile layer over a 128x96 picture scaled 2.5x into 320x240: a put tile shows its
+/// exact pixels where it lands, the video shows through elsewhere, and hiding or
+/// clearing it shows the video again.
+fn tileLayer(pr: ?*c.mswc_presenter, dec: ?*c.mswc_decoder, au: []const u8) !void {
+    var f: c.mswc_frame = undefined;
+    var got: c_int = 0;
+    try win.check(c.mswc_decoder_decode(dec, au.ptr, au.len, 100, &f, &got));
+    try testing.expect(got != 0);
+    defer c.mswc_decoder_release_frame(dec, &f);
+
+    const red: [16 * 16]u32 = @splat(0xFFFF0000);
+    // A 16x16 tile at (32, 32): (80, 80)-(120, 120) in the window.
+    try checkHr("tiles reset", c.mswc_presenter_tiles_reset(pr, 128, 96));
+    try win.check(c.mswc_presenter_tiles_put(pr, 32, 32, 16, 16, @ptrCast(&red), 16 * 4));
+    const Want = enum { tile, video };
+    const check = struct {
+        fn at(p: ?*c.mswc_presenter, fr: *const c.mswc_frame, want: Want) !void {
+            try checkHr("mswc_presenter_draw", c.mswc_presenter_draw(p, fr));
+            var px: u32 = 0;
+            try win.check(c.mswc_presenter_read_pixel(p, 100, 100, &px));
+            switch (want) {
+                .tile => try testing.expectEqual(@as(u32, 0xFF0000), px & 0xFFFFFF),
+                .video => try testing.expect(near(@truncate(px), solid_rgb[2], 12)),
+            }
+            try win.check(c.mswc_presenter_read_pixel(p, 30, 200, &px));
+            try testing.expect(near(@truncate(px), solid_rgb[2], 12));
+        }
+    };
+    c.mswc_presenter_tiles_show(pr, 1);
+    try check.at(pr, &f, .tile);
+    c.mswc_presenter_tiles_show(pr, 0);
+    try check.at(pr, &f, .video);
+    c.mswc_presenter_tiles_show(pr, 1);
+    try check.at(pr, &f, .tile);
+    try win.check(c.mswc_presenter_tiles_put(pr, 0, 0, 64, 64, null, 0));
+    try check.at(pr, &f, .video);
+    c.mswc_presenter_tiles_show(pr, 0);
 }
 
 test "Raw Input: a SendInput key arrives as HID usage down then up" {
