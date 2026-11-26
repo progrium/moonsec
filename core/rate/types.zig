@@ -21,6 +21,11 @@ pub const PacketResult = struct {
 
     pub const lost: i64 = -1;
 
+    /// `frame` of opportunistic bytes (lossless tiles): the delay estimator sees their
+    /// queueing, but they are not the stream's rate (the acked rate leaves them out) and
+    /// not part of any frame's train.
+    pub const opportunistic: u32 = 0xffff_fffe;
+
     pub fn received(r: PacketResult) bool {
         return r.recv_us >= 0;
     }

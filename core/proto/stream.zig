@@ -19,6 +19,8 @@ pub const StreamId = enum(u8) {
     control_fast = 4,
     /// Reserved for microphone passthrough (not in v1).
     mic = 5,
+    /// Lossless tiles and frame damage, host to client (spec/refine-v0.md).
+    refine = 6,
     _,
 };
 
@@ -32,6 +34,17 @@ pub const VideoKind = enum(u8) {
 pub const ControlFastKind = enum(u8) {
     frame_ack = 1,
     feedback = 2,
+    /// 3 is the NACK (core/media/nack.zig).
+    nack = 3,
+    /// Client to host: lossless tiles completed or dropped (spec/refine-v0.md).
+    tile_ack = 4,
+    _,
+};
+
+/// Message kinds on the refine stream (spec/refine-v0.md).
+pub const RefineKind = enum(u8) {
+    tile_piece = 1,
+    damage = 2,
     _,
 };
 

@@ -64,6 +64,8 @@ pub const TrainCap = struct {
 
     /// Feed results in send order.
     pub fn onResult(self: *TrainCap, r: PacketResult) void {
+        // Tiles go out in the gaps between frames and belong to no train.
+        if (r.frame == PacketResult.opportunistic) return;
         if (r.frame != self.cur_frame) {
             self.cur_frame = r.frame;
             self.cur_probe = self.isProbe(r.frame);

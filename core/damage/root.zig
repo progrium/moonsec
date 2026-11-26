@@ -160,6 +160,13 @@ pub const Grid = struct {
         }
     }
 
+    /// Marks cell `i` changed at the latest applied frame (damage already in cell form).
+    pub fn mark(g: *Grid, i: u32) void {
+        std.debug.assert(g.last_frame != never);
+        g.since[i] = g.last_frame;
+        g.history[i] |= 1;
+    }
+
     /// Marks every cell changed at the latest frame (an unknown change, a resize upstream).
     pub fn invalidateAll(g: *Grid) void {
         g.apply(if (g.last_frame == never) 0 else g.last_frame, null);
@@ -207,6 +214,81 @@ pub const Grid = struct {
     pub fn lowMotion(g: *const Grid, i: u32, window: u32) bool {
         const w = @min(window, history_frames);
         return g.changesIn(i, w) * 4 <= w;
+    }
+};
+
+/// Damage by hashing, for frames in memory whose backend reports none (`damage` null):
+/// each `block`-sized cell is hashed (xxHash3 over its rows of bgra8) and compared with
+/// the previous frame's hash. Changed cells come back as rectangles, runs along a row
+/// merged. The first frame (and the first after `reset`) is all damaged.
+///
+/// `init` allocates once; `diff` is allocation-free.
+pub const Hasher = struct {
+    width: u32,
+    height: u32,
+    block: u32,
+    cols: u32,
+    rows: u32,
+    hashes: []u64,
+    rects: []Rect,
+    primed: bool = false,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, width: u32, height: u32, block: u32) !Hasher {
+        const cols = std.math.divCeil(u32, width, block) catch unreachable;
+        const rows = std.math.divCeil(u32, height, block) catch unreachable;
+        const n = @as(usize, cols) * rows;
+        const hashes = try allocator.alloc(u64, n);
+        errdefer allocator.free(hashes);
+        const rects = try allocator.alloc(Rect, n);
+        return .{ .width = width, .height = height, .block = block, .cols = cols, .rows = rows, .hashes = hashes, .rects = rects, .allocator = allocator };
+    }
+
+    pub fn deinit(h: *Hasher) void {
+        h.allocator.free(h.hashes);
+        h.allocator.free(h.rects);
+        h.* = undefined;
+    }
+
+    pub fn reset(h: *Hasher) void {
+        h.primed = false;
+    }
+
+    /// The damage of `data` (bgra8, `width` x `height`, rows `stride` bytes apart) against
+    /// the last frame given. Valid until the next call.
+    pub fn diff(h: *Hasher, data: []const u8, stride: usize) []const Rect {
+        var n: usize = 0;
+        var cy: u32 = 0;
+        while (cy < h.rows) : (cy += 1) {
+            var run: ?Rect = null;
+            var cx: u32 = 0;
+            while (cx < h.cols) : (cx += 1) {
+                const x = cx * h.block;
+                const y = cy * h.block;
+                const w = @min(h.block, h.width - x);
+                const bh = @min(h.block, h.height - y);
+                var hs = std.hash.XxHash3.init(0);
+                var r: u32 = 0;
+                while (r < bh) : (r += 1) hs.update(data[(@as(usize, y) + r) * stride + @as(usize, x) * 4 ..][0 .. @as(usize, w) * 4]);
+                const v = hs.final();
+                const i = cy * h.cols + cx;
+                const changed = !h.primed or h.hashes[i] != v;
+                h.hashes[i] = v;
+                if (changed) {
+                    if (run) |*rr| rr.w += w else run = .{ .x = x, .y = y, .w = w, .h = bh };
+                } else if (run) |rr| {
+                    h.rects[n] = rr;
+                    n += 1;
+                    run = null;
+                }
+            }
+            if (run) |rr| {
+                h.rects[n] = rr;
+                n += 1;
+            }
+        }
+        h.primed = true;
+        return h.rects[0..n];
     }
 };
 
@@ -291,4 +373,24 @@ test "resize starts over" {
     try std.testing.expectEqual(@as(u32, 4 * 2), g.cells());
     try std.testing.expectEqual(never, g.since[7]);
     try std.testing.expectEqual(never, g.last_frame);
+}
+
+test "hasher finds changed blocks and merges runs" {
+    var px: [128 * 64 * 4]u8 = @splat(0);
+    var h = try Hasher.init(std.testing.allocator, 128, 64, 16);
+    defer h.deinit();
+    try std.testing.expectEqual(@as(usize, 4), h.diff(&px, 128 * 4).len); // first frame: 4 rows of runs
+    try std.testing.expectEqual(@as(usize, 0), h.diff(&px, 128 * 4).len);
+    // Change two adjacent blocks of row 1 and one of row 3.
+    px[(20 * 128 + 17) * 4] = 1;
+    px[(20 * 128 + 40) * 4] = 1;
+    px[(63 * 128 + 127) * 4] = 1;
+    const d = h.diff(&px, 128 * 4);
+    try std.testing.expectEqual(@as(usize, 2), d.len);
+    try std.testing.expectEqual(Rect{ .x = 16, .y = 16, .w = 32, .h = 16 }, d[0]);
+    try std.testing.expectEqual(Rect{ .x = 112, .y = 48, .w = 16, .h = 16 }, d[1]);
+    var g = try Grid.init(std.testing.allocator, 128, 64, 64);
+    defer g.deinit();
+    g.apply(1, d);
+    try std.testing.expect(g.changedIn(0, 1) and g.changedIn(1, 1));
 }

@@ -43,6 +43,9 @@ pub const multi = @import("multi/root.zig");
 /// Capture damage on a cell grid (lossless tiles, regional refinement).
 pub const damage = @import("damage/root.zig");
 
+/// Lossless tiles: QOI cells on the refine stream, composited over video (core/refine).
+pub const refine = @import("refine/root.zig");
+
 /// Idle refinement: low-QP refine steps when the screen goes still (core/still).
 pub const still = @import("still/root.zig");
 

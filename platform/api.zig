@@ -284,6 +284,13 @@ pub const Capture = struct {
         /// compares lists to spot hotplug and mode changes. Callable while capturing, from
         /// the capture thread. Null: one display, the one `start` picks.
         displays: ?*const fn (ptr: *anyopaque, out: []DisplayInfo) Error!usize = null,
+        /// Optional (lossless tiles): copy the pixels of `rect` (frame pixels, inside the
+        /// frame) of `frame`, a frame this capture returned and has not released yet, into
+        /// `out` as bgra8 rows of `rect.w * 4` bytes. For frames on the GPU (`image.cpu`
+        /// null): a small staging copy of that rectangle only, never the whole frame.
+        /// Called on the capture thread, a few times per frame at most. Null: the app reads
+        /// `image.cpu` itself, and frames without it get no tiles.
+        readRect: ?*const fn (ptr: *anyopaque, frame: *const CapturedFrame, rect: Rect, out: []u8) Error!void = null,
     };
 
     pub fn start(c: Capture, cfg: CaptureConfig) Error!Size {
@@ -305,6 +312,20 @@ pub const Capture = struct {
     pub fn displays(c: Capture, out: []DisplayInfo) Error!usize {
         const f = c.vtable.displays orelse return error.Unsupported;
         return f(c.ptr, out);
+    }
+    /// The pixels of `rect` of an unreleased frame, bgra8, rows `rect.w * 4` bytes apart
+    /// (see `VTable.readRect`); from `image.cpu` when the backend has no `readRect`.
+    pub fn readRect(c: Capture, f: *const CapturedFrame, rect: Rect, out: []u8) Error!void {
+        if (c.vtable.readRect) |rr| return rr(c.ptr, f, rect, out);
+        const cpu = f.image.cpu orelse return error.Unsupported;
+        if (f.image.format != .bgra8) return error.Unsupported;
+        const row = @as(usize, rect.w) * 4;
+        if (out.len < row * rect.h or rect.x + rect.w > f.image.width or rect.y + rect.h > f.image.height) return error.Unsupported;
+        var y: usize = 0;
+        while (y < rect.h) : (y += 1) {
+            const src = cpu.data[(rect.y + y) * cpu.stride + @as(usize, rect.x) * 4 ..][0..row];
+            @memcpy(out[y * row ..][0..row], src);
+        }
     }
 };
 
@@ -634,6 +655,11 @@ pub const Presented = struct {
     presented_us: Micros,
 };
 
+/// Changes to a presenter's tile layer (core/refine/client.zig): `clear_all`, `clear` a
+/// rectangle (transparent), `put` opaque pixels at a rectangle.
+pub const TileUpdate = core.refine.client.Update;
+pub const TileOp = core.refine.client.Op;
+
 /// Window and swapchain. Used from the present thread.
 pub const Presenter = struct {
     ptr: *anyopaque,
@@ -645,6 +671,15 @@ pub const Presenter = struct {
         /// The caller releases `frame` to the decoder afterwards.
         present: *const fn (ptr: *anyopaque, frame: *const DecodedFrame, overlay: ?*const Overlay) Error!Presented,
         deinit: *const fn (ptr: *anyopaque) void,
+        /// Optional (lossless tiles): apply `u.ops` to the presenter's tile layer, an RGBA
+        /// image of the stream's size (`u.width` x `u.height`), transparent except where a
+        /// tile was put. Called on the present thread right before the `present` it
+        /// belongs to, whose picture (and every later one until the next update) draws the
+        /// video, then the layer alpha-blended over it when `u.visible`, then the overlay.
+        /// Never baked into the decoder's frames. `put` pixels are bgra8, opaque, rows
+        /// `rect.w * 4` bytes, valid for the call. A presenter that has this method makes
+        /// the client advertise tiles; one without it never receives any.
+        tiles: ?*const fn (ptr: *anyopaque, u: *const TileUpdate) Error!void = null,
     };
 
     pub fn configure(p: Presenter, cfg: PresenterConfig) Error!void {
@@ -652,6 +687,13 @@ pub const Presenter = struct {
     }
     pub fn present(p: Presenter, f: *const DecodedFrame, o: ?*const Overlay) Error!Presented {
         return p.vtable.present(p.ptr, f, o);
+    }
+    pub fn hasTiles(p: Presenter) bool {
+        return p.vtable.tiles != null;
+    }
+    pub fn tiles(p: Presenter, u: *const TileUpdate) Error!void {
+        const f = p.vtable.tiles orelse return;
+        return f(p.ptr, u);
     }
     pub fn deinit(p: Presenter) void {
         p.vtable.deinit(p.ptr);
@@ -774,6 +816,11 @@ pub fn bind(comptime Iface: type, comptime T: type, impl: *T) Iface {
                 3 => &struct {
                     fn f(p: *anyopaque, a: P[1].type.?, b: P[2].type.?) R {
                         return m(cast(p), a, b);
+                    }
+                }.f,
+                4 => &struct {
+                    fn f(p: *anyopaque, a: P[1].type.?, b: P[2].type.?, c: P[3].type.?) R {
+                        return m(cast(p), a, b, c);
                     }
                 }.f,
                 else => @compileError("bind: unsupported arity"),

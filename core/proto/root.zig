@@ -12,6 +12,7 @@ pub const version = stream.version;
 pub const StreamId = stream.StreamId;
 pub const VideoKind = stream.VideoKind;
 pub const ControlFastKind = stream.ControlFastKind;
+pub const RefineKind = stream.RefineKind;
 pub const Envelope = stream.Envelope;
 pub const ShardHeader = video.ShardHeader;
 pub const FrameAck = feedback.FrameAck;
@@ -67,7 +68,7 @@ pub fn decode(buf: []const u8) DecodeError!Message {
         .control_fast => switch (@as(ControlFastKind, @enumFromInt(env.kind))) {
             .frame_ack => return .{ .frame_ack = .{ .envelope = env, .ack = try FrameAck.decode(&d) } },
             .feedback => return .{ .feedback = .{ .envelope = env, .feedback = try Feedback.decode(&d) } },
-            _ => {},
+            else => {},
         },
         else => {},
     }
