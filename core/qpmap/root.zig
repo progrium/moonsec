@@ -28,7 +28,6 @@
 const std = @import("std");
 const damage = @import("../damage/root.zig");
 
-
 pub const Rect = damage.Rect;
 
 pub const max_steps = 4;

@@ -119,6 +119,10 @@ pub const Layer = struct {
     unions: std.ArrayList(struct { frame: u32, span: u32, all: bool, bits: []u8 }) = .empty,
     /// Every frame up to here has had its damage applied (null before the first present).
     checked_to: ?u32 = null,
+    /// The host sent damage at least once: it streams tiles. Until then (a host without
+    /// tiles, or one that turned them down) the layer stays hidden and never asks for a
+    /// resync.
+    heard: bool = false,
     gap_presents: u32 = 0,
     clear_pending: bool = true,
     // Tile acks to send.
@@ -233,6 +237,7 @@ pub const Layer = struct {
                     l.stats.malformed += 1;
                     return;
                 };
+                l.heard = true;
                 l.onDamage(m);
             },
             _ => {},
@@ -399,7 +404,7 @@ pub const Layer = struct {
     pub fn present(l: *Layer, p: u32) Update {
         l.ops.clearRetainingCapacity();
         l.pixels.clearRetainingCapacity();
-        if (l.cells == 0) return .{ .width = l.width, .height = l.height, .ops = &.{}, .visible = false };
+        if (l.cells == 0 or !l.heard) return .{ .width = l.width, .height = l.height, .ops = &.{}, .visible = false };
         if (l.clear_pending) {
             l.clear_pending = false;
             l.clearAll();
@@ -701,4 +706,19 @@ test "layer under 10% loss: gaps resync, tiles still never stale" {
     try testing.expectEqual(@as(u32, 0), s.mismatches);
     try testing.expect(s.shown_checks > 1000);
     try testing.expect(s.l.stats.shown > s.e.cells());
+}
+
+test "a host that never sends damage gets no resync requests" {
+    var l: Layer = .init(std.testing.allocator, .{});
+    defer l.deinit();
+    try l.configure(1, 256, 128);
+    var p: u32 = 0;
+    while (p < 100) : (p += 1) {
+        const u = l.present(p);
+        try std.testing.expect(!u.visible);
+    }
+    var b: [256]u8 = undefined;
+    try std.testing.expect(l.takeAck(&b) == null);
+    try std.testing.expectEqual(@as(u64, 0), l.stats.resyncs_asked);
+    try std.testing.expectEqual(@as(u64, 0), l.stats.gaps);
 }

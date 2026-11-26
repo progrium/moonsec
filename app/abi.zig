@@ -729,6 +729,25 @@ const FramePresenter = struct {
     pub fn deinit(self: *FramePresenter) void {
         self.inner.deinit();
     }
+
+    /// The same, for an inner presenter with a tile layer: tile updates go to it.
+    const Tiled = opaque {
+        fn of(t: *Tiled) *FramePresenter {
+            return @ptrCast(@alignCast(t));
+        }
+        pub fn configure(t: *Tiled, cfg: api.PresenterConfig) api.Error!void {
+            return of(t).configure(cfg);
+        }
+        pub fn present(t: *Tiled, f: *const api.DecodedFrame, o: ?*const api.Overlay) api.Error!api.Presented {
+            return of(t).present(f, o);
+        }
+        pub fn tiles(t: *Tiled, u: *const api.TileUpdate) api.Error!void {
+            return of(t).inner.tiles(u);
+        }
+        pub fn deinit(t: *Tiled) void {
+            of(t).deinit();
+        }
+    };
 };
 
 const Transport = union(enum) {
@@ -1126,6 +1145,7 @@ fn hostOptions(cfg: c.moonsec_host_config, codec: api.Codec, ctl: ?pipe_mod.Byte
         .width = cfg.width,
         .height = cfg.height,
         .audio = cfg.flags & c.MOONSEC_HOST_NO_AUDIO == 0,
+        .tiles = cfg.flags & c.MOONSEC_HOST_TILES != 0,
         .session = .{
             .rate_control = cfg.flags & c.MOONSEC_HOST_RATE_CONTROL != 0,
             .loss_policy = cfg.flags & c.MOONSEC_HOST_LOSS_POLICY != 0,
@@ -1170,7 +1190,7 @@ fn newClientSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStr
     if (cfg.flags & c.MOONSEC_CLIENT_NO_OS_INPUT != 0) be.input = null;
     if (cfg.on_frame) |cb| {
         s.presenter = .{ .inner = be.presenter, .cb = cb, .ctx = cfg.frame_ctx };
-        be.presenter = api.bind(api.Presenter, FramePresenter, &s.presenter);
+        be.presenter = if (be.presenter.hasTiles()) api.bind(api.Presenter, FramePresenter.Tiled, @ptrCast(&s.presenter)) else api.bind(api.Presenter, FramePresenter, &s.presenter);
     }
     const clip = try sessionClipboard(s);
     var nonce: [4]u8 = undefined;
@@ -1183,6 +1203,7 @@ fn newClientSession(e: *Endpoint, p: pipe_mod.PacketPipe, ctl: ?pipe_mod.ByteStr
                 .max_width = cfg.max_width,
                 .max_height = cfg.max_height,
                 .nonce = std.mem.readInt(u32, &nonce, .little) | 1,
+                .tiles = cfg.flags & c.MOONSEC_CLIENT_TILES != 0,
                 // Rosters from a multi-user host (spec/multi-user-v0.md).
                 .control = .{ .features = core.multi.feature_bit, .known = &core.multi.known },
             },

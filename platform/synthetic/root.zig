@@ -125,6 +125,96 @@ fn stampTime(t: Micros) u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Text panel
+
+/// A static "text" panel on the left of the pattern, under the digits: glyph-like dark
+/// marks (and a blue link colour) on a light page, the content lossless tiles are for.
+/// With `period` frames > 0, one line of it changes every `period` frames (stamp.frame), so
+/// tiles over it get damaged and sent again. Capture and decoder both draw it, so the
+/// passthrough CRC still checks every pixel.
+pub const TextPanel = struct {
+    period: u32 = 0,
+
+    pub const glyph_w = 6;
+    pub const glyph_h = 10;
+
+    pub fn rect(w: u32, h: u32) api.Rect {
+        const bar_h = @max(h / 8, 4);
+        const y0 = bar_h + h / 32 + h / 5 + h / 16;
+        const y1 = h - h / 16;
+        const x0 = w / 16;
+        const x1 = w * 9 / 16;
+        return .{ .x = x0, .y = y0, .w = x1 - x0, .h = if (y1 > y0) y1 - y0 else 0 };
+    }
+
+    fn rows(r: api.Rect) u32 {
+        return r.h / glyph_h;
+    }
+
+    /// The line epoch `e` changes: lines in a stride, so consecutive changes land in
+    /// different cells.
+    fn lineOf(e: u32, n_rows: u32) u32 {
+        return (e *% 7) % n_rows;
+    }
+
+    /// The epoch line `gy` last changed in (0: its first content).
+    fn lineEpoch(t: TextPanel, gy: u32, n_rows: u32, frame: u32) u32 {
+        if (t.period == 0 or n_rows == 0) return 0;
+        var e = frame / t.period;
+        var k: u32 = 0;
+        while (e > 0 and k < n_rows) : ({
+            e -= 1;
+            k += 1;
+        }) if (lineOf(e, n_rows) == gy) return e;
+        return 0;
+    }
+
+    /// The line that changed at `frame` (null: none), for damage.
+    pub fn changedLine(t: TextPanel, w: u32, h: u32, prev: u32, frame: u32) ?api.Rect {
+        if (t.period == 0 or prev / t.period == frame / t.period) return null;
+        const r = rect(w, h);
+        const n = rows(r);
+        if (n == 0) return null;
+        // Several epochs passed: the whole panel may have changed.
+        if (frame / t.period - prev / t.period != 1) return r;
+        const gy = lineOf(frame / t.period, n);
+        return .{ .x = r.x, .y = r.y + gy * glyph_h, .w = r.w, .h = glyph_h };
+    }
+
+    pub fn draw(t: TextPanel, px: []u8, w: u32, h: u32, stride: u32, frame: u32) void {
+        const r = rect(w, h);
+        const n = rows(r);
+        const page = [4]u8{ 245, 248, 250, 255 };
+        const ink = [4]u8{ 40, 30, 20, 255 };
+        const link = [4]u8{ 200, 90, 20, 255 };
+        var y: u32 = 0;
+        while (y < r.h) : (y += 1) {
+            const gy = y / glyph_h;
+            const in_y = y % glyph_h;
+            const ep = t.lineEpoch(gy, n, frame);
+            const row = px[(r.y + y) * stride ..];
+            var x: u32 = 0;
+            while (x < r.w) : (x += 1) {
+                const gx = x / glyph_w;
+                const in_x = x % glyph_w;
+                var hv: u64 = (@as(u64, gx) << 40) ^ (@as(u64, gy) << 20) ^ ep;
+                hv = (hv ^ (hv >> 31)) *% 0x9e3779b97f4a7c15;
+                hv ^= hv >> 29;
+                // A glyph: a vertical stem, a bar across at one of three heights, and
+                // sometimes a second stem (a few strokes on a page, like text).
+                const blank = gy >= n or hv % 6 == 0 or in_x == glyph_w - 1 or in_y < 1 or in_y >= glyph_h - 1;
+                const stem = @as(u32, @intCast(hv % 5));
+                const bar = 1 + @as(u32, @intCast((hv >> 3) % 3)) * 3;
+                const stem2 = if ((hv >> 6) % 3 == 0) @as(u32, @intCast((hv >> 8) % 5)) else stem;
+                const on = !blank and (in_x == stem or in_x == stem2 or (in_y == bar and in_x < 5));
+                const c = if (!on) page else if (gy % 5 == 3) link else ink;
+                @memcpy(row[(r.x + x) * 4 ..][0..4], &c);
+            }
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Capture
 
 pub const Capture = struct {
@@ -154,6 +244,12 @@ pub const Capture = struct {
     /// Times (host clock) when the screen is still: `acquire` has nothing new, as a real
     /// backend reports a static desktop, so the app repeats and refines the last picture.
     still: []const StillWindow = &.{},
+    /// Draw the text panel (the decoder must be told the same).
+    text: ?TextPanel = null,
+    /// Report each frame's damage, as a capture API does (else the app hashes cells).
+    report_damage: bool = false,
+    damage_buf: [8]api.Rect = undefined,
+    prev_frame: ?u32 = null,
 
     pub const StillWindow = struct { from_us: Micros, until_us: Micros };
 
@@ -207,6 +303,7 @@ pub const Capture = struct {
         if (c.buf.len > 0) c.gpa.free(c.buf);
         c.buf = &.{};
         c.buf = c.gpa.alloc(u8, c.width * c.height * 4) catch return error.OutOfMemory;
+        c.prev_frame = null;
     }
 
     pub fn start(c: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
@@ -265,17 +362,57 @@ pub const Capture = struct {
         if (next <= now) next += (@divTrunc(now - next, c.interval_us) + 1) * c.interval_us;
         c.next_due = next;
         const start_us = now;
-        pattern.render(c.buf, c.width, c.height, c.width * 4, .{ .time_us = stampTime(start_us), .frame = @truncate(c.seq) });
+        const frame: u32 = @truncate(c.seq);
+        pattern.render(c.buf, c.width, c.height, c.width * 4, .{ .time_us = stampTime(start_us), .frame = frame });
+        if (c.text) |t| t.draw(c.buf, c.width, c.height, c.width * 4, frame);
         const f: api.CapturedFrame = .{
             .image = .{ .width = c.width, .height = c.height, .color = c.color, .cpu = .{ .data = c.buf, .stride = c.width * 4 } },
             .seq = c.seq,
             .capture_start_us = start_us,
             .captured_us = c.clock.now(),
+            .damage = if (c.report_damage) c.damageSince(c.prev_frame, frame) else null,
         };
+        c.prev_frame = frame;
         c.seq += 1;
         c.last = f;
         c.out = true;
         return f;
+    }
+
+    /// What changed since frame `prev` was drawn (null: everything): the barcode and
+    /// digits band, the flash square, the motion bar's old and new columns (not where the
+    /// text panel covers them), and a changed text line.
+    fn damageSince(c: *Capture, prev_: ?u32, frame: u32) ?[]const api.Rect {
+        const prev = prev_ orelse return null;
+        const w = c.width;
+        const h = c.height;
+        var n: usize = 0;
+        const bar_h = @max(h / 8, 4);
+        const top = bar_h + h / 32 + h / 5;
+        c.damage_buf[n] = .{ .x = 0, .y = 0, .w = w, .h = @min(top, h) };
+        n += 1;
+        const fl = @min(h / 4, w / 4);
+        c.damage_buf[n] = .{ .x = w - fl, .y = h - fl, .w = fl, .h = fl };
+        n += 1;
+        const bar_w = @max(w / 64, 2);
+        const panel: api.Rect = if (c.text != null) TextPanel.rect(w, h) else .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        for ([_]u32{ prev, frame }) |fr| {
+            const bx = (fr % 64) * (w / 64);
+            const col: api.Rect = .{ .x = bx, .y = top, .w = @min(bar_w, w - bx), .h = h -| top };
+            if (panel.w > 0 and col.intersects(panel)) {
+                c.damage_buf[n] = .{ .x = col.x, .y = top, .w = col.w, .h = panel.y -| top };
+                c.damage_buf[n + 1] = .{ .x = col.x, .y = panel.y + panel.h, .w = col.w, .h = h -| (panel.y + panel.h) };
+                n += 2;
+            } else {
+                c.damage_buf[n] = col;
+                n += 1;
+            }
+        }
+        if (c.text) |t| if (t.changedLine(w, h, prev, frame)) |r| {
+            c.damage_buf[n] = r;
+            n += 1;
+        };
+        return c.damage_buf[0..n];
     }
 
     pub fn repeatLast(c: *Capture) api.Error!?api.CapturedFrame {
@@ -518,6 +655,8 @@ pub const Decoder = struct {
     out: bool = false,
     /// Coded formats it takes for the passthrough codec.
     formats: api.Formats = api.Formats.all,
+    /// The host draws the text panel (Options.text).
+    text: ?TextPanel = null,
     stats: struct { frames: u64 = 0, missing_ref: u64 = 0, corrupt: u64 = 0, wrong_format: u64 = 0 } = .{},
 
     pub fn caps(d: *Decoder) api.DecoderCaps {
@@ -588,6 +727,7 @@ pub const Decoder = struct {
         }
         if (h.flags.keyframe) d.ltrs = @splat(null);
         pattern.render(d.buf, c.width, c.height, c.width * 4, h.stamp);
+        if (d.text) |t| t.draw(d.buf, c.width, c.height, c.width * 4, h.stamp.frame);
         if (pixelCrc(d.buf) != h.pixel_crc) {
             d.stats.corrupt += 1;
             return error.CodecFailed;
@@ -627,11 +767,38 @@ pub const Decoder = struct {
 
 pub const Presenter = struct {
     clock: api.Clock,
+    /// For the tile layer (null: no tiles).
+    gpa: ?std.mem.Allocator = null,
     cfg: ?api.PresenterConfig = null,
     /// Stamp read back from the last presented picture, and its size.
     last_stamp: ?pattern.Stamp = null,
     last_size: ?api.Size = null,
-    stats: struct { presents: u64 = 0, unreadable: u64 = 0, overlays: u64 = 0, wrong_color: u64 = 0 } = .{},
+    /// The lossless tile layer: bgra pixels and which of them are opaque, at the stream's
+    /// size, and whether the last update said to draw it.
+    layer: []u8 = &.{},
+    covered: []bool = &.{},
+    layer_size: api.Size = .{ .width = 0, .height = 0 },
+    layer_visible: bool = false,
+    stats: struct {
+        presents: u64 = 0,
+        unreadable: u64 = 0,
+        overlays: u64 = 0,
+        wrong_color: u64 = 0,
+        /// Tile layer: updates and ops applied; presents that drew opaque tile pixels,
+        /// and how many; pixels drawn that differ from the video under them (a stale or
+        /// wrong tile on screen: the bug lossless tiles must never have), and the presents
+        /// that had any. A put outside the layer is `tile_bad_ops`.
+        tile_updates: u64 = 0,
+        tile_puts: u64 = 0,
+        tile_clears: u64 = 0,
+        tile_presents: u64 = 0,
+        tile_pixels: u64 = 0,
+        tile_wrong_pixels: u64 = 0,
+        tile_wrong_presents: u64 = 0,
+        tile_bad_ops: u64 = 0,
+        /// Opaque pixels in the layer at the last present (0 when hidden).
+        tile_last_pixels: u64 = 0,
+    } = .{},
 
     pub fn configure(p: *Presenter, cfg: api.PresenterConfig) api.Error!void {
         p.cfg = cfg;
@@ -648,12 +815,103 @@ pub const Presenter = struct {
         }
         if (o != null) p.stats.overlays += 1;
         if (f.image.color != p.cfg.?.format.color) p.stats.wrong_color += 1;
+        p.checkTiles(f, img);
         p.stats.presents += 1;
         p.last_size = .{ .width = f.image.width, .height = f.image.height };
         return .{ .presented_us = p.clock.now() };
     }
 
-    pub fn deinit(_: *Presenter) void {}
+    /// Optional presenter method: apply the update to the layer the next present draws.
+    pub fn tiles(p: *Presenter, u: *const api.TileUpdate) api.Error!void {
+        const gpa = p.gpa orelse return error.Unsupported;
+        p.stats.tile_updates += 1;
+        if (u.width != p.layer_size.width or u.height != p.layer_size.height) {
+            p.freeLayer();
+            const n = std.math.mul(usize, u.width, u.height) catch return error.Unsupported;
+            p.layer = gpa.alloc(u8, n * 4) catch return error.OutOfMemory;
+            p.covered = gpa.alloc(bool, n) catch {
+                gpa.free(p.layer);
+                p.layer = &.{};
+                return error.OutOfMemory;
+            };
+            @memset(p.covered, false);
+            p.layer_size = .{ .width = u.width, .height = u.height };
+        }
+        const w = u.width;
+        for (u.ops) |op| switch (op) {
+            .clear_all => {
+                @memset(p.covered, false);
+                p.stats.tile_clears += 1;
+            },
+            .clear => |r| {
+                const c = r.clip(w, u.height);
+                var y = c.y;
+                while (y < c.y + c.h) : (y += 1) @memset(p.covered[y * w + c.x ..][0..c.w], false);
+                p.stats.tile_clears += 1;
+            },
+            .put => |t| {
+                const r = t.rect;
+                if (r.x + r.w > w or r.y + r.h > u.height or t.pixels.len < @as(usize, r.w) * r.h * 4) {
+                    p.stats.tile_bad_ops += 1;
+                    continue;
+                }
+                var y: u32 = 0;
+                while (y < r.h) : (y += 1) {
+                    const at = (r.y + y) * w + r.x;
+                    @memcpy(p.layer[at * 4 ..][0 .. r.w * 4], t.pixels[y * r.w * 4 ..][0 .. r.w * 4]);
+                    @memset(p.covered[at..][0..r.w], true);
+                }
+                p.stats.tile_puts += 1;
+            },
+        };
+        p.layer_visible = u.visible;
+    }
+
+    /// Every opaque tile pixel this present draws must equal the video pixel under it:
+    /// the synthetic decoder's picture is exactly the captured one, so a difference is a
+    /// tile shown over content that changed (or a wrong tile).
+    fn checkTiles(p: *Presenter, f: *const api.DecodedFrame, img: api.Image.Cpu) void {
+        p.stats.tile_last_pixels = 0;
+        if (!p.layer_visible or p.covered.len == 0) return;
+        if (f.image.width != p.layer_size.width or f.image.height != p.layer_size.height) {
+            // A layer of another size is never drawn over this picture.
+            return;
+        }
+        const w = p.layer_size.width;
+        var shown: u64 = 0;
+        var wrong: u64 = 0;
+        var y: u32 = 0;
+        while (y < p.layer_size.height) : (y += 1) {
+            const row = img.data[y * img.stride ..];
+            for (p.covered[y * w ..][0..w], 0..) |cov, x| {
+                if (!cov) continue;
+                shown += 1;
+                const a = p.layer[(y * w + x) * 4 ..][0..3];
+                if (!std.mem.eql(u8, a, row[x * 4 ..][0..3])) wrong += 1;
+            }
+        }
+        if (shown == 0) return;
+        p.stats.tile_presents += 1;
+        p.stats.tile_pixels += shown;
+        p.stats.tile_last_pixels = shown;
+        if (wrong > 0) {
+            p.stats.tile_wrong_pixels += wrong;
+            p.stats.tile_wrong_presents += 1;
+        }
+    }
+
+    fn freeLayer(p: *Presenter) void {
+        const gpa = p.gpa orelse return;
+        if (p.layer.len > 0) gpa.free(p.layer);
+        if (p.covered.len > 0) gpa.free(p.covered);
+        p.layer = &.{};
+        p.covered = &.{};
+        p.layer_size = .{ .width = 0, .height = 0 };
+    }
+
+    pub fn deinit(p: *Presenter) void {
+        p.freeLayer();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -869,6 +1127,12 @@ pub const Options = struct {
     /// when the app asks for HDR capture). Client: what its display shows.
     hdr_display: ?api.HdrMetadata = null,
     display: api.DisplayCaps = .{},
+    /// Both sides: the host draws the text panel and the client's decoder expects it.
+    text: ?TextPanel = null,
+    /// Host: capture reports damage rects (else the app hashes cells).
+    report_damage: bool = false,
+    /// Client: the presenter has a tile layer (and the client asks for tiles).
+    tiles: bool = true,
 };
 
 pub const Host = struct {
@@ -900,6 +1164,22 @@ pub const Host = struct {
     }
 };
 
+/// The presenter without its tile layer: a client that never asks for tiles.
+const NoTiles = opaque {
+    fn of(t: *NoTiles) *Presenter {
+        return @ptrCast(@alignCast(t));
+    }
+    pub fn configure(t: *NoTiles, cfg: api.PresenterConfig) api.Error!void {
+        return of(t).configure(cfg);
+    }
+    pub fn present(t: *NoTiles, f: *const api.DecodedFrame, o: ?*const api.Overlay) api.Error!api.Presented {
+        return of(t).present(f, o);
+    }
+    pub fn deinit(t: *NoTiles) void {
+        of(t).deinit();
+    }
+};
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     decoder: Decoder,
@@ -915,7 +1195,7 @@ pub const Client = struct {
         return .{
             .clock = c.clock,
             .decoder = api.bind(api.Decoder, Decoder, &c.decoder),
-            .presenter = api.bind(api.Presenter, Presenter, &c.presenter),
+            .presenter = if (c.presenter.gpa != null) api.bind(api.Presenter, Presenter, &c.presenter) else api.bind(api.Presenter, NoTiles, @ptrCast(&c.presenter)),
             .input = if (c.with_input) api.bind(api.InputSource, InputSource, &c.input) else null,
             .audio = if (c.with_audio) api.bind(api.AudioSink, AudioSink, &c.audio) else null,
             .display = c.display,
@@ -927,6 +1207,7 @@ pub const Client = struct {
     fn deinitClient(p: ?*anyopaque) void {
         const c: *Client = @ptrCast(@alignCast(p.?));
         c.decoder.deinit();
+        c.presenter.deinit();
         c.gpa.destroy(c);
     }
 };
@@ -937,7 +1218,7 @@ pub fn openHost(gpa: std.mem.Allocator, o: Options) !*Host {
     h.* = .{
         .gpa = gpa,
         .clock = o.clock,
-        .capture = .{ .gpa = gpa, .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx, .hdr_display = o.hdr_display },
+        .capture = .{ .gpa = gpa, .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx, .hdr_display = o.hdr_display, .text = o.text, .report_damage = o.report_damage },
         .encoder = .{ .gpa = gpa, .clock = o.clock, .formats = o.encoder_formats },
         .audio = .{ .clock = o.clock, .sleeper = o.sleeper, .sleep_ctx = o.sleep_ctx },
         .with_audio = o.audio,
@@ -951,8 +1232,8 @@ pub fn openClient(gpa: std.mem.Allocator, o: Options) !*Client {
     c.* = .{
         .gpa = gpa,
         .clock = o.clock,
-        .decoder = .{ .gpa = gpa, .clock = o.clock, .formats = o.decoder_formats },
-        .presenter = .{ .clock = o.clock },
+        .decoder = .{ .gpa = gpa, .clock = o.clock, .formats = o.decoder_formats, .text = o.text },
+        .presenter = .{ .clock = o.clock, .gpa = if (o.tiles) gpa else null },
         .input = .{ .clock = o.clock, .interval_us = @max(o.input_interval_us, 1), .limit = o.input_limit },
         .with_input = o.input_interval_us > 0,
         .audio = .{ .clock = o.clock },

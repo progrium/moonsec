@@ -162,12 +162,18 @@ pub const Engine = struct {
         }
     }
 
-    /// Widens a 32-bit frame id against the newest committed frame.
-    pub fn widen(e: *const Engine, id: u32) u64 {
+    /// Widens a 32-bit frame id against the newest committed frame; negative for an id
+    /// from before the first frame.
+    pub fn widenSigned(e: *const Engine, id: u32) i64 {
         if (e.frame == never) return id;
         const cur: u32 = @truncate(e.frame);
         const d: i32 = @bitCast(id -% cur);
-        return @intCast(@as(i64, @intCast(e.frame)) + d);
+        return @as(i64, @intCast(e.frame)) + d;
+    }
+
+    /// `widenSigned`, with an id from before the first frame as frame 0.
+    pub fn widen(e: *const Engine, id: u32) u64 {
+        return @intCast(@max(0, e.widenSigned(id)));
     }
 
     /// Video frame `id` was encoded (sent or held): the damage captured since the last
@@ -335,14 +341,16 @@ pub const Engine = struct {
     /// or the bitmap does not fit `out`.
     pub fn unionMessage(e: *const Engine, covered_to: u32, out: []u8) ?[]u8 {
         if (e.frame == never) return null;
-        const from = e.widen(covered_to);
-        if (from >= e.frame) return null;
-        const span: u64 = e.frame - from;
+        // Covered to before the first frame: everything since.
+        const from_s = e.widenSigned(covered_to);
+        const from: u64 = @intCast(@max(0, from_s));
+        if (from_s >= 0 and from >= e.frame) return null;
+        const span: u64 = e.frame - from + @intFromBool(from_s < 0);
         const id: u32 = @truncate(e.frame);
         var acc: [wire.Damage.bytesFor(std.math.maxInt(u16))]u8 = undefined;
         const nb = e.pending.len;
         @memset(acc[0..nb], 0);
-        var all = span >= e.cfg.history or span > std.math.maxInt(u31);
+        var all = from_s < 0 or span >= e.cfg.history or span > std.math.maxInt(u31);
         if (!all) {
             var w = from + 1;
             while (w <= e.frame) : (w += 1) {
@@ -736,4 +744,16 @@ test "a tile whose cell changes is never sent" {
     defer p.deinit();
     var buf: [1200]u8 = undefined;
     try testing.expect(p.next(&e, .{ .now = 1_000_000, .ok = true, .target_bps = 100e6 }, 0, &buf) == null);
+}
+
+test "a resync from before the first frame answers with all damage, not a crash" {
+    var e = try Engine.init(std.testing.allocator, .{}, 128, 128, 1);
+    defer e.deinit();
+    e.capture(null);
+    e.commit(3);
+    var b: [256]u8 = undefined;
+    const m = e.unionMessage(0xffff_fff0, &b) orelse return error.TestUnexpectedResult;
+    var maps: [wire.Damage.max_maps][]u8 = undefined;
+    const d = try wire.Damage.decode(m, &maps);
+    try std.testing.expect(d.all);
 }

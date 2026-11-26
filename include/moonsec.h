@@ -173,6 +173,7 @@ typedef struct moonsec_input {
 #define MOONSEC_HOST_REQUIRE_PAIRED 0x0080u /* iroh: admit only paired clients; the default now, kept for source compatibility */
 #define MOONSEC_HOST_INSECURE_NO_PAIRING 0x0100u /* iroh: admit any client that reaches the endpoint (tests and labs only) */
 #define MOONSEC_HOST_FOCUS_WINDOW 0x0200u  /* with `window`: bring that window to the front when a session starts (macOS) */
+#define MOONSEC_HOST_TILES 0x0400u         /* send lossless tiles of still screen areas (sharp text) to clients that ask, in spare bandwidth */
 
 typedef struct moonsec_host_config {
     uint32_t struct_size; /* sizeof(moonsec_host_config) */
@@ -311,6 +312,7 @@ MOONSEC_API moonsec_status moonsec_host_windows(moonsec_host *host, moonsec_wind
 #define MOONSEC_CLIENT_FULLSCREEN 0x0004u
 #define MOONSEC_CLIENT_REQUIRE_PAIRED 0x0008u /* iroh: connect only to paired hosts; the default now, kept for source compatibility */
 #define MOONSEC_CLIENT_INSECURE_NO_PAIRING 0x0010u /* iroh: connect to any host the ticket names (tests and labs only) */
+#define MOONSEC_CLIENT_TILES 0x0020u       /* ask for lossless tiles and draw them over the video (backends whose presenter has a tile layer); on_frame pictures never include them */
 
 /* A presented picture, for moonsec_client_config.on_frame. Valid during the
  * callback only. */
