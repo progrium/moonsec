@@ -55,6 +55,8 @@ typedef struct mlh_nvenc_params {
     uint64_t bitrate_bps;
     const uint64_t *acked_ltr_tokens;
     uint32_t acked_ltr_count;
+    uint32_t refine_qp; /* idle refinement QP cap, 0 = normal (nvc_params) */
+    uint32_t force_ltr;
 } mlh_nvenc_params;
 
 typedef struct mlh_nvenc_output {

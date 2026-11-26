@@ -137,6 +137,8 @@ fn ltrScenario(codec: u32) !void {
             .bitrate_bps = 0,
             .acked_ltr_tokens = if (acked.items.len > 0) acked.items.ptr else null,
             .acked_ltr_count = @intCast(acked.items.len),
+            .refine_qp = 0,
+            .force_ltr = 0,
         };
         var out: c.mlh_enc_output = undefined;
         try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_encode(t, host.y.ptr, host.u.ptr, host.v.ptr, &changed, &p, &out));
@@ -172,6 +174,67 @@ test "HEVC headers and planner: long-term RPS, loss, refresh, bit exact through 
     try ltrScenario(c.MLH_CODEC_HEVC);
 }
 
+/// Idle refinement's long-term mark: a frame with `force_ltr` off the 15-frame interval
+/// is marked, and after a loss the refresh predicts from it (the sharp picture), bit exact.
+fn forcedMarkScenario(codec: u32) !void {
+    const w = 32;
+    const h = 32;
+    var t: ?*c.mlh_testenc = null;
+    try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_create(codec, w, h, 1, &t));
+    defer c.mlh_testenc_destroy(t);
+    const dec = try decoder(if (codec == c.MLH_CODEC_HEVC) mlc.MLC_CODEC_HEVC else mlc.MLC_CODEC_H264);
+    defer mlc.mlc_decoder_destroy(dec);
+    var prng = std.Random.DefaultPrng.init(5);
+    const rnd = prng.random();
+    var host = try Picture.init(w, h);
+    defer host.deinit();
+    var at_mark = try Picture.init(w, h);
+    defer at_mark.deinit();
+    for (0..2) |by| for (0..2) |bx| host.paint(rnd, @intCast(bx), @intCast(by));
+    var token: u64 = 0;
+    for (0..10) |n| {
+        var changed = [_]u8{0} ** 4;
+        if (n > 0 and n != 9) {
+            changed[n % 4] = 1;
+            host.paint(rnd, @intCast(n % 2), @intCast(n % 4 / 2));
+        }
+        const acked = [_]u64{token};
+        const p: c.mlh_enc_params = .{
+            .force = if (n == 9) c.MLH_FORCE_LTR_REFRESH else c.MLH_FORCE_NONE,
+            .bitrate_bps = 0,
+            .acked_ltr_tokens = if (n == 9) &acked else null,
+            .acked_ltr_count = if (n == 9) 1 else 0,
+            .refine_qp = 0,
+            .force_ltr = @intFromBool(n == 5),
+        };
+        var out: c.mlh_enc_output = undefined;
+        try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_encode(t, host.y.ptr, host.u.ptr, host.v.ptr, &changed, &p, &out));
+        try testing.expectEqual(n == 0 or n == 5 or n == 9, out.has_ltr_token != 0);
+        if (n == 5) {
+            token = out.ltr_token;
+            at_mark.copyFrom(&host);
+        }
+        if (n >= 6 and n <= 8) continue; // lost
+        var f: mlc.mlc_frame = undefined;
+        var got: c_int = 0;
+        try testing.expectEqual(@as(c_int, 0), mlc.mlc_decoder_decode(dec, out.data, out.len, @intCast(n), &f, &got));
+        try testing.expect(got != 0);
+        defer mlc.mlc_decoder_release_frame(dec, &f);
+        if (n == 9) {
+            try testing.expect(out.ltr_refresh != 0 and out.keyframe == 0);
+            try testing.expect(at_mark.matches(&f)); // all skipped: a copy of frame 5
+        } else try testing.expect(host.matches(&f));
+    }
+}
+
+test "H.264 planner: force_ltr marks off the interval and a refresh predicts from it" {
+    try forcedMarkScenario(c.MLH_CODEC_H264);
+}
+
+test "HEVC planner: force_ltr marks off the interval and a refresh predicts from it" {
+    try forcedMarkScenario(c.MLH_CODEC_HEVC);
+}
+
 test "H.264 test encoder without long-term references: a refresh is an IDR" {
     var t: ?*c.mlh_testenc = null;
     try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_create(c.MLH_CODEC_H264, 32, 32, 0, &t));
@@ -184,7 +247,7 @@ test "H.264 test encoder without long-term references: a refresh is an IDR" {
     const changed = [_]u8{0} ** 4;
     var out: c.mlh_enc_output = undefined;
     for (0..4) |n| {
-        const p: c.mlh_enc_params = .{ .force = if (n == 2) c.MLH_FORCE_LTR_REFRESH else c.MLH_FORCE_NONE, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
+        const p: c.mlh_enc_params = .{ .force = if (n == 2) c.MLH_FORCE_LTR_REFRESH else c.MLH_FORCE_NONE, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0, .refine_qp = 0, .force_ltr = 0 };
         try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_encode(t, pic.y.ptr, pic.u.ptr, pic.v.ptr, &changed, &p, &out));
         try testing.expectEqual(n == 0 or n == 2, out.keyframe != 0);
         try testing.expectEqual(@as(u32, 0), out.has_ltr_token);
@@ -227,7 +290,7 @@ test "software encoder: lossless round trip is bit exact, slices, keyframes on r
             8 => c.MLH_FORCE_LTR_REFRESH, // no long-term references: an IDR
             else => c.MLH_FORCE_NONE,
         };
-        const p: c.mlh_enc_params = .{ .force = force, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
+        const p: c.mlh_enc_params = .{ .force = force, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0, .refine_qp = 0, .force_ltr = 0 };
         var out: c.mlh_enc_output = undefined;
         try testing.expectEqual(@as(c_int, 0), c.mlh_enc_encode(e, &in, 0, &p, &out));
         try testing.expectEqual(@as(u32, 0), out.dropped); // zerolatency: every frame comes out of its own call
@@ -308,7 +371,7 @@ test "software encoder: a linear dma-buf (memfd) is read like the same pixels in
     dma.fd[0] = fd;
     dma.pitch[0] = w * 4;
     const in: c.mlh_enc_input = .{ .dmabuf = &dma, .data = null, .stride = 0, .format = 0, .width = w, .height = h };
-    const p: c.mlh_enc_params = .{ .force = 0, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
+    const p: c.mlh_enc_params = .{ .force = 0, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0, .refine_qp = 0, .force_ltr = 0 };
     var out: c.mlh_enc_output = undefined;
     try testing.expectEqual(@as(c_int, 0), c.mlh_enc_encode(e, &in, 0, &p, &out));
     const dec = try decoder(mlc.MLC_CODEC_H264);
@@ -325,12 +388,104 @@ test "software encoder: a linear dma-buf (memfd) is read like the same pixels in
     try testing.expectEqual(@as(c_int, c.MLH_E_UNSUPPORTED), c.mlh_enc_encode(e, &in, 0, &p, &out));
 }
 
+/// Text-like BGRA: dark strokes from 64 random 8x16 glyphs on a light background, in
+/// lines with gaps, the kind of picture idle refinement is for.
+fn drawText(px: []u8, w: u32, h: u32) void {
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    var glyphs: [64][16]u8 = @splat(@splat(0));
+    for (&glyphs) |*g| {
+        for (0..5) |_| {
+            const x0 = 1 + rnd.uintLessThan(u8, 5);
+            const y0 = 3 + rnd.uintLessThan(u8, 9);
+            const len = 2 + rnd.uintLessThan(u8, 5);
+            const horiz = rnd.boolean();
+            for (0..len) |t| {
+                const x = if (horiz) x0 + t else x0;
+                const y = if (horiz) y0 else y0 + t;
+                if (x < 7 and y < 14) g[y] |= @as(u8, 1) << @intCast(x);
+            }
+        }
+    }
+    @memset(px, 235);
+    for (0..h / 16) |cy| {
+        if (cy % 3 == 2) continue;
+        for (1..w / 8 - 1) |cx| {
+            if (rnd.uintLessThan(u8, 7) == 0) continue;
+            const g = glyphs[rnd.uintLessThan(u8, 64)];
+            for (0..16) |y| {
+                for (0..8) |x| {
+                    if (g[y] >> @intCast(x) & 1 == 0) continue;
+                    const o = ((cy * 16 + y) * w + cx * 8 + x) * 4;
+                    @memcpy(px[o..][0..3], &[_]u8{ 40, 30, 30 });
+                }
+            }
+        }
+    }
+}
+
+/// Luma PSNR of a decoded frame against `want`.
+fn psnrY(want: *const Picture, f: *const mlc.mlc_frame) f64 {
+    var se: f64 = 0;
+    for (0..want.h) |r| {
+        for (0..want.w) |x| {
+            const d = @as(f64, @floatFromInt(f.planes[0][r * f.strides[0] + x])) - @as(f64, @floatFromInt(want.y[r * want.w + x]));
+            se += d * d;
+        }
+    }
+    se /= @floatFromInt(want.w * want.h);
+    return if (se == 0) 99 else 10 * std.math.log10(255.0 * 255.0 / se);
+}
+
+test "software encoder: refine frames sharpen a still picture without a keyframe" {
+    const w = 640;
+    const h = 368;
+    const px = try gpa.alloc(u8, w * h * 4);
+    defer gpa.free(px);
+    drawText(px, w, h);
+    var want = try Picture.init(w, h);
+    defer want.deinit();
+    c.mlh_bgra_to_i420(px.ptr, w * 4, w, h, want.y.ptr, want.u.ptr, want.v.ptr);
+    // The same still picture twice: plain repeats, then refine steps in their place.
+    var result: [2]f64 = undefined;
+    var refine_bytes: usize = 0;
+    for (0..2) |run| {
+        var storage: enc_mod.Encoder = undefined;
+        const e = try enc_mod.open(&storage, .{ .kind = .software });
+        defer e.deinit();
+        try testing.expect(e.caps().refine);
+        try e.configure(.{ .codec = .h264, .width = w, .height = h, .bitrate_bps = 1_500_000 });
+        const dec = try decoder(mlc.MLC_CODEC_H264);
+        defer mlc.mlc_decoder_destroy(dec);
+        const frame: api.CapturedFrame = .{ .image = .{ .width = w, .height = h, .cpu = .{ .data = px, .stride = w * 4 } }, .seq = 1, .capture_start_us = 0, .captured_us = 0, .repeat = true };
+        const steps = [_]u8{ 24, 16, 8 };
+        for (0..16) |n| {
+            const qp: u8 = if (run == 1 and n >= 10 and n < 13) steps[n - 10] else 0;
+            const ef = (try e.encode(&frame, .{ .refine_qp = qp })).?;
+            try testing.expectEqual(n == 0, ef.keyframe);
+            try testing.expectEqual(qp != 0, ef.refine);
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(gpa);
+            for (ef.slices) |sl| try buf.appendSlice(gpa, sl);
+            if (qp != 0) refine_bytes += buf.items.len;
+            var f: mlc.mlc_frame = undefined;
+            var got: c_int = 0;
+            try testing.expectEqual(@as(c_int, 0), mlc.mlc_decoder_decode(dec, buf.items.ptr, buf.items.len, @intCast(n), &f, &got));
+            try testing.expect(got != 0);
+            defer mlc.mlc_decoder_release_frame(dec, &f);
+            if (n == 13) result[run] = psnrY(&want, &f);
+        }
+    }
+    std.debug.print("still text at 1.5 Mb/s, luma PSNR after 3 more frames: repeats {d:.1} dB, refine steps {d:.1} dB ({d} B)\n", .{ result[0], result[1], refine_bytes });
+    try testing.expect(result[1] > result[0] + 1.0);
+}
+
 test "software encoder through the platform interface" {
     var storage: enc_mod.Encoder = undefined;
     const e = try enc_mod.open(&storage, .{ .kind = .software });
     defer e.deinit();
     const caps = e.caps();
-    try testing.expect(caps.codecs.h264 and !caps.ltr and caps.cpu_input);
+    try testing.expect(caps.codecs.h264 and !caps.ltr and caps.cpu_input and caps.refine);
     try testing.expectError(error.Unsupported, e.configure(.{ .codec = .hevc, .width = 128, .height = 64, .bitrate_bps = 1_000_000 }));
     try testing.expectError(error.Unsupported, e.configure(.{ .codec = .h264, .width = 128, .height = 64, .bitrate_bps = 1_000_000, .format = .{ .bit_depth = 10 } }));
     try e.configure(.{ .codec = .h264, .width = 128, .height = 64, .bitrate_bps = 1_000_000, .slices = 2 });

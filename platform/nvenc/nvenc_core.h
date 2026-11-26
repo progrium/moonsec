@@ -9,7 +9,10 @@
  * GOP, no B-frames, no lookahead, `slices` slices, parameter sets on every IDR, long-term
  * references in "per picture" mode (two slots, a mark every NVC_LTR_INTERVAL frames, on
  * IDRs and on refreshes, into the slot that doesn't hold the newest acked one), bitrate
- * changes through nvEncReconfigureEncoder without an IDR. Synchronous mode. */
+ * changes through nvEncReconfigureEncoder without an IDR. Synchronous mode.
+ * Idle refinement: a frame with refine_qp set is encoded under a reconfigure with
+ * maxQP = refine_qp and a VBV of NVC_REFINE_VBV_FRAMES frame budgets (no IDR, no reset);
+ * the next normal frame reconfigures back. force_ltr marks the frame long-term. */
 #ifndef NVENC_CORE_H
 #define NVENC_CORE_H
 
@@ -29,6 +32,7 @@
 #define NVC_LTR_SLOTS 2
 #define NVC_LTR_INTERVAL 15
 #define NVC_MAX_REGS 8
+#define NVC_REFINE_VBV_FRAMES 4
 
 enum { NVC_CODEC_H264 = 1, NVC_CODEC_HEVC = 2 };
 enum { NVC_FORCE_NONE = 0, NVC_FORCE_LTR_REFRESH = 1, NVC_FORCE_IDR = 2 };
@@ -49,6 +53,10 @@ typedef struct nvc_params {
     uint64_t bitrate_bps; /* 0 = unchanged */
     const uint64_t *acked_ltr_tokens;
     uint32_t acked_ltr_count;
+    /* Idle refinement: cap the QP of this P-frame (H.264/HEVC scale); 0 = normal. */
+    uint32_t refine_qp;
+    /* Mark this frame a long-term reference (when long-term references are on). */
+    uint32_t force_ltr;
 } nvc_params;
 
 typedef struct nvc_output {
@@ -89,6 +97,8 @@ typedef struct nvc {
     uint64_t frame;
     nvc_ltr ltr[NVC_LTR_SLOTS];
     uint64_t since_mark;
+    /* The QP cap the encoder is reconfigured with (0: none, normal rate control). */
+    uint32_t refine_qp;
 } nvc;
 
 /* Fills the function list (checking the driver's API version against the header's: too

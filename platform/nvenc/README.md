@@ -14,6 +14,7 @@ and maps `NVENCSTATUS` to its own errors; the core does the rest:
   frames and every refresh, into the slot that doesn't hold the newest acked one; a
   refresh references the newest acked one, or becomes an IDR when none is acked;
 - bitrate changes through `nvEncReconfigureEncoder` without an IDR;
+- idle refinement (`refine_qp`): a refine frame is encoded under a reconfigure with `maxQP` set and a four-frame VBV, no IDR or encoder reset, and the next normal frame reconfigures back; `force_ltr` marks the frame long-term;
 - input registration (least recently used of 8 goes) and the encode call.
 
 `zig build test-nvenc-core` runs the core against a fake NVENC function list (marks,

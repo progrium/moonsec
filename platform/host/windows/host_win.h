@@ -87,6 +87,7 @@ typedef struct msw_enc_caps {
     uint32_t ltr;
     uint32_t max_slices;
     uint32_t gpu_input, cpu_input;
+    uint32_t refine; /* takes msw_enc_params.refine_qp (idle refinement) */
 } msw_enc_caps;
 
 typedef struct msw_enc_config {
@@ -102,6 +103,10 @@ typedef struct msw_enc_params {
     uint64_t bitrate_bps; /* 0 = unchanged */
     const uint64_t *acked_ltr_tokens;
     uint32_t acked_ltr_count;
+    /* Idle refinement: cap this P-frame's QP (H.264/HEVC scale); 0 = normal. */
+    uint32_t refine_qp;
+    /* Mark this frame a long-term reference (when the encoder has them). */
+    uint32_t force_ltr;
 } msw_enc_params;
 
 typedef struct msw_enc_output {

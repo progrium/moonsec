@@ -8,6 +8,7 @@
 
 static NV_ENC_PIC_PARAMS last_pic;
 static int encodes, reconfigs, reconfig_idr, registered, unregistered;
+static NV_ENC_CONFIG last_reconfig;
 static uint8_t payload[4] = {0, 0, 1, 0x65};
 
 static NVENCSTATUS NVENCAPI f_open(NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS *p, void **enc) {
@@ -102,7 +103,8 @@ static NVENCSTATUS NVENCAPI f_unlock(void *e, NV_ENC_OUTPUT_PTR b) {
 static NVENCSTATUS NVENCAPI f_reconfig(void *e, NV_ENC_RECONFIGURE_PARAMS *r) {
     (void)e;
     reconfigs++;
-    reconfig_idr += r->forceIDR;
+    reconfig_idr += r->forceIDR + r->resetEncoder;
+    last_reconfig = *r->reInitEncodeParams.encodeConfig;
     return NV_ENC_SUCCESS;
 }
 static NVENCSTATUS NVENCAPI f_destroy(void *e) {
@@ -154,15 +156,21 @@ static int sink(void *ctx, const void *d, size_t n) {
     return 0;
 }
 
-static nvc_output frame(nvc *n, uint32_t force, const uint64_t *acked, uint32_t nacked, uint64_t bitrate) {
+static nvc_output frame_with(nvc *n, uint32_t force, const uint64_t *acked, uint32_t nacked, uint64_t bitrate,
+                             uint32_t refine_qp, uint32_t force_ltr) {
     NV_ENC_REGISTERED_PTR reg;
     CHECK(nvc_register(n, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR, (void *)0x1000, 0, 1024, NV_ENC_BUFFER_FORMAT_ARGB, &reg) == NV_ENC_SUCCESS);
-    nvc_params p = {.force = force, .bitrate_bps = bitrate, .acked_ltr_tokens = acked, .acked_ltr_count = nacked};
+    nvc_params p = {.force = force, .bitrate_bps = bitrate, .acked_ltr_tokens = acked, .acked_ltr_count = nacked,
+                    .refine_qp = refine_qp, .force_ltr = force_ltr};
     nvc_output o;
     size_t bytes = 0;
     CHECK(nvc_encode(n, reg, 0, &p, sink, &bytes, &o) == NV_ENC_SUCCESS);
     CHECK(bytes == sizeof payload);
     return o;
+}
+
+static nvc_output frame(nvc *n, uint32_t force, const uint64_t *acked, uint32_t nacked, uint64_t bitrate) {
+    return frame_with(n, force, acked, nacked, bitrate, 0, 0);
 }
 
 int main(void) {
@@ -188,6 +196,23 @@ int main(void) {
     /* A bitrate change reconfigures without an IDR. */
     o = frame(&n, NVC_FORCE_NONE, NULL, 0, 500000);
     CHECK(reconfigs == 1 && reconfig_idr == 0 && !o.keyframe);
+    /* Idle refinement: two capped steps reconfigure without an IDR or reset; the last is
+     * marked long-term on request (frame 17, 12 frames before the next interval mark);
+     * the next normal frame goes back to plain CBR. */
+    const int before = reconfigs;
+    o = frame_with(&n, NVC_FORCE_NONE, NULL, 0, 0, 24, 0);
+    CHECK(reconfigs == before + 1 && reconfig_idr == 0 && !o.keyframe && !o.has_ltr_token);
+    CHECK(last_reconfig.rcParams.enableMaxQP && last_reconfig.rcParams.maxQP.qpInterP == 24);
+    CHECK(last_reconfig.rcParams.vbvBufferSize == 500000 / 60 * NVC_REFINE_VBV_FRAMES);
+    o = frame_with(&n, NVC_FORCE_NONE, NULL, 0, 0, 8, 1);
+    CHECK(reconfigs == before + 2 && !o.keyframe && o.has_ltr_token && o.ltr_token == 19);
+    CHECK(last_reconfig.rcParams.maxQP.qpInterP == 8);
+    o = frame(&n, NVC_FORCE_NONE, NULL, 0, 0);
+    CHECK(reconfigs == before + 3 && !last_reconfig.rcParams.enableMaxQP && !o.has_ltr_token);
+    CHECK(last_reconfig.rcParams.vbvBufferSize == 500000 / 60);
+    o = frame(&n, NVC_FORCE_NONE, NULL, 0, 0);
+    CHECK(reconfigs == before + 3); /* nothing changed: no reconfigure */
+    CHECK(reconfig_idr == 0);
     /* Refresh with only token 1 acked: predicts from slot 0, marks slot 1 (not the acked one). */
     o = frame(&n, NVC_FORCE_LTR_REFRESH, NULL, 0, 0);
     CHECK(!o.keyframe && o.ltr_refresh);

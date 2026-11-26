@@ -419,6 +419,8 @@ int mlh_nvenc_encode(mlh_nvenc *e, const mlh_nvenc_input *in, uint64_t time_us, 
         .bitrate_bps = p->bitrate_bps,
         .acked_ltr_tokens = p->acked_ltr_tokens,
         .acked_ltr_count = p->acked_ltr_count,
+        .refine_qp = p->refine_qp,
+        .force_ltr = p->force_ltr,
     };
     nvc_output o;
     e->out_len = 0;

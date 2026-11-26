@@ -55,6 +55,8 @@ pub const Stats = struct {
     frames: u64 = 0,
     keyframes: u64 = 0,
     refreshes: u64 = 0,
+    /// Idle-refinement frames (sent to every streaming member).
+    refines: u64 = 0,
     encode_drops: u64 = 0,
     joins: u64 = 0,
     leaves: u64 = 0,
@@ -524,6 +526,7 @@ pub const MultiHost = struct {
         m.stats.frames += 1;
         if (flags.keyframe) m.stats.keyframes += 1;
         if (flags.refresh) m.stats.refreshes += 1;
+        if (ef.refine and !flags.keyframe and !flags.refresh) m.stats.refines += 1;
     }
 
     /// Audio goes to every streaming member (for `apps.HostAudio.pump`).
@@ -533,7 +536,7 @@ pub const MultiHost = struct {
 
     pub fn report(m: *const MultiHost, w: *std.Io.Writer) !void {
         const st = m.stats;
-        try w.print("multi host: {d} joined, {d} left; frames {d} (keyframes {d}, refreshes {d}); acks held {d}, released {d}; input applied {d}, dropped {d}, releases {d}; rosters sent {d}\n", .{ st.joins, st.leaves, st.frames, st.keyframes, st.refreshes, m.join.stats.held, m.join.stats.released, st.inputs_applied, st.inputs_dropped, st.releases, st.rosters_sent });
+        try w.print("multi host: {d} joined, {d} left; frames {d} (keyframes {d}, refreshes {d}, refines {d}); acks held {d}, released {d}; input applied {d}, dropped {d}, releases {d}; rosters sent {d}\n", .{ st.joins, st.leaves, st.frames, st.keyframes, st.refreshes, st.refines, m.join.stats.held, m.join.stats.released, st.inputs_applied, st.inputs_dropped, st.releases, st.rosters_sent });
         for (m.peers.items) |p| {
             try w.print("  member {d}{s}: ", .{ p.id, if (p.left) " (left)" else "" });
             try p.s.report(w);
@@ -556,6 +559,8 @@ pub const MultiHostApp = struct {
     audio: ?*apps.HostAudio = null,
     /// The member whose action is being injected (the injector may ask).
     injecting_from: u16 = multi.host_id,
+    /// Idle refinement, as `apps.HostApp` (one encode: every member gets the refine frames).
+    refiner: apps.Refiner,
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0, reconfigures: u64 = 0 } = .{},
 
     pub const Options = struct {
@@ -607,7 +612,7 @@ pub const MultiHostApp = struct {
             .intersect_acks = mo.intersect_acks,
         });
         errdefer m.deinit();
-        var app: MultiHostApp = .{ .be = be, .m = m, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr };
+        var app: MultiHostApp = .{ .be = be, .m = m, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr, .refiner = .init(o, caps) };
         if (o.audio) if (be.audio) |src| {
             app.audio = try apps.HostAudio.init(gpa, src);
         };
@@ -637,7 +642,7 @@ pub const MultiHostApp = struct {
     pub fn tick(a: *MultiHostApp) void {
         a.network(a.be.clock.now());
         if (!a.m.streaming()) return;
-        const f = (a.grab(0) catch return) orelse return;
+        const f = (a.grab(0, null) catch return) orelse return;
         defer a.be.capture.release(&f);
         a.encodeOne(&f, null);
     }
@@ -648,9 +653,10 @@ pub const MultiHostApp = struct {
         const live = a.m.streaming();
         const change = if (live) a.m.takeFormat() else null;
         const bitrate = a.m.bitrate_bps;
-        const params = if (live) a.m.encodeParams() else api.EncodeParams{};
+        var params = if (live) a.m.encodeParams() else api.EncodeParams{};
         if (lock) |l| l.unlock();
         if (!live) return;
+        const refining = change == null and a.refiner.apply(f, &params, a.ltr);
         if (change) |c| {
             a.be.encoder.configure(.{
                 .codec = c.codec,
@@ -677,10 +683,16 @@ pub const MultiHostApp = struct {
         if (lock) |l| l.lock();
         defer if (lock) |l| l.unlock();
         if (r) |ef_| {
-            if (ef_) |ef| {
-                a.m.onEncoded(ef, f, a.be.clock.now());
-                a.last_frame_us = f.captured_us;
-            } else a.m.onEncodeDropped();
+            if (ef_) |ef_v| {
+                var ef = ef_v;
+                const now = a.be.clock.now();
+                a.refiner.after(f, &ef, refining, now);
+                a.m.onEncoded(ef, f, now);
+                a.last_frame_us = now; // when it went out: a repeat keeps its picture's capture time
+            } else {
+                a.refiner.after(f, null, refining, a.be.clock.now());
+                a.m.onEncodeDropped();
+            }
         } else |_| {
             a.stats.encode_errors += 1;
             a.m.onEncodeDropped();
@@ -718,7 +730,7 @@ pub const MultiHostApp = struct {
                 lock.io.sleep(.fromMilliseconds(2), .awake) catch {};
                 continue;
             }
-            const f = (a.grab(interval) catch {
+            const f = (a.grab(interval, lock) catch {
                 lock.io.sleep(.fromMilliseconds(2), .awake) catch {};
                 continue;
             }) orelse continue;
@@ -727,12 +739,20 @@ pub const MultiHostApp = struct {
         }
     }
 
-    fn grab(a: *MultiHostApp, timeout_us: Micros) api.Error!?api.CapturedFrame {
+    fn grab(a: *MultiHostApp, timeout_us: Micros, lock: ?apps.Lock) api.Error!?api.CapturedFrame {
+        a.refiner.step = null;
         if (try a.be.capture.acquire(timeout_us)) |f| return f;
         a.stats.capture_timeouts += 1;
         const last = a.last_frame_us orelse return null;
-        if (a.be.clock.now() - last < a.opts.repeat_after_us) return null;
-        return a.be.capture.repeatLast();
+        const now = a.be.clock.now();
+        if (a.refiner.mayBeDue(now)) {
+            if (lock) |l| l.lock();
+            const ok = a.m.refineOk(now);
+            if (lock) |l| l.unlock();
+            if (a.refiner.pick(now, ok)) return apps.restamp(try a.be.capture.repeatLast(), now);
+        }
+        if (now - last < a.opts.repeat_after_us) return null;
+        return apps.restamp(try a.be.capture.repeatLast(), now);
     }
 
     pub fn done(a: *const MultiHostApp) bool {

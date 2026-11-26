@@ -97,6 +97,7 @@ pub const Encoder = struct {
             .gpu_input = cc.gpu_input != 0,
             .cpu_input = cc.cpu_input != 0,
             .formats = if (cc.nv12_input != 0) &formats_nv12 else &formats_bgra,
+            .refine = cc.refine != 0,
         };
     }
 
@@ -151,6 +152,8 @@ pub const Encoder = struct {
             .bitrate_bps = params.bitrate_bps,
             .acked_ltr_tokens = if (params.acked_ltr_tokens.len > 0) params.acked_ltr_tokens.ptr else null,
             .acked_ltr_count = @intCast(params.acked_ltr_tokens.len),
+            .refine_qp = if (params.force == .none) params.refine_qp else 0,
+            .force_ltr = @intFromBool(params.force_ltr),
         };
         var out: c.mlh_enc_output = undefined;
         const rc = c.mlh_enc_encode(self.enc, &in, @intCast(@max(frame.captured_us, 0)), &p, &out);
@@ -164,6 +167,7 @@ pub const Encoder = struct {
             .keyframe = out.keyframe != 0,
             .ltr_token = if (out.has_ltr_token != 0) out.ltr_token else null,
             .ltr_refresh = out.ltr_refresh != 0,
+            .refine = p.refine_qp != 0,
             .encode_start_us = start_us,
             .encoded_us = nowUs(),
         };

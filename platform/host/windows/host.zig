@@ -218,6 +218,7 @@ pub const Encoder = struct {
             .max_slices = @intCast(@min(self.caps_.max_slices, max_slices)),
             .gpu_input = self.caps_.gpu_input != 0,
             .cpu_input = false,
+            .refine = self.caps_.refine != 0,
         };
     }
 
@@ -255,6 +256,8 @@ pub const Encoder = struct {
             .bitrate_bps = params.bitrate_bps,
             .acked_ltr_tokens = if (params.acked_ltr_tokens.len > 0) params.acked_ltr_tokens.ptr else null,
             .acked_ltr_count = @intCast(params.acked_ltr_tokens.len),
+            .refine_qp = if (params.force == .none) params.refine_qp else 0,
+            .force_ltr = @intFromBool(params.force_ltr),
         };
         var out: c.msw_enc_output = undefined;
         const hr = c.msw_enc_encode(self.enc, tex, frame.image.gpu_index, @intCast(@max(frame.captured_us, 0)), &p, &out);
@@ -271,6 +274,7 @@ pub const Encoder = struct {
             .keyframe = out.keyframe != 0,
             .ltr_token = if (out.has_ltr_token != 0) out.ltr_token else null,
             .ltr_refresh = out.ltr_refresh != 0,
+            .refine = p.refine_qp != 0 and self.caps_.refine != 0,
             .encode_start_us = start_us,
             .encoded_us = nowUs(),
         };

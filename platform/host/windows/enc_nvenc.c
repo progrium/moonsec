@@ -37,6 +37,7 @@ static void nv_caps(const msw_enc *e, msw_enc_caps *out) {
     out->ltr = (uint32_t)n->core.ltr_supported;
     out->max_slices = 4;
     out->gpu_input = 1;
+    out->refine = 1; /* maxQP through nvEncReconfigureEncoder (nvenc_core.c) */
 }
 
 static HRESULT nv_configure(msw_enc *e, const msw_enc_config *cfg) {
@@ -67,6 +68,8 @@ static HRESULT nv_encode(msw_enc *e, ID3D11Texture2D *tex, UINT index, uint64_t 
         .bitrate_bps = p->bitrate_bps,
         .acked_ltr_tokens = p->acked_ltr_tokens,
         .acked_ltr_count = p->acked_ltr_count,
+        .refine_qp = p->refine_qp,
+        .force_ltr = p->force_ltr,
     };
     nvc_output o;
     hr = nv_hr(nvc_encode(&n->core, reg, time_us, &np, nv_append, &n->base, &o));

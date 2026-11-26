@@ -82,6 +82,8 @@ typedef struct mlh_enc_caps {
     uint32_t max_slices;
     uint32_t gpu_input, cpu_input;
     uint32_t nv12_input;
+    /* Takes mlh_enc_params.refine_qp (idle refinement). */
+    uint32_t refine;
 } mlh_enc_caps;
 
 typedef struct mlh_enc_config {
@@ -99,6 +101,11 @@ typedef struct mlh_enc_params {
     uint64_t bitrate_bps; /* 0 = unchanged */
     const uint64_t *acked_ltr_tokens;
     uint32_t acked_ltr_count;
+    /* Idle refinement: a still picture again, as a P-frame with its QP capped at this
+     * (H.264/HEVC scale); 0 = normal rate control. Ignored with `force`. */
+    uint32_t refine_qp;
+    /* Mark this frame a long-term reference (when the encoder has them). */
+    uint32_t force_ltr;
 } mlh_enc_params;
 
 #define MLH_MAX_SLICES 64

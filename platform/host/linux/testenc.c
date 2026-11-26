@@ -287,7 +287,7 @@ int mlh_testenc_encode(mlh_testenc *t, const uint8_t *y, const uint8_t *u, const
     memset(out, 0, sizeof *out);
     refs_ack(&t->refs, p->acked_ltr_tokens, p->acked_ltr_count);
     refs_plan plan;
-    refs_plan_frame(&t->refs, (int)p->force, &plan);
+    refs_plan_frame_mark(&t->refs, (int)p->force, (int)p->force_ltr, &plan);
     size_t len = 0;
     int rc = t->codec == MLH_CODEC_H264 ? h264_frame(t, &plan, y, u, v, changed, &len)
                                          : hevc_frame(t, &plan, y, u, v, changed, &len);
