@@ -1,4 +1,10 @@
-/* Desktop Duplication capture (IDXGIOutputDuplication). */
+/* Desktop Duplication capture (IDXGIOutputDuplication).
+ *
+ * Damage: each presented frame's move and dirty rectangles (GetFrameMoveRects,
+ * GetFrameDirtyRects, read before ReleaseFrame) are handed to host.zig as DXGI gives them;
+ * DXGI already folds them over AccumulatedFrames. The first frame of a duplication has
+ * none we trust (it is the whole desktop anyway). msw_dup_read_rect copies a rectangle of
+ * our copy texture through a small staging texture, for lossless tiles. */
 #include "msw_internal.h"
 #include "host_win.h"
 
@@ -17,6 +23,11 @@ struct msw_dup {
     uint32_t shape_len, shape_cap;
     DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info;
     DXGI_OUTDUPL_POINTER_POSITION pointer;
+    int fresh; /* no frame presented yet on this duplication */
+    uint8_t *meta; /* move rects, then dirty rects, of the last frame */
+    uint32_t meta_cap;
+    ID3D11Texture2D *staging; /* for msw_dup_read_rect, grown as asked */
+    uint32_t staging_w, staging_h;
 };
 
 msw_hr msw_dup_create(msw_d3d *d, uint32_t output_index, msw_dup **out) {
@@ -24,6 +35,7 @@ msw_hr msw_dup_create(msw_d3d *d, uint32_t output_index, msw_dup **out) {
     msw_dup *p = (msw_dup *)calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
     p->d = d;
+    p->fresh = 1;
     HRESULT hr;
     IDXGIOutput *o = NULL;
     MSW_TRY(IDXGIAdapter1_EnumOutputs(d->adapter, output_index, &o), fail);
@@ -58,10 +70,12 @@ fail:
 void msw_dup_destroy(msw_dup *p) {
     if (!p) return;
     if (p->holding) IDXGIOutputDuplication_ReleaseFrame(p->dup);
+    MSW_RELEASE(p->staging);
     MSW_RELEASE(p->copy);
     MSW_RELEASE(p->dup);
     MSW_RELEASE(p->output);
     free(p->shape);
+    free(p->meta);
     free(p);
 }
 
@@ -84,6 +98,27 @@ static uint64_t qpc_to_ns(LONGLONG t) {
     if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
     uint64_t f = (uint64_t)freq.QuadPart, u = (uint64_t)t;
     return (u / f) * 1000000000ull + (u % f) * 1000000000ull / f;
+}
+
+/* The frame's move and dirty rectangles into p->meta (before ReleaseFrame); 0 when DXGI
+ * gave none or they could not be read (the damage is then unknown). */
+static int read_damage(msw_dup *p, const DXGI_OUTDUPL_FRAME_INFO *fi, msw_dup_frame *out) {
+    UINT need = fi->TotalMetadataBufferSize;
+    if (need == 0) return 0;
+    if (need > p->meta_cap) {
+        uint8_t *n = (uint8_t *)realloc(p->meta, need);
+        if (!n) return 0;
+        p->meta = n;
+        p->meta_cap = need;
+    }
+    UINT moves = 0, dirty = 0;
+    if (FAILED(IDXGIOutputDuplication_GetFrameMoveRects(p->dup, p->meta_cap, (DXGI_OUTDUPL_MOVE_RECT *)p->meta, &moves))) return 0;
+    if (FAILED(IDXGIOutputDuplication_GetFrameDirtyRects(p->dup, p->meta_cap - moves, (RECT *)(p->meta + moves), &dirty))) return 0;
+    out->move_rects = (const int32_t *)p->meta;
+    out->n_moves = moves / sizeof(DXGI_OUTDUPL_MOVE_RECT);
+    out->dirty_rects = (const int32_t *)(p->meta + moves);
+    out->n_dirty = dirty / sizeof(RECT);
+    return 1;
 }
 
 msw_hr msw_dup_acquire(msw_dup *p, uint32_t timeout_ms, msw_dup_frame *out) {
@@ -121,6 +156,8 @@ msw_hr msw_dup_acquire(msw_dup *p, uint32_t timeout_ms, msw_dup_frame *out) {
         if (FAILED(hr)) goto done;
         ID3D11DeviceContext_CopyResource(p->d->context, (ID3D11Resource *)p->copy, (ID3D11Resource *)tex);
         out->present_ns = qpc_to_ns(fi.LastPresentTime.QuadPart);
+        out->damage_known = (uint32_t)(read_damage(p, &fi, out) && !p->fresh);
+        p->fresh = 0;
     }
     /* The copy is ours: hand the desktop image back right away so DWM is never held up. */
     IDXGIOutputDuplication_ReleaseFrame(p->dup);
@@ -136,6 +173,39 @@ msw_hr msw_dup_acquire(msw_dup *p, uint32_t timeout_ms, msw_dup_frame *out) {
 done:
     MSW_RELEASE(tex);
     MSW_RELEASE(res);
+    return hr;
+}
+
+msw_hr msw_dup_read_rect(msw_dup *p, uint32_t x, uint32_t y, uint32_t w, uint32_t h, void *out, uint32_t out_stride) {
+    if (!p->copy || w == 0 || h == 0 || x > p->width || y > p->height || w > p->width - x || h > p->height - y || out_stride < w * 4)
+        return E_INVALIDARG;
+    HRESULT hr = S_OK;
+    if (!p->staging || w > p->staging_w || h > p->staging_h) {
+        MSW_RELEASE(p->staging);
+        uint32_t sw = w > p->staging_w ? w : p->staging_w, sh = h > p->staging_h ? h : p->staging_h;
+        if (sw < 64) sw = 64;
+        if (sh < 64) sh = 64;
+        D3D11_TEXTURE2D_DESC td = {0};
+        td.Width = sw;
+        td.Height = sh;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        p->staging_w = p->staging_h = 0;
+        MSW_TRY(ID3D11Device_CreateTexture2D(p->d->device, &td, NULL, &p->staging), done);
+        p->staging_w = sw;
+        p->staging_h = sh;
+    }
+    D3D11_BOX box = {x, y, 0, x + w, y + h, 1};
+    ID3D11DeviceContext_CopySubresourceRegion(p->d->context, (ID3D11Resource *)p->staging, 0, 0, 0, 0, (ID3D11Resource *)p->copy, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE m;
+    MSW_TRY(ID3D11DeviceContext_Map(p->d->context, (ID3D11Resource *)p->staging, 0, D3D11_MAP_READ, 0, &m), done);
+    for (uint32_t r = 0; r < h; r++) memcpy((uint8_t *)out + (size_t)r * out_stride, (const uint8_t *)m.pData + (size_t)r * m.RowPitch, (size_t)w * 4);
+    ID3D11DeviceContext_Unmap(p->d->context, (ID3D11Resource *)p->staging, 0);
+done:
     return hr;
 }
 

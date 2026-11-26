@@ -24,6 +24,11 @@
 //! (CLOCK_MONOTONIC, not after arrival), else the arrival time in the process callback.
 //! PipeWire screen streams send nothing while the screen is static (damage-driven), so
 //! the app keeps the stream alive with `repeatLast`, as on the other hosts.
+//!
+//! Damage (`CapturedFrame.damage`) comes from the producer's SPA_META_VideoDamage (GNOME
+//! and KDE give it), united over the buffers the mailbox dropped; null when the producer
+//! sends none. `readRect` copies a rectangle out of memory frames and linear dma-bufs
+//! (mapped once per frame); a tiled dma-buf is `error.Unsupported`.
 const std = @import("std");
 const api = @import("platform");
 pub const c = @import("mlh_c");
@@ -111,6 +116,8 @@ pub const Capture = struct {
     /// Each stream's size in pixels once it has been captured (the portal gives logical
     /// sizes, which differ under scaling), for `displays`. Cleared with the session.
     pixels: [max_streams]api.Size = @splat(.{ .width = 0, .height = 0 }),
+    /// The damage of the frame that is out.
+    damage: [c.MLH_DAMAGE_MAX]api.Rect = undefined,
 
     pub const max_streams = 16;
 
@@ -217,6 +224,7 @@ pub const Capture = struct {
             .capture_start_us = @min(start_us, f.arrived_us),
             .captured_us = f.pts_us,
             .repeat = f.repeat != 0,
+            .damage = damageRects(f, &self.damage),
         };
         if (f.has_cursor != 0) {
             const cur = f.cursor;
@@ -235,7 +243,6 @@ pub const Capture = struct {
                 } else null,
             };
         }
-        _ = self;
         return out;
     }
 
@@ -273,6 +280,18 @@ pub const Capture = struct {
         fr.capture_start_us = start_us;
         fr.captured_us = start_us;
         return fr;
+    }
+
+    /// Copies `rect` of the frame that is out as bgra8 rows (api.Capture.VTable.readRect).
+    pub fn readRect(self: *Capture, frame: *const api.CapturedFrame, rect: api.Rect, out: []u8) api.Error!void {
+        const h = self.cap orelse return error.Closed;
+        const f = &(self.out orelse return error.Closed);
+        if (frame.seq != f.seq) return error.Closed;
+        const row = @as(usize, rect.w) * 4;
+        if (out.len < row * rect.h) return error.Unsupported;
+        const rc = c.mlh_capture_read_rect(h, f, rect.x, rect.y, rect.w, rect.h, out.ptr, @intCast(row));
+        if (rc == c.MLH_E_UNSUPPORTED) return error.Unsupported;
+        try check("capture read_rect", rc);
     }
 
     pub fn release(self: *Capture, _: *const api.CapturedFrame) void {
@@ -344,6 +363,14 @@ pub const Capture = struct {
         return api.bind(api.Capture, Capture, self);
     }
 };
+
+/// A C frame's damage as platform rectangles in `buf` (null when unknown).
+pub fn damageRects(f: *const c.mlh_frame, buf: *[c.MLH_DAMAGE_MAX]api.Rect) ?[]const api.Rect {
+    const d = f.damage orelse return null;
+    const n = @min(f.n_damage, buf.len);
+    for (d[0..n], buf[0..n]) |r, *o| o.* = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+    return buf[0..n];
+}
 
 /// Portal stream `index` as a display: `pixels` when known (it has been captured), else
 /// the portal's logical size; null when neither is there. The first stream is primary.

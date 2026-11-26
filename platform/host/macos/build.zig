@@ -1,7 +1,7 @@
 //! Build steps for the macOS host backend, kept out of the root build.zig so the
 //! per-OS threads don't collide there. The root calls `add`.
 //!
-//!   zig build test       the HID key map (portable)
+//!   zig build test       the HID key map and the capture's damage arithmetic (portable)
 //!   zig build check-mac  type-checks the Zig side for aarch64 and x86_64 macOS from any
 //!                        host (no SDK needed: the .m files are not compiled)
 //!   zig build test-mac   compiles the .m files and runs test.zig (macOS host)
@@ -86,6 +86,9 @@ fn modulesFor(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, m: Modules, test_step: *std.Build.Step) void {
     const keymap = b.createModule(.{ .root_source_file = b.path("platform/host/macos/keymap.zig"), .target = target, .optimize = optimize });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "mac-keymap-test", .root_module = keymap })).step);
+    // Dirty rectangles in points to frame pixels (damage.zig): portable.
+    const damage = b.createModule(.{ .root_source_file = b.path("platform/host/macos/damage.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "core", .module = m.core }} });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "mac-damage-test", .root_module = damage })).step);
 
     const check_mac = b.step("check-mac", "Type-check the macOS host backend for aarch64 and x86_64 macOS (any host; the .m files need test-mac)");
     for ([_]std.Target.Cpu.Arch{ .aarch64, .x86_64 }) |arch| {

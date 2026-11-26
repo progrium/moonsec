@@ -5,11 +5,17 @@
 //! On a GPU-less machine (the windows-2022 CI runner) open with `.driver = .warp` and
 //! `.encoder = .mf_software`: capture then has no outputs to duplicate, and the encoder
 //! still runs on textures the caller fills.
+//!
+//! Capture damage (`CapturedFrame.damage`) is Desktop Duplication's move and dirty
+//! rectangles (damage.zig); `readRect` copies a rectangle of the frame through a small
+//! staging texture for lossless tiles.
 const std = @import("std");
 const api = @import("platform");
 const core = @import("core");
 const win = @import("win");
 pub const c = @import("host_win_c");
+/// Desktop Duplication's rectangles as frame damage (portable, tested by `zig build test`).
+pub const damage = @import("damage.zig");
 
 const log = std.log.scoped(.win_host);
 
@@ -75,6 +81,10 @@ pub const Capture = struct {
     height: u32 = 0,
     /// The output's rectangle on the virtual desktop, for absolute pointer moves.
     rect: [4]i32 = .{ 0, 0, 0, 0 },
+    /// The damage of the last frame (`last.damage` points here).
+    damage_buf: [max_damage]api.Rect = undefined,
+
+    pub const max_damage = 64;
 
     pub fn start(self: *Capture, cfg: api.CaptureConfig) api.Error!api.Size {
         self.stop();
@@ -119,6 +129,7 @@ pub const Capture = struct {
                 .seq = self.seq,
                 .capture_start_us = start_us,
                 .captured_us = @intCast(f.present_ns / 1000),
+                .damage = frameDamage(&f, &self.damage_buf),
             };
             self.have_last = true;
             return self.last;
@@ -130,7 +141,20 @@ pub const Capture = struct {
         var f = self.last;
         f.repeat = true;
         f.capture_start_us = nowUs();
+        f.damage = &.{};
         return f;
+    }
+
+    /// Copies `rect` of the frame (our copy of the desktop image) as bgra8 rows, through a
+    /// staging texture of about that size (api.Capture.VTable.readRect).
+    pub fn readRect(self: *Capture, frame: *const api.CapturedFrame, rect: api.Rect, out: []u8) api.Error!void {
+        const dup = self.dup orelse return error.Closed;
+        // A frame from before a re-duplication is gone with its texture.
+        if (frame.image.gpu == null or frame.image.gpu != c.msw_dup_last_texture(dup)) return error.Closed;
+        const row = @as(usize, rect.w) * 4;
+        if (out.len < row * rect.h) return error.Unsupported;
+        const hr = c.msw_dup_read_rect(dup, rect.x, rect.y, rect.w, rect.h, out.ptr, @intCast(row));
+        if (!ok(hr)) return hrError("read rect", hr);
     }
 
     pub fn release(_: *Capture, _: *const api.CapturedFrame) void {
@@ -148,6 +172,14 @@ pub const Capture = struct {
         return listDisplays(dev(self.d3d), 0, out);
     }
 };
+
+/// A duplicated frame's damage in `buf`, or null when DXGI did not say.
+pub fn frameDamage(f: *const c.msw_dup_frame, buf: []api.Rect) ?[]const api.Rect {
+    if (f.damage_known == 0) return null;
+    const moves: []const damage.MoveRect = if (f.n_moves == 0) &.{} else @as([*]const damage.MoveRect, @ptrCast(f.move_rects))[0..f.n_moves];
+    const dirty: []const damage.DirtyRect = if (f.n_dirty == 0) &.{} else @as([*]const damage.DirtyRect, @ptrCast(f.dirty_rects))[0..f.n_dirty];
+    return damage.fromDxgi(moves, dirty, f.width, f.height, buf);
+}
 
 /// The displays Desktop Duplication can capture: the outputs of the device's adapter
 /// attached to the desktop, or with `d` null, those of adapter `adapter` (no device is

@@ -7,6 +7,12 @@
  * "last") until a newer one is taken, which is what repeat hands out again. So at most
  * two buffers are held, and we ask the producer for at least four.
  *
+ * Damage: we ask for SPA_META_VideoDamage, the regions the producer repainted since its
+ * previous picture (in buffer pixels). The process callback unites them over every picture
+ * buffer since the capture thread last took one, so a frame's damage covers the buffers
+ * the mailbox dropped too; a producer without the meta, a dropped corrupted buffer or a
+ * renegotiation makes it unknown until the next take.
+ *
  * Buffers with an empty chunk carry only cursor metadata (the portal's metadata cursor
  * mode sends those when just the pointer moved); they update the cursor and wake the
  * capture thread, which returns a repeat of the last picture with the new cursor.
@@ -20,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -74,6 +81,8 @@ struct mlh_capture {
     size_t cursor_cap;
     int cursor_changed;
     int have_cursor;
+    /* What changed (buffer pixels) since the capture thread last took a picture. */
+    mlh_damage acc;
 
     /* The capture thread's own copies (outside the lock). */
     uint8_t *cursor_out;
@@ -83,6 +92,15 @@ struct mlh_capture {
     size_t swz_cap;
     mlh_dmabuf dmabuf_out;
     int synced_fd;
+    /* The damage of the frame that is out (frame pixels), and the crop of the last picture
+     * handed out (a different crop makes the damage unknown). */
+    mlh_damage damage_out;
+    uint32_t last_crop[4];
+    int have_last_crop;
+    /* A linear dma-buf mapped by mlh_capture_read_rect, until release. */
+    void *rr_map;
+    size_t rr_len;
+    int rr_fd;
 };
 
 /* ------------------------------------------------------------------------ */
@@ -204,6 +222,8 @@ static void on_process(void *data) {
         struct spa_chunk *ch = buf->datas[0].chunk;
         if ((hdr && (hdr->flags & SPA_META_HEADER_FLAG_CORRUPTED)) || (ch->flags & SPA_CHUNK_FLAG_CORRUPTED)) {
             c->stats.corrupted++;
+            /* The producer counts what it repainted from this picture on; we never saw it. */
+            mlh_damage_reset(&c->acc, 0);
             pw_stream_queue_buffer(c->stream, b);
             continue;
         }
@@ -214,6 +234,14 @@ static void on_process(void *data) {
             pw_stream_queue_buffer(c->stream, b);
             if (c->cursor_changed) woke = 1;
             continue;
+        }
+        struct spa_meta *dm = spa_buffer_find_meta(buf, SPA_META_VideoDamage);
+        if (dm) {
+            mlh_damage bd;
+            mlh_damage_from_meta(&bd, dm->data, dm->size, c->info.size.width, c->info.size.height);
+            mlh_damage_union(&c->acc, &bd);
+        } else {
+            mlh_damage_reset(&c->acc, 0);
         }
         if (c->pending.b) {
             c->stats.dropped++;
@@ -259,6 +287,7 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
     c->modifier = mod ? info.modifier : MLH_MOD_INVALID;
     if (c->format_ready) c->stats.renegotiations++;
     c->info = info;
+    mlh_damage_reset(&c->acc, 0);
     c->stats.width = info.size.width;
     c->stats.height = info.size.height;
     c->stats.fourcc = fourcc_of(info.format);
@@ -276,9 +305,9 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
         return;
     }
 
-    uint8_t pod_buf[1024];
+    uint8_t pod_buf[2048];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(pod_buf, sizeof pod_buf);
-    const struct spa_pod *params[4];
+    const struct spa_pod *params[5];
     uint32_t n = 0;
     int types = c->dmabuf ? (1 << SPA_DATA_DmaBuf) : ((1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr));
     params[n++] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
@@ -288,6 +317,10 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
                                              SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
     params[n++] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoCrop),
                                              SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_region)));
+    params[n++] = spa_pod_builder_add_object(
+        &b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoDamage), SPA_PARAM_META_size,
+        SPA_POD_CHOICE_RANGE_Int(sizeof(struct spa_meta_region) * 16, sizeof(struct spa_meta_region) * 1,
+                                 sizeof(struct spa_meta_region) * MLH_DAMAGE_MAX));
     if (c->cursor_meta)
         params[n++] = spa_pod_builder_add_object(
             &b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Cursor), SPA_PARAM_META_size,
@@ -339,6 +372,7 @@ int mlh_capture_start(const mlh_capture_config *cfg, mlh_capture **out) {
         return MLH_E_NOMEM;
     }
     c->synced_fd = -1;
+    c->rr_fd = -1;
     c->fps = cfg->fps ? cfg->fps : 60;
     c->cursor_meta = cfg->cursor_meta;
     c->n_modifiers = cfg->n_modifiers < 32 ? cfg->n_modifiers : 32;
@@ -409,6 +443,7 @@ void mlh_capture_destroy(mlh_capture *c) {
     if (c->core) pw_core_disconnect(c->core);
     if (c->context) pw_context_destroy(c->context);
     if (c->loop) pw_thread_loop_destroy(c->loop);
+    if (c->rr_map) munmap(c->rr_map, c->rr_len);
     free(c->cursor_px);
     free(c->cursor_out);
     free(c->swz);
@@ -420,6 +455,23 @@ void mlh_capture_size(mlh_capture *c, uint32_t *width, uint32_t *height) {
     *width = c->info.size.width;
     *height = c->info.size.height;
     pw_thread_loop_unlock(c->loop);
+}
+
+/* The frame's damage (lock held): a repeat has none; a new picture takes what accumulated
+ * since the last one, seen through its crop. */
+static void take_damage(mlh_capture *c, mlh_frame *f, int repeat, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (repeat) {
+        mlh_damage_reset(&c->damage_out, 1);
+    } else {
+        int same = c->have_last_crop && c->last_crop[0] == x && c->last_crop[1] == y && c->last_crop[2] == w && c->last_crop[3] == h;
+        mlh_damage_crop(&c->acc, x, y, w, h, &c->damage_out);
+        if (!same) mlh_damage_reset(&c->damage_out, 0);
+        mlh_damage_reset(&c->acc, 1);
+        c->last_crop[0] = x, c->last_crop[1] = y, c->last_crop[2] = w, c->last_crop[3] = h;
+        c->have_last_crop = 1;
+    }
+    f->damage = c->damage_out.known ? c->damage_out.r : NULL;
+    f->n_damage = c->damage_out.known ? c->damage_out.n : 0;
 }
 
 /* Fills `f` from c->last (lock held). */
@@ -460,6 +512,7 @@ static int fill_frame(mlh_capture *c, mlh_frame *f, int repeat) {
             f->data = (const uint8_t *)d->data + d->chunk->offset;
             f->stride = stride;
         }
+        take_damage(c, f, repeat, 0, 0, f->width, f->height);
         return MLH_OK;
     }
     if (!d->data || d->maxsize == 0) return mlh_fail(MLH_E_FAIL, "capture: buffer not mapped (type %u)", d->type);
@@ -471,6 +524,7 @@ static int fill_frame(mlh_capture *c, mlh_frame *f, int repeat) {
     f->stride = stride;
     f->data = src;
     f->fourcc = fourcc_of(fmt);
+    take_damage(c, f, repeat, h->x, h->y, h->w, h->h);
     return MLH_OK;
 }
 
@@ -577,7 +631,57 @@ void mlh_capture_release(mlh_capture *c, mlh_frame *f) {
         ioctl(c->synced_fd, DMA_BUF_IOCTL_SYNC, &s);
         c->synced_fd = -1;
     }
+    if (c->rr_map) {
+        struct dma_buf_sync s = {.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ};
+        ioctl(c->rr_fd, DMA_BUF_IOCTL_SYNC, &s);
+        munmap(c->rr_map, c->rr_len);
+        c->rr_map = NULL;
+        c->rr_fd = -1;
+    }
     c->out = 0;
+}
+
+int mlh_capture_read_rect(mlh_capture *c, const mlh_frame *f, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *out,
+                          uint32_t out_stride) {
+    if (!c->out) return mlh_fail(MLH_E_FAIL, "read_rect: no frame out");
+    if (w == 0 || h == 0 || x > f->width || y > f->height || w > f->width - x || h > f->height - y || out_stride < w * 4)
+        return mlh_fail(MLH_E_FAIL, "read_rect: %ux%u at %u,%u is not inside the %ux%u frame", w, h, x, y, f->width, f->height);
+    const uint8_t *src;
+    uint32_t stride;
+    int swizzle = 0;
+    if (f->data) {
+        /* Memory frames (swizzled already) and linear dma-bufs PipeWire mapped. */
+        src = f->data;
+        stride = f->stride;
+    } else if (f->kind == MLH_FRAME_DMABUF && f->dmabuf && f->dmabuf->modifier == MLH_MOD_LINEAR && f->dmabuf->n_planes >= 1) {
+        const mlh_dmabuf *db = f->dmabuf;
+        stride = db->stride[0] ? db->stride[0] : db->width * 4;
+        if (!c->rr_map) {
+            size_t len = (size_t)db->offset[0] + (size_t)stride * db->height;
+            void *m = mmap(NULL, len, PROT_READ, MAP_SHARED, db->fd[0], 0);
+            if (m == MAP_FAILED) return mlh_fail(MLH_E_UNSUPPORTED, "read_rect: mmap dma-buf: %s", strerror(errno));
+            struct dma_buf_sync s = {.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
+            ioctl(db->fd[0], DMA_BUF_IOCTL_SYNC, &s);
+            c->rr_map = m;
+            c->rr_len = len;
+            c->rr_fd = db->fd[0];
+        }
+        src = (const uint8_t *)c->rr_map + db->offset[0];
+        swizzle = db->fourcc == MLH_FOURCC_XBGR8888 || db->fourcc == MLH_FOURCC_ABGR8888;
+    } else {
+        /* A tiled (or compressed) dma-buf: reading it needs the GPU. */
+        return MLH_E_UNSUPPORTED;
+    }
+    for (uint32_t r = 0; r < h; r++) {
+        const uint8_t *s = src + (size_t)(y + r) * stride + (size_t)x * 4;
+        uint8_t *d = out + (size_t)r * out_stride;
+        if (!swizzle) {
+            memcpy(d, s, (size_t)w * 4);
+            continue;
+        }
+        for (uint32_t i = 0; i < w; i++, s += 4, d += 4) d[0] = s[2], d[1] = s[1], d[2] = s[0], d[3] = s[3];
+    }
+    return MLH_OK;
 }
 
 void mlh_capture_get_stats(mlh_capture *c, mlh_capture_stats *out) {

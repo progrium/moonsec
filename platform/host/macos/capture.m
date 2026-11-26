@@ -12,6 +12,12 @@
 // after the last one's (out of order) are dropped as stale; frames that arrive more than
 // two frame intervals after their display time are late and still delivered, since a late
 // frame is still the newest picture we have.
+//
+// Damage. Complete frames carry SCStreamFrameInfoDirtyRects, in points of the display.
+// The handler unites them over the frames the mailbox replaces, so an acquired frame's
+// rects cover everything since the previous acquire; a frame without the attachment, a
+// stale frame dropped or a blank/suspended status in between makes it unknown. Idle
+// frames change nothing. host.zig scales points to frame pixels (damage.zig).
 #import <AppKit/AppKit.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -155,21 +161,48 @@ struct mh_capture {
     uint64_t pending_seq;
     int64_t pending_captured_us, pending_arrived_us;
     int64_t last_display_us;
+    // Dirty rects since the last acquire (points); acc_known 0: unknown.
+    mh_rectf acc[MH_DIRTY_MAX];
+    uint32_t acc_n;
+    int acc_known;
+    // The acquired frame's copy (until the next acquire).
+    mh_rectf out_dirty[MH_DIRTY_MAX];
+    double src_w, src_h;
     uint64_t seq;
     mh_capture_stats stats;
     int stopped;     // the stream stopped with an error
     char err[256];
 };
 
-static void push_frame(struct mh_capture *c, CVPixelBufferRef pb, int64_t display_us, int64_t arrived_us) {
+static void dirty_add(mh_rectf *list, uint32_t *n, mh_rectf r) {
+    if (r.w <= 0 || r.h <= 0) return;
+    if (*n < MH_DIRTY_MAX) {
+        list[(*n)++] = r;
+        return;
+    }
+    mh_rectf *l = &list[MH_DIRTY_MAX - 1];
+    double x1 = fmax(l->x + l->w, r.x + r.w), y1 = fmax(l->y + l->h, r.y + r.h);
+    l->x = fmin(l->x, r.x);
+    l->y = fmin(l->y, r.y);
+    l->w = x1 - l->x;
+    l->h = y1 - l->y;
+}
+
+// `dirty` NULL: this frame's dirty rects are unknown.
+static void push_frame(struct mh_capture *c, CVPixelBufferRef pb, int64_t display_us, int64_t arrived_us, const mh_rectf *dirty,
+                       uint32_t n_dirty) {
     pthread_mutex_lock(&c->mu);
     c->stats.complete++;
     c->seq++;
     if (display_us <= c->last_display_us) {
         c->stats.stale++;
+        c->acc_known = 0; // the next frame's rects are relative to this one, which we drop
         pthread_mutex_unlock(&c->mu);
         return;
     }
+    if (!dirty) c->acc_known = 0;
+    else if (c->acc_known)
+        for (uint32_t i = 0; i < n_dirty; i++) dirty_add(c->acc, &c->acc_n, dirty[i]);
     c->last_display_us = display_us;
     int64_t late = arrived_us - display_us;
     if (late > 2 * c->interval_us) c->stats.late++;
@@ -198,6 +231,9 @@ static void push_frame(struct mh_capture *c, CVPixelBufferRef pb, int64_t displa
     if (!status || status.integerValue != SCFrameStatusComplete) {
         pthread_mutex_lock(&c->mu);
         c->stats.idle++;
+        // Idle: the same picture. Anything else (blank, suspended, started, stopped):
+        // we cannot say what the next complete frame changed.
+        if (!status || status.integerValue != SCFrameStatusIdle) c->acc_known = 0;
         pthread_mutex_unlock(&c->mu);
         return;
     }
@@ -205,7 +241,23 @@ static void push_frame(struct mh_capture *c, CVPixelBufferRef pb, int64_t displa
     if (!pb) return;
     NSNumber *disp = info[SCStreamFrameInfoDisplayTime];
     int64_t display_us = disp ? mh_ticks_to_us(disp.unsignedLongLongValue) : arrived;
-    push_frame(c, pb, display_us, arrived);
+    mh_rectf dirty[MH_DIRTY_MAX];
+    uint32_t n_dirty = 0;
+    int known = 0;
+    id rects = info[SCStreamFrameInfoDirtyRects];
+    if ([rects isKindOfClass:[NSArray class]]) {
+        known = 1;
+        for (id d in (NSArray *)rects) {
+            CGRect r;
+            if (![d isKindOfClass:[NSDictionary class]] || !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)d, &r)) {
+                known = 0;
+                break;
+            }
+            r = CGRectStandardize(r);
+            dirty_add(dirty, &n_dirty, (mh_rectf){r.origin.x, r.origin.y, r.size.width, r.size.height});
+        }
+    }
+    push_frame(c, pb, display_us, arrived, known ? dirty : NULL, n_dirty);
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
@@ -291,6 +343,15 @@ int mh_capture_start(mh_capture *c, const mh_capture_config *cfg, uint32_t *widt
         c->stopped = 0;
         c->err[0] = 0;
         c->last_display_us = INT64_MIN;
+        c->acc_known = 0;
+        c->acc_n = 0;
+        c->src_w = c->src_h = 0;
+        if (!cfg->window) {
+            // Dirty rects are in the display's points.
+            CGRect b = CGDisplayBounds(mh_display_id(cfg->display));
+            c->src_w = b.size.width;
+            c->src_h = b.size.height;
+        }
         memset(&c->stats, 0, sizeof c->stats);
         pthread_mutex_unlock(&c->mu);
 
@@ -347,8 +408,35 @@ int mh_capture_acquire(mh_capture *c, int64_t timeout_us, mh_frame *out) {
     out->seq = c->pending_seq;
     out->captured_us = c->pending_captured_us;
     out->arrived_us = c->pending_arrived_us;
+    out->dirty = NULL;
+    out->n_dirty = 0;
+    if (c->acc_known) {
+        memcpy(c->out_dirty, c->acc, c->acc_n * sizeof c->acc[0]);
+        out->dirty = c->out_dirty;
+        out->n_dirty = c->acc_n;
+    }
+    out->src_w = c->src_w;
+    out->src_h = c->src_h;
+    c->acc_known = 1;
+    c->acc_n = 0;
     pthread_mutex_unlock(&c->mu);
     return MH_OK;
+}
+
+int mh_frame_read_rect(void *pixel_buffer, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *out, uint32_t out_stride) {
+    CVPixelBufferRef pb = (CVPixelBufferRef)pixel_buffer;
+    if (!pb) return mh_fail(MH_ERR, "read_rect: no pixel buffer");
+    if (CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_32BGRA) return MH_ERR_UNSUPPORTED;
+    size_t pw = CVPixelBufferGetWidth(pb), ph = CVPixelBufferGetHeight(pb);
+    if (w == 0 || h == 0 || x > pw || y > ph || w > pw - x || h > ph - y || out_stride < w * 4)
+        return mh_fail(MH_ERR, "read_rect: %ux%u at %u,%u is not inside the %zux%zu frame", w, h, x, y, pw, ph);
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return mh_fail(MH_ERR, "read_rect: lock failed");
+    const uint8_t *base = CVPixelBufferGetBaseAddress(pb);
+    size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+    if (base)
+        for (uint32_t r = 0; r < h; r++) memcpy(out + (size_t)r * out_stride, base + (size_t)(y + r) * bpr + (size_t)x * 4, (size_t)w * 4);
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return base ? MH_OK : mh_fail(MH_ERR, "read_rect: no base address");
 }
 
 int mh_capture_update(mh_capture *c, uint32_t width, uint32_t height, uint32_t fps) {
@@ -372,6 +460,7 @@ int mh_capture_update(mh_capture *c, uint32_t width, uint32_t height, uint32_t f
         c->width = w;
         c->height = h;
         c->interval_us = 1000000 / (cfg.fps ? cfg.fps : 60);
+        c->acc_known = 0; // frames of the new size start over
         pthread_mutex_unlock(&c->mu);
         mh_cf_release(c->config);
         c->config = (void *)CFBridgingRetain(sc);
