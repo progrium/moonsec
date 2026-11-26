@@ -18,6 +18,11 @@
  * with VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, no copy) is converted to NV12 by VA video
  * processing (BT.709, limited range) on the GPU.
  *
+ * Regional refine: when the driver takes ROI with delta QP under its rate control
+ * (VAConfigAttribEncROI with roi_rc_qp_delta_support), a frame's QP map goes out as
+ * VAEncMiscParameterBufferROI, one rectangle per horizontal run of equal offsets, at most
+ * the driver's num_roi_regions (caps.qp_map_max_regions, which core/qpmap plans within).
+ *
  * Hardware only: Mesa has no software VAAPI encoder, so CI tests the "not available" path
  * and the headers through testenc.c; enc_check (zig build linux-enc-check) runs it on a GPU. */
 #define _GNU_SOURCE
@@ -101,6 +106,7 @@ typedef struct codec_probe {
     int ltr;             /* packed sequence, picture and slice headers: we own the references */
     uint32_t hevc_features, hevc_blocks;
     int have_features, have_blocks;
+    uint32_t roi_regions; /* ROI rectangles with delta QP under rate control; 0 = none */
 } codec_probe;
 
 typedef struct imported {
@@ -144,6 +150,7 @@ typedef struct va_enc {
 
     VABufferID bufs[MAX_BUFFERS];
     int nbufs;
+    VAEncROI roi[256]; /* the frame's QP map as rectangles, read during vaRenderPicture */
 } va_enc;
 
 static int va_err(va_enc *v, VAStatus s, const char *what) {
@@ -214,13 +221,13 @@ static void probe_codec(va_enc *v, const VAProfile *profiles, int nprofiles, cod
         if (!has_profile(v, profiles[i])) continue;
         for (int j = 0; j < 2; j++) {
             if (!has_entrypoint(v, profiles[i], eps[j])) continue;
-            VAConfigAttrib a[7] = {
+            VAConfigAttrib a[8] = {
                 {.type = VAConfigAttribRTFormat},         {.type = VAConfigAttribRateControl},
                 {.type = VAConfigAttribEncPackedHeaders}, {.type = VAConfigAttribEncMaxSlices},
                 {.type = VAConfigAttribEncMaxRefFrames},  {.type = VAConfigAttribEncHEVCFeatures},
-                {.type = VAConfigAttribEncHEVCBlockSizes},
+                {.type = VAConfigAttribEncHEVCBlockSizes}, {.type = VAConfigAttribEncROI},
             };
-            if (v->lib.vaGetConfigAttributes(v->dpy, profiles[i], eps[j], a, 7) != VA_STATUS_SUCCESS) continue;
+            if (v->lib.vaGetConfigAttributes(v->dpy, profiles[i], eps[j], a, 8) != VA_STATUS_SUCCESS) continue;
             if (a[0].value == VA_ATTRIB_NOT_SUPPORTED || !(a[0].value & VA_RT_FORMAT_YUV420)) continue;
             uint32_t rc = 0;
             if (a[1].value != VA_ATTRIB_NOT_SUPPORTED) {
@@ -244,6 +251,10 @@ static void probe_codec(va_enc *v, const VAProfile *profiles, int nprofiles, cod
             out->hevc_features = a[5].value;
             out->have_blocks = a[6].value != VA_ATTRIB_NOT_SUPPORTED;
             out->hevc_blocks = a[6].value;
+            if (a[7].value != VA_ATTRIB_NOT_SUPPORTED) {
+                VAConfigAttribValEncROI roi = {.value = a[7].value};
+                if (roi.bits.roi_rc_qp_delta_support) out->roi_regions = roi.bits.num_roi_regions;
+            }
             return;
         }
     }
@@ -332,6 +343,8 @@ static void va_caps(const mlh_enc *e, mlh_enc_caps *out) {
     out->gpu_input = 1;
     out->cpu_input = 1;
     out->nv12_input = 1;
+    out->qp_map_max_regions = p->roi_regions;
+    out->qp_map_block = p->roi_regions ? (v->session ? v->ctb : 16) : 0;
 }
 
 static uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
@@ -960,6 +973,43 @@ static int hevc_buffers(va_enc *v, const refs_plan *plan) {
 
 /* ---- Encode ------------------------------------------------------------------------ */
 
+/* Regional refine: the QP map as ROI rectangles, one per run of equal offsets, at most the
+ * driver's count (the rest is left out; core/qpmap plans within it). */
+static int add_roi(va_enc *v, const mlh_enc_params *p) {
+    const uint32_t max = v->probe->roi_regions < 256 ? v->probe->roi_regions : 256;
+    if (!p->qp_map || max == 0) return MLH_OK;
+    const uint32_t b = v->ctb, w = v->base.cfg.width, h = v->base.cfg.height;
+    const uint32_t cols = (w + b - 1) / b, rows = (h + b - 1) / b;
+    if (p->qp_map_cols != cols || p->qp_map_rows != rows) return MLH_OK;
+    uint32_t n = 0;
+    int8_t lo = 0, hi = 0;
+    for (uint32_t r = 0; r < rows && n < max; r++)
+        for (uint32_t c = 0; c < cols && n < max;) {
+            const int8_t o = p->qp_map[r * cols + c];
+            uint32_t e = c + 1;
+            while (e < cols && p->qp_map[r * cols + e] == o) e++;
+            if (o != 0) {
+                const uint32_t x1 = e * b < w ? e * b : w, y1 = (r + 1) * b < h ? (r + 1) * b : h;
+                v->roi[n++] = (VAEncROI){
+                    .roi_rectangle = {.x = (int16_t)(c * b), .y = (int16_t)(r * b), .width = (uint16_t)(x1 - c * b), .height = (uint16_t)(y1 - r * b)},
+                    .roi_value = o,
+                };
+                if (o < lo) lo = o;
+                if (o > hi) hi = o;
+            }
+            c = e;
+        }
+    if (n == 0) return MLH_OK;
+    VAEncMiscParameterBufferROI roi;
+    memset(&roi, 0, sizeof roi);
+    roi.num_roi = n;
+    roi.min_delta_qp = lo;
+    roi.max_delta_qp = hi;
+    roi.roi = v->roi;
+    roi.roi_flags.bits.roi_value_is_qp_delta = 1;
+    return add_misc(v, VAEncMiscParameterTypeROI, &roi, sizeof roi);
+}
+
 static int va_encode(mlh_enc *e, const mlh_enc_input *in, uint64_t time_us, const mlh_enc_params *p, mlh_enc_output *out) {
     va_enc *v = (va_enc *)e;
     (void)time_us;
@@ -976,6 +1026,7 @@ static int va_encode(mlh_enc *e, const mlh_enc_input *in, uint64_t time_us, cons
 
     free_frame_buffers(v);
     rc = e->cfg.codec == MLH_CODEC_HEVC ? hevc_buffers(v, &plan) : h264_buffers(v, &plan);
+    if (!rc) rc = add_roi(v, p);
     if (rc) {
         free_frame_buffers(v);
         return rc;

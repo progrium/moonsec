@@ -5,7 +5,14 @@
  * frame threads, sliced threads), no B-frames, no periodic keyframes or scene cuts, VBV of
  * one frame at the target bitrate, parameter sets on every IDR, `slices` slices. A new
  * bitrate goes through x264_encoder_reconfig (libavcodec does this when bit_rate changes)
- * without a keyframe. No long-term references: recovery is an IDR (caps.ltr = 0). */
+ * without a keyframe. No long-term references: recovery is an IDR (caps.ltr = 0).
+ *
+ * Regional refine (x264 only): a frame's QP map goes to libavcodec as
+ * AV_FRAME_DATA_REGIONS_OF_INTEREST side data, one region per horizontal run of equal
+ * offsets, and libavcodec's libx264 wrapper turns it into x264's per-macroblock
+ * quant_offsets (it scales qoffset by 25, so an offset of d QP is qoffset d/25; it needs
+ * adaptive quantisation on, which superfast with zerolatency keeps). OpenH264 has no
+ * per-block QP through libavcodec, so it reports no QP maps. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +48,7 @@ static void sw_caps(const mlh_enc *e, mlh_enc_caps *out) {
     out->cpu_input = 1;
     out->gpu_input = 1; /* linear dma-bufs are read through a mapping */
     out->nv12_input = 1;
+    out->qp_map_block = ((const sw_enc *)e)->x264 ? 16 : 0;
 }
 
 static void sw_close(sw_enc *s) {
@@ -154,6 +162,44 @@ static int fill_frame(sw_enc *s, const uint8_t *data, uint32_t stride, uint32_t 
     return MLH_OK;
 }
 
+/* Regional refine: the QP map as regions of interest on s->frame (replacing the last
+ * frame's). A map of the wrong size, or none, leaves the frame without regions. */
+static int sw_apply_qp_map(sw_enc *s, const mlh_enc_params *p) {
+    av_frame_remove_side_data(s->frame, AV_FRAME_DATA_REGIONS_OF_INTEREST);
+    if (!p->qp_map || !s->x264 || s->base.cfg.lossless) return MLH_OK;
+    const uint32_t w = (uint32_t)s->ctx->width, h = (uint32_t)s->ctx->height;
+    const uint32_t cols = (w + 15) / 16, rows = (h + 15) / 16;
+    if (p->qp_map_cols != cols || p->qp_map_rows != rows) return MLH_OK;
+    size_t runs = 0;
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint32_t c = 0; c < cols; c++) {
+            const int8_t o = p->qp_map[r * cols + c];
+            if (o != 0 && (c == 0 || p->qp_map[r * cols + c - 1] != o)) runs++;
+        }
+    if (runs == 0) return MLH_OK;
+    AVFrameSideData *sd = av_frame_new_side_data(s->frame, AV_FRAME_DATA_REGIONS_OF_INTEREST, runs * sizeof(AVRegionOfInterest));
+    if (!sd) return MLH_E_NOMEM;
+    AVRegionOfInterest *roi = (AVRegionOfInterest *)sd->data;
+    size_t n = 0;
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint32_t c = 0; c < cols;) {
+            const int8_t o = p->qp_map[r * cols + c];
+            uint32_t e = c + 1;
+            while (e < cols && p->qp_map[r * cols + e] == o) e++;
+            if (o != 0) {
+                roi[n++] = (AVRegionOfInterest){
+                    .self_size = sizeof(AVRegionOfInterest),
+                    .top = (int)(r * 16),
+                    .bottom = (int)((r + 1) * 16 < h ? (r + 1) * 16 : h),
+                    .left = (int)(c * 16),
+                    .right = (int)(e * 16 < w ? e * 16 : w),
+                    .qoffset = (AVRational){o, 25},
+                };
+            }
+            c = e;
+        }
+    return MLH_OK;
+}
 
 static int sw_encode(mlh_enc *e, const mlh_enc_input *in, uint64_t time_us, const mlh_enc_params *p,
                      mlh_enc_output *out) {
@@ -181,6 +227,8 @@ static int sw_encode(mlh_enc *e, const mlh_enc_input *in, uint64_t time_us, cons
     const int idr = p->force != MLH_FORCE_NONE;
     s->frame->pict_type = idr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
     s->frame->pts = s->pts++;
+    rc = sw_apply_qp_map(s, p);
+    if (rc) return rc;
     int err = avcodec_send_frame(s->ctx, s->frame);
     if (err < 0) return av_fail(MLH_E_CODEC, "send", err);
     for (;;) {

@@ -46,6 +46,9 @@ pub const damage = @import("damage/root.zig");
 /// Lossless tiles: QOI cells on the refine stream, composited over video (core/refine).
 pub const refine = @import("refine/root.zig");
 
+/// Regional refine: per-block QP offsets for still regions (encoder QP maps).
+pub const qpmap = @import("qpmap/root.zig");
+
 /// Idle refinement: low-QP refine steps when the screen goes still (core/still).
 pub const still = @import("still/root.zig");
 

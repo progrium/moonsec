@@ -40,6 +40,7 @@ typedef struct mlh_nvenc_input {
 
 typedef struct mlh_nvenc_caps {
     uint32_t h264, hevc, ltr, max_slices;
+    uint32_t qp_map_block; /* the QP delta map's block edge for the configured codec */
 } mlh_nvenc_caps;
 
 typedef struct mlh_nvenc_config {
@@ -55,6 +56,8 @@ typedef struct mlh_nvenc_params {
     uint64_t bitrate_bps;
     const uint64_t *acked_ltr_tokens;
     uint32_t acked_ltr_count;
+    const int8_t *qp_map; /* QP deltas per qp_map_block block, cols x rows; NULL = none */
+    uint32_t qp_map_cols, qp_map_rows;
 } mlh_nvenc_params;
 
 typedef struct mlh_nvenc_output {

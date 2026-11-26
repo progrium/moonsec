@@ -128,7 +128,7 @@ fn encodeSequence(d: win.D3d, kind: c.msw_enc_kind, codec: u32, ltr: bool) !void
     for (0..40) |i| {
         // Fresh noise every frame, so every frame is limited by the bitrate.
         try hrOk(c.msw_texture_noise(host.dev(d), tex, @intCast(i + 1)));
-        var p: c.msw_enc_params = .{ .force = c.MSW_FORCE_NONE, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
+        var p: c.msw_enc_params = .{ .force = c.MSW_FORCE_NONE, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0, .qp_map = null, .qp_map_cols = 0, .qp_map_rows = 0 };
         if (i == 15) p.bitrate_bps = 500_000; // per-frame bitrate change: must not cost an IDR
         if (i == 30) p.force = c.MSW_FORCE_IDR;
         var out: c.msw_enc_output = undefined;

@@ -9,7 +9,11 @@
  * GOP, no B-frames, no lookahead, `slices` slices, parameter sets on every IDR, long-term
  * references in "per picture" mode (two slots, a mark every NVC_LTR_INTERVAL frames, on
  * IDRs and on refreshes, into the slot that doesn't hold the newest acked one), bitrate
- * changes through nvEncReconfigureEncoder without an IDR. Synchronous mode. */
+ * changes through nvEncReconfigureEncoder without an IDR. Synchronous mode.
+ *
+ * Regional refine: the rate control runs with qpMapMode = NV_ENC_QP_MAP_DELTA, so a frame
+ * may carry a QP delta map (one signed byte per macroblock for H.264, per 32x32 CTB for
+ * HEVC) that is added to the QP rate control picks. A frame without one codes as usual. */
 #ifndef NVENC_CORE_H
 #define NVENC_CORE_H
 
@@ -49,6 +53,10 @@ typedef struct nvc_params {
     uint64_t bitrate_bps; /* 0 = unchanged */
     const uint64_t *acked_ltr_tokens;
     uint32_t acked_ltr_count;
+    /* Regional refine: QP deltas over nvc_qp_map_block()-pixel blocks, cols x rows in
+     * raster order; NULL = none. Ignored when the size doesn't match the picture's. */
+    const int8_t *qp_map;
+    uint32_t qp_map_cols, qp_map_rows;
 } nvc_params;
 
 typedef struct nvc_output {
@@ -109,5 +117,7 @@ void nvc_forget(nvc *n, void *resource);
 NVENCSTATUS nvc_encode(nvc *n, NV_ENC_REGISTERED_PTR reg, uint64_t time_us, const nvc_params *p, nvc_append_fn append,
                        void *ctx, nvc_output *out);
 void nvc_close(nvc *n);
+/* The QP map block edge for `codec`: 16 (H.264 macroblocks) or 32 (HEVC CTBs). */
+uint32_t nvc_qp_map_block(uint32_t codec);
 
 #endif

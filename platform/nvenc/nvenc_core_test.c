@@ -44,6 +44,7 @@ static NVENCSTATUS NVENCAPI f_preset(void *e, GUID c, GUID p, NV_ENC_TUNING_INFO
 }
 static NVENCSTATUS NVENCAPI f_init(void *e, NV_ENC_INITIALIZE_PARAMS *p) {
     (void)e;
+    if (p->encodeConfig->rcParams.qpMapMode != NV_ENC_QP_MAP_DELTA) return NV_ENC_ERR_INVALID_PARAM;
     return p->encodeConfig->frameIntervalP == 1 && p->encodeConfig->rcParams.rateControlMode == NV_ENC_PARAMS_RC_CBR
                ? NV_ENC_SUCCESS
                : NV_ENC_ERR_INVALID_PARAM;
@@ -198,6 +199,23 @@ int main(void) {
     CHECK(o.keyframe && !o.ltr_refresh);
     o = frame(&n, NVC_FORCE_LTR_REFRESH, NULL, 0, 0);
     CHECK(o.keyframe && !o.ltr_refresh);
+    CHECK(last_pic.qpDeltaMap == NULL);
+    /* Regional refine: a QP delta map of 4x4 macroblocks goes with the picture; one of the
+     * wrong size is left out. */
+    {
+        NV_ENC_REGISTERED_PTR reg;
+        CHECK(nvc_register(&n, NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR, (void *)0x1000, 0, 1024, NV_ENC_BUFFER_FORMAT_ARGB, &reg) == NV_ENC_SUCCESS);
+        int8_t map[16] = {0};
+        map[5] = -6;
+        CHECK(nvc_qp_map_block(NVC_CODEC_H264) == 16 && nvc_qp_map_block(NVC_CODEC_HEVC) == 32);
+        nvc_params p = {.qp_map = map, .qp_map_cols = 4, .qp_map_rows = 4};
+        size_t bytes = 0;
+        CHECK(nvc_encode(&n, reg, 0, &p, sink, &bytes, &o) == NV_ENC_SUCCESS);
+        CHECK(last_pic.qpDeltaMap == map && last_pic.qpDeltaMapSize == 16 && !o.keyframe);
+        p.qp_map_rows = 3;
+        CHECK(nvc_encode(&n, reg, 0, &p, sink, &bytes, &o) == NV_ENC_SUCCESS);
+        CHECK(last_pic.qpDeltaMap == NULL);
+    }
     /* Without long-term references every refresh is an IDR and nothing is marked. */
     const nvc_config no_ltr = {.codec = NVC_CODEC_HEVC, .width = 64, .height = 64, .fps = 60, .bitrate_bps = 1000000, .slices = 1, .ltr = 0};
     CHECK(nvc_configure(&n, &no_ltr) == NV_ENC_SUCCESS);

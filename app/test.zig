@@ -8,6 +8,7 @@ test {
     _ = @import("keystore.zig");
     _ = @import("pairing.zig");
     _ = @import("multi_test.zig");
+    _ = @import("qprefine.zig");
 }
 
 fn expectPass(o: simrun.Options) !simrun.Result {
@@ -383,4 +384,19 @@ test "format negotiation: every combination of decoder formats, preferences and 
 test "format negotiation: an encoder without 4:4:4 streams 4:2:0 to a client that wants it" {
     const r = try expectPass(.{ .profile = .clean, .seconds = 1, .audio = false, .input_interval_us = 0, .yuv444 = true, .encoder_formats = .{ .yuv420_8 = true, .yuv420_10 = true } });
     try std.testing.expect(r.host.format.eql(.{}));
+}
+
+test "regional refine: QP maps on still blocks when capture reports damage, never a bad map" {
+    // A lossy WAN with rate control: losses force refreshes and IDRs, and the controller
+    // cuts; none of those frames may carry a map.
+    for ([_]simrun.Profile{ .clean, .wan }) |profile| {
+        const r = try expectPass(.{ .profile = profile, .seconds = 4, .rate_control = profile == .wan });
+        std.debug.print("regional refine, {s}: {d} damaged frames, {d} QP maps, {d} block offsets, {d} refused\n", .{ @tagName(profile), r.host.damaged_frames, r.host.qp_maps, r.host.qp_blocks, r.host.qp_bad });
+        try std.testing.expectEqual(@as(u64, 0), r.host.qp_bad);
+        // The test pattern changes only its stamp bands and a moving bar: with damage from
+        // capture the rest of the frame refines. Without damage (unknown) nothing does.
+        if (r.host.damaged_frames == 0) {
+            try std.testing.expectEqual(@as(u64, 0), r.host.qp_maps);
+        } else try std.testing.expect(r.host.qp_maps > 0 and r.host.qp_blocks > 0);
+    }
 }

@@ -14,6 +14,9 @@ and maps `NVENCSTATUS` to its own errors; the core does the rest:
   frames and every refresh, into the slot that doesn't hold the newest acked one; a
   refresh references the newest acked one, or becomes an IDR when none is acked;
 - bitrate changes through `nvEncReconfigureEncoder` without an IDR;
+- regional refine: rate control with `qpMapMode = NV_ENC_QP_MAP_DELTA`, and a frame's QP
+  delta map (per macroblock for H.264, per 32x32 CTB for HEVC) in `qpDeltaMap`
+  ([docs/regional-refine.md](../../docs/regional-refine.md));
 - input registration (least recently used of 8 goes) and the encode call.
 
 `zig build test-nvenc-core` runs the core against a fake NVENC function list (marks,
