@@ -237,7 +237,16 @@ pub const CapturedFrame = struct {
     /// The pointer, when the backend captures it apart from the picture (`cfg.cursor` off
     /// and the OS gives it as metadata, as PipeWire does). Valid until `release`.
     cursor: ?Cursor = null,
+    /// What changed since the previous frame this backend returned, in frame pixels; valid
+    /// until `release`. null = unknown (the core treats everything as changed); an empty
+    /// slice = nothing changed. Moves count as damage at both source and destination.
+    /// When the backend coalesces several OS frames into one, this is their union. A
+    /// `repeatLast` frame reports an empty slice.
+    damage: ?[]const Rect = null,
 };
+
+/// A rectangle in frame pixels (core/damage).
+pub const Rect = core.damage.Rect;
 
 /// The pointer as capture saw it, for the client to draw over the picture.
 pub const Cursor = struct {

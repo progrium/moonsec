@@ -40,6 +40,9 @@ pub const display = @import("display/root.zig");
 /// (spec/multi-user-v0.md).
 pub const multi = @import("multi/root.zig");
 
+/// Capture damage on a cell grid (lossless tiles, regional refinement).
+pub const damage = @import("damage/root.zig");
+
 /// Per-frame stage timing and rolling stats for the latency overlay.
 pub const telemetry = @import("telemetry/root.zig");
 
