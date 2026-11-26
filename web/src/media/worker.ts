@@ -7,12 +7,19 @@
 // reference is missing; a decoder error is reported as a failed decode, the decoder is
 // rebuilt, and frames are failed until the next keyframe, so recovery asks for one.
 //
+// Lossless tiles (core/refine): the core asks the host for them (this worker composites
+// them), and right before each decoded frame is drawn it says how the tile layer changes
+// with that frame (`tilePresent(id)`); the frame is drawn, then the layer over it, in the
+// same present. So a tile shows from the frame it was validated for and disappears with
+// the frame that changes the video under it, never a frame late (media/tiles.ts).
+//
 // Audio: the worklet asks for a frame whenever its queue runs low; the worker renders
 // one from the core's jitter buffer (spec/audio-v0.md: 20 ms target) and posts it.
 
 import { CoreSession, State } from "../core";
 import { WebSocketTransport, type Transport } from "../transport";
 import { codecString, probeDecoders, type DecoderSupport } from "./codec";
+import { TileLayer } from "./tiles";
 import type { AudioReport, FromWorker, IrohDial, InputOp, NeedMsg, PcmMsg, ProbeEvent, StartMsg, ToWorker, VideoReport } from "./protocol";
 import { IrohTransport } from "../../../shim-web/js/transport.js";
 import { loadPair, PairError } from "../../../shim-web/js/pair.js";
@@ -34,6 +41,7 @@ class Media {
   canvas: OffscreenCanvas;
   ctx: OffscreenCanvasRenderingContext2D;
   support: DecoderSupport;
+  tiles = new TileLayer();
   relayed: boolean;
   decoder: VideoDecoder | null = null;
   needKey = true;
@@ -46,7 +54,7 @@ class Media {
   /** When the last stats message went to the page (µs). */
   reportedAt = 0;
   seconds: number;
-  video: VideoReport = { codec: null, hardware: "", configured: 0, submitted: 0, decoded: 0, drawn: 0, failed: 0, errors: [], decodeMs: [], drawMs: [], nonBlank: false };
+  video: VideoReport = { codec: null, hardware: "", configured: 0, submitted: 0, decoded: 0, drawn: 0, failed: 0, errors: [], decodeMs: [], drawMs: [], nonBlank: false, tilePuts: 0, tileClears: 0, tileFrames: 0 };
   audio: AudioReport = { rendered: 0, paced: 0, played: 0, loud: 0, underruns: 0, queued: 0, sampleRate: 0 };
   audioPort: MessagePort | null;
   /** When the first audio frame was rendered, and how much audio has been since (µs). */
@@ -175,8 +183,14 @@ class Media {
       this.canvas.width = frame.displayWidth;
       this.canvas.height = frame.displayHeight;
     }
+    // The tile layer as it is with this frame, before anything of it is drawn.
+    const tu = this.core.tilePresent(id);
+    if (tu) this.tiles.apply(tu);
+    else this.tiles.drop();
     this.ctx.drawImage(frame, 0, 0);
     frame.close();
+    this.tiles.drawOver(this.ctx, this.canvas.width, this.canvas.height);
+    if (this.tiles.visible && this.tiles.canvas) this.video.tileFrames++;
     const presentedAt = nowUs();
     this.core.onPresented(id, presentedAt);
     if (this.probe) {
@@ -251,7 +265,7 @@ class Media {
       config: this.core.config(),
       overlay: this.core.overlay(nowUs()),
       stats: this.core.stats(),
-      video: { ...this.video, errors: [...this.video.errors] },
+      video: { ...this.video, errors: [...this.video.errors], tilePuts: this.tiles.puts, tileClears: this.tiles.clears },
       audio: { ...this.audio },
       relayed: this.relayed,
       probe: this.probeEvents,
@@ -387,7 +401,7 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
       const pending: Uint8Array[] = [];
       // Pairing can wait on a person typing a PIN: dial before the session starts its clock.
       const dialed = m.iroh ? await dialIroh(m.iroh) : null;
-      const core = await CoreSession.create(fetch(m.wasmUrl), { codecs: support.codecs, channels: m.audio ? 2 : 0 }, (dg) => {
+      const core = await CoreSession.create(fetch(m.wasmUrl), { codecs: support.codecs, channels: m.audio ? 2 : 0, tiles: true }, (dg) => {
         // Copy out of wasm memory before returning.
         if (transport) transport.send(dg.slice());
         else pending.push(dg.slice());
