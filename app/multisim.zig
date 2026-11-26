@@ -33,6 +33,8 @@ pub const ClientSpec = struct {
     /// What the client's decoder takes and its display shows (sent in its hello).
     decoder_formats: api.Formats = api.Formats.all,
     display: api.DisplayCaps = .{},
+    /// Ask for tiles (with `Options.tiles`): its presenter composites and checks them.
+    tiles: bool = true,
 };
 
 pub const Event = union(enum) {
@@ -75,6 +77,10 @@ pub const Options = struct {
     ten_bit: bool = false,
     /// The host's display is in HDR mode with this metadata.
     hdr_source: ?api.HdrMetadata = null,
+    /// Lossless tiles from the host, the text panel on its screen, still windows.
+    tiles: bool = false,
+    text: ?synthetic.TextPanel = null,
+    still: []const synthetic.Capture.StillWindow = &.{},
 };
 
 pub const ClientResult = struct {
@@ -100,6 +106,12 @@ pub const ClientResult = struct {
     format: api.VideoFormat = .{},
     config_changes: u64 = 0,
     wrong_format: u64 = 0,
+    /// Lossless tiles: put on the layer, and drawn pixels that differed from the video
+    /// under them (must be 0); its peer's tiles sent.
+    tiles_shown: u64 = 0,
+    tile_pixels: u64 = 0,
+    tile_wrong_pixels: u64 = 0,
+    tiles_sent: u64 = 0,
     presence: [80]u8 = undefined,
     presence_len: u8 = 0,
 
@@ -128,6 +140,8 @@ pub const Result = struct {
         format_changes: u64,
         format_refusals: u64,
         reconfigures: u64,
+        /// Lossless tiles encoded: once for every member.
+        tiles_encoded: u64 = 0,
     },
     clients: [multi.max_members]ClientResult,
     n: usize,
@@ -252,7 +266,8 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
 
     // The host's clock is the host side of the first path (every path's host side reads the
     // same simulated time: all are advanced together and the host has no offset).
-    const sh = try synthetic.openHost(gpa, .{ .clock = slots[0].hclock.clock(), .width = o.width, .height = o.height, .audio = o.audio, .encoder_formats = o.encoder_formats, .hdr_display = o.hdr_source });
+    const sh = try synthetic.openHost(gpa, .{ .clock = slots[0].hclock.clock(), .width = o.width, .height = o.height, .audio = o.audio, .encoder_formats = o.encoder_formats, .hdr_display = o.hdr_source, .text = o.text });
+    sh.capture.still = o.still;
     const hb = sh.backend();
     defer hb.deinit();
     var host = try multi_host.MultiHostApp.init(gpa, hb, .{
@@ -262,6 +277,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         .audio = o.audio,
         .yuv444 = o.yuv444,
         .ten_bit = o.ten_bit,
+        .tiles = o.tiles,
         .session = .{ .rate_control = o.rate_control, .loss_policy = o.loss_policy },
     }, .{ .roster = o.roster, .rate = o.rate, .intersect_acks = o.intersect_acks });
     defer host.deinit();
@@ -290,13 +306,13 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         }
         for (slots, 0..) |*s, i| {
             if (s.app == null and t >= s.spec.join_at_us and t < end_us) {
-                const sc = try synthetic.openClient(gpa, .{ .clock = s.cclock.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio, .decoder_formats = s.spec.decoder_formats, .display = s.spec.display });
+                const sc = try synthetic.openClient(gpa, .{ .clock = s.cclock.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio, .decoder_formats = s.spec.decoder_formats, .display = s.spec.display, .text = o.text, .tiles = o.tiles and s.spec.tiles });
                 s.sc = sc;
                 s.app = try apps.ClientApp.init(gpa, sc.backend(), .{
                     .content_ctx = sc,
                     .contentFn = patternContent,
                     .audio = o.audio,
-                    .session = .{ .nonce = @intCast(i + 1), .control = .{ .features = if (s.spec.multi_user) multi.feature_bit else 0, .known = &multi.known } },
+                    .session = .{ .nonce = @intCast(i + 1), .tiles = o.tiles and s.spec.tiles, .control = .{ .features = if (s.spec.multi_user) multi.feature_bit else 0, .known = &multi.known } },
                     .control_stream = s.net.streamFor(.b),
                 }, s.pipeFor(.b));
                 s.peer = try host.m.addPeer(s.pipeFor(.a), s.net.streamFor(.a), s.spec.name, s.spec.may_control);
@@ -362,6 +378,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .format_changes = host.m.stats.format_changes,
             .format_refusals = host.m.stats.format_refusals,
             .reconfigures = host.stats.reconfigures,
+            .tiles_encoded = if (host.m.tiles) |e| e.stats.tiles else 0,
         },
         .clients = undefined,
         .n = slots.len,
@@ -392,6 +409,10 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
                 .format = if (a.s.config) |cf| cf.format else .{},
                 .config_changes = a.s.stats.config_changes,
                 .wrong_format = sc.decoder.stats.wrong_format,
+                .tiles_shown = if (a.s.tiles) |l| l.stats.shown else 0,
+                .tile_pixels = sc.presenter.stats.tile_pixels,
+                .tile_wrong_pixels = sc.presenter.stats.tile_wrong_pixels,
+                .tiles_sent = s.peer.?.s.tile_peer.stats.tiles_sent,
             };
             const v = s.snap orelse s.view;
             const p = v.presence(&c.presence);
