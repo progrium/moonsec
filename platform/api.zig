@@ -339,6 +339,29 @@ pub const EncoderCaps = struct {
     /// Takes `EncodeParams.refine_qp` (idle refinement: a per-frame quality cap that
     /// forces no keyframe). Without it the host never sends refine frames.
     refine: bool = false,
+    /// Takes `EncodeParams.qp_map` (regional refine, core/qpmap), for the configured codec.
+    qp_map: QpMapCaps = .{},
+};
+
+/// What kind of QP map an encoder takes. `block` 0: none, and the host never sends one.
+pub const QpMapCaps = struct {
+    /// Block edge in pixels: 16 for H.264 macroblocks, the CTB for HEVC (32 on NVENC).
+    block: u16 = 0,
+    /// The encoder takes rectangles, not a per-block map (VAAPI ROI): at most this many
+    /// per frame, where each horizontal run of equal offsets is one. 0: per block.
+    max_regions: u16 = 0,
+};
+
+/// Per-block QP offsets for one frame (regional refine), in raster order over the frame
+/// cut into `block`-pixel blocks (the right and bottom ones may be partial). Negative is
+/// finer. On the H.264/HEVC QP scale; added to what rate control picks, so CBR still
+/// holds the frame budget.
+pub const QpMap = struct {
+    block: u16,
+    cols: u16,
+    rows: u16,
+    /// cols × rows offsets. Valid for the `encode` call only.
+    offsets: []const i8,
 };
 
 /// Session settings, from the design's "Encoder settings": no B-frames, no lookahead,
@@ -378,6 +401,10 @@ pub const EncodeParams = struct {
     /// Mark this frame a long-term reference (only when `caps.ltr`), so a later loss
     /// refreshes against it: the last refine step of a still picture.
     force_ltr: bool = false,
+    /// Regional refine: per-block QP offsets for this frame (only when `caps.qp_map.block`
+    /// is set, and at that block size). The host sends none on forced or refine frames.
+    /// An encoder that can't apply it ignores it.
+    qp_map: ?QpMap = null,
 };
 
 pub const EncodedFrame = struct {

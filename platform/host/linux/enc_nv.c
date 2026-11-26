@@ -44,6 +44,7 @@ static void nv_caps(const mlh_enc *e, mlh_enc_caps *out) {
     out->gpu_input = 1;
     out->cpu_input = 1;
     out->nv12_input = 1;
+    out->qp_map_block = c.qp_map_block;
 }
 
 static int nv_configure(mlh_enc *e, const mlh_enc_config *cfg) {
@@ -94,6 +95,9 @@ static int nv_encode(mlh_enc *e, const mlh_enc_input *in, uint64_t time_us, cons
         .bitrate_bps = p->bitrate_bps,
         .acked_ltr_tokens = p->acked_ltr_tokens,
         .acked_ltr_count = p->acked_ltr_count,
+        .qp_map = p->qp_map,
+        .qp_map_cols = p->qp_map_cols,
+        .qp_map_rows = p->qp_map_rows,
     };
     if (in->dmabuf && !n->no_import && importable(in->dmabuf) && in->dmabuf->width == e->cfg.width &&
         in->dmabuf->height == e->cfg.height) {

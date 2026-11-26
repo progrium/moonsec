@@ -14,6 +14,7 @@ const api = @import("platform");
 const enc_mod = @import("host_linux_enc");
 const client = @import("client_linux");
 const check = @import("enc_check.zig");
+const core = @import("core");
 const c = enc_mod.c;
 const mlc = client.c;
 
@@ -137,6 +138,9 @@ fn ltrScenario(codec: u32) !void {
             .bitrate_bps = 0,
             .acked_ltr_tokens = if (acked.items.len > 0) acked.items.ptr else null,
             .acked_ltr_count = @intCast(acked.items.len),
+            .qp_map = null,
+            .qp_map_cols = 0,
+            .qp_map_rows = 0,
         };
         var out: c.mlh_enc_output = undefined;
         try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_encode(t, host.y.ptr, host.u.ptr, host.v.ptr, &changed, &p, &out));
@@ -184,7 +188,7 @@ test "H.264 test encoder without long-term references: a refresh is an IDR" {
     const changed = [_]u8{0} ** 4;
     var out: c.mlh_enc_output = undefined;
     for (0..4) |n| {
-        const p: c.mlh_enc_params = .{ .force = if (n == 2) c.MLH_FORCE_LTR_REFRESH else c.MLH_FORCE_NONE, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
+        const p: c.mlh_enc_params = .{ .force = if (n == 2) c.MLH_FORCE_LTR_REFRESH else c.MLH_FORCE_NONE, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0, .qp_map = null, .qp_map_cols = 0, .qp_map_rows = 0 };
         try testing.expectEqual(@as(c_int, 0), c.mlh_testenc_encode(t, pic.y.ptr, pic.u.ptr, pic.v.ptr, &changed, &p, &out));
         try testing.expectEqual(n == 0 or n == 2, out.keyframe != 0);
         try testing.expectEqual(@as(u32, 0), out.has_ltr_token);
@@ -227,7 +231,7 @@ test "software encoder: lossless round trip is bit exact, slices, keyframes on r
             8 => c.MLH_FORCE_LTR_REFRESH, // no long-term references: an IDR
             else => c.MLH_FORCE_NONE,
         };
-        const p: c.mlh_enc_params = .{ .force = force, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
+        const p: c.mlh_enc_params = .{ .force = force, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0, .qp_map = null, .qp_map_cols = 0, .qp_map_rows = 0 };
         var out: c.mlh_enc_output = undefined;
         try testing.expectEqual(@as(c_int, 0), c.mlh_enc_encode(e, &in, 0, &p, &out));
         try testing.expectEqual(@as(u32, 0), out.dropped); // zerolatency: every frame comes out of its own call
@@ -308,7 +312,7 @@ test "software encoder: a linear dma-buf (memfd) is read like the same pixels in
     dma.fd[0] = fd;
     dma.pitch[0] = w * 4;
     const in: c.mlh_enc_input = .{ .dmabuf = &dma, .data = null, .stride = 0, .format = 0, .width = w, .height = h };
-    const p: c.mlh_enc_params = .{ .force = 0, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
+    const p: c.mlh_enc_params = .{ .force = 0, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0, .qp_map = null, .qp_map_cols = 0, .qp_map_rows = 0 };
     var out: c.mlh_enc_output = undefined;
     try testing.expectEqual(@as(c_int, 0), c.mlh_enc_encode(e, &in, 0, &p, &out));
     const dec = try decoder(mlc.MLC_CODEC_H264);
@@ -341,6 +345,83 @@ test "software encoder through the platform interface" {
     try testing.expect(ef.keyframe);
     try testing.expectEqual(@as(usize, 2), ef.slices.len);
     try testing.expect(ef.encoded_us >= ef.encode_start_us);
+}
+
+/// Regional refine on x264: fine "text" over the whole frame and a noisy "video" in one
+/// corner that changes every frame and takes the bitrate. Run twice at the same bitrate,
+/// without and with the QP map core/qpmap plans from exact damage; the still text must
+/// come out sharper (higher luma PSNR outside the video) with the map, and the stream
+/// must stay within the same rate.
+fn refineRun(with_map: bool) !struct { psnr_still: f64, bytes: usize, maps: u64 } {
+    const w = 320;
+    const h = 192;
+    const fps = 60;
+    var enc = try enc_mod.Encoder.create(.{ .kind = .software });
+    defer enc.deinit();
+    const caps = enc.caps();
+    try testing.expectEqual(@as(u16, 16), caps.qp_map.block);
+    try enc.configure(.{ .codec = .h264, .width = w, .height = h, .fps = fps, .bitrate_bps = 1_500_000 });
+    var ledger = try core.qpmap.Ledger.init(gpa, w, h, caps.qp_map.block, .{ .pace = 16 });
+    defer ledger.deinit();
+    const dec = try decoder(mlc.MLC_CODEC_H264);
+    defer mlc.mlc_decoder_destroy(dec);
+
+    var px: [w * h * 4]u8 = undefined;
+    var rng = std.Random.DefaultPrng.init(7);
+    const rnd = rng.random();
+    // "Text": dark strokes, 1-2 px wide, on a light page.
+    for (0..h) |y| for (0..w) |x| {
+        const ink = (x % 7 < 2 and (y / 3) % 4 != 3) or (y % 9 == 0 and x % 5 != 0);
+        const v: u8 = if (ink) 30 else 235;
+        px[(y * w + x) * 4 ..][0..4].* = .{ v, v, if (x % 11 < 3) 200 else v, 255 };
+    };
+    const video = core.damage.Rect{ .x = 0, .y = 0, .w = 64, .h = 48 };
+    var want = try Picture.init(w, h);
+    defer want.deinit();
+    var bytes: usize = 0;
+    var psnr: f64 = 0;
+    const frames = 150;
+    for (0..frames) |n| {
+        for (video.y..video.y + video.h) |y| rnd.bytes(px[(y * w + video.x) * 4 ..][0 .. video.w * 4]);
+        ledger.observe(if (n == 0) null else &.{video});
+        const m = if (with_map) ledger.plan(true) else null;
+        const frame: api.CapturedFrame = .{ .image = .{ .width = w, .height = h, .cpu = .{ .data = &px, .stride = w * 4 } }, .seq = n, .capture_start_us = 0, .captured_us = 0 };
+        const params: api.EncodeParams = .{ .qp_map = if (m) |mm| .{ .block = @intCast(mm.block), .cols = @intCast(mm.cols), .rows = @intCast(mm.rows), .offsets = mm.offsets } else null };
+        const ef = (try enc.encode(&frame, params)).?;
+        ledger.commit(if (ef.keyframe) .keyframe else .coded);
+        var au: std.ArrayList(u8) = .empty;
+        defer au.deinit(gpa);
+        for (ef.slices) |s| try au.appendSlice(gpa, s);
+        if (n >= 30) bytes += au.items.len;
+        var f: mlc.mlc_frame = undefined;
+        var got: c_int = 0;
+        try testing.expectEqual(@as(c_int, 0), mlc.mlc_decoder_decode(dec, au.items.ptr, au.items.len, @intCast(n), &f, &got));
+        try testing.expect(got != 0);
+        defer mlc.mlc_decoder_release_frame(dec, &f);
+        if (n + 1 == frames) {
+            c.mlh_bgra_to_i420(&px, w * 4, w, h, want.y.ptr, want.u.ptr, want.v.ptr);
+            var se: f64 = 0;
+            var count: f64 = 0;
+            for (0..h) |y| for (0..w) |x| {
+                if (x < video.x + video.w + 16 and y < video.y + video.h + 16) continue; // the video and its edge
+                const d = @as(f64, @floatFromInt(f.planes[0][y * @as(usize, @intCast(f.strides[0])) + x])) - @as(f64, @floatFromInt(want.y[y * w + x]));
+                se += d * d;
+                count += 1;
+            };
+            psnr = 10 * std.math.log10(255.0 * 255.0 / @max(se / count, 1e-9));
+        }
+    }
+    return .{ .psnr_still = psnr, .bytes = bytes, .maps = ledger.stats.maps };
+}
+
+test "software encoder: regional refine sharpens still text next to a playing video" {
+    const plain = try refineRun(false);
+    const refined = try refineRun(true);
+    std.debug.print("still-region luma PSNR: {d:.1} dB without QP maps, {d:.1} dB with ({d} maps); bytes after frame 30: {d} vs {d}\n", .{ plain.psnr_still, refined.psnr_still, refined.maps, plain.bytes, refined.bytes });
+    try testing.expect(refined.maps > 0);
+    try testing.expect(refined.psnr_still > plain.psnr_still + 2.0);
+    // CBR: the map moves bits, it doesn't add many.
+    try testing.expect(refined.bytes * 10 < plain.bytes * 13);
 }
 
 // ---------------------------------------------------------------------------

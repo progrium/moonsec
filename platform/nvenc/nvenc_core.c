@@ -104,6 +104,7 @@ NVENCSTATUS nvc_configure(nvc *n, const nvc_config *cfg) {
     c->rcParams.vbvBufferSize = (uint32_t)(cfg->bitrate_bps / cfg->fps);
     c->rcParams.vbvInitialDelay = c->rcParams.vbvBufferSize;
     c->rcParams.enableLookahead = 0;
+    c->rcParams.qpMapMode = NV_ENC_QP_MAP_DELTA; /* regional refine (nvc_params.qp_map) */
     const int ltr = cfg->ltr && n->ltr_supported;
     const uint32_t slices = cfg->slices ? cfg->slices : 1;
     if (cfg->codec == NVC_CODEC_HEVC) {
@@ -198,6 +199,18 @@ void nvc_forget(nvc *n, void *resource) {
             n->fn.nvEncUnregisterResource(n->enc, n->regs[i].reg);
             memset(&n->regs[i], 0, sizeof n->regs[i]);
         }
+}
+
+uint32_t nvc_qp_map_block(uint32_t codec) { return codec == NVC_CODEC_HEVC ? 32 : 16; }
+
+/* Regional refine: the frame's QP delta map, when it covers the picture block for block. */
+static void apply_qp_map(const nvc *n, const nvc_params *p, NV_ENC_PIC_PARAMS *pp) {
+    if (!p->qp_map) return;
+    const uint32_t b = nvc_qp_map_block(n->cfg.codec);
+    const uint32_t cols = (n->cfg.width + b - 1) / b, rows = (n->cfg.height + b - 1) / b;
+    if (p->qp_map_cols != cols || p->qp_map_rows != rows) return;
+    pp->qpDeltaMap = (int8_t *)p->qp_map; /* read during the (synchronous) encode call */
+    pp->qpDeltaMapSize = cols * rows;
 }
 
 NVENCSTATUS nvc_encode(nvc *n, NV_ENC_REGISTERED_PTR reg, uint64_t time_us, const nvc_params *p, nvc_append_fn append,
@@ -301,6 +314,8 @@ NVENCSTATUS nvc_encode(nvc *n, NV_ENC_REGISTERED_PTR reg, uint64_t time_us, cons
             h->ltrUseFrameBitmap = 1u << use_slot;
         }
     }
+
+    apply_qp_map(n, p, &pp);
 
     NVENCSTATUS st = n->fn.nvEncEncodePicture(n->enc, &pp);
     if (st == NV_ENC_SUCCESS) {
