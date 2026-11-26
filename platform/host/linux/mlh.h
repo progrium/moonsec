@@ -9,6 +9,7 @@
  *                   memfd/memory buffers, cursor metadata, newest-frame mailbox.
  *   mlh_audio.c     A PipeWire capture stream on the default sink's monitor, f32, into a
  *                   ring the audio thread reads with a timeout.
+ *   mlh_damage.c    Damage rectangle lists: PipeWire's VideoDamage meta, unions, crops.
  *   mlh_common.c    Errors and the clock.
  *
  * Every function returns 0 (MLH_OK) on success, MLH_TIMEOUT where noted, and a negative
@@ -164,6 +165,35 @@ typedef struct mlh_cursor {
     uint8_t visible;
 } mlh_cursor;
 
+/* A rectangle in frame (or buffer) pixels. */
+typedef struct mlh_rect {
+    uint32_t x, y, w, h;
+} mlh_rect;
+
+/* What changed since the previous frame, as a short list of rectangles. `known` 0: unknown
+ * (treat everything as changed). Rectangles beyond MLH_DAMAGE_MAX are merged into the last
+ * one (a bounding box: more than changed, never less). */
+#define MLH_DAMAGE_MAX 32
+typedef struct mlh_damage {
+    uint32_t n;
+    uint8_t known;
+    mlh_rect r[MLH_DAMAGE_MAX];
+} mlh_damage;
+
+/* known 1: nothing changed; 0: unknown. */
+void mlh_damage_reset(mlh_damage *d, int known);
+/* Adds a rectangle cut to a width x height picture (nothing when it misses it). */
+void mlh_damage_add(mlh_damage *d, int32_t x, int32_t y, uint32_t w, uint32_t h, uint32_t width, uint32_t height);
+/* d = d united with s (unknown when either is). */
+void mlh_damage_union(mlh_damage *d, const mlh_damage *s);
+/* SPA_META_VideoDamage's data (`size` bytes of struct spa_meta_region: int32 x, y, uint32
+ * w, h; the list ends at the first one with an empty size) into `d`, cut to the buffer's
+ * width x height. No regions at all is unknown, not nothing: a picture buffer came. */
+void mlh_damage_from_meta(mlh_damage *d, const void *regions, uint32_t size, uint32_t width, uint32_t height);
+/* `in` (buffer pixels) seen through the crop x, y, w, h: moved to the crop's origin and
+ * cut to it. */
+void mlh_damage_crop(const mlh_damage *in, uint32_t x, uint32_t y, uint32_t w, uint32_t h, mlh_damage *out);
+
 typedef struct mlh_frame {
     uint32_t kind;
     uint32_t width, height;
@@ -186,6 +216,12 @@ typedef struct mlh_frame {
     uint8_t repeat;
     uint8_t has_cursor;
     mlh_cursor cursor;
+    /* What changed since the previous frame handed out, in frame pixels (crop applied);
+     * NULL when unknown (no VideoDamage meta from the producer, a dropped corrupted buffer,
+     * a renegotiation, the first frame). A repeat has none (n_damage 0, damage not NULL).
+     * Valid until the next acquire or repeat. */
+    const mlh_rect *damage;
+    uint32_t n_damage;
     /* Private: which buffer. */
     void *priv;
 } mlh_frame;
@@ -219,6 +255,11 @@ int mlh_capture_acquire(mlh_capture *c, int64_t timeout_us, mlh_frame *out);
 /* The last picture again (repeat = 1, current cursor); MLH_TIMEOUT when there is none. */
 int mlh_capture_repeat(mlh_capture *c, mlh_frame *out);
 void mlh_capture_release(mlh_capture *c, mlh_frame *f);
+/* Copies the w x h rectangle at x, y of `f` (the frame that is out, before release) as
+ * B, G, R, A rows `out_stride` bytes apart. From the pixels when the frame has them, else
+ * from a linear dma-buf mapped here (until release); MLH_E_UNSUPPORTED for a tiled one. */
+int mlh_capture_read_rect(mlh_capture *c, const mlh_frame *f, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *out,
+                          uint32_t out_stride);
 void mlh_capture_get_stats(mlh_capture *c, mlh_capture_stats *out);
 
 /* ------------------------------------------------------------------------ */

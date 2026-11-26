@@ -432,6 +432,22 @@ test "token path" {
 }
 
 // ---------------------------------------------------------------------------
+// Damage: the C frame's rectangles as platform ones (the list arithmetic is in
+// damage_test.zig, which `zig build test` runs).
+
+test "damage: C frame rectangles to platform rectangles" {
+    var f = std.mem.zeroes(c.mlh_frame);
+    var buf: [c.MLH_DAMAGE_MAX]api.Rect = undefined;
+    try testing.expect(host.damageRects(&f, &buf) == null);
+    const rs = [_]c.mlh_rect{ .{ .x = 0, .y = 0, .w = 10, .h = 10 }, .{ .x = 50, .y = 55, .w = 30, .h = 15 } };
+    f.damage = &rs;
+    f.n_damage = rs.len;
+    try testing.expectEqualSlices(api.Rect, &.{ .{ .x = 0, .y = 0, .w = 10, .h = 10 }, .{ .x = 50, .y = 55, .w = 30, .h = 15 } }, host.damageRects(&f, &buf).?);
+    f.n_damage = 0;
+    try testing.expectEqual(@as(usize, 0), host.damageRects(&f, &buf).?.len);
+}
+
+// ---------------------------------------------------------------------------
 // Input injection (uinput): the injector on real devices, read back from their
 // /dev/input/event* nodes the way a compositor reads them. Needs write access to
 // /dev/uinput and read access to the event nodes (linux.yml sets both up); without them

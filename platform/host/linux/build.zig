@@ -3,7 +3,8 @@
 //!
 //!   zig build test-linux-host   the capture, audio and uinput tests (Linux; the portal,
 //!                               PipeWire and uinput tests skip without them, see test.zig)
-//!   zig build test              includes the injector's pure tests (input.zig)
+//!   zig build test              includes the injector's pure tests (input.zig) and the
+//!                               capture's damage lists (damage_test.zig, mlh_damage.c)
 //!
 //! `linuxHostModule` is what an app imports as "host_linux".
 
@@ -47,7 +48,7 @@ pub fn linuxHostModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize
     mod.addIncludePath(b.path("platform/host/linux"));
     mod.addCSourceFiles(.{
         .root = b.path("platform/host/linux"),
-        .files = &.{ "mlh_common.c", "mlh_portal.c", "mlh_capture.c", "mlh_audio.c" },
+        .files = &.{ "mlh_common.c", "mlh_portal.c", "mlh_capture.c", "mlh_audio.c", "mlh_damage.c" },
         .flags = c_flags,
     });
     for (linux_host_libs) |lib| mod.linkSystemLibrary(lib, .{});
@@ -69,6 +70,16 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             },
         });
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "host-linux-input-test", .root_module = input_mod })).step);
+        // The capture's damage lists (mlh_damage.c): plain C, no PipeWire.
+        const damage_mod = b.createModule(.{
+            .root_source_file = b.path("platform/host/linux/damage_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "mlh_c", .module = b.addTranslateC(.{ .root_source_file = b.path("platform/host/linux/mlh.h"), .target = target, .optimize = optimize }).createModule() }},
+        });
+        damage_mod.addCSourceFiles(.{ .root = b.path("platform/host/linux"), .files = &.{"mlh_damage.c"}, .flags = c_flags });
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "host-linux-damage-test", .root_module = damage_mod })).step);
     }
     if (target.result.os.tag != .linux) {
         step.dependOn(&b.addFail("test-linux-host needs a Linux host").step);
