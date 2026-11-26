@@ -98,6 +98,14 @@ struct mlc_window {
     GLuint overlay_tex;
     uint32_t overlay_w, overlay_h;
     int overlay_on;
+    /* The tile layer (mlc_window_tiles_*): BGRA bytes uploaded as RGBA like the overlay,
+     * the stream's size, transparent except where tiles were put. */
+    GLuint tiles_tex;
+    uint32_t tiles_w, tiles_h;
+    int tiles_on;
+    /* Zero rows for clears, TILES_BAND rows of the layer's width. */
+    uint8_t *zeros;
+    size_t zeros_len;
     GLuint vao;
 };
 
@@ -357,6 +365,13 @@ static int gl_init(mlc_window *w) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
+    /* The tile layer is scaled with the video, so it gets the video's filtering. */
+    glGenTextures(1, &w->tiles_tex);
+    glBindTexture(GL_TEXTURE_2D, w->tiles_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glGenVertexArrays(1, &w->vao);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -478,6 +493,7 @@ void mlc_window_destroy(mlc_window *w) {
         if (w->egl_context && eglMakeCurrent(w->egl_display, w->egl_surface, w->egl_surface, w->egl_context)) {
             glDeleteTextures(3, w->tex);
             glDeleteTextures(1, &w->overlay_tex);
+            glDeleteTextures(1, &w->tiles_tex);
             if (w->prog_yuv) glDeleteProgram(w->prog_yuv);
             if (w->prog_rgb) glDeleteProgram(w->prog_rgb);
             if (w->vao) glDeleteVertexArrays(1, &w->vao);
@@ -503,6 +519,7 @@ void mlc_window_destroy(mlc_window *w) {
         wl_display_disconnect(w->display);
     }
     free(w->scratch);
+    free(w->zeros);
     free(w);
 }
 
@@ -631,6 +648,7 @@ static void letterbox(const mlc_window *w, uint32_t fw, uint32_t fh, float rect[
 }
 
 static int draw_dmabuf(mlc_window *w, const mlc_frame *f, EGLImageKHR images[2]);
+static void draw_tiles(mlc_window *w, const float rect[4]);
 
 /* Column-major YUV -> RGB for the shader, after subtracting `offset`. */
 static void yuv_matrix(const mlc_frame *f, float m[9], float off[3]) {
@@ -727,6 +745,7 @@ int mlc_window_draw(mlc_window *w, const mlc_frame *f) {
         default:
             return mlc_fail(MLC_E_UNSUPPORTED, "frame kind %u", f->kind);
         }
+        draw_tiles(w, rect);
     }
 
     for (int i = 0; i < 2; i++)
@@ -773,6 +792,90 @@ int mlc_window_set_overlay(mlc_window *w, const uint32_t *pixels, uint32_t width
     w->overlay_on = 1;
     return glGetError() == GL_NO_ERROR ? MLC_OK : mlc_fail(MLC_E_FAIL, "overlay upload failed");
 }
+
+/* ------------------------------------------------------------------------ */
+/* Tile layer */
+
+/* Clears go up in bands of this many zero rows, so the zero buffer stays small. */
+#define TILES_BAND 64
+
+/* Over the video, through the same letterbox rect and filtering, so a tile lands on the
+ * pixels it replaces at any window size. Cleared texels are all zero and put texels are
+ * opaque, so the layer is premultiplied as it stands: blending it as such keeps the
+ * linear filter from darkening the edges of a tile next to transparent texels. */
+static void draw_tiles(mlc_window *w, const float rect[4]) {
+    if (!w->tiles_on || !w->tiles_w || !w->tiles_h) return;
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(w->prog_rgb);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, w->tiles_tex);
+    glUniform1i(w->rgb_tex, 0);
+    glUniform1i(w->rgb_blend, 1);
+    glUniform4fv(w->rgb_rect, 1, rect);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisable(GL_BLEND);
+}
+
+/* Trims a rectangle to the layer; 0 when nothing of it is left. */
+static int tiles_clip(const mlc_window *w, uint32_t x, uint32_t y, uint32_t *width, uint32_t *height) {
+    if (x >= w->tiles_w || y >= w->tiles_h || !*width || !*height) return 0;
+    if (*width > w->tiles_w - x) *width = w->tiles_w - x;
+    if (*height > w->tiles_h - y) *height = w->tiles_h - y;
+    return 1;
+}
+
+static void tiles_zero(mlc_window *w, uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+    glBindTexture(GL_TEXTURE_2D, w->tiles_tex);
+    for (uint32_t r = 0; r < height; r += TILES_BAND) {
+        uint32_t n = height - r < TILES_BAND ? height - r : TILES_BAND;
+        glTexSubImage2D(GL_TEXTURE_2D, 0, (GLint)x, (GLint)(y + r), (GLsizei)width, (GLsizei)n, GL_RGBA, GL_UNSIGNED_BYTE, w->zeros);
+    }
+}
+
+int mlc_window_tiles_reset(mlc_window *w, uint32_t width, uint32_t height) {
+    int rc = make_current(w);
+    if (rc) return rc;
+    if (!width || !height) {
+        w->tiles_w = w->tiles_h = 0;
+        return MLC_OK;
+    }
+    size_t need = (size_t)width * 4 * TILES_BAND;
+    if (need > w->zeros_len) {
+        uint8_t *z = calloc(1, need);
+        if (!z) return mlc_fail(MLC_E_NOMEM, "tile layer: no memory");
+        free(w->zeros);
+        w->zeros = z;
+        w->zeros_len = need;
+    }
+    glBindTexture(GL_TEXTURE_2D, w->tiles_tex);
+    if (width != w->tiles_w || height != w->tiles_h)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width, (GLsizei)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    w->tiles_w = width;
+    w->tiles_h = height;
+    /* A new texture's contents are undefined in GLES, so it is cleared like an old one. */
+    tiles_zero(w, 0, 0, width, height);
+    GLenum err = glGetError();
+    return err == GL_NO_ERROR ? MLC_OK : mlc_fail(MLC_E_FAIL, "tile layer reset: GL error 0x%x", err);
+}
+
+int mlc_window_tiles_put(mlc_window *w, uint32_t x, uint32_t y, uint32_t width, uint32_t height, const uint8_t *pixels, uint32_t stride) {
+    if (!tiles_clip(w, x, y, &width, &height)) return MLC_OK;
+    int rc = make_current(w);
+    if (rc) return rc;
+    if (!pixels) {
+        tiles_zero(w, x, y, width, height);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, w->tiles_tex);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(stride / 4));
+        glTexSubImage2D(GL_TEXTURE_2D, 0, (GLint)x, (GLint)y, (GLsizei)width, (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    }
+    GLenum err = glGetError();
+    return err == GL_NO_ERROR ? MLC_OK : mlc_fail(MLC_E_FAIL, "tile upload: GL error 0x%x", err);
+}
+
+void mlc_window_tiles_show(mlc_window *w, int on) { w->tiles_on = on; }
 
 int mlc_window_present(mlc_window *w) {
     int rc = make_current(w);
