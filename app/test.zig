@@ -8,6 +8,7 @@ test {
     _ = @import("keystore.zig");
     _ = @import("pairing.zig");
     _ = @import("multi_test.zig");
+    _ = @import("qprefine.zig");
 }
 
 fn expectPass(o: simrun.Options) !simrun.Result {

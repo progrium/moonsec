@@ -87,6 +87,8 @@ typedef struct msw_enc_caps {
     uint32_t ltr;
     uint32_t max_slices;
     uint32_t gpu_input, cpu_input;
+    /* Regional refine: the QP map block edge for the configured codec; 0 = no QP maps. */
+    uint32_t qp_map_block;
 } msw_enc_caps;
 
 typedef struct msw_enc_config {
@@ -102,6 +104,9 @@ typedef struct msw_enc_params {
     uint64_t bitrate_bps; /* 0 = unchanged */
     const uint64_t *acked_ltr_tokens;
     uint32_t acked_ltr_count;
+    /* Regional refine: QP offsets per caps.qp_map_block block, cols x rows; NULL = none. */
+    const int8_t *qp_map;
+    uint32_t qp_map_cols, qp_map_rows;
 } msw_enc_params;
 
 typedef struct msw_enc_output {

@@ -34,6 +34,7 @@ const api = @import("platform");
 const pipe_mod = @import("pipe");
 const host_session = @import("host_session.zig");
 const apps = @import("apps.zig");
+const qprefine = @import("qprefine.zig");
 
 const HostSession = host_session.HostSession;
 const multi = core.multi;
@@ -554,6 +555,8 @@ pub const MultiHostApp = struct {
     ltr: bool,
     last_frame_us: ?Micros = null,
     audio: ?*apps.HostAudio = null,
+    /// Regional refine (QP maps) on the shared encode.
+    qp: qprefine.Refiner,
     /// The member whose action is being injected (the injector may ask).
     injecting_from: u16 = multi.host_id,
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0, reconfigures: u64 = 0 } = .{},
@@ -607,7 +610,7 @@ pub const MultiHostApp = struct {
             .intersect_acks = mo.intersect_acks,
         });
         errdefer m.deinit();
-        var app: MultiHostApp = .{ .be = be, .m = m, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr };
+        var app: MultiHostApp = .{ .be = be, .m = m, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr, .qp = .init(gpa, o.qp_refine_cfg) };
         if (o.audio) if (be.audio) |src| {
             app.audio = try apps.HostAudio.init(gpa, src);
         };
@@ -617,6 +620,7 @@ pub const MultiHostApp = struct {
     pub fn deinit(a: *MultiHostApp) void {
         a.be.capture.stop();
         if (a.audio) |au| au.deinit();
+        a.qp.deinit();
         a.m.deinit();
     }
 
@@ -648,8 +652,12 @@ pub const MultiHostApp = struct {
         const live = a.m.streaming();
         const change = if (live) a.m.takeFormat() else null;
         const bitrate = a.m.bitrate_bps;
-        const params = if (live) a.m.encodeParams() else api.EncodeParams{};
+        var params = if (live) a.m.encodeParams() else api.EncodeParams{};
+        const qp_ok = live and a.opts.qp_refine and a.m.refineOk(a.be.clock.now());
         if (lock) |l| l.unlock();
+        // Regional refine sees every frame's damage, streamed or not. A codec change
+        // below changes the caps' block size, which starts the ledger over next frame.
+        a.qp.observe(a.be.encoder.caps(), f);
         if (!live) return;
         if (change) |c| {
             a.be.encoder.configure(.{
@@ -673,9 +681,11 @@ pub const MultiHostApp = struct {
             };
             a.stats.reconfigures += 1;
         }
+        a.qp.plan(&params, qp_ok);
         const r = a.be.encoder.encode(f, params);
         if (lock) |l| l.lock();
         defer if (lock) |l| l.unlock();
+        a.qp.commit(if (r) |ef| ef else |_| null, a.m.refineOk(a.be.clock.now()));
         if (r) |ef_| {
             if (ef_) |ef| {
                 a.m.onEncoded(ef, f, a.be.clock.now());

@@ -300,10 +300,39 @@ pub const Encoder = struct {
     drop_every: u32 = 0,
     /// Coded formats it offers for the passthrough codec.
     formats: api.Formats = api.Formats.all,
-    stats: struct { frames: u64 = 0, keyframes: u64 = 0, refreshes: u64 = 0, dropped: u64 = 0, bytes: u64 = 0, configures: u64 = 0 } = .{},
+    /// Regional refine: the QP map block it reports (0: none), like H.264 macroblocks.
+    qp_map_block: u16 = 16,
+    stats: struct {
+        frames: u64 = 0,
+        keyframes: u64 = 0,
+        refreshes: u64 = 0,
+        dropped: u64 = 0,
+        bytes: u64 = 0,
+        configures: u64 = 0,
+        /// Frames that came with a QP map, the blocks with an offset in them, and maps
+        /// refused for a wrong size or a forced frame (the host must not send those).
+        qp_maps: u64 = 0,
+        qp_blocks: u64 = 0,
+        qp_bad: u64 = 0,
+    } = .{},
 
     pub fn caps(e: *Encoder) api.EncoderCaps {
-        return .{ .codecs = .{ .passthrough = true }, .ltr = true, .max_slices = 16, .cpu_input = true, .coded = .{ .passthrough = e.formats } };
+        return .{ .codecs = .{ .passthrough = true }, .ltr = true, .max_slices = 16, .cpu_input = true, .coded = .{ .passthrough = e.formats }, .qp_map = .{ .block = e.qp_map_block } };
+    }
+
+    /// Counts a frame's QP map; one that doesn't fit the frame, or that comes with a forced
+    /// frame, is a host bug the sim checks for.
+    fn countQpMap(e: *Encoder, c: api.EncoderConfig, p: api.EncodeParams) void {
+        const m = p.qp_map orelse return;
+        const b: u32 = e.qp_map_block;
+        if (b == 0 or m.block != b or m.cols != (c.width + b - 1) / b or m.rows != (c.height + b - 1) / b or
+            m.offsets.len != @as(usize, m.cols) * m.rows or p.force != .none)
+        {
+            e.stats.qp_bad += 1;
+            return;
+        }
+        e.stats.qp_maps += 1;
+        for (m.offsets) |o| e.stats.qp_blocks += @intFromBool(o != 0);
     }
 
     pub fn configure(e: *Encoder, cfg: api.EncoderConfig) api.Error!void {
@@ -347,6 +376,7 @@ pub const Encoder = struct {
         }
         const img = f.image.cpu orelse return error.Unsupported;
         if (f.image.width != c.width or f.image.height != c.height) return error.Unsupported;
+        e.countQpMap(c, p);
 
         // Pick the reference.
         var key = e.last_seq == null or p.force == .idr;

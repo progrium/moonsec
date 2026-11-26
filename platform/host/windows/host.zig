@@ -212,12 +212,14 @@ pub const Encoder = struct {
     }
 
     pub fn caps(self: *Encoder) api.EncoderCaps {
+        c.msw_enc_caps_get(self.enc, &self.caps_); // the QP map block follows the configured codec
         return .{
             .codecs = .{ .h264 = self.caps_.h264 != 0, .hevc = self.caps_.hevc != 0 },
             .ltr = self.caps_.ltr != 0,
             .max_slices = @intCast(@min(self.caps_.max_slices, max_slices)),
             .gpu_input = self.caps_.gpu_input != 0,
             .cpu_input = false,
+            .qp_map = .{ .block = @intCast(self.caps_.qp_map_block) },
         };
     }
 
@@ -255,6 +257,9 @@ pub const Encoder = struct {
             .bitrate_bps = params.bitrate_bps,
             .acked_ltr_tokens = if (params.acked_ltr_tokens.len > 0) params.acked_ltr_tokens.ptr else null,
             .acked_ltr_count = @intCast(params.acked_ltr_tokens.len),
+            .qp_map = if (params.qp_map) |m| m.offsets.ptr else null,
+            .qp_map_cols = if (params.qp_map) |m| m.cols else 0,
+            .qp_map_rows = if (params.qp_map) |m| m.rows else 0,
         };
         var out: c.msw_enc_output = undefined;
         const hr = c.msw_enc_encode(self.enc, tex, frame.image.gpu_index, @intCast(@max(frame.captured_us, 0)), &p, &out);

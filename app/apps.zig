@@ -31,6 +31,7 @@ const audio_stage = @import("audio_stage");
 const clipboard = @import("clipboard");
 const clipsync = @import("clipsync.zig");
 const control = @import("control.zig");
+const qprefine = @import("qprefine.zig");
 
 const proto = core.proto;
 
@@ -76,6 +77,9 @@ pub const HostOptions = struct {
     /// What the connected device may do (input, clipboard), asked again on every
     /// reconnect. Null: everything (lab runs, the sim).
     perms: ?control.PermsSource = null,
+    /// Regional refine (core/qpmap): QP maps on still blocks when the encoder takes them.
+    qp_refine: bool = true,
+    qp_refine_cfg: core.qpmap.Config = .{},
 };
 
 pub const HostApp = struct {
@@ -88,6 +92,8 @@ pub const HostApp = struct {
     last_frame_us: ?Micros = null,
     audio: ?*HostAudio = null,
     clip: ?clipsync.Sync = null,
+    /// Regional refine (QP maps), on the media stage.
+    qp: qprefine.Refiner,
     /// What capture runs at now: display, frame rate, and whether at the display's own
     /// size (the top of the ladder) or scaled. `cap` is the client's latest size and rate cap.
     display: u32,
@@ -111,7 +117,7 @@ pub const HostApp = struct {
         for ([_]api.Codec{ o.codec, .hevc, .h264, .av1, .passthrough }) |c| {
             if (caps.codecs.has(c)) order.add(@intFromEnum(c));
         }
-        var app: HostApp = .{ .be = be, .s = undefined, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr, .display = o.display, .fps = o.fps, .window = o.window };
+        var app: HostApp = .{ .be = be, .s = undefined, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr, .display = o.display, .fps = o.fps, .window = o.window, .qp = .init(gpa, o.qp_refine_cfg) };
         if (o.window != 0 and o.width == 0 and o.height == 0) app.window_size = size;
         var s = try HostSession.init(gpa, .{
             .negotiate = .{
@@ -156,6 +162,7 @@ pub const HostApp = struct {
     pub fn deinit(a: *HostApp) void {
         a.be.capture.stop();
         if (a.audio) |au| au.deinit();
+        a.qp.deinit();
         a.s.deinit();
     }
 
@@ -201,8 +208,12 @@ pub const HostApp = struct {
         const live = a.s.streaming();
         const change = if (live) a.s.takeFormat() else null;
         const bitrate = a.s.bitrate_bps;
-        const params = if (live) a.s.encodeParams() else api.EncodeParams{};
+        var params = if (live) a.s.encodeParams() else api.EncodeParams{};
+        const qp_ok = live and a.opts.qp_refine and a.s.refineOk(a.be.clock.now());
         if (lock) |l| l.unlock();
+        // Regional refine sees every frame's damage, streamed or not. A codec change
+        // below changes the caps' block size, which starts the ledger over next frame.
+        a.qp.observe(a.be.encoder.caps(), f);
         if (!live) return;
         if (change) |c| a.be.encoder.configure(.{
             .codec = c.codec,
@@ -221,9 +232,11 @@ pub const HostApp = struct {
             a.s.abort("the encoder rejected the negotiated codec or format");
             return;
         };
+        a.qp.plan(&params, qp_ok);
         const r = a.be.encoder.encode(f, params);
         if (lock) |l| l.lock();
         defer if (lock) |l| l.unlock();
+        a.qp.commit(if (r) |ef| ef else |_| null, a.s.refineOk(a.be.clock.now()));
         if (r) |ef_| {
             if (ef_) |ef| {
                 a.s.onEncoded(ef, f, a.be.clock.now());
