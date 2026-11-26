@@ -89,6 +89,9 @@ pub const Options = struct {
     /// Run the control channel with in-memory clipboards and this script of copies; the
     /// outcome is written back into it.
     clipboard: ?*ClipScript = null,
+    /// When the host's screen is still (host clock), and whether the host refines it.
+    still: []const synthetic.Capture.StillWindow = &.{},
+    refine: bool = true,
 };
 
 pub const DisplayEvent = struct {
@@ -162,6 +165,17 @@ pub const Result = struct {
         qp_maps: u64 = 0,
         qp_blocks: u64 = 0,
         qp_bad: u64 = 0,
+        /// Idle refinement: refine frames sent, sequences that ran to the end, sequences
+        /// cut short by new content, restarts after a recovery frame; long-term marks the
+        /// encoder made on request and LTR refreshes that predicted from one; and the
+        /// longest time from the start of a still window to its first refine frame.
+        refines: u64 = 0,
+        refine_sequences: u64 = 0,
+        refine_interrupted: u64 = 0,
+        refine_restarts: u64 = 0,
+        forced_ltrs: u64 = 0,
+        refreshes_from_forced: u64 = 0,
+        refine_latency_us: Micros = 0,
         /// The stream at the end.
         width: u32 = 0,
         height: u32 = 0,
@@ -196,6 +210,8 @@ pub const Result = struct {
         /// The format in the config the client got, and frames presented in another colour space.
         format: api.VideoFormat = .{},
         wrong_color: u64 = 0,
+        /// Frames that arrived flagged `refine`.
+        refines: u64 = 0,
         end: []const u8,
     },
     sim_losses: u64,
@@ -321,7 +337,9 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         if (cs.client_start.len > 0) try client_clip.set(cs.client_start);
     }
     const with_clip = o.clipboard != null;
+    sh.capture.still = o.still;
     var host = try apps.HostApp.init(gpa, hb, .{
+        .refine = o.refine,
         .fps = o.fps,
         .bitrate_bps = o.bitrate_bps,
         .slices = o.slices,
@@ -351,6 +369,8 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     var next_progress: Micros = @as(Micros, o.progress_every_s) * simnet.SEC;
     var closing = false;
     var next_event: usize = 0;
+    var refine_steps_seen: u64 = 0;
+    var refine_latency: Micros = 0;
     while (!(host.done() and client.done())) : (t += o.step_us) {
         while (next_event < o.display_events.len and t >= o.display_events[next_event].at_us) : (next_event += 1) switch (o.display_events[next_event].what) {
             .select => |q| client.s.selectDisplay(q.display, q.max_width, q.max_height, q.max_fps, net.localTime(.b)),
@@ -382,6 +402,16 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         };
         host.tick();
         client.tick();
+        if (host.refiner.still.stats.steps != refine_steps_seen) {
+            // The first step of a sequence: how long after its still window began.
+            if (host.refiner.still.step == 1) {
+                const hnow = net.localTime(.a);
+                for (o.still) |sw| if (hnow >= sw.from_us and hnow < sw.until_us) {
+                    refine_latency = @max(refine_latency, hnow - sw.from_us);
+                };
+            }
+            refine_steps_seen = host.refiner.still.stats.steps;
+        }
         if (log) |w| if (o.progress_every_s > 0 and t >= next_progress) {
             const fz = client.s.freeze.stats;
             try w.print("  t={d} s: presented {d}, freezes {d}, longest gap {d:.1} ms; host encoder {d} kbit/s, pacing {d} kbit/s, stream {d}x{d}@{d}\n", .{ @divTrunc(t, simnet.SEC), client.s.stats.frames_presented, fz.freezes, @as(f64, @floatFromInt(fz.longest_gap_us)) / 1000, host.s.bitrate_bps / 1000, host.s.last_pacing / 1000, host.s.cfg.width, host.s.cfg.height, host.s.cfg.fps });
@@ -441,6 +471,13 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .qp_maps = sh.encoder.stats.qp_maps,
             .qp_blocks = sh.encoder.stats.qp_blocks,
             .qp_bad = sh.encoder.stats.qp_bad,
+            .refines = host.s.stats.refines,
+            .refine_sequences = host.refiner.still.stats.sequences,
+            .refine_interrupted = host.refiner.still.stats.interrupted,
+            .refine_restarts = host.refiner.still.stats.restarts,
+            .forced_ltrs = sh.encoder.stats.forced_ltrs,
+            .refreshes_from_forced = sh.encoder.stats.refreshes_from_forced,
+            .refine_latency_us = refine_latency,
             .width = host.s.cfg.width,
             .height = host.s.cfg.height,
             .fps = host.s.cfg.fps,
@@ -471,6 +508,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .height = if (sc.presenter.last_size) |z| z.height else 0,
             .format = if (client.s.config) |c| c.format else .{},
             .wrong_color = sc.presenter.stats.wrong_color,
+            .refines = client.s.stats.frames_refine,
             .end = @tagName(client.s.end),
         },
         .sim_losses = net.linkStats(.a).random_losses + net.linkStats(.b).random_losses,

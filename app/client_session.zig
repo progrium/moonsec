@@ -88,6 +88,8 @@ pub const End = enum { none, host_bye, peer_timeout, connect_timeout, pipe_close
 
 pub const Stats = struct {
     frames_received: u64 = 0,
+    /// Idle-refinement frames received (video flag `refine`; decoded like any other).
+    frames_refine: u64 = 0,
     frames_lost: u64 = 0,
     frames_dropped: u64 = 0,
     frames_stale: u64 = 0,
@@ -612,6 +614,7 @@ pub const ClientSession = struct {
         while (s.receiver.poll(unow)) |ev| switch (ev) {
             .frame => |f| {
                 s.stats.frames_received += 1;
+                if (f.meta.flags.refine) s.stats.frames_refine += 1;
                 if (s.cfg.max_frame_age_us > 0) if (s.offset(now)) |off| {
                     const cap_local = @as(Micros, @bitCast(f.meta.capture_us)) - off;
                     if (now - cap_local > s.cfg.max_frame_age_us) {
@@ -827,7 +830,7 @@ pub const ClientSession = struct {
         try w.print("client: {s}{s}{s}\n", .{ @tagName(s.end), if (s.reason.len > 0) ": " else "", s.reason });
         var fb: [32]u8 = undefined;
         if (s.config) |c| try w.print("  stream {s} {s} {d}x{d}@{d} at {d} kbit/s, {d} slices\n", .{ @tagName(c.codec), c.format.name(&fb), c.width, c.height, c.fps, c.bitrate_bps / 1000, c.slices });
-        try w.print("  frames received {d}, presented {d}, lost {d}, stale {d}, dropped while frozen {d}, decode errors {d}, queue overflows {d}\n", .{ st.frames_received, st.frames_presented, st.frames_lost, st.frames_stale, st.frames_dropped, st.decode_errors, st.queue_overflows });
+        try w.print("  frames received {d} (refine {d}), presented {d}, lost {d}, stale {d}, dropped while frozen {d}, decode errors {d}, queue overflows {d}\n", .{ st.frames_received, st.frames_refine, st.frames_presented, st.frames_lost, st.frames_stale, st.frames_dropped, st.decode_errors, st.queue_overflows });
         try w.print("  shards {d} (retransmitted {d}), NACKs {d}, feedback {d}, frame acks {d}, pongs {d}, input events {d}\n", .{ st.shards, s.video_retx, st.nacks, st.feedback, st.frame_acks, st.pongs, st.input_events });
         const r = s.rec.stats;
         try w.print("  recovery: freezes {d}, requests {d} (retries {d}), longest frozen {d:.1} ms\n", .{ r.freezes, r.requests, r.retries, @as(f64, @floatFromInt(r.frozen_us_max)) / 1000.0 });

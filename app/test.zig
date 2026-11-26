@@ -400,3 +400,66 @@ test "regional refine: QP maps on still blocks when capture reports damage, neve
         } else try std.testing.expect(r.host.qp_maps > 0 and r.host.qp_blocks > 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Idle refinement (core/still)
+
+fn printRefine(r: simrun.Result) void {
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    r.print(&w) catch {};
+    std.debug.print("{s}  refine: {d} frames, {d} sequences ({d} cut short, {d} restarts), {d} forced marks, {d} refreshes from one, first step {d} us into the still\n", .{ w.buffered(), r.host.refines, r.host.refine_sequences, r.host.refine_interrupted, r.host.refine_restarts, r.host.forced_ltrs, r.host.refreshes_from_forced, r.host.refine_latency_us });
+}
+
+test "a still screen gets three refine steps, the last marked long-term, and no keyframe" {
+    const o: simrun.Options = .{ .profile = .clean, .seconds = 4, .still = &.{.{ .from_us = 1_000_000, .until_us = 2_500_000 }} };
+    const r = try simrun.run(std.testing.allocator, o, null);
+    errdefer printRefine(r);
+    try std.testing.expectEqual(@as(u64, 3), r.host.refines);
+    try std.testing.expectEqual(@as(u64, 3), r.client.refines); // the flag reaches the client
+    try std.testing.expectEqual(@as(u64, 1), r.host.refine_sequences);
+    try std.testing.expectEqual(@as(u64, 0), r.host.refine_interrupted);
+    try std.testing.expectEqual(@as(u64, 1), r.host.forced_ltrs);
+    try std.testing.expectEqual(@as(u64, 1), r.host.keyframes);
+    // Within refine_after (150 ms) of the last new frame, which is at most a frame before
+    // the window, plus a tick.
+    try std.testing.expect(r.host.refine_latency_us > 100_000 and r.host.refine_latency_us <= 150_000 + 2_000);
+    try std.testing.expectEqual(@as(u64, 0), r.client.corrupt);
+    try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+    try std.testing.expectEqual(@as(u64, 0), r.client.lost);
+}
+
+test "refinement off, or nothing still: no refine frames" {
+    const off = try simrun.run(std.testing.allocator, .{ .profile = .clean, .seconds = 3, .refine = false, .still = &.{.{ .from_us = 1_000_000, .until_us = 2_000_000 }} }, null);
+    try std.testing.expectEqual(@as(u64, 0), off.host.refines);
+    const busy = try simrun.run(std.testing.allocator, .{ .profile = .clean, .seconds = 3 }, null);
+    try std.testing.expectEqual(@as(u64, 0), busy.host.refines);
+}
+
+test "new content stops a refine sequence; the next still screen refines again" {
+    // 160 ms still: a step or two (the first about 150 ms after the last new frame), then
+    // the screen changes. Then a long still, refined in full.
+    const o: simrun.Options = .{ .profile = .clean, .seconds = 4, .still = &.{
+        .{ .from_us = 1_000_000, .until_us = 1_160_000 },
+        .{ .from_us = 2_000_000, .until_us = 3_000_000 },
+    } };
+    const r = try simrun.run(std.testing.allocator, o, null);
+    errdefer printRefine(r);
+    try std.testing.expectEqual(@as(u64, 1), r.host.refine_interrupted);
+    try std.testing.expectEqual(@as(u64, 1), r.host.refine_sequences);
+    try std.testing.expect(r.host.refines >= 4 and r.host.refines <= 5);
+    try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+}
+
+test "a loss after refinement refreshes against the refined long-term reference, then refines again" {
+    const o: simrun.Options = .{ .seed = 3, .profile = .lan, .seconds = 4, .still = &.{.{ .from_us = 1_000_000, .until_us = 3_500_000 }}, .outage_at_us = 1_400_000, .outage_us = 300_000 };
+    const r = try simrun.run(std.testing.allocator, o, null);
+    errdefer printRefine(r);
+    try std.testing.expect(r.host.refreshes >= 1);
+    try std.testing.expect(r.host.refreshes_from_forced >= 1);
+    // The refresh is at normal quality again: refined once more.
+    try std.testing.expect(r.host.refine_restarts >= 1);
+    try std.testing.expect(r.host.refine_sequences >= 2);
+    try std.testing.expectEqual(@as(u64, 0), r.client.corrupt);
+    try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+}

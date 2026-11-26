@@ -423,6 +423,8 @@ int mlh_nvenc_encode(mlh_nvenc *e, const mlh_nvenc_input *in, uint64_t time_us, 
         .qp_map = p->qp_map,
         .qp_map_cols = p->qp_map_cols,
         .qp_map_rows = p->qp_map_rows,
+        .refine_qp = p->refine_qp,
+        .force_ltr = p->force_ltr,
     };
     nvc_output o;
     e->out_len = 0;

@@ -38,6 +38,7 @@ static void nv_caps(const msw_enc *e, msw_enc_caps *out) {
     out->max_slices = 4;
     out->gpu_input = 1;
     out->qp_map_block = nvc_qp_map_block(n->core.initialized ? n->core.cfg.codec : NVC_CODEC_H264);
+    out->refine = 1; /* maxQP through nvEncReconfigureEncoder (nvenc_core.c) */
 }
 
 static HRESULT nv_configure(msw_enc *e, const msw_enc_config *cfg) {
@@ -71,6 +72,8 @@ static HRESULT nv_encode(msw_enc *e, ID3D11Texture2D *tex, UINT index, uint64_t 
         .qp_map = p->qp_map,
         .qp_map_cols = p->qp_map_cols,
         .qp_map_rows = p->qp_map_rows,
+        .refine_qp = p->refine_qp,
+        .force_ltr = p->force_ltr,
     };
     nvc_output o;
     hr = nv_hr(nvc_encode(&n->core, reg, time_us, &np, nv_append, &n->base, &o));

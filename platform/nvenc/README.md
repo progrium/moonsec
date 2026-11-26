@@ -17,6 +17,7 @@ and maps `NVENCSTATUS` to its own errors; the core does the rest:
 - regional refine: rate control with `qpMapMode = NV_ENC_QP_MAP_DELTA`, and a frame's QP
   delta map (per macroblock for H.264, per 32x32 CTB for HEVC) in `qpDeltaMap`
   ([docs/regional-refine.md](../../docs/regional-refine.md));
+- idle refinement (`refine_qp`): a refine frame is encoded under a reconfigure with `maxQP` set and a four-frame VBV, no IDR or encoder reset, and the next normal frame reconfigures back; `force_ltr` marks the frame long-term;
 - input registration (least recently used of 8 goes) and the encode call.
 
 `zig build test-nvenc-core` runs the core against a fake NVENC function list (marks,

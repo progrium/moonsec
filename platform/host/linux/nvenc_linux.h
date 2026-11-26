@@ -58,6 +58,8 @@ typedef struct mlh_nvenc_params {
     uint32_t acked_ltr_count;
     const int8_t *qp_map; /* QP deltas per qp_map_block block, cols x rows; NULL = none */
     uint32_t qp_map_cols, qp_map_rows;
+    uint32_t refine_qp; /* idle refinement QP cap, 0 = normal (nvc_params) */
+    uint32_t force_ltr;
 } mlh_nvenc_params;
 
 typedef struct mlh_nvenc_output {

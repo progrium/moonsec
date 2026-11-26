@@ -62,7 +62,9 @@ pub const AuFlags = packed struct(u8) {
     keyframe: bool = false,
     ltr: bool = false,
     refresh: bool = false,
-    _r: u5 = 0,
+    /// An idle-refinement frame (`EncodeParams.refine_qp`), so the sim can count them.
+    refine: bool = false,
+    _r: u4 = 0,
 };
 
 pub const AuHeader = struct {
@@ -149,6 +151,16 @@ pub const Capture = struct {
     /// `start` reports this metadata (the pixels stay the 8-bit pattern).
     hdr_display: ?api.HdrMetadata = null,
     color: api.ColorSpace = .sdr_bt709,
+    /// Times (host clock) when the screen is still: `acquire` has nothing new, as a real
+    /// backend reports a static desktop, so the app repeats and refines the last picture.
+    still: []const StillWindow = &.{},
+
+    pub const StillWindow = struct { from_us: Micros, until_us: Micros };
+
+    fn isStill(c: *const Capture, now: Micros) bool {
+        for (c.still) |w| if (now >= w.from_us and now < w.until_us) return true;
+        return false;
+    }
 
     pub const max_displays = 8;
 
@@ -231,6 +243,10 @@ pub const Capture = struct {
             }
         }
         var now = c.clock.now();
+        if (c.last != null and c.isStill(now)) {
+            if (c.sleeper) |s| s(c.sleep_ctx, timeout_us);
+            return null;
+        }
         const due = c.next_due orelse now;
         if (now < due) {
             const s = c.sleeper orelse return null;
@@ -293,7 +309,7 @@ pub const Encoder = struct {
     seq: u32 = 0,
     last_seq: ?u32 = null,
     /// Long-term references marked and not yet invalidated by a keyframe: token -> seq.
-    ltrs: [32]?struct { token: u64, seq: u32, acked: bool } = @splat(null),
+    ltrs: [32]?struct { token: u64, seq: u32, acked: bool, forced: bool = false } = @splat(null),
     /// Mark every Nth frame as a long-term reference.
     ltr_interval: u32 = 30,
     /// Make a frame with seq in this set fail to "encode" (null): tests the drop path.
@@ -302,6 +318,8 @@ pub const Encoder = struct {
     formats: api.Formats = api.Formats.all,
     /// Regional refine: the QP map block it reports (0: none), like H.264 macroblocks.
     qp_map_block: u16 = 16,
+    /// Takes `EncodeParams.refine_qp` (caps.refine). Off: an encoder without it.
+    refine: bool = true,
     stats: struct {
         frames: u64 = 0,
         keyframes: u64 = 0,
@@ -314,10 +332,14 @@ pub const Encoder = struct {
         qp_maps: u64 = 0,
         qp_blocks: u64 = 0,
         qp_bad: u64 = 0,
+        refines: u64 = 0,
+        forced_ltrs: u64 = 0,
+        last_refine_qp: u8 = 0,
+        refreshes_from_forced: u64 = 0,
     } = .{},
 
     pub fn caps(e: *Encoder) api.EncoderCaps {
-        return .{ .codecs = .{ .passthrough = true }, .ltr = true, .max_slices = 16, .cpu_input = true, .coded = .{ .passthrough = e.formats }, .qp_map = .{ .block = e.qp_map_block } };
+        return .{ .codecs = .{ .passthrough = true }, .ltr = true, .max_slices = 16, .cpu_input = true, .coded = .{ .passthrough = e.formats }, .qp_map = .{ .block = e.qp_map_block }, .refine = e.refine };
     }
 
     /// Counts a frame's QP map; one that doesn't fit the frame, or that comes with a forced
@@ -348,10 +370,13 @@ pub const Encoder = struct {
         e.stats.configures += 1;
     }
 
-    fn frameBytes(e: *const Encoder, key: bool, refresh: bool) usize {
+    fn frameBytes(e: *const Encoder, key: bool, refresh: bool, refine_qp: u8) usize {
         const c = e.cfg.?;
         const mean: f64 = @as(f64, @floatFromInt(c.bitrate_bps)) / 8.0 / @as(f64, @floatFromInt(@max(c.fps, 1)));
-        const mult: f64 = if (key) 2.0 else if (refresh) 1.5 else 1.0;
+        // A refine step costs a few frame budgets, more for a lower QP cap (stage 1's
+        // "within about four frame budgets").
+        const refine_mult: f64 = if (refine_qp >= 24) 2.0 else if (refine_qp >= 16) 3.0 else 4.0;
+        const mult: f64 = if (key) 2.0 else if (refresh) 1.5 else if (refine_qp != 0) refine_mult else 1.0;
         return @max(header_len + 16, @as(usize, @intFromFloat(mean * mult)));
     }
 
@@ -385,12 +410,15 @@ pub const Encoder = struct {
         if (!key and p.force == .ltr_refresh) {
             // Newest acked long-term reference.
             var best: ?u32 = null;
+            var forced = false;
             for (e.ltrs) |l| if (l) |x| if (x.acked and (best == null or x.seq -% best.? < 1 << 31)) {
                 best = x.seq;
+                forced = x.forced;
             };
             if (best) |b| {
                 ref = b;
                 refresh = true;
+                if (forced) e.stats.refreshes_from_forced += 1;
             } else key = true;
         }
         const seq = e.seq;
@@ -398,7 +426,10 @@ pub const Encoder = struct {
             ref = seq;
             e.ltrs = @splat(null);
         }
-        const mark_ltr = key or seq % e.ltr_interval == 0;
+        const refine_qp: u8 = if (e.refine and !key and !refresh) p.refine_qp else 0;
+        const mark_ltr = key or seq % e.ltr_interval == 0 or p.force_ltr;
+        const forced_mark = p.force_ltr and !key and seq % e.ltr_interval != 0;
+        if (forced_mark) e.stats.forced_ltrs += 1;
         const token: u64 = if (mark_ltr) @as(u64, seq) + 1 else 0;
         if (mark_ltr) {
             // Replace the oldest slot.
@@ -410,10 +441,10 @@ pub const Encoder = struct {
                 }
                 if (seq -% l.?.seq > seq -% e.ltrs[slot].?.seq) slot = i;
             }
-            e.ltrs[slot] = .{ .token = token, .seq = seq, .acked = false };
+            e.ltrs[slot] = .{ .token = token, .seq = seq, .acked = false, .forced = p.force_ltr };
         }
 
-        const total = e.frameBytes(key, refresh);
+        const total = e.frameBytes(key, refresh, refine_qp);
         if (e.buf.len < total) {
             if (e.buf.len > 0) e.gpa.free(e.buf);
             e.buf = e.gpa.alloc(u8, @max(total, 64 * 1024)) catch return error.OutOfMemory;
@@ -424,7 +455,7 @@ pub const Encoder = struct {
         const crc = if (img.stride == stride) pixelCrc(rows) else return error.Unsupported;
         const stamp = pattern.read(img.data, c.width, c.height, img.stride) orelse return error.CodecFailed;
         (AuHeader{
-            .flags = .{ .keyframe = key, .ltr = mark_ltr, .refresh = refresh },
+            .flags = .{ .keyframe = key, .ltr = mark_ltr, .refresh = refresh, .refine = refine_qp != 0 },
             .width = c.width,
             .height = c.height,
             .stamp = stamp,
@@ -450,11 +481,16 @@ pub const Encoder = struct {
         e.stats.bytes += total;
         if (key) e.stats.keyframes += 1;
         if (refresh) e.stats.refreshes += 1;
+        if (refine_qp != 0) {
+            e.stats.refines += 1;
+            e.stats.last_refine_qp = refine_qp;
+        }
         return .{
             .slices = e.slices[0..@max(n, 1)],
             .keyframe = key,
             .ltr_token = if (mark_ltr) token else null,
             .ltr_refresh = refresh,
+            .refine = refine_qp != 0,
             .encode_start_us = t0,
             .encoded_us = e.clock.now(),
         };

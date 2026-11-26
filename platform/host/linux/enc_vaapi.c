@@ -5,6 +5,9 @@
  * Settings: no B-frames, no lookahead, no periodic keyframes, CBR (VBR when the driver
  * has no CBR) with the HRD buffer one frame long, `slices` slices per frame. A bitrate
  * change sends new rate-control and HRD parameters with the next frame, without an IDR.
+ * Idle refinement (refine_qp) goes the same way: rate control with max_qp = refine_qp
+ * and an HRD buffer of VA_REFINE_HRD_FRAMES frames for that frame, then back. Whether
+ * a driver honours max_qp under CBR varies; the hardware check measures it.
  *
  * References: the planner in h26x.c (refs_*) keeps two long-term slots, the previous
  * frame and the current one. When the driver takes packed sequence, picture and slice
@@ -145,6 +148,8 @@ typedef struct va_enc {
     hevc_params hevcp;
     uint64_t bitrate;
     int rate_dirty;
+    /* The QP cap rate control was last sent with (0: none). */
+    uint32_t refine_qp;
     imported cache[IMPORT_CACHE];
     uint64_t frame;
 
@@ -345,6 +350,7 @@ static void va_caps(const mlh_enc *e, mlh_enc_caps *out) {
     out->nv12_input = 1;
     out->qp_map_max_regions = p->roi_regions;
     out->qp_map_block = p->roi_regions ? (v->session ? v->ctb : 16) : 0;
+    out->refine = 1; /* max_qp in VAEncMiscParameterRateControl, driver permitting */
 }
 
 static uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
@@ -456,6 +462,7 @@ static int va_configure(mlh_enc *e, const mlh_enc_config *cfg) {
     v->idr_id = 0;
     v->bitrate = cfg->bitrate_bps;
     v->rate_dirty = 1;
+    v->refine_qp = 0;
     v->frame = 0;
     snprintf(v->base.describe, sizeof v->base.describe, "VAAPI %s (%s, %s%s%s)", v->vendor, v->node,
              hevc ? "HEVC" : "H.264", p->entrypoint == VAEntrypointEncSliceLP ? " low-power" : "",
@@ -669,6 +676,9 @@ static int add_misc(va_enc *v, VAEncMiscParameterType type, const void *payload,
     return add_buffer(v, VAEncMiscParameterBufferType, (unsigned)(sizeof *m + size), buf);
 }
 
+/* A refine frame's HRD buffer, in frame budgets. */
+#define VA_REFINE_HRD_FRAMES 4
+
 static int add_rate_control(va_enc *v) {
     const uint32_t fps = v->base.cfg.fps;
     const uint64_t bps = v->bitrate;
@@ -677,9 +687,10 @@ static int add_rate_control(va_enc *v) {
     rc.bits_per_second = (uint32_t)(bps > UINT32_MAX ? UINT32_MAX : bps);
     rc.target_percentage = 100;
     rc.window_size = 1000 / fps ? 1000 / fps : 1; /* ms: one frame */
+    rc.max_qp = v->refine_qp; /* 0: no cap */
     VAEncMiscParameterHRD hrd;
     memset(&hrd, 0, sizeof hrd);
-    hrd.buffer_size = (uint32_t)(bps / fps); /* one frame */
+    hrd.buffer_size = (uint32_t)(bps / fps) * (v->refine_qp ? VA_REFINE_HRD_FRAMES : 1); /* one frame, more while refining */
     hrd.initial_buffer_fullness = hrd.buffer_size;
     VAEncMiscParameterFrameRate fr;
     memset(&fr, 0, sizeof fr);
@@ -1020,9 +1031,14 @@ static int va_encode(mlh_enc *e, const mlh_enc_input *in, uint64_t time_us, cons
         v->bitrate = p->bitrate_bps;
         v->rate_dirty = 1;
     }
+    const uint32_t refine_qp = p->force == MLH_FORCE_NONE ? p->refine_qp : 0;
+    if (refine_qp != v->refine_qp) {
+        v->refine_qp = refine_qp;
+        v->rate_dirty = 1;
+    }
     refs_ack(&v->refs, p->acked_ltr_tokens, p->acked_ltr_count);
     refs_plan plan;
-    refs_plan_frame(&v->refs, (int)p->force, &plan);
+    refs_plan_frame_mark(&v->refs, (int)p->force, (int)p->force_ltr, &plan);
 
     free_frame_buffers(v);
     rc = e->cfg.codec == MLH_CODEC_HEVC ? hevc_buffers(v, &plan) : h264_buffers(v, &plan);

@@ -12,7 +12,18 @@
  * offsets, and libavcodec's libx264 wrapper turns it into x264's per-macroblock
  * quant_offsets (it scales qoffset by 25, so an offset of d QP is qoffset d/25; it needs
  * adaptive quantisation on, which superfast with zerolatency keeps). OpenH264 has no
- * per-block QP through libavcodec, so it reports no QP maps. */
+ * per-block QP through libavcodec, so it reports no QP maps.
+ *
+ * Idle refinement (refine_qp): libavcodec gives libx264 no per-frame QP (it never sets
+ * x264_picture_t.i_qpplus1, and reconfig_encoder doesn't pass qpmax), and quant offsets
+ * through AV_FRAME_DATA_REGIONS_OF_INTEREST are undone by the one-frame VBV. What does
+ * work is the VBV itself: a still picture is cheap, so ABR has budget to spend, and the
+ * one-frame buffer is what keeps it from spending it. A refine frame gets 4 to 8 times
+ * the rate (more for a lower QP cap) and a VBV of twice that many frame budgets, through
+ * the same x264_encoder_reconfig path as a bitrate change, and the next normal frame
+ * goes back. Measured at 720p, 6 Mbit/s on synthetic text: three steps take luma PSNR
+ * from 23 to about 30 dB where three plain repeats reach 26 (refine_test in enc_test.zig
+ * checks the direction, not those figures). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +43,8 @@ typedef struct sw_enc {
     AVPacket *pkt;
     int64_t pts;
     uint64_t bitrate;
+    /* The rate multiple the last frame was encoded with (1: normal). */
+    uint32_t boost;
 } sw_enc;
 
 static int av_fail(int code, const char *what, int err) {
@@ -49,6 +62,7 @@ static void sw_caps(const mlh_enc *e, mlh_enc_caps *out) {
     out->gpu_input = 1; /* linear dma-bufs are read through a mapping */
     out->nv12_input = 1;
     out->qp_map_block = ((const sw_enc *)e)->x264 ? 16 : 0;
+    out->refine = ((const sw_enc *)e)->x264;
 }
 
 static void sw_close(sw_enc *s) {
@@ -61,6 +75,30 @@ static void set_rate(AVCodecContext *ctx, uint64_t bps, uint32_t fps) {
     ctx->rc_max_rate = (int64_t)bps;
     ctx->rc_buffer_size = (int)(bps / fps); /* one frame */
     ctx->rc_initial_buffer_occupancy = ctx->rc_buffer_size;
+}
+
+/* The rate multiple for a refine frame capped at `qp`: 4 at QP 24, 6 at 16, 8 at 8 and
+ * below. 1 for a normal frame. */
+static uint32_t refine_boost(uint32_t qp) {
+    if (!qp) return 1;
+    int b = (40 - (int)qp) / 4;
+    return (uint32_t)(b < 2 ? 2 : b > 8 ? 8 : b);
+}
+
+/* The rate `boost` times the normal one and a VBV of 2 x boost frame budgets, so a
+ * refine frame may spend a few frame budgets; reconfigured by libx264.c without a
+ * keyframe. boost 1 is the normal one-frame VBV. */
+static void set_boost(sw_enc *s, uint32_t boost, uint32_t fps) {
+    if (boost == s->boost) return;
+    s->boost = boost;
+    AVCodecContext *ctx = s->ctx;
+    if (boost == 1) {
+        set_rate(ctx, s->bitrate, fps);
+        return;
+    }
+    ctx->bit_rate = (int64_t)(s->bitrate * boost);
+    ctx->rc_max_rate = ctx->bit_rate;
+    ctx->rc_buffer_size = (int)(s->bitrate / fps * boost * 2); /* 2x boost frame budgets */
 }
 
 static int sw_configure(mlh_enc *e, const mlh_enc_config *cfg) {
@@ -85,6 +123,7 @@ static int sw_configure(mlh_enc *e, const mlh_enc_config *cfg) {
     const uint32_t slices = cfg->slices ? cfg->slices : 1;
     ctx->slices = (int)slices;
     s->bitrate = cfg->bitrate_bps;
+    s->boost = 1;
     if (s->x264) {
         av_opt_set(ctx->priv_data, "preset", "superfast", 0);
         av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
@@ -222,9 +261,11 @@ static int sw_encode(mlh_enc *e, const mlh_enc_input *in, uint64_t time_us, cons
     if (p->bitrate_bps && p->bitrate_bps != s->bitrate && !e->cfg.lossless) {
         s->bitrate = p->bitrate_bps;
         set_rate(s->ctx, p->bitrate_bps, e->cfg.fps); /* libx264.c reconfigures, no keyframe */
+        s->boost = 1;
     }
     /* No long-term references: a refresh is an IDR. */
     const int idr = p->force != MLH_FORCE_NONE;
+    if (s->x264 && !e->cfg.lossless) set_boost(s, idr ? 1 : refine_boost(p->refine_qp), e->cfg.fps);
     s->frame->pict_type = idr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
     s->frame->pts = s->pts++;
     rc = sw_apply_qp_map(s, p);

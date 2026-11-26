@@ -252,6 +252,7 @@ pub const Encoder = struct {
             .gpu_input = self.caps_.gpu_input != 0,
             .cpu_input = false,
             .qp_map = .{ .block = @intCast(self.caps_.qp_map_block) },
+            .refine = self.caps_.refine != 0,
         };
     }
 
@@ -292,6 +293,8 @@ pub const Encoder = struct {
             .qp_map = if (params.qp_map) |m| m.offsets.ptr else null,
             .qp_map_cols = if (params.qp_map) |m| m.cols else 0,
             .qp_map_rows = if (params.qp_map) |m| m.rows else 0,
+            .refine_qp = if (params.force == .none) params.refine_qp else 0,
+            .force_ltr = @intFromBool(params.force_ltr),
         };
         var out: c.msw_enc_output = undefined;
         const hr = c.msw_enc_encode(self.enc, tex, frame.image.gpu_index, @intCast(@max(frame.captured_us, 0)), &p, &out);
@@ -308,6 +311,7 @@ pub const Encoder = struct {
             .keyframe = out.keyframe != 0,
             .ltr_token = if (out.has_ltr_token != 0) out.ltr_token else null,
             .ltr_refresh = out.ltr_refresh != 0,
+            .refine = p.refine_qp != 0 and self.caps_.refine != 0,
             .encode_start_us = start_us,
             .encoded_us = nowUs(),
         };

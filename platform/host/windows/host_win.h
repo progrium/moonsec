@@ -103,6 +103,7 @@ typedef struct msw_enc_caps {
     uint32_t gpu_input, cpu_input;
     /* Regional refine: the QP map block edge for the configured codec; 0 = no QP maps. */
     uint32_t qp_map_block;
+    uint32_t refine; /* takes msw_enc_params.refine_qp (idle refinement) */
 } msw_enc_caps;
 
 typedef struct msw_enc_config {
@@ -121,6 +122,10 @@ typedef struct msw_enc_params {
     /* Regional refine: QP offsets per caps.qp_map_block block, cols x rows; NULL = none. */
     const int8_t *qp_map;
     uint32_t qp_map_cols, qp_map_rows;
+    /* Idle refinement: cap this P-frame's QP (H.264/HEVC scale); 0 = normal. */
+    uint32_t refine_qp;
+    /* Mark this frame a long-term reference (when the encoder has them). */
+    uint32_t force_ltr;
 } msw_enc_params;
 
 typedef struct msw_enc_output {

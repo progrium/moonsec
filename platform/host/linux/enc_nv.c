@@ -45,6 +45,7 @@ static void nv_caps(const mlh_enc *e, mlh_enc_caps *out) {
     out->cpu_input = 1;
     out->nv12_input = 1;
     out->qp_map_block = c.qp_map_block;
+    out->refine = 1; /* maxQP through nvEncReconfigureEncoder (nvenc_core.c) */
 }
 
 static int nv_configure(mlh_enc *e, const mlh_enc_config *cfg) {
@@ -98,6 +99,8 @@ static int nv_encode(mlh_enc *e, const mlh_enc_input *in, uint64_t time_us, cons
         .qp_map = p->qp_map,
         .qp_map_cols = p->qp_map_cols,
         .qp_map_rows = p->qp_map_rows,
+        .refine_qp = p->refine_qp,
+        .force_ltr = p->force_ltr,
     };
     if (in->dmabuf && !n->no_import && importable(in->dmabuf) && in->dmabuf->width == e->cfg.width &&
         in->dmabuf->height == e->cfg.height) {

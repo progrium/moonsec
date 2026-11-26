@@ -81,6 +81,9 @@ void refs_reset(refs_state *s, int ltr);
 void refs_ack(refs_state *s, const uint64_t *tokens, uint32_t n);
 /* Plans the next frame. */
 void refs_plan_frame(refs_state *s, int force, refs_plan *p);
+/* The same, and with `mark` set the frame is marked long-term even off the interval (the
+ * last idle-refinement step, so a later refresh predicts from the sharp picture). */
+void refs_plan_frame_mark(refs_state *s, int force, int mark, refs_plan *p);
 /* Commits a planned frame after it was encoded; returns the frame's long-term token or 0. */
 uint64_t refs_commit(refs_state *s, const refs_plan *p);
 /* Uncommitted frame (the encoder dropped it): nothing changes. */
