@@ -43,6 +43,9 @@ pub const multi = @import("multi/root.zig");
 /// Capture damage on a cell grid (lossless tiles, regional refinement).
 pub const damage = @import("damage/root.zig");
 
+/// Idle refinement: low-QP refine steps when the screen goes still (core/still).
+pub const still = @import("still/root.zig");
+
 /// Per-frame stage timing and rolling stats for the latency overlay.
 pub const telemetry = @import("telemetry/root.zig");
 
