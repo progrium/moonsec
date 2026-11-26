@@ -311,6 +311,15 @@ after 1.0: a config whose `struct_size` ends before it is still taken, with `win
 - A client's select of another display (when that is exposed) leaves the window for that
   display; the display list still describes the host's displays.
 
+## Lossless tiles
+
+`MOONSEC_HOST_TILES` makes a host send exact 64×64 tiles of still screen areas, in
+bandwidth the video leaves free, to clients that ask; `MOONSEC_CLIENT_TILES` makes a
+client ask, when its backend's presenter has a tile layer (the system backends on Linux,
+Windows and macOS do), and draw them over the video until the video changes there
+([refine-v0.md](refine-v0.md)). Both are off by default in this draft. Pictures given to
+`on_frame` are the decoded video only and never include tiles.
+
 ## Linking
 
 - `zig build abi` installs `include/moonsec.h`, `lib/libmoonsec.a` and the shared

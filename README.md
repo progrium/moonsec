@@ -3,7 +3,7 @@
 Low-latency remote desktop and game streaming core in Zig, with networking from
 Rust [iroh](https://github.com/n0-computer/iroh) through a small in-repo shim.
 
-Design and plan: [docs/design.md](docs/design.md). Wire protocol: [spec/wire-v0.md](spec/wire-v0.md) (audio: [spec/audio-v0.md](spec/audio-v0.md); pairing: [spec/pairing-v0.md](spec/pairing-v0.md)). Spike write-ups, code and results:
+Design and plan: [docs/design.md](docs/design.md). Wire protocol: [spec/wire-v0.md](spec/wire-v0.md) (audio: [spec/audio-v0.md](spec/audio-v0.md); pairing: [spec/pairing-v0.md](spec/pairing-v0.md); lossless tiles for sharp text: [spec/refine-v0.md](spec/refine-v0.md)). Spike write-ups, code and results:
 [spikes/](spikes) (status table in the design doc's "Spike status" section).
 
 Zig is pinned to **0.16.0** (`build.zig.zon` `minimum_zig_version`).

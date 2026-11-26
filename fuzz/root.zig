@@ -10,6 +10,7 @@ pub const recovery = @import("recovery.zig");
 pub const control = @import("control.zig");
 pub const pair = @import("pair.zig");
 pub const video = @import("video.zig");
+pub const refine = @import("refine.zig");
 
 const common = @import("common.zig");
 
@@ -34,6 +35,10 @@ pub const harnesses = .{
     .{ "pair_exchange_host", pair.exchangeHost },
     .{ "pair_exchange_client", pair.exchangeClient },
     .{ "video_passthrough_decoder", video.passthroughDecoder },
+    .{ "refine_qoi", refine.qoiDecode },
+    .{ "refine_wire", refine.wireMessages },
+    .{ "refine_layer", refine.layer },
+    .{ "refine_host_acks", refine.hostAcks },
 };
 
 test {
