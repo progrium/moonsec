@@ -15,6 +15,10 @@ header ([mlh_enc.h](mlh_enc.h)) that translate-c reads; Zig never sees libva or 
 | `nvenc` | libcuda and libnvidia-encode loaded at run time ([enc_nv.c](enc_nv.c) over [enc_nvenc.c](enc_nvenc.c)), on the NVENC core shared with the Windows host (`platform/nvenc`). H.264 and HEVC, the same low-latency settings as Windows. A dma-buf goes to CUDA with `cuImportExternalMemory`; when CUDA refuses it (a buffer another driver exported) frames are mapped and uploaded from then on. `--device` / `Options.device` is a CUDA ordinal. Compile-only: no NVIDIA hardware is planned. | Long-term references when the GPU has them; IDR otherwise. |
 | `auto` | The first of `vaapi`, `nvenc`, `software` that opens. | |
 
+Regional refine (per-block QP maps, [docs/regional-refine.md](../../docs/regional-refine.md)):
+x264 through libavcodec's regions of interest, NVENC through its QP delta map, VAAPI through
+ROI rectangles when the driver takes delta QP under rate control. OpenH264 has none.
+
 ## Long-term references on VAAPI
 
 libavcodec's VAAPI encoders don't expose long-term references or per-frame reference

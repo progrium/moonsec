@@ -24,6 +24,9 @@ pub const Refiner = struct {
     max_regions: u16 = 0,
     /// The current frame's map was planned (so `commit` has something to settle).
     planned: bool = false,
+    /// New (not repeated) frames whose capture reported damage, and maps planned.
+    damaged_frames: u64 = 0,
+    maps: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, cfg: qpmap.Config) Refiner {
         return .{ .gpa = gpa, .cfg = cfg };
@@ -57,6 +60,7 @@ pub const Refiner = struct {
             if (r.ledger) |*l| l.observe(null);
             return;
         }
+        if (!f.repeat and f.damage != null) r.damaged_frames += 1;
         r.ledger.?.observe(if (f.repeat) &.{} else f.damage);
     }
 
@@ -69,6 +73,7 @@ pub const Refiner = struct {
         const m = l.plan(allow) orelse return;
         params.qp_map = .{ .block = @intCast(m.block), .cols = @intCast(m.cols), .rows = @intCast(m.rows), .offsets = m.offsets };
         r.planned = true;
+        r.maps += 1;
     }
 
     /// What the encoder made of the frame: null when it dropped it or failed. `ok`: the

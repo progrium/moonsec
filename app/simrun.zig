@@ -156,6 +156,12 @@ pub const Result = struct {
         display_switches: u64 = 0,
         mode_changes: u64 = 0,
         config_resends: u64 = 0,
+        /// Regional refine: captured frames that reported damage, QP maps the encoder got,
+        /// blocks with an offset in them, and maps it refused (wrong size, forced frame).
+        damaged_frames: u64 = 0,
+        qp_maps: u64 = 0,
+        qp_blocks: u64 = 0,
+        qp_bad: u64 = 0,
         /// The stream at the end.
         width: u32 = 0,
         height: u32 = 0,
@@ -431,6 +437,10 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .display_switches = host.s.stats.display_switches,
             .mode_changes = host.s.stats.mode_changes,
             .config_resends = host.s.stats.config_resends,
+            .damaged_frames = host.qp.damaged_frames,
+            .qp_maps = sh.encoder.stats.qp_maps,
+            .qp_blocks = sh.encoder.stats.qp_blocks,
+            .qp_bad = sh.encoder.stats.qp_bad,
             .width = host.s.cfg.width,
             .height = host.s.cfg.height,
             .fps = host.s.cfg.fps,
