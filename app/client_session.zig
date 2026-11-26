@@ -78,6 +78,9 @@ pub const Config = struct {
     /// The reliable control channel (spec/control-v0.md): clipboard and the features built
     /// on it. It runs once the app attaches a stream (`control.attach`).
     control: control.Config = .{},
+    /// Ask for lossless tiles (the presenter has a tile layer, `api.Presenter.tiles`).
+    tiles: bool = false,
+    tile_layer: core.refine.client.Config = .{},
 };
 
 pub const State = enum { connecting, streaming, ended };
@@ -103,6 +106,7 @@ pub const Stats = struct {
     input_packets: u64 = 0,
     malformed: u64 = 0,
     unknown: u64 = 0,
+    tile_acks: u64 = 0,
     path_changes: u64 = 0,
     /// Mid-stream configs heard of (a display or mode change, a rate ladder step, a
     /// multi-user host re-picking the format), and the ones that needed the decoder
@@ -195,6 +199,9 @@ pub const ClientSession = struct {
     free_bufs: std.ArrayList([]u8) = .empty,
     current: ?Queued = null,
     times: []Times,
+    /// Lossless tiles (with `cfg.tiles`): reassembly, damage and the validity rule. The
+    /// decode stage calls `tilePresent` before each present; datagrams feed it here.
+    tiles: ?*core.refine.Layer = null,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config, p: PacketPipe) !ClientSession {
         var receiver = try media.Receiver.init(gpa, .{
@@ -212,7 +219,14 @@ pub const ClientSession = struct {
         @memset(times, .{});
         var control_ = try control.Control.init(gpa, .client, cfg.control);
         errdefer control_.deinit();
+        var layer: ?*core.refine.Layer = null;
+        if (cfg.tiles) {
+            const l = try gpa.create(core.refine.Layer);
+            l.* = .init(gpa, cfg.tile_layer);
+            layer = l;
+        }
         return .{
+            .tiles = layer,
             .gpa = gpa,
             .control = control_,
             .cfg = cfg,
@@ -229,6 +243,10 @@ pub const ClientSession = struct {
 
     pub fn deinit(s: *ClientSession) void {
         s.control.deinit();
+        if (s.tiles) |l| {
+            l.deinit();
+            s.gpa.destroy(l);
+        }
         s.receiver.deinit();
         s.gpa.destroy(s.est);
         s.gpa.destroy(s.tele);
@@ -404,6 +422,23 @@ pub const ClientSession = struct {
             s.sendFeedback(now);
             s.next_feedback = now + s.cfg.feedback_interval_us;
         }
+        if (s.tiles) |l| if (s.state == .streaming) {
+            var b: [proto.max_datagram - proto.Envelope.size]u8 = undefined;
+            var n: u32 = 0;
+            while (n < 4) : (n += 1) {
+                const a = l.takeAck(&b) orelse break;
+                s.sendOther(.control_fast, @intFromEnum(proto.ControlFastKind.tile_ack), a);
+                s.stats.tile_acks += 1;
+            }
+        };
+    }
+
+    /// The decode stage, before presenting frame `id`: the ops for the presenter's tile
+    /// layer (`api.Presenter.tiles`). Call with the session lock held; the update's slices
+    /// stay valid until the next call (datagrams arriving meanwhile don't touch them).
+    pub fn tilePresent(s: *ClientSession, id: u32) ?core.refine.client.Update {
+        const l = s.tiles orelse return null;
+        return l.present(id);
     }
 
     fn sendConfigAck(s: *ClientSession) void {
@@ -439,11 +474,17 @@ pub const ClientSession = struct {
     pub fn decoderConfigured(s: *ClientSession, c: wire.Config) void {
         if (s.decoder_config != null) s.stats.decoder_reconfigures += 1;
         s.decoder_config = c;
+        // Tiles of another config don't apply to its frames.
+        if (s.tiles) |l| l.configure(c.epoch, c.width, c.height) catch {
+            l.deinit();
+            s.gpa.destroy(l);
+            s.tiles = null;
+        };
     }
 
     fn sendHello(s: *ClientSession) void {
         var b: [wire.Hello.len]u8 = undefined;
-        (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height, .formats = s.cfg.formats, .display = s.cfg.display }).encode(&b);
+        (wire.Hello{ .nonce = s.cfg.nonce, .codecs = s.cfg.codecs, .max_width = s.cfg.max_width, .max_height = s.cfg.max_height, .formats = s.cfg.formats, .display = s.cfg.display, .tiles = if (s.cfg.tiles) core.refine.wire.caps_qoi else 0 }).encode(&b);
         s.sendOther(.control_fast, @intFromEnum(wire.Kind.hello), &b);
     }
 
@@ -539,6 +580,11 @@ pub const ClientSession = struct {
                     s.sender.onAck(next);
                 },
                 .audio => if (s.cfg.onAudio) |f| f(s.cfg.audio_ctx, o.envelope, o.payload, now),
+                .refine => if (s.tiles) |l| {
+                    if (s.state == .streaming) l.onRefine(o.envelope.kind, o.payload);
+                } else {
+                    s.stats.unknown += 1;
+                },
                 else => s.stats.unknown += 1,
             },
             else => s.stats.unknown += 1,
@@ -799,6 +845,10 @@ pub const ClientSession = struct {
         inline for (.{ "network", "decode", "present", "total" }) |n| try host_session.printStage(w, n, snap.stage(@field(telemetry.Stage, n)));
         if (st.config_changes + st.display_lists > 0)
             try w.print("  configs: {d} mid-stream, decoder configured again {d}, frames waiting for a config {d}, display lists {d} ({d} displays), selects sent {d}\n", .{ st.config_changes, st.decoder_reconfigures, st.frames_await_config, st.display_lists, s.n_displays, st.selects_sent });
+        if (s.tiles) |l| {
+            const t = l.stats;
+            try w.print("  tiles: {d} complete from {d} pieces, {d} shown, {d} cleared by damage, {d} stale, {d} ambiguous; damage gaps {d} (hidden {d} presents, {d} resyncs asked, {d} clears); acks {d}\n", .{ t.tiles, t.pieces, t.shown, t.invalidated, t.stale, t.ambiguous, t.gaps, t.hidden_presents, t.resyncs_asked, t.clears, st.tile_acks });
+        }
         if (st.path_changes + st.reconnects + st.reconnect_requests > 0)
             try w.print("  path changes {d}, reconnects {d} (asked {d})\n", .{ st.path_changes, st.reconnects, st.reconnect_requests });
         try s.log.print(w, "client");

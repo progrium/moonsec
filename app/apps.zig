@@ -76,6 +76,60 @@ pub const HostOptions = struct {
     /// What the connected device may do (input, clipboard), asked again on every
     /// reconnect. Null: everything (lab runs, the sim).
     perms: ?control.PermsSource = null,
+    /// Send lossless tiles of still cells to clients that ask (core/refine).
+    tiles: bool = false,
+    tile_engine: core.refine.host.Config = .{},
+};
+
+/// The encode stage's side of lossless tiles: each captured frame's damage into the
+/// engine (the backend's, or hashed when it reports none and the frame is in memory),
+/// and after the encode, the cells the engine wants read from the frame before release.
+pub const TileReader = struct {
+    hasher: ?core.damage.Hasher = null,
+    buf: [core.refine.wire.cell_size * core.refine.wire.cell_size * 4]u8 = undefined,
+    stats: struct { reads: u64 = 0, read_errors: u64 = 0, hashed: u64 = 0 } = .{},
+
+    pub fn deinit(t: *TileReader) void {
+        if (t.hasher) |*h| h.deinit();
+    }
+
+    /// The frame's damage: what the backend reported, nothing for a repeat, else a hash
+    /// of its cells when the pixels are in memory, else null (unknown). Call outside the
+    /// session lock (hashing reads the whole frame); valid until the next call.
+    pub fn damage(t: *TileReader, gpa: std.mem.Allocator, f: *const api.CapturedFrame) ?[]const api.Rect {
+        if (f.repeat) return &.{};
+        if (f.damage) |d| return d;
+        const cpu = f.image.cpu orelse return null;
+        if (f.image.format != .bgra8) return null;
+        if (t.hasher) |h| if (h.width != f.image.width or h.height != f.image.height) {
+            t.hasher.?.deinit();
+            t.hasher = null;
+        };
+        if (t.hasher == null) t.hasher = core.damage.Hasher.init(gpa, f.image.width, f.image.height, core.refine.wire.cell_size) catch return null;
+        t.stats.hashed += 1;
+        return t.hasher.?.diff(cpu.data, cpu.stride);
+    }
+
+    /// After the frame's encode was committed (under the session lock): read and offer
+    /// the cells the engine wants, from `f` (still unreleased).
+    pub fn read(t: *TileReader, e: *core.refine.Engine, cap: api.Capture, f: *const api.CapturedFrame) void {
+        if (f.image.width != e.grid.width or f.image.height != e.grid.height) return;
+        if (f.image.color == .hdr10) return;
+        if (f.cursor) |c| if (c.visible and c.x >= 0 and c.y >= 0) {
+            e.pointer = .{ .x = @intCast(c.x), .y = @intCast(c.y) };
+        };
+        var want: [32]u32 = undefined;
+        const n = e.wanted(&want);
+        for (want[0..n]) |c| {
+            const r = e.grid.cellRect(c);
+            cap.readRect(f, r, &t.buf) catch {
+                t.stats.read_errors += 1;
+                continue;
+            };
+            e.offer(c, &t.buf, @as(usize, r.w) * 4);
+            t.stats.reads += 1;
+        }
+    }
 };
 
 pub const HostApp = struct {
@@ -98,6 +152,7 @@ pub const HostApp = struct {
     fps: u32,
     cap: struct { width: u32 = 0, height: u32 = 0, fps: u32 = 0 } = .{},
     next_display_poll: Micros = 0,
+    tiles: TileReader = .{},
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0, reconfigure_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: HostOptions, p: pipe_mod.PacketPipe) !HostApp {
@@ -139,6 +194,8 @@ pub const HostApp = struct {
             .loss_policy = o.session.loss_policy,
             .pause_on_stall = o.pause_on_stall,
             .control = .{ .perms = o.perms },
+            .tiles = o.tiles,
+            .tile_engine = o.tile_engine,
         }, p);
         var dl: [core.display.DisplayList.max_displays]api.DisplayInfo = undefined;
         if (be.capture.displays(&dl)) |n| s.setDisplays(dl[0..n], be.clock.now()) else |_| {}
@@ -154,6 +211,7 @@ pub const HostApp = struct {
     }
 
     pub fn deinit(a: *HostApp) void {
+        a.tiles.deinit();
         a.be.capture.stop();
         if (a.audio) |au| au.deinit();
         a.s.deinit();
@@ -197,11 +255,13 @@ pub const HostApp = struct {
                 return;
             }
         }
+        const dmg = if (a.opts.tiles) a.tiles.damage(a.s.gpa, f) else null;
         if (lock) |l| l.lock();
         const live = a.s.streaming();
         const change = if (live) a.s.takeFormat() else null;
         const bitrate = a.s.bitrate_bps;
         const params = if (live) a.s.encodeParams() else api.EncodeParams{};
+        if (a.s.tileEngine()) |e| e.capture(dmg);
         if (lock) |l| l.unlock();
         if (!live) return;
         if (change) |c| a.be.encoder.configure(.{
@@ -228,6 +288,7 @@ pub const HostApp = struct {
             if (ef_) |ef| {
                 a.s.onEncoded(ef, f, a.be.clock.now());
                 a.last_frame_us = f.captured_us;
+                if (a.s.tileEngine()) |e| a.tiles.read(e, a.be.capture, f);
             } else a.s.onEncodeDropped();
         } else |_| {
             a.stats.encode_errors += 1;
@@ -434,6 +495,8 @@ pub const ClientApp = struct {
         cfg.codecs = caps.codecs;
         cfg.formats = api.effectiveFormats(caps.codecs, caps.coded);
         cfg.display = be.display;
+        // Tiles only where the presenter can composite them.
+        cfg.tiles = cfg.tiles and be.presenter.hasTiles();
         var au: ?*ClientAudio = null;
         if (o.audio) if (be.audio) |sink| {
             au = try ClientAudio.init(gpa, sink);
@@ -531,6 +594,12 @@ pub const ClientApp = struct {
             return true;
         } orelse return true;
         defer a.be.decoder.release(&df);
+        if (lock) |l| l.lock();
+        const tu = a.s.tilePresent(au.frame_id);
+        if (lock) |l| l.unlock();
+        if (tu) |u| a.be.presenter.tiles(&u) catch {
+            a.stats.present_errors += 1;
+        };
         const pr = a.be.presenter.present(&df, &ov);
         const content = if (a.opts.contentFn) |f| f(a.opts.content_ctx, &df) else df.frame_id;
         if (lock) |l| l.lock();

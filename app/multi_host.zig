@@ -137,6 +137,8 @@ pub const MultiHost = struct {
     held: Held = .{},
     releases: std.Deque(core.input.Action) = .empty,
     actions: std.Deque(Pending) = .empty,
+    /// Lossless tiles: one engine for the one encode; every member's peer sends from it.
+    tiles: ?*core.refine.Engine = null,
     stats: Stats = .{},
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) !MultiHost {
@@ -149,7 +151,15 @@ pub const MultiHost = struct {
         c.session.shared = true;
         c.session.control.features |= multi.feature_bit;
         if (c.session.control.known.len == 0) c.session.control.known = &multi.known;
+        var engine: ?*core.refine.Engine = null;
+        if (c.session.tiles) {
+            const e = try gpa.create(core.refine.Engine);
+            errdefer gpa.destroy(e);
+            e.* = try core.refine.Engine.init(gpa, c.session.tile_engine, c.session.width, c.session.height, 0);
+            engine = e;
+        }
         return .{
+            .tiles = engine,
             .gpa = gpa,
             .cfg = c,
             .rec = rec,
@@ -172,6 +182,10 @@ pub const MultiHost = struct {
         m.gpa.destroy(m.join);
         m.actions.deinit(m.gpa);
         m.releases.deinit(m.gpa);
+        if (m.tiles) |e| {
+            e.deinit();
+            m.gpa.destroy(e);
+        }
     }
 
     /// A client the host admitted (the allowlist said yes, and whether it may control).
@@ -190,6 +204,8 @@ pub const MultiHost = struct {
         };
         errdefer peer.s.deinit();
         if (!m.cfg.intersect_acks) peer.s.join = null;
+        // A joiner gets the cached tiles of still cells right away.
+        peer.s.setTileEngine(m.tiles);
         peer.s.next_frame_id = m.next_frame_id;
         peer.s.bitrate_bps = m.bitrate_bps;
         peer.s.codec = m.codec;
@@ -505,6 +521,7 @@ pub const MultiHost = struct {
             return;
         }
         const id = m.next_frame_id;
+        if (m.tiles) |e| e.commit(id);
         const flags = m.rec.onEncoded(id, ef.ltr_token, ef.keyframe);
         m.next_frame_id +%= 1;
         var required: u32 = 0;
@@ -557,6 +574,7 @@ pub const MultiHostApp = struct {
     /// The member whose action is being injected (the injector may ask).
     injecting_from: u16 = multi.host_id,
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0, reconfigures: u64 = 0 } = .{},
+    tiles: apps.TileReader = .{},
 
     pub const Options = struct {
         roster: multi.roster.Config = .{},
@@ -601,6 +619,8 @@ pub const MultiHostApp = struct {
                 .peer_timeout_us = o.session.peer_timeout_us,
                 .loss_policy = o.session.loss_policy,
                 .pause_on_stall = o.pause_on_stall,
+                .tiles = o.tiles,
+                .tile_engine = o.tile_engine,
             },
             .roster = mo.roster,
             .rate = mo.rate,
@@ -615,6 +635,7 @@ pub const MultiHostApp = struct {
     }
 
     pub fn deinit(a: *MultiHostApp) void {
+        a.tiles.deinit();
         a.be.capture.stop();
         if (a.audio) |au| au.deinit();
         a.m.deinit();
@@ -644,7 +665,9 @@ pub const MultiHostApp = struct {
 
     /// One encode of a captured frame; the lock, if any, is taken around the session calls.
     fn encodeOne(a: *MultiHostApp, f: *const api.CapturedFrame, lock: ?apps.Lock) void {
+        const dmg = if (a.m.tiles != null) a.tiles.damage(a.m.gpa, f) else null;
         if (lock) |l| l.lock();
+        if (a.m.tiles) |e| e.capture(dmg);
         const live = a.m.streaming();
         const change = if (live) a.m.takeFormat() else null;
         const bitrate = a.m.bitrate_bps;
@@ -680,6 +703,7 @@ pub const MultiHostApp = struct {
             if (ef_) |ef| {
                 a.m.onEncoded(ef, f, a.be.clock.now());
                 a.last_frame_us = f.captured_us;
+                if (a.m.tiles) |e| a.tiles.read(e, a.be.capture, f);
             } else a.m.onEncodeDropped();
         } else |_| {
             a.stats.encode_errors += 1;
