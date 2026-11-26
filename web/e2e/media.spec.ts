@@ -118,6 +118,10 @@ test("plays video and audio from a real host", async ({ page }, info) => {
   expect(st.overlay.stages.total.count).toBeGreaterThan(0);
   expect(st.overlay.relayed).toBe(true);
   expect(m.overlay).toContain("RELAY");
+  // The client asked for lossless tiles and its layer was configured with the stream and
+  // presented with every frame; this host sends none (tiles.spec.ts covers compositing).
+  expect(st.stats.tiles_hidden_presents + st.video.tileFrames).toBeGreaterThan(seconds * 60 * 0.5);
+  expect(st.video.tilePuts).toBe(0);
   checkAudio(st, seconds * 0.7, 0.8);
   // The host saw a clean session end.
   expect(host.code).toBe(0);

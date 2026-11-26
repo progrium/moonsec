@@ -9,6 +9,7 @@ test {
     _ = @import("pairing.zig");
     _ = @import("multi_test.zig");
     _ = @import("qprefine.zig");
+    _ = @import("web_tiles.zig");
 }
 
 fn expectPass(o: simrun.Options) !simrun.Result {

@@ -13,6 +13,11 @@
 //! microseconds on the Worker's `performance.now()` clock, passed as f64 so JavaScript
 //! never deals in BigInt. Structs returned by pointer are `extern` with the layouts
 //! web/src/core.ts reads; bump `abi_version` when one changes.
+//!
+//! Lossless tiles (core/refine): with `tiles` set at `ms_client_new` the hello asks for
+//! them, and JavaScript calls `ms_tile_present(id)` right before drawing each decoded
+//! frame `id`, applies the ops to its tile layer (RGBA, the stream's size) and draws the
+//! layer over that same frame when the update says visible (app/web_tiles.zig).
 const std = @import("std");
 const core = @import("core");
 const api = @import("platform");
@@ -20,12 +25,13 @@ const pipe_mod = @import("pipe");
 const audio_stage = @import("audio_stage");
 const client_session = @import("client_session.zig");
 const web_pipe = @import("web_pipe.zig");
+const web_tiles = @import("web_tiles.zig");
 
 const ClientSession = client_session.ClientSession;
 const proto = core.proto;
 const Micros = i64;
 
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
 
 const gpa = std.heap.wasm_allocator;
 
@@ -111,6 +117,13 @@ pub const StatsOut = extern struct {
     audio_silence: f64,
     audio_delay_us: f64,
     rx_drops: f64,
+    /// Lossless tiles: complete tiles, tiles put on the layer, tiles cleared by damage,
+    /// presents with the layer hidden (a damage gap), tile acks sent.
+    tiles_complete: f64,
+    tiles_shown: f64,
+    tiles_invalidated: f64,
+    tiles_hidden_presents: f64,
+    tile_acks: f64,
 };
 
 pub const Web = struct {
@@ -123,6 +136,10 @@ pub const Web = struct {
     overlay: OverlayOut = undefined,
     stats: StatsOut = undefined,
     pcm: [2880 * 2]f32 = undefined,
+    tiles: web_tiles.TilesOut = .{},
+    tile_ops: std.ArrayList(web_tiles.TileOp) = .empty,
+    /// Decoder configs handed out with a frame, applied at its present.
+    pending: web_tiles.PendingConfigs = .{},
 
     fn onAudio(ctx: ?*anyopaque, env: proto.Envelope, payload: []const u8, recv_us: Micros) void {
         const w: *Web = @ptrCast(@alignCast(ctx.?));
@@ -135,8 +152,10 @@ export fn ms_abi_version() u32 {
 }
 
 /// A new session. `codecs` is the `CodecSet` byte (h264 1, hevc 2, av1 4); `channels`
-/// 0 turns audio off, else 1 or 2 at 48 kHz. `ctx` is passed back to `ms_send`.
-export fn ms_client_new(ctx: u32, codecs: u32, nonce: u32, max_width: u32, max_height: u32, channels: u32) ?*Web {
+/// 0 turns audio off, else 1 or 2 at 48 kHz. `tiles` 1 asks the host for lossless tiles:
+/// only when the caller composites them (`ms_tile_present`). `ctx` is passed back to
+/// `ms_send`.
+export fn ms_client_new(ctx: u32, codecs: u32, nonce: u32, max_width: u32, max_height: u32, channels: u32, tiles: u32) ?*Web {
     if (channels > 2) return null;
     const w = gpa.create(Web) catch return null;
     w.pipe = .{ .ctx = ctx };
@@ -153,6 +172,9 @@ export fn ms_client_new(ctx: u32, codecs: u32, nonce: u32, max_width: u32, max_h
         .max_height = max_height,
         .audio_ctx = if (channels > 0) w else null,
         .onAudio = if (channels > 0) Web.onAudio else null,
+        .tiles = tiles != 0,
+        // Straight into ImageData.
+        .tile_layer = .{ .order = .rgba },
     };
     w.s = ClientSession.init(gpa, cfg, .{ .ptr = &w.pipe, .vtable = &JsPipe.vtable }) catch {
         if (w.audio) |*a| a.deinit(gpa);
@@ -160,10 +182,14 @@ export fn ms_client_new(ctx: u32, codecs: u32, nonce: u32, max_width: u32, max_h
         return null;
     };
     w.frame = std.mem.zeroes(FrameOut);
+    w.tiles = .{};
+    w.tile_ops = .empty;
+    w.pending = .{};
     return w;
 }
 
 export fn ms_client_free(w: *Web) void {
+    w.tile_ops.deinit(gpa);
     w.s.deinit();
     if (w.audio) |*a| a.deinit(gpa);
     gpa.destroy(w);
@@ -245,6 +271,7 @@ export fn ms_config(w: *Web) *const ConfigOut {
 /// every frame returned here is decodable given the ones before it.
 export fn ms_next_frame(w: *Web) ?*const FrameOut {
     const au = w.s.nextAccessUnit() orelse return null;
+    if (w.s.takeDecoderConfig()) |c| w.pending.push(au.frame_id, c);
     w.frame = .{
         .data = @intFromPtr(au.data.ptr),
         .len = @intCast(au.data.len),
@@ -263,7 +290,36 @@ export fn ms_on_decoded(w: *Web, id: u32, ok: u32, decoded_us: f64) void {
 }
 
 export fn ms_on_presented(w: *Web, id: u32, presented_us: f64) void {
+    configureFor(w, id);
     w.s.onPresented(id, us(presented_us), id);
+}
+
+/// Configs whose first frame is `id` or older reach the session (and its tile layer)
+/// now, as the native decode stage's `decoderConfigured` would before that frame.
+fn configureFor(w: *Web, id: u32) void {
+    while (w.pending.due(id)) |c| w.s.decoderConfigured(c);
+}
+
+/// Decoded frame `id` is about to be drawn: the ops that bring the tile layer to what
+/// shows with it (`TilesOut`, its `ops` an array of `n_ops` `TileOp`), or null without
+/// tiles. Apply them, then draw the frame, then the layer over it when `visible`. The
+/// ops and their pixels stay valid until the next call.
+export fn ms_tile_present(w: *Web, id: u32) ?*const web_tiles.TilesOut {
+    configureFor(w, id);
+    const u = w.s.tilePresent(id) orelse return null;
+    web_tiles.flatten(gpa, &w.tile_ops, u, &w.tiles) catch {
+        // No room for the ops: the page's layer would no longer match the session's, so
+        // tiles end here, as when the layer can't be configured (`decoderConfigured`).
+        // Hidden now; null from the next call on, and the page drops its layer.
+        if (w.s.tiles) |l| {
+            l.deinit();
+            w.s.gpa.destroy(l);
+            w.s.tiles = null;
+        }
+        w.tiles = .{ .width = u.width, .height = u.height };
+        return &w.tiles;
+    };
+    return &w.tiles;
 }
 
 /// Renders the next audio frame from the jitter buffer into `ms_audio_buf` (interleaved
@@ -331,6 +387,12 @@ export fn ms_stats(w: *Web) *const StatsOut {
         out.audio_delay_us = f(bs.delay_us);
     }
     out.rx_drops = f(w.pipe.recv_drops);
+    if (w.s.tiles) |l| {
+        out.tiles_complete = f(l.stats.tiles);
+        out.tiles_shown = f(l.stats.shown);
+        out.tiles_invalidated = f(l.stats.invalidated);
+        out.tiles_hidden_presents = f(l.stats.hidden_presents);
+    }
     w.stats = out;
     return &w.stats;
 }
@@ -391,4 +453,6 @@ comptime {
     std.debug.assert(@sizeOf(FrameOut) == 40);
     std.debug.assert(@sizeOf(ConfigOut) == 32);
     std.debug.assert(@sizeOf(OverlayOut) == 8 * (8 + 4 * core.telemetry.Stage.count));
+    std.debug.assert(@sizeOf(web_tiles.TileOp) == 32);
+    std.debug.assert(@sizeOf(web_tiles.TilesOut) == 20);
 }
