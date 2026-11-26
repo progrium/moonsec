@@ -40,6 +40,9 @@ pub const display = @import("display/root.zig");
 /// (spec/multi-user-v0.md).
 pub const multi = @import("multi/root.zig");
 
+/// Idle refinement: low-QP refine steps when the screen goes still (core/still).
+pub const still = @import("still/root.zig");
+
 /// Per-frame stage timing and rolling stats for the latency overlay.
 pub const telemetry = @import("telemetry/root.zig");
 

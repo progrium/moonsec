@@ -18,7 +18,10 @@ pub const Flags = packed struct(u8) {
     /// First frame of a new stream config (size, frame rate or display changed; an IDR).
     /// A client that has not received that config waits for it instead of decoding.
     new_config: bool = false,
-    _reserved: u3 = 0,
+    /// An idle-refinement frame: the same picture as the previous frame, coded at a lower
+    /// QP (core/still). Decoded like any other frame; clients count them.
+    refine: bool = false,
+    _reserved: u2 = 0,
 };
 
 /// Fixed 40-byte header. A frame is split into slices; each slice into FEC groups; each
@@ -122,7 +125,7 @@ pub const ShardHeader = struct {
         h.data_shards = try d.int(u8);
         h.parity_shards = try d.int(u8);
         const raw_flags = try d.int(u8);
-        h.flags = @bitCast(raw_flags & 0x1f); // reserved bits are ignored on receive
+        h.flags = @bitCast(raw_flags & 0x3f); // reserved bits are ignored on receive
         h.group_len = try d.int(u32);
         h.capture_us = try d.int(u64);
         const encode_delta = try d.int(u32);

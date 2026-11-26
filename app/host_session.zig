@@ -139,6 +139,8 @@ pub const Stats = struct {
     refreshes: u64 = 0,
     encode_drops: u64 = 0,
     repeats: u64 = 0,
+    /// Idle-refinement frames sent (video flag `refine`), counted in `repeats` too.
+    refines: u64 = 0,
     bytes: u64 = 0,
     shards: u64 = 0,
     parity_shards: u64 = 0,
@@ -839,6 +841,16 @@ pub const HostSession = struct {
         }, .acked_ltr_tokens = d.acked_tokens, .bitrate_bps = s.pending_bitrate };
     }
 
+    /// Room for an idle-refinement step (core/still) on this client's path: the video is
+    /// not held for a stall, and with rate control the controller is calm (not cutting for
+    /// overuse, draining a queue or capped by loss). The regional and tile refiners use
+    /// the same test.
+    pub fn refineOk(s: *const HostSession, now: Micros) bool {
+        if (s.state != .streaming or s.paused_at != null) return false;
+        if (s.cfg.rate_control and !s.ctl.calm(now)) return false;
+        return true;
+    }
+
     pub fn onEncodeDropped(s: *HostSession) void {
         std.debug.assert(s.in_encoder);
         s.in_encoder = false;
@@ -870,7 +882,7 @@ pub const HostSession = struct {
     /// False when the frame did not go out (held for a stalled path, or the session failed).
     pub fn sendFrame(s: *HostSession, id: u32, flags: recovery.FrameFlags, ef: api.EncodedFrame, cf: *const api.CapturedFrame, now: Micros) bool {
         s.next_frame_id = id +% 1;
-        var vflags: proto.video.Flags = .{ .keyframe = flags.keyframe, .ltr_refresh = flags.refresh, .ltr = ef.ltr_token != null, .new_config = s.epoch != 0 and id == s.first_frame };
+        var vflags: proto.video.Flags = .{ .keyframe = flags.keyframe, .ltr_refresh = flags.refresh, .ltr = ef.ltr_token != null, .new_config = s.epoch != 0 and id == s.first_frame, .refine = ef.refine and !flags.keyframe and !flags.refresh };
         if (!ef.keyframe and ef.ltr_refresh) vflags.ltr_refresh = true;
         const cap: u64 = @bitCast(cf.captured_us);
         const enc: u64 = @bitCast(@max(ef.encoded_us, cf.captured_us));
@@ -925,6 +937,7 @@ pub const HostSession = struct {
         if (flags.keyframe) s.stats.keyframes += 1;
         if (flags.refresh) s.stats.refreshes += 1;
         if (cf.repeat) s.stats.repeats += 1;
+        if (vflags.refine) s.stats.refines += 1;
         s.tele.record(.{ .frame_id = id, .capture_start = cf.capture_start_us, .captured = cf.captured_us, .encoded = ef.encoded_us }, null);
         return true;
     }
@@ -970,7 +983,7 @@ pub const HostSession = struct {
     pub fn report(s: *const HostSession, w: *std.Io.Writer) !void {
         const st = s.stats;
         try w.print("host: {s}{s}{s}\n", .{ @tagName(s.end), if (s.reason.len > 0) ": " else "", s.reason });
-        try w.print("  frames {d} (keyframes {d}, refreshes {d}, repeats {d}, encoder drops {d}), {d} MB in {d} shards\n", .{ st.frames, st.keyframes, st.refreshes, st.repeats, st.encode_drops, st.bytes / 1_000_000, st.shards });
+        try w.print("  frames {d} (keyframes {d}, refreshes {d}, repeats {d}, refines {d}, encoder drops {d}), {d} MB in {d} shards\n", .{ st.frames, st.keyframes, st.refreshes, st.repeats, st.refines, st.encode_drops, st.bytes / 1_000_000, st.shards });
         var fb: [32]u8 = undefined;
         try w.print("  stream {s} {s}{s}\n", .{ @tagName(s.codec), s.format.name(&fb), if (st.format_changes > 1) " (changed by a hello)" else "" });
         if (s.decision) |d| try w.print("  loss policy: {s}, loss {d:.2}%, FEC overhead {d:.0}%, {d} parity shards, {d} NACKs ignored, {d} mode switches\n", .{ @tagName(d.mode), d.loss * 100, d.overhead * 100, st.parity_shards, st.nacks_ignored, s.policy.switches });
