@@ -336,6 +336,9 @@ pub const EncoderCaps = struct {
     /// Coded formats per codec (chroma, bit depth, HDR10). A codec in `codecs` with no bits
     /// here does 8-bit 4:2:0 SDR only (`effectiveFormats`).
     coded: FormatCaps = .{},
+    /// Takes `EncodeParams.refine_qp` (idle refinement: a per-frame quality cap that
+    /// forces no keyframe). Without it the host never sends refine frames.
+    refine: bool = false,
 };
 
 /// Session settings, from the design's "Encoder settings": no B-frames, no lookahead,
@@ -366,6 +369,15 @@ pub const EncodeParams = struct {
     acked_ltr_tokens: []const u64 = &.{},
     /// New target bitrate, applied from this frame on without a keyframe; 0 = unchanged.
     bitrate_bps: u64 = 0,
+    /// Idle refinement (core/still): this frame repeats a still picture, so code it as a
+    /// normal P-frame but with its quantiser capped at this QP, on the H.264/HEVC scale
+    /// (0-51; encoders for other scales map it, AV1's q index is about 5x). 0 = normal
+    /// rate control. Only when `caps.refine`; never forces a keyframe, and ignored on a
+    /// frame with `force` set.
+    refine_qp: u8 = 0,
+    /// Mark this frame a long-term reference (only when `caps.ltr`), so a later loss
+    /// refreshes against it: the last refine step of a still picture.
+    force_ltr: bool = false,
 };
 
 pub const EncodedFrame = struct {
@@ -377,6 +389,9 @@ pub const EncodedFrame = struct {
     ltr_token: ?u64 = null,
     /// Set when this frame references only an acked long-term reference (the forced refresh).
     ltr_refresh: bool = false,
+    /// A refine frame (`EncodeParams.refine_qp` was applied). Encoders may leave it unset:
+    /// the app sets it from the params it passed.
+    refine: bool = false,
     /// When the encoder started on it and when it returned it.
     encode_start_us: Micros,
     encoded_us: Micros,

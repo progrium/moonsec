@@ -320,7 +320,37 @@ pub const Controller = struct {
             .probes = self.probes,
         };
     }
+
+    /// How long after a rate decrease (overuse, drain or loss cut) the controller counts
+    /// as unsettled for `calm`.
+    pub const calm_after_decrease_us: i64 = 1_000_000;
+
+    /// The path has room for opportunistic bytes (idle refinement, tiles): not cutting
+    /// for overuse, no decrease (overuse, standing-queue drain or loss) in the last
+    /// `calm_after_decrease_us`, and not capped by loss.
+    pub fn calm(self: *const Controller, now_us: i64) bool {
+        const g = &self.gcc;
+        if (g.state == .decrease or g.usage == .overuse) return false;
+        if (g.loss_cap < g.bitrate) return false;
+        if (g.last_decrease_us >= 0 and now_us - g.last_decrease_us < calm_after_decrease_us) return false;
+        return true;
+    }
 };
+
+test "calm: not while decreasing, after a recent cut, or loss-capped" {
+    const c = try std.testing.allocator.create(Controller);
+    defer std.testing.allocator.destroy(c);
+    c.reset(.{});
+    try std.testing.expect(c.calm(0));
+    c.gcc.state = .decrease;
+    try std.testing.expect(!c.calm(0));
+    c.gcc.state = .hold;
+    c.gcc.last_decrease_us = 5_000_000;
+    try std.testing.expect(!c.calm(5_500_000));
+    try std.testing.expect(c.calm(6_000_000));
+    c.gcc.loss_cap = c.gcc.bitrate / 2;
+    try std.testing.expect(!c.calm(9_000_000));
+}
 
 test "onPathChange keeps the target and drops the path estimates" {
     // About 1.9 MB: on the heap, not a test thread's stack.

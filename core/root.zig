@@ -46,6 +46,9 @@ pub const damage = @import("damage/root.zig");
 /// Regional refine: per-block QP offsets for still regions (encoder QP maps).
 pub const qpmap = @import("qpmap/root.zig");
 
+/// Idle refinement: low-QP refine steps when the screen goes still (core/still).
+pub const still = @import("still/root.zig");
+
 /// Per-frame stage timing and rolling stats for the latency overlay.
 pub const telemetry = @import("telemetry/root.zig");
 

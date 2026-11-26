@@ -97,7 +97,8 @@ Flags (bit 0 = LSB):
 | 2 | `ltr` | This frame is a long-term reference; the client acks `ltr_token` after decoding it. |
 | 3 | `retransmit` | Re-sent shard (NACK response). |
 | 4 | `new_config` | First frame of a new stream config (an IDR): see [display-v0.md](display-v0.md). |
-| 5–7 | | Reserved; ignored on receive. |
+| 5 | `refine` | Idle refinement: the same picture as the previous frame, re-coded at a lower QP so a still screen sharpens. Decoded like any other frame; clients may count it. |
+| 6–7 | | Reserved; ignored on receive. |
 
 **Shard sizes.** Let `S = ceil(group_len / data_shards)`. Every data shard carries `S`
 bytes except the last data shard, which carries `group_len − S·(data_shards − 1)` (at

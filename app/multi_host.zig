@@ -477,6 +477,18 @@ pub const MultiHost = struct {
         }, .acked_ltr_tokens = d.acked_tokens, .bitrate_bps = m.pending_bitrate };
     }
 
+    /// Room for an idle-refinement step: every streaming member's path has it
+    /// (`HostSession.refineOk`), since the one encode goes to all of them.
+    pub fn refineOk(m: *const MultiHost, now: Micros) bool {
+        var any = false;
+        for (m.peers.items) |p| {
+            if (p.left or !p.s.streaming()) continue;
+            if (!p.s.refineOk(now)) return false;
+            any = true;
+        }
+        return any;
+    }
+
     pub fn onEncodeDropped(m: *MultiHost) void {
         std.debug.assert(m.in_encoder);
         m.in_encoder = false;
