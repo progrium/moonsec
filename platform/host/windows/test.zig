@@ -105,6 +105,41 @@ test "Desktop Duplication delivers BGRA frames" {
     try hrOk(c.msw_texture_read(host.dev(d), f.texture, 0, px.ptr, w * 4));
     // A desktop is opaque.
     try testing.expectEqual(@as(u8, 0xFF), px[3]);
+    // The first frame of a duplication has no damage we trust.
+    try testing.expectEqual(@as(u32, 0), f.damage_known);
+    // A rectangle through the staging texture matches the whole-frame read, also one
+    // bigger than the first staging texture (it grows).
+    for ([_][4]u32{ .{ 0, 0, 16, 16 }, .{ w - 70, h - 65, 70, 65 }, .{ 3, 5, 1, 1 } }) |r| {
+        var buf: [70 * 65 * 4]u8 = undefined;
+        try hrOk(c.msw_dup_read_rect(dup, r[0], r[1], r[2], r[3], &buf, r[2] * 4));
+        for (0..r[3]) |y| {
+            const want = px[((r[1] + y) * w + r[0]) * 4 ..][0 .. r[2] * 4];
+            try testing.expectEqualSlices(u8, want, buf[y * r[2] * 4 ..][0 .. r[2] * 4]);
+        }
+    }
+    var one: [4]u8 = undefined;
+    try testing.expect(c.msw_dup_read_rect(dup, w, 0, 1, 1, &one, 4) < 0);
+}
+
+test "Desktop Duplication damage: moves at both ends, through the platform frame" {
+    var f = std.mem.zeroes(c.msw_dup_frame);
+    f.width = 100;
+    f.height = 100;
+    const moves = [_]i32{ 0, 0, 10, 0, 30, 20 };
+    const dirty = [_]i32{ 50, 50, 60, 60 };
+    f.damage_known = 1;
+    f.move_rects = &moves;
+    f.n_moves = 1;
+    f.dirty_rects = &dirty;
+    f.n_dirty = 1;
+    var buf: [8]api.Rect = undefined;
+    try testing.expectEqualSlices(api.Rect, &.{
+        .{ .x = 0, .y = 0, .w = 20, .h = 20 },
+        .{ .x = 10, .y = 0, .w = 20, .h = 20 },
+        .{ .x = 50, .y = 50, .w = 10, .h = 10 },
+    }, host.frameDamage(&f, &buf).?);
+    f.damage_known = 0;
+    try testing.expect(host.frameDamage(&f, &buf) == null);
 }
 
 fn encodeSequence(d: win.D3d, kind: c.msw_enc_kind, codec: u32, ltr: bool) !void {
@@ -128,7 +163,7 @@ fn encodeSequence(d: win.D3d, kind: c.msw_enc_kind, codec: u32, ltr: bool) !void
     for (0..40) |i| {
         // Fresh noise every frame, so every frame is limited by the bitrate.
         try hrOk(c.msw_texture_noise(host.dev(d), tex, @intCast(i + 1)));
-        var p: c.msw_enc_params = .{ .force = c.MSW_FORCE_NONE, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
+        var p: c.msw_enc_params = .{ .force = c.MSW_FORCE_NONE, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0, .qp_map = null, .qp_map_cols = 0, .qp_map_rows = 0, .refine_qp = 0, .force_ltr = 0 };
         if (i == 15) p.bitrate_bps = 500_000; // per-frame bitrate change: must not cost an IDR
         if (i == 30) p.force = c.MSW_FORCE_IDR;
         var out: c.msw_enc_output = undefined;

@@ -8,6 +8,8 @@ test {
     _ = @import("keystore.zig");
     _ = @import("pairing.zig");
     _ = @import("multi_test.zig");
+    _ = @import("qprefine.zig");
+    _ = @import("web_tiles.zig");
 }
 
 fn expectPass(o: simrun.Options) !simrun.Result {
@@ -383,4 +385,175 @@ test "format negotiation: every combination of decoder formats, preferences and 
 test "format negotiation: an encoder without 4:4:4 streams 4:2:0 to a client that wants it" {
     const r = try expectPass(.{ .profile = .clean, .seconds = 1, .audio = false, .input_interval_us = 0, .yuv444 = true, .encoder_formats = .{ .yuv420_8 = true, .yuv420_10 = true } });
     try std.testing.expect(r.host.format.eql(.{}));
+}
+
+test "regional refine: QP maps on still blocks when capture reports damage, never a bad map" {
+    // A lossy WAN with rate control: losses force refreshes and IDRs, and the controller
+    // cuts; none of those frames may carry a map.
+    for ([_]simrun.Profile{ .clean, .wan }) |profile| {
+        const r = try expectPass(.{ .profile = profile, .seconds = 4, .rate_control = profile == .wan });
+        std.debug.print("regional refine, {s}: {d} damaged frames, {d} QP maps, {d} block offsets, {d} refused\n", .{ @tagName(profile), r.host.damaged_frames, r.host.qp_maps, r.host.qp_blocks, r.host.qp_bad });
+        try std.testing.expectEqual(@as(u64, 0), r.host.qp_bad);
+        // The test pattern changes only its stamp bands and a moving bar: with damage from
+        // capture the rest of the frame refines. Without damage (unknown) nothing does.
+        if (r.host.damaged_frames == 0) {
+            try std.testing.expectEqual(@as(u64, 0), r.host.qp_maps);
+        } else try std.testing.expect(r.host.qp_maps > 0 and r.host.qp_blocks > 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idle refinement (core/still)
+
+fn printRefine(r: simrun.Result) void {
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    r.print(&w) catch {};
+    std.debug.print("{s}  refine: {d} frames, {d} sequences ({d} cut short, {d} restarts), {d} forced marks, {d} refreshes from one, first step {d} us into the still\n", .{ w.buffered(), r.host.refines, r.host.refine_sequences, r.host.refine_interrupted, r.host.refine_restarts, r.host.forced_ltrs, r.host.refreshes_from_forced, r.host.refine_latency_us });
+}
+
+test "a still screen gets three refine steps, the last marked long-term, and no keyframe" {
+    const o: simrun.Options = .{ .profile = .clean, .seconds = 4, .still = &.{.{ .from_us = 1_000_000, .until_us = 2_500_000 }} };
+    const r = try simrun.run(std.testing.allocator, o, null);
+    errdefer printRefine(r);
+    try std.testing.expectEqual(@as(u64, 3), r.host.refines);
+    try std.testing.expectEqual(@as(u64, 3), r.client.refines); // the flag reaches the client
+    try std.testing.expectEqual(@as(u64, 1), r.host.refine_sequences);
+    try std.testing.expectEqual(@as(u64, 0), r.host.refine_interrupted);
+    try std.testing.expectEqual(@as(u64, 1), r.host.forced_ltrs);
+    try std.testing.expectEqual(@as(u64, 1), r.host.keyframes);
+    // Within refine_after (150 ms) of the last new frame, which is at most a frame before
+    // the window, plus a tick.
+    try std.testing.expect(r.host.refine_latency_us > 100_000 and r.host.refine_latency_us <= 150_000 + 2_000);
+    try std.testing.expectEqual(@as(u64, 0), r.client.corrupt);
+    try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+    try std.testing.expectEqual(@as(u64, 0), r.client.lost);
+}
+
+test "refinement off, or nothing still: no refine frames" {
+    const off = try simrun.run(std.testing.allocator, .{ .profile = .clean, .seconds = 3, .refine = false, .still = &.{.{ .from_us = 1_000_000, .until_us = 2_000_000 }} }, null);
+    try std.testing.expectEqual(@as(u64, 0), off.host.refines);
+    const busy = try simrun.run(std.testing.allocator, .{ .profile = .clean, .seconds = 3 }, null);
+    try std.testing.expectEqual(@as(u64, 0), busy.host.refines);
+}
+
+test "new content stops a refine sequence; the next still screen refines again" {
+    // 160 ms still: a step or two (the first about 150 ms after the last new frame), then
+    // the screen changes. Then a long still, refined in full.
+    const o: simrun.Options = .{ .profile = .clean, .seconds = 4, .still = &.{
+        .{ .from_us = 1_000_000, .until_us = 1_160_000 },
+        .{ .from_us = 2_000_000, .until_us = 3_000_000 },
+    } };
+    const r = try simrun.run(std.testing.allocator, o, null);
+    errdefer printRefine(r);
+    try std.testing.expectEqual(@as(u64, 1), r.host.refine_interrupted);
+    try std.testing.expectEqual(@as(u64, 1), r.host.refine_sequences);
+    try std.testing.expect(r.host.refines >= 4 and r.host.refines <= 5);
+    try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+}
+
+test "a loss after refinement refreshes against the refined long-term reference, then refines again" {
+    const o: simrun.Options = .{ .seed = 3, .profile = .lan, .seconds = 4, .still = &.{.{ .from_us = 1_000_000, .until_us = 3_500_000 }}, .outage_at_us = 1_400_000, .outage_us = 300_000 };
+    const r = try simrun.run(std.testing.allocator, o, null);
+    errdefer printRefine(r);
+    try std.testing.expect(r.host.refreshes >= 1);
+    try std.testing.expect(r.host.refreshes_from_forced >= 1);
+    // The refresh is at normal quality again: refined once more.
+    try std.testing.expect(r.host.refine_restarts >= 1);
+    try std.testing.expect(r.host.refine_sequences >= 2);
+    try std.testing.expectEqual(@as(u64, 0), r.client.corrupt);
+    try std.testing.expectEqual(@as(u64, 0), r.client.unreadable);
+}
+
+// ---------------------------------------------------------------------------
+// Lossless tiles (core/refine). The synthetic presenter checks every tile pixel it draws
+// against the video under it: a tile shown over content that changed is a failure.
+
+fn printTiles(r: simrun.Result) void {
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    r.print(&w) catch {};
+    std.debug.print("{s}  tiles: host encoded {d}, sent {d} (resent {d}), acked {d}, {d} KB, {d} resyncs; client complete {d}, shown {d}, cleared by damage {d}, gaps {d}; {d} presents drew {d} tile pixels, {d} wrong in {d} presents, {d} on screen at the end\n", .{
+        w.buffered(),              r.host.tiles_encoded,   r.host.tiles_sent,    r.host.tile_resends,        r.host.tiles_acked,
+        r.host.tile_bytes / 1000,  r.host.tile_resyncs,    r.client.tiles,       r.client.tiles_shown,       r.client.tiles_invalidated,
+        r.client.tile_gaps,        r.client.tile_presents, r.client.tile_pixels, r.client.tile_wrong_pixels, r.client.tile_wrong_presents,
+        r.client.tile_last_pixels,
+    });
+}
+
+const text_panel: simrun.TextPanel = .{};
+
+test "tiles: a still screen gets lossless tiles, every one exact, gone the present the screen changes" {
+    for ([_]bool{ false, true }) |report_damage| {
+        const o: simrun.Options = .{ .profile = .clean, .seconds = 4, .width = 640, .height = 360, .tiles = true, .text = text_panel, .report_damage = report_damage, .still = &.{.{ .from_us = 1_000_000, .until_us = 2_500_000 }} };
+        const r = try expectPass(o);
+        errdefer printTiles(r);
+        try std.testing.expect(r.host.tiles_sent > 0);
+        try std.testing.expect(r.client.tiles_shown > 0);
+        try std.testing.expect(r.client.tile_presents > 0);
+        // The barcode and digits went into tiles while still, and were cleared when they
+        // changed after it (in the same present, or tile_wrong_pixels would count it).
+        try std.testing.expect(r.client.tiles_invalidated > 0);
+        try std.testing.expectEqual(@as(u64, 0), r.client.tile_wrong_pixels);
+        // The text panel never changes: its tiles are on screen at the end.
+        try std.testing.expect(r.client.tile_last_pixels > 0);
+        try std.testing.expectEqual(@as(u64, 0), r.client.tile_gaps);
+    }
+}
+
+test "tiles: off on either side, or no text, sends none" {
+    const host_off = try expectPass(.{ .profile = .clean, .seconds = 2, .tiles = false, .text = text_panel });
+    try std.testing.expectEqual(@as(u64, 0), host_off.host.tiles_sent);
+    try std.testing.expectEqual(@as(u64, 0), host_off.client.tile_presents);
+    // The bare pattern: flat background and changing bands, nothing worth a tile but the
+    // cells along the flash square's edge.
+    const bare = try expectPass(.{ .profile = .clean, .seconds = 2, .tiles = true });
+    try std.testing.expectEqual(@as(u64, 0), bare.client.tile_wrong_pixels);
+}
+
+test "tiles: text that stays still while the rest moves gets tiles; a changed line is cleared and sent again" {
+    const o: simrun.Options = .{ .profile = .clean, .seconds = 4, .width = 640, .height = 360, .tiles = true, .text = .{ .period = 30 }, .report_damage = true, .rate_control = true };
+    const r = try expectPass(o);
+    errdefer printTiles(r);
+    try std.testing.expect(r.client.tiles_shown > 0);
+    try std.testing.expect(r.client.tiles_invalidated > 0);
+    try std.testing.expect(r.host.tiles_sent > r.client.tiles_invalidated); // the changed lines went out again
+    try std.testing.expectEqual(@as(u64, 0), r.client.tile_wrong_pixels);
+}
+
+test "tiles: under loss, rate control and outages, never a wrong pixel, and video delay holds" {
+    for ([_]simrun.Profile{ .lan, .wan, .longhaul }, 1..) |profile, seed| {
+        const base: simrun.Options = .{ .seed = seed, .width = 640, .height = 360, .profile = profile, .seconds = 5, .rate_control = true, .loss_policy = profile == .longhaul, .text = .{ .period = 45 }, .report_damage = seed % 2 == 0, .still = &.{.{ .from_us = 1_500_000, .until_us = 3_000_000 }}, .outage_at_us = 3_500_000, .outage_us = 200_000 };
+        var with = base;
+        with.tiles = true;
+        const off = try simrun.run(std.testing.allocator, base, null);
+        const r = try simrun.run(std.testing.allocator, with, null);
+        errdefer printTiles(r);
+        try std.testing.expectEqual(@as(u64, 0), r.client.tile_wrong_pixels);
+        try std.testing.expectEqual(@as(u64, 0), r.client.tile_bad_ops);
+        try std.testing.expectEqual(@as(u64, 0), r.client.corrupt);
+        try std.testing.expect(r.client.tiles_shown > 0);
+        // Tiles only take spare bandwidth: the video's delay stays where it was.
+        std.debug.print("tiles, {s}: glass-to-glass p50 {d} us p99 {d} us (without tiles {d} / {d}); presented {d} ({d}); tiles shown {d}, resent {d}\n", .{ @tagName(profile), r.client.total_p50_us, r.client.total_p99_us, off.client.total_p50_us, off.client.total_p99_us, r.client.presented, off.client.presented, r.client.tiles_shown, r.host.tile_resends });
+        // (Longhaul's 5% loss makes single runs too noisy to compare.)
+        if (profile != .longhaul) try std.testing.expect(r.client.total_p50_us <= off.client.total_p50_us + 2_000);
+    }
+}
+
+test "tiles: path flaps and a reconnect never leave a stale tile on screen" {
+    const paths = [_]@import("pathsim.zig").Config{
+        .{ .idle_us = 1_000_000, .flaps = &.{.{ .at_us = 2_000_000, .outage_us = 500_000 }} },
+        .{ .drops = &.{.{ .at_us = 2_000_000, .outage_us = 1_000_000 }} },
+    };
+    for (paths, 0..) |pc, i| {
+        const o: simrun.Options = .{ .seed = 2 + i, .profile = .lan, .seconds = if (i == 0) 4 else 8, .width = 640, .height = 360, .tiles = true, .text = .{ .period = 60 }, .path = pc };
+        const r = try simrun.run(std.testing.allocator, o, null);
+        errdefer printTiles(r);
+        if (r.failure(o)) |why| {
+            std.debug.print("{s}\n", .{why});
+            return error.RunFailed;
+        }
+        try std.testing.expect(r.client.tiles_shown > 0);
+        try std.testing.expectEqual(@as(u64, 0), r.client.tile_wrong_pixels);
+    }
 }

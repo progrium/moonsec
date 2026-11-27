@@ -28,6 +28,16 @@ typedef struct msw_dup_frame {
     uint32_t pointer_visible;
     /* A new pointer shape is available (msw_dup_pointer_shape). */
     uint32_t pointer_shape_changed;
+    /* Frames with a present: 1 when the rectangles below say what changed since the
+     * previous frame (0: unknown, e.g. the first frame of a duplication). Owned by the
+     * msw_dup, valid until the next acquire. move_rects: n_moves DXGI_OUTDUPL_MOVE_RECTs
+     * (source x, y; destination left, top, right, bottom); dirty_rects: n_dirty RECTs
+     * (left, top, right, bottom); in the desktop image's pixels. */
+    uint32_t damage_known;
+    const int32_t *move_rects;
+    uint32_t n_moves;
+    const int32_t *dirty_rects;
+    uint32_t n_dirty;
 } msw_dup_frame;
 
 /* Duplicates output `output_index` of the device's adapter. The device must be a
@@ -64,6 +74,10 @@ msw_hr msw_displays(msw_d3d *d, uint32_t adapter_index, msw_display_info *out, u
 msw_hr msw_dup_acquire(msw_dup *dup, uint32_t timeout_ms, msw_dup_frame *out);
 /* The last copied image (null before the first frame). */
 void *msw_dup_last_texture(const msw_dup *dup);
+/* Copies the w x h rectangle at x, y of the last copied image as B, G, R, A rows
+ * `out_stride` bytes apart, through a staging texture of at least that size (kept for the
+ * next call). Capture thread (it uses the device's immediate context). */
+msw_hr msw_dup_read_rect(msw_dup *dup, uint32_t x, uint32_t y, uint32_t w, uint32_t h, void *out, uint32_t out_stride);
 /* Copies the current pointer shape (DXGI_OUTDUPL_POINTER_SHAPE_INFO type, size, pitch,
  * hotspot) into buf; *needed gets the size required. */
 msw_hr msw_dup_pointer_shape(msw_dup *dup, void *buf, uint32_t len, uint32_t *needed, uint32_t *type,
@@ -87,6 +101,9 @@ typedef struct msw_enc_caps {
     uint32_t ltr;
     uint32_t max_slices;
     uint32_t gpu_input, cpu_input;
+    /* Regional refine: the QP map block edge for the configured codec; 0 = no QP maps. */
+    uint32_t qp_map_block;
+    uint32_t refine; /* takes msw_enc_params.refine_qp (idle refinement) */
 } msw_enc_caps;
 
 typedef struct msw_enc_config {
@@ -102,6 +119,13 @@ typedef struct msw_enc_params {
     uint64_t bitrate_bps; /* 0 = unchanged */
     const uint64_t *acked_ltr_tokens;
     uint32_t acked_ltr_count;
+    /* Regional refine: QP offsets per caps.qp_map_block block, cols x rows; NULL = none. */
+    const int8_t *qp_map;
+    uint32_t qp_map_cols, qp_map_rows;
+    /* Idle refinement: cap this P-frame's QP (H.264/HEVC scale); 0 = normal. */
+    uint32_t refine_qp;
+    /* Mark this frame a long-term reference (when the encoder has them). */
+    uint32_t force_ltr;
 } msw_enc_params;
 
 typedef struct msw_enc_output {

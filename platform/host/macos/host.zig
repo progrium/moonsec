@@ -7,6 +7,9 @@
 //!                  the frame's CVPixelBufferRef (IOSurface-backed), NV12 by default.
 //!                  captured_us is SCK's display time, never later than arrival. A
 //!                  window captured at its own size is followed when it is resized.
+//!                  Damage: SCK's dirty rects (points) scaled to frame pixels
+//!                  (damage.zig), for display captures; null for a window. `readRect`
+//!                  copies a rectangle of a BGRA frame (NV12: error.Unsupported).
 //!   Encoder        VideoToolbox. Default: the low-latency encoder with long-term
 //!                  references, RealTime on, ExpectedFrameRate 1000 (S7b). Falls back to
 //!                  the regular encoder (no LTR) when the low-latency one is missing.
@@ -27,6 +30,8 @@ const api = @import("platform");
 const core = @import("core");
 pub const c = @import("mh_c");
 pub const keymap = @import("keymap.zig");
+/// SCK's dirty rects in points as frame pixels (portable, tested by `zig build test`).
+pub const damage = @import("damage.zig");
 
 const log = std.log.scoped(.mac_host);
 
@@ -97,6 +102,8 @@ pub const Capture = struct {
     input: ?*c.mh_input = null,
     /// A window captured at its own size: when to look at its size next.
     next_window_check_us: api.Micros = 0,
+    /// The damage of the frame that is out.
+    damage_buf: [c.MH_DIRTY_MAX]api.Rect = undefined,
 
     pub fn create(format: api.PixelFormat) api.Error!Capture {
         _ = try fmtToC(format);
@@ -193,6 +200,7 @@ pub const Capture = struct {
             .seq = f.seq,
             .capture_start_us = @min(start_us, f.arrived_us),
             .captured_us = f.captured_us,
+            .damage = frameDamage(&f, &self.damage_buf),
         };
         self.setLast(frame);
         return frame;
@@ -209,7 +217,20 @@ pub const Capture = struct {
         _ = c.mh_cf_retain(f.image.gpu);
         f.repeat = true;
         f.capture_start_us = nowUs();
+        f.damage = &.{};
         return f;
+    }
+
+    /// Copies `rect` of a BGRA frame as bgra8 rows, locking its IOSurface read-only
+    /// (api.Capture.VTable.readRect). NV12 frames: error.Unsupported.
+    pub fn readRect(_: *Capture, frame: *const api.CapturedFrame, rect: api.Rect, out: []u8) api.Error!void {
+        if (frame.image.format != .bgra8) return error.Unsupported;
+        const pb = frame.image.gpu orelse return error.Closed;
+        const row = @as(usize, rect.w) * 4;
+        if (out.len < row * rect.h) return error.Unsupported;
+        const rc = c.mh_frame_read_rect(pb, rect.x, rect.y, rect.w, rect.h, out.ptr, @intCast(row));
+        if (rc == c.MH_ERR_UNSUPPORTED) return error.Unsupported;
+        try check("capture read rect", rc);
     }
 
     pub fn release(_: *Capture, frame: *const api.CapturedFrame) void {
@@ -239,6 +260,15 @@ pub const Capture = struct {
         return s;
     }
 };
+
+/// An acquired frame's dirty rects as frame pixels in `buf` (null when unknown).
+pub fn frameDamage(f: *const c.mh_frame, buf: []api.Rect) ?[]const api.Rect {
+    const d = f.dirty orelse return null;
+    const n = @min(f.n_dirty, c.MH_DIRTY_MAX);
+    var pts: [c.MH_DIRTY_MAX]damage.PointRect = undefined;
+    for (d[0..n], pts[0..n]) |r, *p| p.* = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+    return damage.fromPoints(pts[0..n], f.src_w, f.src_h, f.width, f.height, buf);
+}
 
 /// The displays ScreenCaptureKit can capture, main display first. Ids are indexes in
 /// CGGetActiveDisplayList order (what `CaptureConfig.display` takes); positions are in

@@ -35,10 +35,16 @@ pub const Hello = struct {
     /// means 8-bit 4:2:0 SDR only (the 16-byte hello).
     formats: api.FormatCaps = .{},
     display: api.DisplayCaps = .{},
+    /// Lossless tile codecs the client decodes and composites (core/refine/wire.zig
+    /// `caps_*`); 0: no tiles.
+    tiles: u32 = 0,
 
     /// The original hello, without formats or display.
     pub const base_len = 16;
-    pub const len = 24;
+    /// Plus formats and display (Phase 5F).
+    pub const format_len = 24;
+    /// Plus tile caps.
+    pub const len = 28;
 
     pub fn encode(h: Hello, out: *[len]u8) void {
         @memset(out, 0);
@@ -49,21 +55,23 @@ pub const Hello = struct {
         h.formats.encode(out[16..20]);
         out[20] = @intFromBool(h.display.hdr10);
         std.mem.writeInt(u16, out[22..24], h.display.peak_nits, .little);
+        std.mem.writeInt(u32, out[24..28], h.tiles, .little);
     }
 
     /// Takes the 16-byte hello of older clients too.
     pub fn decode(b: []const u8) ?Hello {
-        if (b.len != base_len and b.len != len) return null;
+        if (b.len != base_len and b.len != format_len and b.len != len) return null;
         var h: Hello = .{
             .nonce = std.mem.readInt(u32, b[0..4], .little),
             .codecs = @bitCast(b[4]),
             .max_width = std.mem.readInt(u32, b[8..12], .little),
             .max_height = std.mem.readInt(u32, b[12..16], .little),
         };
-        if (b.len == len) {
+        if (b.len >= format_len) {
             h.formats = api.FormatCaps.decode(b[16..20]);
             h.display = .{ .hdr10 = b[20] & 1 != 0, .peak_nits = std.mem.readInt(u16, b[22..24], .little) };
         }
+        if (b.len == len) h.tiles = std.mem.readInt(u32, b[24..28], .little);
         return h;
     }
 
@@ -195,9 +203,14 @@ test "hello and config carry formats, display and HDR metadata" {
         .codecs = .{ .hevc = true, .av1 = true },
         .formats = .{ .hevc = api.Formats.all, .av1 = .{ .yuv420_8 = true, .yuv420_10 = true, .hdr10 = true } },
         .display = .{ .hdr10 = true, .peak_nits = 1000 },
+        .tiles = 1,
     };
     h.encode(&hb);
     try std.testing.expectEqual(@as(?Hello, h), Hello.decode(&hb));
+    // The 24-byte hello of clients before tiles.
+    var older = h;
+    older.tiles = 0;
+    try std.testing.expectEqual(@as(?Hello, older), Hello.decode(hb[0..Hello.format_len]));
     try std.testing.expectEqual(@as(?Hello, null), Hello.decode(hb[0..20]));
 
     var cb: [Config.len]u8 = undefined;

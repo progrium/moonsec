@@ -204,6 +204,20 @@ pub const Presenter = struct {
         return .{ .presented_us = at };
     }
 
+    /// Lossless tiles (see `api.Presenter.VTable.tiles`): the ops go to the Metal tile
+    /// layer as they come, and `macc_presenter_draw` blends it over the next pictures.
+    pub fn tiles(p: *Presenter, u: *const api.TileUpdate) api.Error!void {
+        for (u.ops) |op| switch (op) {
+            .clear_all => try ok("tiles", c.macc_presenter_tiles_reset(p.pr, u.width, u.height)),
+            .clear => |r| try ok("tiles", c.macc_presenter_tiles_put(p.pr, r.x, r.y, r.w, r.h, null, 0)),
+            .put => |t| {
+                std.debug.assert(t.pixels.len >= @as(usize, t.rect.w) * t.rect.h * 4);
+                try ok("tiles", c.macc_presenter_tiles_put(p.pr, t.rect.x, t.rect.y, t.rect.w, t.rect.h, t.pixels.ptr, t.rect.w * 4));
+            },
+        };
+        c.macc_presenter_tiles_show(p.pr, @intFromBool(u.visible));
+    }
+
     fn countFrame(p: *Presenter, now: api.Micros) void {
         if (p.fps_count == 0) p.fps_window_start = now;
         p.fps_count += 1;

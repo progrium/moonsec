@@ -114,13 +114,24 @@ int mlc_window_set_mode(mlc_window *w, int mode);
 void mlc_window_resize(mlc_window *w, uint32_t width, uint32_t height);
 void mlc_window_size(const mlc_window *w, uint32_t *width, uint32_t *height);
 
-/* Draws a frame letterboxed into the window (NULL: clear to black). */
+/* Draws a frame letterboxed into the window (NULL: clear to black), then the tile layer
+ * over it while that is shown (mlc_window_tiles_*). */
 int mlc_window_draw(mlc_window *w, const mlc_frame *f);
 /* Draws the overlay (if one is set) over what mlc_window_draw drew. */
 int mlc_window_draw_overlay(mlc_window *w);
 /* The overlay image (straight-alpha 0xAARRGGBB words, `stride` words per row), drawn at
  * the top-left corner; NULL hides it. Copied. */
 int mlc_window_set_overlay(mlc_window *w, const uint32_t *pixels, uint32_t width, uint32_t height, uint32_t stride);
+/* The tile layer (lossless tiles): an image of the stream's size, transparent except
+ * where tiles were put, that mlc_window_draw blends over the video while it is shown,
+ * through the same letterbox and filtering, before the overlay. Never part of a frame.
+ * mlc_window_tiles_reset makes it width x height and all transparent (0 x 0 drops it).
+ * mlc_window_tiles_put writes BGRA pixels (`stride` bytes per row, opaque) at x, y, or
+ * makes the rectangle transparent when `pixels` is NULL; rectangles are trimmed to the
+ * layer, and ignored while there is none. */
+int mlc_window_tiles_reset(mlc_window *w, uint32_t width, uint32_t height);
+int mlc_window_tiles_put(mlc_window *w, uint32_t x, uint32_t y, uint32_t width, uint32_t height, const uint8_t *pixels, uint32_t stride);
+void mlc_window_tiles_show(mlc_window *w, int on);
 /* eglSwapBuffers. */
 int mlc_window_present(mlc_window *w);
 

@@ -15,6 +15,28 @@ header ([mlh_enc.h](mlh_enc.h)) that translate-c reads; Zig never sees libva or 
 | `nvenc` | libcuda and libnvidia-encode loaded at run time ([enc_nv.c](enc_nv.c) over [enc_nvenc.c](enc_nvenc.c)), on the NVENC core shared with the Windows host (`platform/nvenc`). H.264 and HEVC, the same low-latency settings as Windows. A dma-buf goes to CUDA with `cuImportExternalMemory`; when CUDA refuses it (a buffer another driver exported) frames are mapped and uploaded from then on. `--device` / `Options.device` is a CUDA ordinal. Compile-only: no NVIDIA hardware is planned. | Long-term references when the GPU has them; IDR otherwise. |
 | `auto` | The first of `vaapi`, `nvenc`, `software` that opens. | |
 
+Regional refine (per-block QP maps, [docs/regional-refine.md](../../docs/regional-refine.md)):
+x264 through libavcodec's regions of interest, NVENC through its QP delta map, VAAPI through
+ROI rectangles when the driver takes delta QP under rate control. OpenH264 has none.
+## Idle refinement
+
+When the screen goes still the host re-encodes the last picture as a few refine frames
+(`EncodeParams.refine_qp`: QP caps 24, 16, 8, the last marked long-term with `force_ltr`;
+see `core/still`). Each backend sets `caps.refine`:
+
+- `software`: libavcodec gives libx264 no per-frame QP (it never sets `i_qpplus1`, and
+  `reconfig_encoder` passes no `qpmax`), and region-of-interest quant offsets are undone by
+  the one-frame VBV. A refine frame instead gets 4 to 8 times the rate and a VBV of twice
+  that many frame budgets through `x264_encoder_reconfig`, no keyframe, and the next
+  normal frame goes back. At 640x368, 1.5 Mbit/s on synthetic text, three steps take luma
+  PSNR from 19.6 to 25.3 dB where three plain repeats stay at 19.6 (`zig build
+  test-linux-enc`).
+- `nvenc`: `nvEncReconfigureEncoder` with `maxQP` and a four-frame VBV, no IDR or reset
+  (platform/nvenc).
+- `vaapi`: `max_qp` in the rate-control parameters and a four-frame HRD buffer for that
+  frame; `force_ltr` marks it in the planner (`refs_plan_frame_mark`). Whether a driver
+  honours `max_qp` under CBR is for the hardware check to show.
+
 ## Long-term references on VAAPI
 
 libavcodec's VAAPI encoders don't expose long-term references or per-frame reference

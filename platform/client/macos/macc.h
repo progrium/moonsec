@@ -183,8 +183,8 @@ int macc_presenter_uses_layer(macc_presenter *p);
 void macc_presenter_sync_size(macc_presenter *p);
 void macc_presenter_set_mode(macc_presenter *p, uint32_t mode);
 /* Takes the next drawable (waiting up to `timeout_ms`; MACC_E_TIMEOUT) if none is
- * held, then draws `frame` (NULL: clear to black) and the overlay, if one was set,
- * into it and commits the GPU work. Does not present. */
+ * held, then draws `frame` (NULL: clear to black), the tile layer while it is shown,
+ * and the overlay, if one was set, into it and commits the GPU work. Does not present. */
 macc_status macc_presenter_draw(macc_presenter *p, const macc_frame *frame, uint32_t timeout_ms);
 /* Presents what draw drew (layer path; the offscreen path just finishes the work).
  * Smooth mode waits for the drawable's presented handler (up to 100 ms). *presented_ns
@@ -196,6 +196,18 @@ macc_status macc_presenter_present(macc_presenter *p, uint64_t *presented_ns);
  * pixel; w = 0 or h = 0 hides it. Clipped to 1024 x 512. */
 macc_status macc_presenter_set_overlay(macc_presenter *p, const uint32_t *pixels, uint32_t w, uint32_t h,
                                        uint32_t stride);
+/* The tile layer (lossless tiles): a BGRA image of the stream's size, transparent except
+ * where tiles were put, that macc_presenter_draw blends over the video's letterboxed
+ * quad (same sampler) while it is shown, before the overlay. Never part of a frame.
+ * macc_presenter_tiles_reset makes it w x h and all transparent (0 x 0 drops it).
+ * macc_presenter_tiles_put writes BGRA pixels (`stride` bytes per row, opaque) at x, y,
+ * or makes the rectangle transparent when `pixels` is NULL; rectangles are trimmed to
+ * the layer, and ignored while there is none. Writes wait for the last draw's GPU work
+ * if it is still running, since it may sample the layer. */
+macc_status macc_presenter_tiles_reset(macc_presenter *p, uint32_t w, uint32_t h);
+macc_status macc_presenter_tiles_put(macc_presenter *p, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                     const uint8_t *pixels, uint32_t stride);
+void macc_presenter_tiles_show(macc_presenter *p, int on);
 /* Test hook: the drawn target's pixel at (x, y) as 0xAARRGGBB (after draw, before
  * present; the layer path needs MACC_PRESENTER_READBACK). */
 macc_status macc_presenter_read_pixel(macc_presenter *p, uint32_t x, uint32_t y, uint32_t *out);

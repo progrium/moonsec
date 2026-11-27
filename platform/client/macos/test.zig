@@ -253,6 +253,49 @@ test "Metal offscreen present: colour conversion, letterbox, overlay" {
     try check("present", c.macc_presenter_present(wide, &ns));
 }
 
+test "Metal tile layer: put tiles blend over the scaled video, clears and hiding show it again" {
+    const pr = try createPresenter(null, 320, 240, 0);
+    defer c.macc_presenter_destroy(pr);
+    var dec: ?*c.macc_decoder = null;
+    try check("macc_decoder_create", c.macc_decoder_create(c.MACC_CODEC_H264, 1, &dec));
+    defer c.macc_decoder_destroy(dec);
+    var aus: [16][]const u8 = undefined;
+    _ = splitAccessUnits(.h264, solid_h264, &aus);
+    var f: c.macc_frame = undefined;
+    var got: c_int = 0;
+    try check("decode", c.macc_decoder_decode(dec, aus[0].ptr, aus[0].len, 0, &f, &got));
+    defer c.macc_decoder_release_frame(dec, &f);
+
+    // A 16x16 red tile at (32, 32) of the 128x96 stream: (80, 80)-(120, 120) at 2.5x.
+    const red: [16 * 16]u32 = @splat(0xFFFF0000);
+    try check("tiles_reset", c.macc_presenter_tiles_reset(pr, 128, 96));
+    try check("tiles_put", c.macc_presenter_tiles_put(pr, 32, 32, 16, 16, @ptrCast(&red), 16 * 4));
+    const Want = enum { tile, video };
+    const at = struct {
+        fn at(p: ?*c.macc_presenter, fr: *const c.macc_frame, want: Want) !void {
+            try check("draw", c.macc_presenter_draw(p, fr, 1000));
+            var px: u32 = 0;
+            try check("read_pixel", c.macc_presenter_read_pixel(p, 100, 100, &px));
+            switch (want) {
+                .tile => try testing.expectEqual(@as(u32, 0xFF0000), px & 0xFFFFFF),
+                .video => try testing.expect(near(@truncate(px), solid_rgb[2], 12)),
+            }
+            try check("read_pixel", c.macc_presenter_read_pixel(p, 30, 200, &px));
+            try testing.expect(near(@truncate(px), solid_rgb[2], 12));
+            var ns: u64 = 0;
+            try check("present", c.macc_presenter_present(p, &ns));
+        }
+    }.at;
+    c.macc_presenter_tiles_show(pr, 1);
+    try at(pr, &f, .tile);
+    c.macc_presenter_tiles_show(pr, 0);
+    try at(pr, &f, .video);
+    c.macc_presenter_tiles_show(pr, 1);
+    try at(pr, &f, .tile);
+    try check("tiles_put", c.macc_presenter_tiles_put(pr, 0, 0, 64, 64, null, 0));
+    try at(pr, &f, .video);
+}
+
 test "Metal present through a CAMetalLayer outside any window" {
     const pr = try createPresenter(null, 320, 240, c.MACC_PRESENTER_DETACHED_LAYER | c.MACC_PRESENTER_READBACK);
     defer c.macc_presenter_destroy(pr);

@@ -292,7 +292,7 @@ pub const Gcc = struct {
                 self.batch_lost += 1;
                 continue;
             }
-            self.acked.add(r.recv_us, r.size);
+            if (r.frame != PacketResult.opportunistic) self.acked.add(r.recv_us, r.size);
             self.last_recv = @max(self.last_recv, r.recv_us);
             // A probe frame leaves at twice the link rate on purpose: the queue it
             // builds (and the next frame meets) is ours, short, and not congestion.

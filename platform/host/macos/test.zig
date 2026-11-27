@@ -426,9 +426,47 @@ test "ScreenCaptureKit: display frames with timestamps" {
     if (frames == 0) return error.NoFrames;
     const r = (try cap.repeatLast()).?;
     try testing.expect(r.repeat);
+    try testing.expectEqual(@as(usize, 0), r.damage.?.len);
     cap.release(&r);
     try cap.resize(640, 360, 15);
     cap.stop();
+}
+
+test "capture damage: dirty rects in points become frame pixels; a window's are unknown" {
+    var f = std.mem.zeroes(c.mh_frame);
+    f.width = 2880;
+    f.height = 1800;
+    var buf: [c.MH_DIRTY_MAX]api.Rect = undefined;
+    try testing.expect(host.frameDamage(&f, &buf) == null);
+    const dirty = [_]c.mh_rectf{ .{ .x = 10, .y = 20, .w = 30.5, .h = 40 }, .{ .x = 1430, .y = 890, .w = 10.5, .h = 10.5 } };
+    f.dirty = &dirty;
+    f.n_dirty = dirty.len;
+    f.src_w = 1440;
+    f.src_h = 900;
+    try testing.expectEqualSlices(api.Rect, &.{ .{ .x = 20, .y = 40, .w = 61, .h = 80 }, .{ .x = 2860, .y = 1780, .w = 20, .h = 20 } }, host.frameDamage(&f, &buf).?);
+    f.src_w = 0;
+    f.src_h = 0;
+    try testing.expect(host.frameDamage(&f, &buf) == null);
+}
+
+test "capture readRect: a rectangle of a BGRA pixel buffer; NV12 is unsupported" {
+    var cap = try host.Capture.create(.bgra8);
+    defer cap.destroy();
+    const pb = c.mh_pixel_buffer_create(64, 48, c.MH_FMT_BGRA) orelse return error.MacHost;
+    defer c.mh_cf_release(pb);
+    try testing.expectEqual(@as(c_int, c.MH_OK), c.mh_pixel_buffer_fill(pb, 1, 1));
+    const f: api.CapturedFrame = .{ .image = .{ .width = 64, .height = 48, .format = .bgra8, .gpu = pb }, .seq = 1, .capture_start_us = 0, .captured_us = 0 };
+    var whole: [64 * 48 * 4]u8 = undefined;
+    try cap.readRect(&f, .{ .x = 0, .y = 0, .w = 64, .h = 48 }, &whole);
+    var part: [7 * 5 * 4]u8 = undefined;
+    try cap.readRect(&f, .{ .x = 50, .y = 40, .w = 7, .h = 5 }, &part);
+    for (0..5) |y| try testing.expectEqualSlices(u8, whole[((40 + y) * 64 + 50) * 4 ..][0 .. 7 * 4], part[y * 7 * 4 ..][0 .. 7 * 4]);
+    try testing.expectError(error.BackendFailed, cap.readRect(&f, .{ .x = 60, .y = 0, .w = 7, .h = 1 }, &part));
+
+    const nv = c.mh_pixel_buffer_create(64, 48, c.MH_FMT_NV12) orelse return error.MacHost;
+    defer c.mh_cf_release(nv);
+    const g: api.CapturedFrame = .{ .image = .{ .width = 64, .height = 48, .format = .nv12, .gpu = nv }, .seq = 1, .capture_start_us = 0, .captured_us = 0 };
+    try testing.expectError(error.Unsupported, cap.readRect(&g, .{ .x = 0, .y = 0, .w = 1, .h = 1 }, &part));
 }
 
 test "ScreenCaptureKit: system audio" {

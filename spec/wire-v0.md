@@ -56,7 +56,8 @@ kind skips the datagram.
 | 3 | `input` | client → host | Kinds defined with the input module. |
 | 4 | `control_fast` | both | Small latency-critical control: frame acks, feedback. |
 | 5 | `mic` | client → host | Reserved; not in v1. |
-| 6–255 | | | Unassigned. |
+| 6 | `refine` | host → client | Lossless tiles: kind 1 tile piece, kind 2 damage: [refine-v0.md](refine-v0.md). |
+| 7–255 | | | Unassigned. |
 
 Reliable control (session setup, clipboard, display config, file transfer) runs on a QUIC
 stream, not datagrams: [control-v0.md](control-v0.md).
@@ -97,7 +98,8 @@ Flags (bit 0 = LSB):
 | 2 | `ltr` | This frame is a long-term reference; the client acks `ltr_token` after decoding it. |
 | 3 | `retransmit` | Re-sent shard (NACK response). |
 | 4 | `new_config` | First frame of a new stream config (an IDR): see [display-v0.md](display-v0.md). |
-| 5–7 | | Reserved; ignored on receive. |
+| 5 | `refine` | Idle refinement: the same picture as the previous frame, re-coded at a lower QP so a still screen sharpens. Decoded like any other frame; clients may count it. |
+| 6–7 | | Reserved; ignored on receive. |
 
 **Shard sizes.** Let `S = ceil(group_len / data_shards)`. Every data shard carries `S`
 bytes except the last data shard, which carries `group_len − S·(data_shards − 1)` (at
@@ -182,6 +184,10 @@ same shard header plus `flags.retransmit` and a new envelope `seq`; it ignores t
 The client sends the first NACK for a gap after a reorder wait (adaptive, 1–5 ms by
 default) and repeats it every RTT plus slack while the shard's frame is still pending.
 
+### `control_fast` kind 4: tile ack (client → host)
+
+Completed and dropped lossless tiles, and resync and reset requests: [refine-v0.md](refine-v0.md).
+
 ### `control_fast` kinds 18 and 32–37: session (both directions)
 
 Session setup on datagrams, until the reliable QUIC control streams land. Defined in
@@ -190,7 +196,7 @@ Session setup on datagrams, until the reliable QUIC control streams land. Define
 | kind | name | direction | payload |
 | ---: | --- | --- | --- |
 | 18 | `clock_report` | client → host | `i64 offset_us` (host clock − client clock, from clock sync), `i64 error_bound_us`. 16 bytes. The host uses it to time input injection against capture. |
-| 32 | `hello` | client → host | `u32 nonce`, `u8 codecs` (bit 0 H.264, 1 HEVC, 2 AV1, 3 passthrough), 3 reserved, `u32 max_width`, `u32 max_height` (0 = any), `u8 formats[4]` (per codec: H.264, HEVC, AV1, passthrough; bits below), `u8 display` (bit 0: the display is in an HDR10 mode), 1 reserved, `u16 peak_nits` (display peak luminance, cd/m², 0 = unknown). 24 bytes. |
+| 32 | `hello` | client → host | `u32 nonce`, `u8 codecs` (bit 0 H.264, 1 HEVC, 2 AV1, 3 passthrough), 3 reserved, `u32 max_width`, `u32 max_height` (0 = any), `u8 formats[4]` (per codec: H.264, HEVC, AV1, passthrough; bits below), `u8 display` (bit 0: the display is in an HDR10 mode), 1 reserved, `u16 peak_nits` (display peak luminance, cd/m², 0 = unknown), `u32 tiles` (tile codecs the client decodes and composites, bit 0 QOI; 0 = no tiles: [refine-v0.md](refine-v0.md)). 28 bytes (the 16- and 24-byte forms mean no tiles). |
 | 33 | `config` | host → client | `u32 nonce` (echo), `u8 codec` (1 H.264, 2 HEVC, 3 AV1, 250 passthrough), `u8 slices`, `u16 fps`, `u32 width`, `u32 height`, `u64 bitrate_bps`, `u8 chroma` (0 4:2:0, 1 4:4:4), `u8 bit_depth` (8 or 10), `u8 color` (0 SDR BT.709, 1 HDR10), `u8 flags` (bit 0: HDR metadata follows), `hdr_metadata` (28 bytes, zero when flag 0 is clear), then `u32 epoch`, `u32 first_frame`, `u32 display`, `u32 request` ([display-v0.md](display-v0.md), "stream_config"). 72 bytes (the 24- and 56-byte forms are read as epoch 0); `fps`, `slices`, `width`, `height` non-zero. |
 | 34 | `bye` | both | `u8 reason` (0 done, 1 quit, 2 error). |
 | 35 | `display_list` | host → client | [display-v0.md](display-v0.md). |
@@ -243,3 +249,5 @@ display list and display selection (repeats, acks) are in [display-v0.md](displa
 - v0 (Nov 2026): a `config` can change the stream mid-session (multi-user hosts).
 - v0 (Nov 2026): mid-stream configs and displays: `config` grows to 72 bytes, kinds 35–37,
   video flag `new_config` (Phase 5B).
+- v0 (Nov 2026): lossless tiles: stream 6 `refine`, `control_fast` kind 4 tile ack, and
+  `hello` grows to 28 bytes with `tiles`.

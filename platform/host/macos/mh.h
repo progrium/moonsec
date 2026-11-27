@@ -114,6 +114,14 @@ typedef struct {
                              * width/height 0: the window's size in pixels at start */
 } mh_capture_config;
 
+/* A CGRect in points (top-left origin). */
+typedef struct {
+    double x, y, w, h;
+} mh_rectf;
+
+/* Dirty rectangles kept per frame; more are merged into the last one. */
+#define MH_DIRTY_MAX 32
+
 typedef struct {
     void *pixel_buffer; /* CVPixelBufferRef, retained: mh_cf_release it */
     uint32_t width, height, format;
@@ -122,6 +130,16 @@ typedef struct {
     int64_t captured_us;
     /* When the sample handler got it. */
     int64_t arrived_us;
+    /* What changed since the previous frame acquired: SCStreamFrameInfoDirtyRects in
+     * points of the display, united over the frames the mailbox replaced. NULL when
+     * unknown (no attachment, the first frame, a stale or blank frame in between); n_dirty
+     * 0 with dirty set: nothing changed. Owned by the capture, valid until the next
+     * acquire. */
+    const mh_rectf *dirty;
+    uint32_t n_dirty;
+    /* The captured display's size in points (what the dirty rects are relative to); 0
+     * for a window capture (its dirty rects are not used). */
+    double src_w, src_h;
 } mh_frame;
 
 typedef struct {
@@ -141,6 +159,10 @@ int mh_capture_acquire(mh_capture *c, int64_t timeout_us, mh_frame *out);
 /* Changes size and rate on the running stream (SCStream updateConfiguration). */
 int mh_capture_update(mh_capture *c, uint32_t width, uint32_t height, uint32_t fps);
 void mh_capture_get_stats(mh_capture *c, mh_capture_stats *out);
+/* Copies the w x h rectangle at x, y of a BGRA frame's pixel buffer (mh_frame.pixel_buffer)
+ * as B, G, R, A rows `out_stride` bytes apart, locking it read-only.
+ * MH_ERR_UNSUPPORTED for NV12 frames. */
+int mh_frame_read_rect(void *pixel_buffer, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t *out, uint32_t out_stride);
 void mh_capture_stop(mh_capture *c);
 void mh_capture_destroy(mh_capture *c);
 

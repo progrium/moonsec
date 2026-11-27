@@ -285,3 +285,36 @@ test "a joiner with no format in common is turned away; the others keep theirs" 
     try expectClean(&r.clients[0], 3);
     try testing.expectEqual(@as(u64, 0), r.clients[1].presented);
 }
+
+test "tiles to several clients: encoded once, each exact, a late joiner gets them, a client without tiles gets none" {
+    const r = try runShow(.{
+        .seed = 2,
+        .seconds = 5,
+        .width = 640,
+        .height = 360,
+        .loss_policy = true,
+        .tiles = true,
+        .text = .{ .period = 90 },
+        .still = &.{.{ .from_us = 1_000_000, .until_us = 3_500_000 }},
+        .clients = &.{
+            .{ .name = "LAN 1" },
+            .{ .name = "Lossy", .profile = .longhaul },
+            .{ .name = "Relayed", .relayed = true },
+            .{ .name = "No tiles", .tiles = false },
+            .{ .name = "Late", .join_at_us = 2_500_000 },
+        },
+    });
+    errdefer show(&r);
+    var sent: u64 = 0;
+    for (r.clients[0..r.n], 0..) |c, i| {
+        std.debug.print("tiles, {d}: shown {d}, sent {d}, {d} pixels drawn, {d} wrong\n", .{ i, c.tiles_shown, c.tiles_sent, c.tile_pixels, c.tile_wrong_pixels });
+        try testing.expectEqual(@as(u64, 0), c.tile_wrong_pixels);
+        try testing.expectEqual(@as(u64, 0), c.corrupt);
+        sent += c.tiles_sent;
+        if (i == 3) {
+            try testing.expectEqual(@as(u64, 0), c.tiles_sent);
+        } else try testing.expect(c.tiles_shown > 0);
+    }
+    // One engine for the one encode: members share its tiles.
+    try testing.expect(r.host.tiles_encoded > 0 and r.host.tiles_encoded < sent);
+}

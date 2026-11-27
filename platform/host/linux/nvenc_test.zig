@@ -25,7 +25,7 @@ test "Linux NVENC: not found without an NVIDIA driver, or a short encode with on
     for (0..20) |n| {
         for (&px, 0..) |*b, i| b.* = @truncate(i *% 7 +% n * 3);
         const in: c.mlh_nvenc_input = .{ .fd = -1, .fourcc = 0, .modifier = 0, .offset = 0, .pitch = 0, .data = &px, .stride = 256 * 4, .nv12 = 0, .width = 256, .height = 128 };
-        const p: c.mlh_nvenc_params = .{ .force = 0, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0 };
+        const p: c.mlh_nvenc_params = .{ .force = 0, .bitrate_bps = 0, .acked_ltr_tokens = null, .acked_ltr_count = 0, .qp_map = null, .qp_map_cols = 0, .qp_map_rows = 0, .refine_qp = 0, .force_ltr = 0 };
         var out: c.mlh_nvenc_output = undefined;
         try testing.expectEqual(@as(c_int, 0), c.mlh_nvenc_encode(e, &in, n, &p, &out));
         try testing.expect(out.len > 0);

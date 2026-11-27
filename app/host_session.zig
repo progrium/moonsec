@@ -59,6 +59,7 @@ const rate = core.rate;
 const recovery = core.recovery;
 const telemetry = core.telemetry;
 const clock = core.clock;
+const refine = core.refine;
 const PacketPipe = pipe_mod.PacketPipe;
 const Micros = i64;
 
@@ -118,6 +119,13 @@ pub const Config = struct {
     /// The reliable control channel (spec/control-v0.md): clipboard and the features built
     /// on it. It runs once the app attaches a stream (`control.attach`).
     control: control.Config = .{},
+    /// Offer lossless tiles (core/refine) to clients that advertise them. With `shared`,
+    /// the multi host owns the engine and hands it over with `setTileEngine`.
+    tiles: bool = false,
+    tile_engine: refine.host.Config = .{},
+    tile_peer: refine.host.PeerConfig = .{},
+    /// No tiles on a relayed path below this target rate.
+    tile_relay_min_bps: f64 = 2_000_000,
 };
 
 pub const Negotiate = struct {
@@ -139,6 +147,8 @@ pub const Stats = struct {
     refreshes: u64 = 0,
     encode_drops: u64 = 0,
     repeats: u64 = 0,
+    /// Idle-refinement frames sent (video flag `refine`), counted in `repeats` too.
+    refines: u64 = 0,
     bytes: u64 = 0,
     shards: u64 = 0,
     parity_shards: u64 = 0,
@@ -176,6 +186,12 @@ pub const Stats = struct {
     display_lists: u64 = 0,
     malformed: u64 = 0,
     unknown: u64 = 0,
+    /// Lossless tiles: damage messages, tile pieces and their bytes, acks and resyncs.
+    tile_damage: u64 = 0,
+    tile_pieces: u64 = 0,
+    tile_bytes: u64 = 0,
+    tile_acks: u64 = 0,
+    tile_resyncs: u64 = 0,
 };
 
 /// A change the app applied to capture and encoder (`onReconfigured`).
@@ -272,6 +288,12 @@ pub const HostSession = struct {
     acked_gen: ?u32 = null,
     next_resend: Micros = 0,
 
+    /// Lossless tiles: the engine (owned unless `cfg.shared`), this client's sender, and
+    /// whether the client's hello asked for tiles.
+    tiles: ?*refine.Engine = null,
+    tile_peer: refine.Peer,
+    tiles_on: bool = false,
+
     pub fn init(gpa: std.mem.Allocator, cfg: Config, p: PacketPipe) !HostSession {
         return initWith(gpa, cfg, p, null);
     }
@@ -306,7 +328,16 @@ pub const HostSession = struct {
         const pb = try gpa.create(media.ParityBuffer);
         var control_ = try control.Control.init(gpa, .host, cfg.control);
         errdefer control_.deinit();
+        var engine: ?*refine.Engine = null;
+        if (cfg.tiles and !cfg.shared) {
+            const e = try gpa.create(refine.Engine);
+            errdefer gpa.destroy(e);
+            e.* = try refine.Engine.init(gpa, cfg.tile_engine, cfg.width, cfg.height, 0);
+            engine = e;
+        }
         return .{
+            .tiles = engine,
+            .tile_peer = refine.Peer.init(gpa, cfg.tile_peer),
             .gpa = gpa,
             .control = control_,
             .cfg = cfg,
@@ -327,6 +358,11 @@ pub const HostSession = struct {
 
     pub fn deinit(s: *HostSession) void {
         s.control.deinit();
+        s.tile_peer.deinit();
+        if (!s.cfg.shared) if (s.tiles) |e| {
+            e.deinit();
+            s.gpa.destroy(e);
+        };
         s.history.deinit(s.gpa);
         s.gpa.destroy(s.ctl);
         if (!s.cfg.shared) s.gpa.destroy(s.rec);
@@ -463,6 +499,11 @@ pub const HostSession = struct {
             s.pending_reconfigure = null;
         }
         s.ctl.setFrameRate(@floatFromInt(r.fps));
+        if (!s.cfg.shared) if (s.tiles) |e| e.reset(r.width, r.height, s.epoch) catch {
+            e.deinit();
+            s.gpa.destroy(e);
+            s.tiles = null;
+        };
         // The decoder is configured afresh at the new size: nothing before this frame is a
         // valid reference.
         if (s.next_frame_id > 0 or s.nonce != null)
@@ -489,6 +530,7 @@ pub const HostSession = struct {
         if (s.state == .ended) return;
         s.path = s.pipe.stats();
         s.onPathState(now);
+        s.pumpTiles(now);
         if (s.byes_left > 0 and now >= s.next_bye) {
             s.sendOther(.control_fast, @intFromEnum(wire.Kind.bye), &.{@intFromEnum(wire.ByeReason.done)}, now);
             s.byes_left -= 1;
@@ -575,6 +617,9 @@ pub const HostSession = struct {
         var t = now + 5_000;
         if (s.state == .streaming and s.unacked()) t = @min(t, s.next_resend);
         if (s.byes_left > 0) t = @min(t, s.next_bye);
+        if (s.tilesLive()) if (s.tiles) |e| if (s.tile_peer.wants(e)) {
+            t = @min(t, now + 1_000);
+        };
         return @max(t, now);
     }
 
@@ -673,6 +718,7 @@ pub const HostSession = struct {
                     };
                     return;
                 }
+                if (env.kind == @intFromEnum(proto.ControlFastKind.tile_ack)) return s.onTileAck(payload, now);
                 switch (@as(wire.Kind, @enumFromInt(env.kind))) {
                     .hello => s.onHello(wire.Hello.decode(payload) orelse {
                         s.stats.malformed += 1;
@@ -756,6 +802,7 @@ pub const HostSession = struct {
 
     fn onHello(s: *HostSession, h: wire.Hello, now: Micros) void {
         s.stats.hellos += 1;
+        s.tiles_on = s.cfg.tiles and h.tiles & refine.wire.caps_qoi != 0;
         const decodable = h.decodable();
         if (s.cfg.shared) {
             // One encode for every member: the multi host picks the format.
@@ -839,6 +886,16 @@ pub const HostSession = struct {
         }, .acked_ltr_tokens = d.acked_tokens, .bitrate_bps = s.pending_bitrate };
     }
 
+    /// Room for an idle-refinement step (core/still) on this client's path: the video is
+    /// not held for a stall, and with rate control the controller is calm (not cutting for
+    /// overuse, draining a queue or capped by loss). The regional and tile refiners use
+    /// the same test.
+    pub fn refineOk(s: *const HostSession, now: Micros) bool {
+        if (s.state != .streaming or s.paused_at != null) return false;
+        if (s.cfg.rate_control and !s.ctl.calm(now)) return false;
+        return true;
+    }
+
     pub fn onEncodeDropped(s: *HostSession) void {
         std.debug.assert(s.in_encoder);
         s.in_encoder = false;
@@ -855,6 +912,7 @@ pub const HostSession = struct {
             return;
         }
         const id = s.next_frame_id;
+        if (!s.cfg.shared) if (s.tiles) |e| e.commit(id);
         const flags = s.rec.onEncoded(id, ef.ltr_token, ef.keyframe);
         if (s.sendFrame(id, flags, ef, cf, now)) s.rec.setRetryWindow(s.retryWindow());
     }
@@ -870,7 +928,7 @@ pub const HostSession = struct {
     /// False when the frame did not go out (held for a stalled path, or the session failed).
     pub fn sendFrame(s: *HostSession, id: u32, flags: recovery.FrameFlags, ef: api.EncodedFrame, cf: *const api.CapturedFrame, now: Micros) bool {
         s.next_frame_id = id +% 1;
-        var vflags: proto.video.Flags = .{ .keyframe = flags.keyframe, .ltr_refresh = flags.refresh, .ltr = ef.ltr_token != null, .new_config = s.epoch != 0 and id == s.first_frame };
+        var vflags: proto.video.Flags = .{ .keyframe = flags.keyframe, .ltr_refresh = flags.refresh, .ltr = ef.ltr_token != null, .new_config = s.epoch != 0 and id == s.first_frame, .refine = ef.refine and !flags.keyframe and !flags.refresh };
         if (!ef.keyframe and ef.ltr_refresh) vflags.ltr_refresh = true;
         const cap: u64 = @bitCast(cf.captured_us);
         const enc: u64 = @bitCast(@max(ef.encoded_us, cf.captured_us));
@@ -899,8 +957,11 @@ pub const HostSession = struct {
             s.ctl.onFrame(now, id, total);
             s.applyPacing(now);
         }
+        const tile_damage = s.tilesLive();
+        if (tile_damage) s.sendTileDamage(id, now);
         for (ef.slices, 0..) |sl, i| {
             if (sl.len == 0) continue;
+            if (tile_damage) s.tile_peer.onVideo(now, sl.len);
             var it = s.packetizer.slice(.{
                 .frame_id = id,
                 .slice = @intCast(i),
@@ -921,12 +982,99 @@ pub const HostSession = struct {
             }
             s.stats.bytes += sl.len;
         }
+        // Again after the frame: a lost damage message would hide the client's tiles
+        // until the next one, so it goes twice (it is small).
+        if (tile_damage) s.sendTileDamage(id, now);
         s.stats.frames += 1;
         if (flags.keyframe) s.stats.keyframes += 1;
         if (flags.refresh) s.stats.refreshes += 1;
         if (cf.repeat) s.stats.repeats += 1;
+        if (vflags.refine) s.stats.refines += 1;
         s.tele.record(.{ .frame_id = id, .capture_start = cf.capture_start_us, .captured = cf.captured_us, .encoded = ef.encoded_us }, null);
         return true;
+    }
+
+    // --- lossless tiles ---------------------------------------------------
+
+    /// With `cfg.shared`: the multi host's engine (one per encode).
+    pub fn setTileEngine(s: *HostSession, e: ?*refine.Engine) void {
+        std.debug.assert(s.cfg.shared);
+        s.tiles = e;
+    }
+
+    /// The engine, for the encode stage (`capture` before an encode; `wanted`/`offer` after).
+    pub fn tileEngine(s: *HostSession) ?*refine.Engine {
+        return if (s.cfg.tiles) s.tiles else null;
+    }
+
+    /// Tiles go to this client: it asked, the host offers them, the stream is SDR (HDR10
+    /// gets none in v0) and running.
+    pub fn tilesLive(s: *const HostSession) bool {
+        return s.tiles_on and s.tiles != null and s.state == .streaming and s.byes_left == 0 and s.format.color != .hdr10;
+    }
+
+    fn sendRefine(s: *HostSession, kind: proto.RefineKind, body: []const u8, now: Micros) void {
+        var buf: [proto.max_datagram]u8 = undefined;
+        const dg = wire.message(&buf, .refine, @intFromEnum(kind), s.envSeq(), body);
+        // Opportunistic for the rate controller: the delay estimate sees the queue tiles
+        // build, but they are not the stream's rate or part of a frame's train.
+        s.ctl.onSent(s.seq, now, @intCast(dg.len), rate.types.PacketResult.opportunistic, false);
+        s.sendRaw(dg);
+    }
+
+    fn sendTileDamage(s: *HostSession, id: u32, now: Micros) void {
+        const e = s.tiles orelse return;
+        var b: [proto.max_datagram - proto.Envelope.size]u8 = undefined;
+        const m = e.damageMessage(id, &b) orelse return;
+        s.sendRefine(.damage, m, now);
+        s.stats.tile_damage += 1;
+    }
+
+    fn onTileAck(s: *HostSession, payload: []const u8, now: Micros) void {
+        var es: [refine.wire.TileAck.max_entries]refine.wire.AckEntry = undefined;
+        const a = refine.wire.TileAck.decode(payload, &es) catch {
+            s.stats.malformed += 1;
+            return;
+        };
+        if (!s.tilesLive()) return;
+        const e = s.tiles.?;
+        s.stats.tile_acks += 1;
+        if (s.tile_peer.onAck(e, a)) {
+            var b: [proto.max_datagram - proto.Envelope.size]u8 = undefined;
+            if (e.unionMessage(a.covered_to, &b)) |m| {
+                s.sendRefine(.damage, m, now);
+                s.stats.tile_resyncs += 1;
+            }
+        }
+    }
+
+    /// Send tile pieces while the pacer is idle and the path is calm, within the spare rate.
+    fn pumpTiles(s: *HostSession, now: Micros) void {
+        if (!s.tilesLive()) return;
+        const e = s.tiles.?;
+        const target: f64 = if (s.cfg.rate_control) s.ctl.targetBps() else @floatFromInt(s.bitrate_bps);
+        var ok = s.paused_at == null and !s.path.stalled;
+        if (s.cfg.rate_control and !s.ctl.calm(now)) ok = false;
+        if (s.path.relayed and target < s.cfg.tile_relay_min_bps) ok = false;
+        var round: usize = 0;
+        while (true) {
+            // Only into idle gaps: the pipe has nothing queued and no frame is still leaving.
+            const idle = s.pipe.stats().send_queue_bytes == 0 and now >= s.ctl.pacer_busy_until_us;
+            const path: refine.host.Path = .{
+                .now = now,
+                .ok = ok and idle,
+                .target_bps = target,
+                .rtt_us = @max(s.path.rtt_us, 0),
+                .frame_us = @divTrunc(1_000_000, @as(i64, @max(s.cfg.fps, 1))),
+            };
+            var b: [proto.max_datagram - proto.Envelope.size]u8 = undefined;
+            const body = s.tile_peer.next(e, path, round, &b) orelse break;
+            s.sendRefine(.tile_piece, body, now);
+            round += body.len;
+            s.stats.tile_pieces += 1;
+            s.stats.tile_bytes += body.len;
+            if (s.state == .ended) return;
+        }
     }
 
     fn sendShard(s: *HostSession, shard: media.Shard, now: Micros) void {
@@ -970,13 +1118,17 @@ pub const HostSession = struct {
     pub fn report(s: *const HostSession, w: *std.Io.Writer) !void {
         const st = s.stats;
         try w.print("host: {s}{s}{s}\n", .{ @tagName(s.end), if (s.reason.len > 0) ": " else "", s.reason });
-        try w.print("  frames {d} (keyframes {d}, refreshes {d}, repeats {d}, encoder drops {d}), {d} MB in {d} shards\n", .{ st.frames, st.keyframes, st.refreshes, st.repeats, st.encode_drops, st.bytes / 1_000_000, st.shards });
+        try w.print("  frames {d} (keyframes {d}, refreshes {d}, repeats {d}, refines {d}, encoder drops {d}), {d} MB in {d} shards\n", .{ st.frames, st.keyframes, st.refreshes, st.repeats, st.refines, st.encode_drops, st.bytes / 1_000_000, st.shards });
         var fb: [32]u8 = undefined;
         try w.print("  stream {s} {s}{s}\n", .{ @tagName(s.codec), s.format.name(&fb), if (st.format_changes > 1) " (changed by a hello)" else "" });
         if (s.decision) |d| try w.print("  loss policy: {s}, loss {d:.2}%, FEC overhead {d:.0}%, {d} parity shards, {d} NACKs ignored, {d} mode switches\n", .{ @tagName(d.mode), d.loss * 100, d.overhead * 100, st.parity_shards, st.nacks_ignored, s.policy.switches });
         try w.print("  NACKs {d} -> retransmits {d}; feedback {d}; frame acks {d} (recovery requests {d}); pings {d}; inputs {d} (denied {d})\n", .{ st.nacks, st.retransmits, st.feedback, st.frame_acks, st.recovery_requests, st.pings, st.inputs_applied, st.inputs_denied });
         if (st.reconfigures + st.selects > 0)
             try w.print("  configs: epoch {d}, {d} mid-stream ({d} display switches, {d} mode changes), {d} selects, {d} resends; stream {d}x{d}@{d} on display {d}\n", .{ s.epoch, st.reconfigures, st.display_switches, st.mode_changes, st.selects, st.config_resends, s.cfg.width, s.cfg.height, s.cfg.fps, s.cfg.display });
+        if (s.tiles_on) if (s.tiles) |e| {
+            const ps = s.tile_peer.stats;
+            try w.print("  tiles: {d} encoded ({d} KB; {d} flat, {d} photo), {d} sent ({d} resent) in {d} pieces, {d} KB; {d} acked, {d} dropped, {d} resets, {d} resyncs; {d} damage messages\n", .{ e.stats.tiles, e.stats.tile_bytes / 1000, e.stats.flat, e.stats.photo, ps.tiles_sent, ps.resends, st.tile_pieces, st.tile_bytes / 1000, ps.acked, ps.dropped, ps.resets, st.tile_resyncs, st.tile_damage });
+        };
         if (st.path_changes + st.reconnects + st.stall_pauses > 0)
             try w.print("  path changes {d}, reconnects {d}; stalls {d} ({d} frames held, longest {d:.0} ms)\n", .{ st.path_changes, st.reconnects, st.stall_pauses, st.stall_frames, ms(st.stall_longest_us) });
         const snap = s.tele.snapshot();

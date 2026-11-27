@@ -260,6 +260,7 @@ void mlh_nvenc_caps_get(const mlh_nvenc *e, mlh_nvenc_caps *out) {
     out->hevc = (uint32_t)e->core.hevc;
     out->ltr = (uint32_t)e->core.ltr_supported;
     out->max_slices = 4;
+    out->qp_map_block = nvc_qp_map_block(e->core.initialized ? e->core.cfg.codec : NVC_CODEC_H264);
 }
 
 int mlh_nvenc_configure(mlh_nvenc *e, const mlh_nvenc_config *cfg) {
@@ -419,6 +420,11 @@ int mlh_nvenc_encode(mlh_nvenc *e, const mlh_nvenc_input *in, uint64_t time_us, 
         .bitrate_bps = p->bitrate_bps,
         .acked_ltr_tokens = p->acked_ltr_tokens,
         .acked_ltr_count = p->acked_ltr_count,
+        .qp_map = p->qp_map,
+        .qp_map_cols = p->qp_map_cols,
+        .qp_map_rows = p->qp_map_rows,
+        .refine_qp = p->refine_qp,
+        .force_ltr = p->force_ltr,
     };
     nvc_output o;
     e->out_len = 0;

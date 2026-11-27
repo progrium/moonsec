@@ -156,8 +156,8 @@ int mswc_presenter_uses_shader(const mswc_presenter *p);
 msw_hr mswc_presenter_wait(mswc_presenter *p, uint32_t timeout_ms);
 /* Resizes the back buffers to the window's client size if it changed. */
 msw_hr mswc_presenter_sync_size(mswc_presenter *p);
-/* Draws `frame` (NULL: clear to black) and the overlay, if one was set, into the
- * back buffer. Does not present. */
+/* Draws `frame` (NULL: clear to black), the tile layer while it is shown, and the
+ * overlay, if one was set, into the back buffer. Does not present. */
 msw_hr mswc_presenter_draw(mswc_presenter *p, const mswc_frame *frame);
 /* Presents the back buffer. */
 msw_hr mswc_presenter_present(mswc_presenter *p, uint32_t mode);
@@ -166,6 +166,18 @@ msw_hr mswc_presenter_present(mswc_presenter *p, uint32_t mode);
  * Clipped to 1024 x 512. */
 msw_hr mswc_presenter_set_overlay(mswc_presenter *p, const uint32_t *pixels, uint32_t w, uint32_t h,
                                   uint32_t stride);
+/* The tile layer (lossless tiles): a BGRA image of the stream's size, transparent except
+ * where tiles were put, that mswc_presenter_draw blends over the video's letterbox rect
+ * (same scaling, linear filter) while it is shown, before the overlay. Never part of a
+ * frame. mswc_presenter_tiles_reset makes it w x h and all transparent (0 x 0 drops
+ * it); the first reset compiles its shaders, so it can fail where d3dcompiler_47 is
+ * missing. mswc_presenter_tiles_put writes BGRA pixels (`stride` bytes per row, opaque)
+ * at x, y, or makes the rectangle transparent when `pixels` is NULL; rectangles are
+ * trimmed to the layer, and ignored while there is none. */
+msw_hr mswc_presenter_tiles_reset(mswc_presenter *p, uint32_t w, uint32_t h);
+msw_hr mswc_presenter_tiles_put(mswc_presenter *p, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                const uint8_t *pixels, uint32_t stride);
+void mswc_presenter_tiles_show(mswc_presenter *p, int on);
 /* Test hook: the back buffer's pixel at (x, y) as 0xAARRGGBB. */
 msw_hr mswc_presenter_read_pixel(mswc_presenter *p, uint32_t x, uint32_t y, uint32_t *out);
 void mswc_presenter_size(const mswc_presenter *p, uint32_t *w, uint32_t *h);

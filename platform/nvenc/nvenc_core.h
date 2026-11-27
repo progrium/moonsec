@@ -9,7 +9,15 @@
  * GOP, no B-frames, no lookahead, `slices` slices, parameter sets on every IDR, long-term
  * references in "per picture" mode (two slots, a mark every NVC_LTR_INTERVAL frames, on
  * IDRs and on refreshes, into the slot that doesn't hold the newest acked one), bitrate
- * changes through nvEncReconfigureEncoder without an IDR. Synchronous mode. */
+ * changes through nvEncReconfigureEncoder without an IDR. Synchronous mode.
+ *
+ * Regional refine: the rate control runs with qpMapMode = NV_ENC_QP_MAP_DELTA, so a frame
+ * may carry a QP delta map (one signed byte per macroblock for H.264, per 32x32 CTB for
+ * HEVC) that is added to the QP rate control picks. A frame without one codes as usual.
+ *
+ * Idle refinement: a frame with refine_qp set is encoded under a reconfigure with
+ * maxQP = refine_qp and a VBV of NVC_REFINE_VBV_FRAMES frame budgets (no IDR, no reset);
+ * the next normal frame reconfigures back. force_ltr marks the frame long-term. */
 #ifndef NVENC_CORE_H
 #define NVENC_CORE_H
 
@@ -29,6 +37,7 @@
 #define NVC_LTR_SLOTS 2
 #define NVC_LTR_INTERVAL 15
 #define NVC_MAX_REGS 8
+#define NVC_REFINE_VBV_FRAMES 4
 
 enum { NVC_CODEC_H264 = 1, NVC_CODEC_HEVC = 2 };
 enum { NVC_FORCE_NONE = 0, NVC_FORCE_LTR_REFRESH = 1, NVC_FORCE_IDR = 2 };
@@ -49,6 +58,14 @@ typedef struct nvc_params {
     uint64_t bitrate_bps; /* 0 = unchanged */
     const uint64_t *acked_ltr_tokens;
     uint32_t acked_ltr_count;
+    /* Regional refine: QP deltas over nvc_qp_map_block()-pixel blocks, cols x rows in
+     * raster order; NULL = none. Ignored when the size doesn't match the picture's. */
+    const int8_t *qp_map;
+    uint32_t qp_map_cols, qp_map_rows;
+    /* Idle refinement: cap the QP of this P-frame (H.264/HEVC scale); 0 = normal. */
+    uint32_t refine_qp;
+    /* Mark this frame a long-term reference (when long-term references are on). */
+    uint32_t force_ltr;
 } nvc_params;
 
 typedef struct nvc_output {
@@ -89,6 +106,8 @@ typedef struct nvc {
     uint64_t frame;
     nvc_ltr ltr[NVC_LTR_SLOTS];
     uint64_t since_mark;
+    /* The QP cap the encoder is reconfigured with (0: none, normal rate control). */
+    uint32_t refine_qp;
 } nvc;
 
 /* Fills the function list (checking the driver's API version against the header's: too
@@ -109,5 +128,7 @@ void nvc_forget(nvc *n, void *resource);
 NVENCSTATUS nvc_encode(nvc *n, NV_ENC_REGISTERED_PTR reg, uint64_t time_us, const nvc_params *p, nvc_append_fn append,
                        void *ctx, nvc_output *out);
 void nvc_close(nvc *n);
+/* The QP map block edge for `codec`: 16 (H.264 macroblocks) or 32 (HEVC CTBs). */
+uint32_t nvc_qp_map_block(uint32_t codec);
 
 #endif

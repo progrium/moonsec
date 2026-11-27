@@ -106,7 +106,9 @@ static int slot_entry(const refs_state *s, int slot) {
     return -1;
 }
 
-void refs_plan_frame(refs_state *s, int force, refs_plan *p) {
+void refs_plan_frame(refs_state *s, int force, refs_plan *p) { refs_plan_frame_mark(s, force, 0, p); }
+
+void refs_plan_frame_mark(refs_state *s, int force, int mark, refs_plan *p) {
     memset(p, 0, sizeof *p);
     p->ref = -1;
     p->mark_slot = -1;
@@ -127,7 +129,7 @@ void refs_plan_frame(refs_state *s, int force, refs_plan *p) {
     /* Every short-term picture goes after this frame: the next one predicts from this. */
     for (int d = 0; d < REFS_DPB; d++)
         if (s->dpb[d].used && s->dpb[d].lt_slot < 0) p->drop[p->ndrop++] = d;
-    if (s->ltr && (p->refresh || s->since_mark + 1 >= REFS_INTERVAL)) {
+    if (s->ltr && (p->refresh || mark || s->since_mark + 1 >= REFS_INTERVAL)) {
         /* Into the slot that does not hold the newest acked reference, oldest first. */
         const int keep = acked >= 0 ? s->dpb[acked].lt_slot : -1;
         uint64_t oldest = UINT64_MAX;

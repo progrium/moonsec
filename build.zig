@@ -63,6 +63,13 @@ pub fn build(b: *std.Build) void {
     @import("platform/host/linux/build.zig").add(b, target, optimize, host_linux_mods, test_step);
     // macOS host backend (platform/host/macos/build.zig): test-mac, check-mac.
     @import("platform/host/macos/build.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod }, test_step);
+    // Windows host capture damage (platform/host/windows/damage.zig): portable, in `test`.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "win-host-damage-test", .root_module = b.createModule(.{
+        .root_source_file = b.path("platform/host/windows/damage.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core_mod }},
+    }) })).step);
     // Linux host encoders (platform/host/linux/build_enc.zig): test-linux-enc, linux-enc-check.
     @import("platform/host/linux/build_enc.zig").add(b, target, optimize, .{ .core = core_mod, .platform = platform_mod, .synthetic = synthetic_mod, .linux_uinput = linux_uinput_mod });
 

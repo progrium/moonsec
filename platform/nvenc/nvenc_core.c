@@ -104,6 +104,7 @@ NVENCSTATUS nvc_configure(nvc *n, const nvc_config *cfg) {
     c->rcParams.vbvBufferSize = (uint32_t)(cfg->bitrate_bps / cfg->fps);
     c->rcParams.vbvInitialDelay = c->rcParams.vbvBufferSize;
     c->rcParams.enableLookahead = 0;
+    c->rcParams.qpMapMode = NV_ENC_QP_MAP_DELTA; /* regional refine (nvc_params.qp_map) */
     const int ltr = cfg->ltr && n->ltr_supported;
     const uint32_t slices = cfg->slices ? cfg->slices : 1;
     if (cfg->codec == NVC_CODEC_HEVC) {
@@ -153,6 +154,7 @@ NVENCSTATUS nvc_configure(nvc *n, const nvc_config *cfg) {
     n->bitstream = bb.bitstreamBuffer;
     n->frame = 0;
     n->since_mark = 0;
+    n->refine_qp = 0;
     memset(n->ltr, 0, sizeof n->ltr);
     return NV_ENC_SUCCESS;
 }
@@ -200,6 +202,50 @@ void nvc_forget(nvc *n, void *resource) {
         }
 }
 
+uint32_t nvc_qp_map_block(uint32_t codec) { return codec == NVC_CODEC_HEVC ? 32 : 16; }
+
+/* Regional refine: the frame's QP delta map, when it covers the picture block for block. */
+static void apply_qp_map(const nvc *n, const nvc_params *p, NV_ENC_PIC_PARAMS *pp) {
+    if (!p->qp_map) return;
+    const uint32_t b = nvc_qp_map_block(n->cfg.codec);
+    const uint32_t cols = (n->cfg.width + b - 1) / b, rows = (n->cfg.height + b - 1) / b;
+    if (p->qp_map_cols != cols || p->qp_map_rows != rows) return;
+    pp->qpDeltaMap = (int8_t *)p->qp_map; /* read during the (synchronous) encode call */
+    pp->qpDeltaMapSize = cols * rows;
+}
+
+static NVENCSTATUS reconfigure(nvc *n) {
+    NV_ENC_RECONFIGURE_PARAMS rp;
+    memset(&rp, 0, sizeof rp);
+    rp.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+    rp.reInitEncodeParams = n->init;
+    rp.reInitEncodeParams.encodeConfig = &n->config;
+    rp.resetEncoder = 0;
+    rp.forceIDR = 0;
+    return n->fn.nvEncReconfigureEncoder(n->enc, &rp);
+}
+
+/* Idle refinement: reconfigure to the QP cap `qp` (0: back to normal CBR), with a VBV of a
+ * few frame budgets while capped so the refine frame has room. Only when it changes. */
+static NVENCSTATUS apply_refine(nvc *n, uint32_t qp) {
+    if (qp == n->refine_qp) return NV_ENC_SUCCESS;
+    NV_ENC_RC_PARAMS *rc = &n->config.rcParams;
+    const uint32_t budget = rc->averageBitRate / (n->cfg.fps ? n->cfg.fps : 60);
+    if (qp) {
+        rc->enableMaxQP = 1;
+        rc->maxQP.qpInterP = rc->maxQP.qpInterB = rc->maxQP.qpIntra = qp;
+        rc->vbvBufferSize = budget * NVC_REFINE_VBV_FRAMES;
+    } else {
+        rc->enableMaxQP = 0;
+        memset(&rc->maxQP, 0, sizeof rc->maxQP);
+        rc->vbvBufferSize = budget;
+    }
+    rc->vbvInitialDelay = rc->vbvBufferSize;
+    NVENCSTATUS s = reconfigure(n);
+    if (s == NV_ENC_SUCCESS) n->refine_qp = qp;
+    return s;
+}
+
 NVENCSTATUS nvc_encode(nvc *n, NV_ENC_REGISTERED_PTR reg, uint64_t time_us, const nvc_params *p, nvc_append_fn append,
                        void *ctx, nvc_output *out) {
     memset(out, 0, sizeof *out);
@@ -212,16 +258,14 @@ NVENCSTATUS nvc_encode(nvc *n, NV_ENC_REGISTERED_PTR reg, uint64_t time_us, cons
         n->config.rcParams.maxBitRate = (uint32_t)p->bitrate_bps;
         n->config.rcParams.vbvBufferSize = (uint32_t)(p->bitrate_bps / n->cfg.fps);
         n->config.rcParams.vbvInitialDelay = n->config.rcParams.vbvBufferSize;
-        NV_ENC_RECONFIGURE_PARAMS rp;
-        memset(&rp, 0, sizeof rp);
-        rp.version = NV_ENC_RECONFIGURE_PARAMS_VER;
-        rp.reInitEncodeParams = n->init;
-        rp.reInitEncodeParams.encodeConfig = &n->config;
-        rp.resetEncoder = 0;
-        rp.forceIDR = 0;
-        s = n->fn.nvEncReconfigureEncoder(n->enc, &rp);
+        n->refine_qp = 0; /* the plain one-frame VBV again; apply_refine redoes the cap */
+        n->config.rcParams.enableMaxQP = 0;
+        memset(&n->config.rcParams.maxQP, 0, sizeof n->config.rcParams.maxQP);
+        s = reconfigure(n);
         if (s != NV_ENC_SUCCESS) return s;
     }
+    s = apply_refine(n, p->force == NVC_FORCE_NONE ? p->refine_qp : 0);
+    if (s != NV_ENC_SUCCESS) return s;
     for (uint32_t i = 0; i < p->acked_ltr_count; i++)
         for (int k = 0; k < NVC_LTR_SLOTS; k++)
             if (n->ltr[k].token && n->ltr[k].token == p->acked_ltr_tokens[i]) n->ltr[k].acked = 1;
@@ -265,7 +309,7 @@ NVENCSTATUS nvc_encode(nvc *n, NV_ENC_REGISTERED_PTR reg, uint64_t time_us, cons
     /* Mark this frame a long-term reference on IDRs, refreshes and every NVC_LTR_INTERVAL
      * frames, into the slot that is not the newest acked one. */
     int mark_slot = -1;
-    if (ltr && (idr || use_slot >= 0 || n->since_mark + 1 >= NVC_LTR_INTERVAL)) {
+    if (ltr && (idr || use_slot >= 0 || p->force_ltr || n->since_mark + 1 >= NVC_LTR_INTERVAL)) {
         int keep = -1;
         uint64_t best = 0;
         for (int k = 0; k < NVC_LTR_SLOTS; k++)
@@ -301,6 +345,8 @@ NVENCSTATUS nvc_encode(nvc *n, NV_ENC_REGISTERED_PTR reg, uint64_t time_us, cons
             h->ltrUseFrameBitmap = 1u << use_slot;
         }
     }
+
+    apply_qp_map(n, p, &pp);
 
     NVENCSTATUS st = n->fn.nvEncEncodePicture(n->enc, &pp);
     if (st == NV_ENC_SUCCESS) {

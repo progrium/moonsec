@@ -84,7 +84,8 @@ document (or its own spec, linked here) and claims its block below.
 | `0x0300`–`0x03ff` | multi-user sessions: roster, input request and handoff (Phase 5D) | [multi-user-v0.md](multi-user-v0.md) |
 | `0x0400`–`0x04ff` | codec, chroma and colour negotiation (Phase 5F) | reserved |
 | `0x0500`–`0x05ff` | file transfer | reserved |
-| `0x0600`–`0xefff` | unassigned | |
+| `0x0600`–`0x06ff` | lossless tiles | reserved: v0 negotiates in the datagram `hello`, [refine-v0.md](refine-v0.md) |
+| `0x0700`–`0xefff` | unassigned | |
 | `0xf000`–`0xffff` | experiments; never shipped enabled | |
 
 Feature bits in `hello` follow the same split (below).
@@ -118,7 +119,8 @@ Feature bits (bit 0 = LSB):
 | 16–23 | multi-user (5D): bit 16 `multi_user`, [multi-user-v0.md](multi-user-v0.md); 17–23 reserved. |
 | 24–31 | codec negotiation (5F), reserved. |
 | 32–39 | file transfer, reserved. |
-| 40–63 | unassigned. |
+| 40–47 | lossless tiles: bit 40 reserved, unused in v0 ([refine-v0.md](refine-v0.md), "Negotiation"). |
+| 48–63 | unassigned. |
 
 A side clears a feature's bit to refuse that feature's messages (see Clipboard, "Policy").
 
@@ -203,3 +205,4 @@ telemetry, only their sizes.
 ## Changes
 
 - v0 (Nov 2026): first draft: framing, type registry, `hello`, `close`, clipboard text.
+- v0 (Nov 2026): type block `0x0600` and feature bits 40–47 reserved for lossless tiles.

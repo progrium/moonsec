@@ -129,6 +129,7 @@ const Args = struct {
     verify_input: bool = false,
     /// Host format preferences (platform/format.zig): 4:4:4 and 10-bit when the client has them.
     yuv444: bool = false,
+    tiles: bool = false,
     ten_bit: bool = false,
     p: pair_cmd.Args = .{},
     /// peer iroh: no pairing, anyone who reaches the endpoint gets a session (`run iroh`
@@ -175,6 +176,7 @@ fn usage() error{Usage} {
         \\opts:  --fps N --bitrate BPS --size WxH --slices N --rate-control
         \\       --yuv444 --ten-bit (host: prefer 4:4:4 / 10-bit when the client decodes it)
         \\       --loss-policy (sim, soak: NACK/FEC/relay chosen per path)
+        \\       --tiles (lossless tiles of still screen areas over the video; sim: with a text panel)
         \\sim:   --flaps T:D,.. --drops T:D,.. --idle-ms N --repunch-ms N --relay-delay-ms N --no-stall-pause
         \\client: --client synthetic|linux (moonsec-linux: Wayland/EGL, libavcodec, PipeWire, evdev)
         \\       --uinput-script (type the host's key script on a uinput keyboard) --no-audio
@@ -224,6 +226,10 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         }
         if (std.mem.eql(u8, s, "--no-audio")) {
             a.no_audio = true;
+            continue;
+        }
+        if (std.mem.eql(u8, s, "--tiles")) {
+            a.tiles = true;
             continue;
         }
         if (std.mem.eql(u8, s, "--yuv444")) {
@@ -388,6 +394,8 @@ fn simOptions(a: *const Args, seconds: u32, progress: u32) simrun.Options {
         .display_events = a.switches[0..a.n_switches],
         .yuv444 = a.yuv444,
         .ten_bit = a.ten_bit,
+        .tiles = a.tiles,
+        .text = if (a.tiles) .{ .period = 120 } else null,
     };
 }
 
@@ -477,6 +485,10 @@ const PeerArgs = struct {
         }
         if (a.no_audio) {
             p.list[p.n] = "--no-audio";
+            p.n += 1;
+        }
+        if (a.tiles) {
+            p.list[p.n] = "--tiles";
             p.n += 1;
         }
         if (a.yuv444) {
@@ -742,7 +754,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
                 fx = .init(clock, codec, fixture_data, split);
                 hb.encoder = api.bind(api.Encoder, synthetic.fixture.Encoder, &fx);
             }
-            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .codec = codec, .pause_on_stall = !a.no_stall_pause, .yuv444 = a.yuv444, .ten_bit = a.ten_bit, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt, .perms = perms }, p);
+            var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .codec = codec, .pause_on_stall = !a.no_stall_pause, .yuv444 = a.yuv444, .ten_bit = a.ten_bit, .tiles = a.tiles, .session = .{ .rate_control = a.rate_control }, .control_stream = ctl_stream, .clipboard = clip_opt, .perms = perms }, p);
             defer app.deinit();
             try app.runThreaded(io);
             try app.s.report(&w);
@@ -782,7 +794,7 @@ fn peer(gpa: std.mem.Allocator, io: Io, a: Args, role: Role, p: pipe_mod.PacketP
             defer cb.deinit();
             var switches: [16]apps.Switch = undefined;
             for (a.switches[0..a.n_switches], switches[0..a.n_switches]) |e, *sw| sw.* = .{ .after_us = e.at_us, .display = e.what.select.display };
-            var app = try apps.ClientApp.init(gpa, cb, .{ .content_ctx = sc, .contentFn = patternContent, .control_stream = ctl_stream, .clipboard = clip_opt, .switches = switches[0..a.n_switches] }, p);
+            var app = try apps.ClientApp.init(gpa, cb, .{ .session = .{ .tiles = a.tiles }, .content_ctx = sc, .contentFn = patternContent, .control_stream = ctl_stream, .clipboard = clip_opt, .switches = switches[0..a.n_switches] }, p);
             defer app.deinit();
             // Stop after `seconds` of streaming: the input source asks to quit.
             var timer = try io.concurrent(quitAfter, .{ &app, io, seconds });
@@ -846,7 +858,7 @@ fn peerLinuxHost(gpa: std.mem.Allocator, io: Io, a: Args, p: pipe_mod.PacketPipe
         };
     }
     defer if (check.reader) |r| r.close();
-    var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .session = .{ .rate_control = a.rate_control }, .perms = perms }, p);
+    var app = try apps.HostApp.init(gpa, hb, .{ .fps = a.fps, .bitrate_bps = a.bitrate, .slices = a.slices, .pause_on_stall = !a.no_stall_pause, .tiles = a.tiles, .session = .{ .rate_control = a.rate_control }, .perms = perms }, p);
     defer app.deinit();
     var reading: ?Io.Future(Io.Cancelable!void) = if (check.reader != null) try io.concurrent(KeyCheck.run, .{ &check, io }) else null;
     defer if (reading) |*f| f.cancel(io) catch {};
@@ -921,7 +933,7 @@ fn peerLinuxClient(gpa: std.mem.Allocator, io: Io, a: Args, p: pipe_mod.PacketPi
         }
     }
     if (!audio) be.audio = null;
-    var app = try apps.ClientApp.init(gpa, be, .{ .content_ctx = cl, .contentFn = linuxPatternContent }, p);
+    var app = try apps.ClientApp.init(gpa, be, .{ .session = .{ .tiles = a.tiles }, .content_ctx = cl, .contentFn = linuxPatternContent }, p);
     defer app.deinit();
     var timer = try io.concurrent(quitAfter, .{ &app, io, seconds });
     defer timer.cancel(io) catch {};

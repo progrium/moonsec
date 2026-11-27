@@ -77,6 +77,10 @@ fixes it.
 | `core/pair/exchange.zig` `Client.onMessage`, `classify`, `admitResult` | network | `pair_exchange_client` |
 | `app/wire.zig` `Hello`, `Config`, `ClockReport` | network | `app_session` |
 | `platform/synthetic` decoder (`AuHeader.decode`, `configure` with the host's dimensions) | network | `video_passthrough_decoder` |
+| `core/refine/qoi.zig` `decode` (lossless tiles) | network | `refine_qoi` |
+| `core/refine/wire.zig` `TilePiece`, `Damage`, `TileAck` decode | network | `refine_wire` |
+| `core/refine/client.zig` `Layer.onRefine`, `present`, `takeAck` (reassembly, validity, bounded memory) | network | `refine_layer` |
+| `core/refine/host.zig` `Peer.onAck`, `Engine.unionMessage` (tile acks, resync answers) | network (client to host) | `refine_host_acks` |
 | Shim C ABI (`shim/include/iroh_shim.h`): datagrams, streams, tickets, bind options | the Zig side | `shim/fuzz` `c_abi` |
 
 `core/pair/qr.zig` only encodes, so it has no parser. `app/keystore.zig` reads a 64-digit

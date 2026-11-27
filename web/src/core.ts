@@ -1,10 +1,11 @@
 // The Zig core in WebAssembly (app/web.zig): the client session and the Opus audio
 // stage behind a C ABI. This file loads the module and wraps the ABI; the struct
-// layouts below must match the extern structs in app/web.zig (ABI version 1).
+// layouts below must match the extern structs in app/web.zig and app/web_tiles.zig
+// (ABI version 2).
 
 import type { PadState } from "./input/gamepad.js";
 
-export const ABI_VERSION = 1;
+export const ABI_VERSION = 2;
 
 /// api.Codec values.
 export const Codec = { h264: 1, hevc: 2, av1: 3, passthrough: 250 } as const;
@@ -37,6 +38,37 @@ export interface Frame {
   codec: number;
   captureUs: number;
   receivedUs: number;
+}
+
+/// web_tiles.TileOp kinds.
+export const enum TileOpKind {
+  /// The whole layer transparent (its size may have changed: resize it to the update's).
+  clearAll = 0,
+  /// This rectangle transparent.
+  clear = 1,
+  /// Opaque RGBA pixels at this rectangle.
+  put = 2,
+}
+
+export interface TileOp {
+  kind: TileOpKind;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /// put: RGBA, rows `w * 4` bytes, a view into wasm memory valid until the next
+  /// `tilePresent` (or any call that may grow the memory). Else null.
+  pixels: Uint8ClampedArray | null;
+}
+
+/// What the tile layer (stream-sized, transparent where no tile is) does before frame
+/// `frameId` is drawn: apply `ops` in order, then draw the frame, then the layer over it
+/// when `visible`.
+export interface TileUpdate {
+  width: number;
+  height: number;
+  visible: boolean;
+  ops: TileOp[];
 }
 
 export interface StageTimes {
@@ -87,6 +119,11 @@ export const statNames = [
   'audio_silence',
   'audio_delay_us',
   'rx_drops',
+  'tiles_complete',
+  'tiles_shown',
+  'tiles_invalidated',
+  'tiles_hidden_presents',
+  'tile_acks',
 ] as const;
 export type Stats = Record<(typeof statNames)[number], number>;
 
@@ -94,7 +131,7 @@ interface Exports {
   memory: WebAssembly.Memory;
   _initialize(): void;
   ms_abi_version(): number;
-  ms_client_new(ctx: number, codecs: number, nonce: number, maxW: number, maxH: number, channels: number): number;
+  ms_client_new(ctx: number, codecs: number, nonce: number, maxW: number, maxH: number, channels: number, tiles: number): number;
   ms_client_free(w: number): void;
   ms_rx_slot(w: number): number;
   ms_rx_slot_cap(): number;
@@ -110,6 +147,7 @@ interface Exports {
   ms_next_frame(w: number): number;
   ms_on_decoded(w: number, id: number, ok: number, t: number): void;
   ms_on_presented(w: number, id: number, t: number): void;
+  ms_tile_present(w: number, id: number): number;
   ms_audio_render(w: number, nowUs: number): number;
   ms_audio_buf(w: number): number;
   ms_audio_channels(w: number): number;
@@ -179,7 +217,9 @@ export class CoreSession {
   /// as a view into wasm memory: copy it before returning.
   static async create(
     source: BufferSource | Response | Promise<Response>,
-    opts: { codecs: number; nonce?: number; maxWidth?: number; maxHeight?: number; channels?: number },
+    /// `tiles`: ask the host for lossless tiles; only when the caller composites them
+    /// (`tilePresent` before every frame it draws).
+    opts: { codecs: number; nonce?: number; maxWidth?: number; maxHeight?: number; channels?: number; tiles?: boolean },
     send: (dg: Uint8Array) => void,
   ): Promise<CoreSession> {
     const module =
@@ -199,7 +239,7 @@ export class CoreSession {
     x._initialize();
     if (x.ms_abi_version() !== ABI_VERSION) throw new Error(`moonsec core ABI ${x.ms_abi_version()}, want ${ABI_VERSION}`);
     const nonce = opts.nonce ?? ((Math.random() * 0xffffffff) >>> 0 || 1);
-    const w = x.ms_client_new(0, opts.codecs, nonce, opts.maxWidth ?? 0, opts.maxHeight ?? 0, opts.channels ?? 2);
+    const w = x.ms_client_new(0, opts.codecs, nonce, opts.maxWidth ?? 0, opts.maxHeight ?? 0, opts.channels ?? 2, opts.tiles ? 1 : 0);
     if (w === 0) throw new Error('moonsec core: could not create the session');
     return new CoreSession(x, w);
   }
@@ -281,6 +321,24 @@ export class CoreSession {
 
   onPresented(id: number, t: number): void {
     this.x.ms_on_presented(this.w, id, t);
+  }
+
+  /// Call right before drawing decoded frame `id` (null: no tiles in this session).
+  tilePresent(id: number): TileUpdate | null {
+    const p = this.x.ms_tile_present(this.w, id);
+    if (p === 0) return null;
+    const buf = this.x.memory.buffer;
+    const dv = new DataView(buf);
+    const n = dv.getUint32(p + 12, true);
+    const base = dv.getUint32(p + 16, true);
+    const ops: TileOp[] = [];
+    for (let i = 0; i < n; i++) {
+      const o = base + i * 32;
+      const kind = dv.getUint32(o, true) as TileOpKind;
+      const pixels = kind === TileOpKind.put ? new Uint8ClampedArray(buf, dv.getUint32(o + 24, true), dv.getUint32(o + 28, true)) : null;
+      ops.push({ kind, x: dv.getUint32(o + 4, true), y: dv.getUint32(o + 8, true), w: dv.getUint32(o + 12, true), h: dv.getUint32(o + 16, true), pixels });
+    }
+    return { width: dv.getUint32(p, true), height: dv.getUint32(p + 4, true), visible: dv.getUint32(p + 8, true) !== 0, ops };
   }
 
   get audioChannels(): number {

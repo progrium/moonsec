@@ -8,6 +8,7 @@ const core = @import("core");
 const api = @import("platform");
 const simnet = @import("simnet");
 const synthetic = @import("synthetic");
+pub const TextPanel = synthetic.TextPanel;
 const apps = @import("apps.zig");
 const clipboard = @import("clipboard");
 pub const pathsim = @import("pathsim.zig");
@@ -89,6 +90,15 @@ pub const Options = struct {
     /// Run the control channel with in-memory clipboards and this script of copies; the
     /// outcome is written back into it.
     clipboard: ?*ClipScript = null,
+    /// When the host's screen is still (host clock), and whether the host refines it.
+    still: []const synthetic.Capture.StillWindow = &.{},
+    refine: bool = true,
+    /// Lossless tiles: the host sends them and the client's presenter composites them
+    /// (checking every tile pixel against the video under it); the text panel on the
+    /// host's screen; capture reports damage rects instead of the app hashing cells.
+    tiles: bool = false,
+    text: ?synthetic.TextPanel = null,
+    report_damage: bool = false,
 };
 
 pub const DisplayEvent = struct {
@@ -156,6 +166,30 @@ pub const Result = struct {
         display_switches: u64 = 0,
         mode_changes: u64 = 0,
         config_resends: u64 = 0,
+        /// Regional refine: captured frames that reported damage, QP maps the encoder got,
+        /// blocks with an offset in them, and maps it refused (wrong size, forced frame).
+        damaged_frames: u64 = 0,
+        qp_maps: u64 = 0,
+        qp_blocks: u64 = 0,
+        qp_bad: u64 = 0,
+        /// Idle refinement: refine frames sent, sequences that ran to the end, sequences
+        /// cut short by new content, restarts after a recovery frame; long-term marks the
+        /// encoder made on request and LTR refreshes that predicted from one; and the
+        /// longest time from the start of a still window to its first refine frame.
+        refines: u64 = 0,
+        refine_sequences: u64 = 0,
+        refine_interrupted: u64 = 0,
+        refine_restarts: u64 = 0,
+        forced_ltrs: u64 = 0,
+        refreshes_from_forced: u64 = 0,
+        refine_latency_us: Micros = 0,
+        /// Lossless tiles: encoded, sent (and resent), acked, bytes on the wire.
+        tiles_encoded: u64 = 0,
+        tiles_sent: u64 = 0,
+        tile_resends: u64 = 0,
+        tiles_acked: u64 = 0,
+        tile_bytes: u64 = 0,
+        tile_resyncs: u64 = 0,
         /// The stream at the end.
         width: u32 = 0,
         height: u32 = 0,
@@ -190,6 +224,22 @@ pub const Result = struct {
         /// The format in the config the client got, and frames presented in another colour space.
         format: api.VideoFormat = .{},
         wrong_color: u64 = 0,
+        /// Frames that arrived flagged `refine`.
+        refines: u64 = 0,
+        /// Lossless tiles: complete, put on the layer, cleared by damage; presents that
+        /// drew tile pixels and how many; drawn pixels that differed from the video under
+        /// them and the presents with any (must be 0); bad ops; damage gaps; tile pixels
+        /// on screen at the end.
+        tiles: u64 = 0,
+        tiles_shown: u64 = 0,
+        tiles_invalidated: u64 = 0,
+        tile_presents: u64 = 0,
+        tile_pixels: u64 = 0,
+        tile_wrong_pixels: u64 = 0,
+        tile_wrong_presents: u64 = 0,
+        tile_bad_ops: u64 = 0,
+        tile_gaps: u64 = 0,
+        tile_last_pixels: u64 = 0,
         end: []const u8,
     },
     sim_losses: u64,
@@ -214,21 +264,27 @@ pub const Result = struct {
 
     /// What `moonsec sim`/`soak` and the tests hold a run to. Null when it passes.
     pub fn failure(r: Result, o: Options) ?[]const u8 {
-        const want = r.expectedFrames(o.fps);
+        var want = r.expectedFrames(o.fps);
+        // A still screen sends a few repeats, not new frames.
+        for (o.still) |w| want -|= @intCast(@divTrunc((w.until_us - w.from_us) * o.fps, 1_000_000));
         if (o.path != null) {
             // Scripted outages freeze the picture by design: hold the run to a clean end,
             // an intact picture, and most frames.
             if (r.client.corrupt > 0) return "the decoder saw a corrupt access unit";
             if (r.client.unreadable > 0) return "a presented frame's pattern did not read back";
+            if (r.client.tile_wrong_pixels > 0) return "a lossless tile was drawn over video that differs from it";
             if (!std.mem.eql(u8, r.client.end, "closed") or !std.mem.eql(u8, r.host.end, "client_bye")) return "the session did not end cleanly";
             if (r.client.presented * 100 < want * 50) return "client presented under half of the frames";
             return null;
         }
         if (r.client.presented * 100 < want * 95) return "client presented under 95% of the frames";
-        if (r.client.freezes > 0) return "the freeze detector saw a freeze";
+        // A still screen sends no new frames by design.
+        if (r.client.freezes > 0 and o.still.len == 0) return "the freeze detector saw a freeze";
         if (r.client.unreadable > 0) return "a presented frame's pattern did not read back";
         if (r.client.corrupt > 0) return "the decoder saw a corrupt access unit";
         if (r.client.wrong_color > 0) return "a presented frame was in another colour space than the config";
+        if (r.client.tile_wrong_pixels > 0) return "a lossless tile was drawn over video that differs from it";
+        if (r.client.tile_bad_ops > 0) return "a tile op fell outside the layer";
         if (!r.client.format.eql(r.host.format)) return "the client's config names another format than the host streams";
         if (r.host.keys_wrong > 0) return "input arrived out of order";
         if (o.input_interval_us > 0 and r.host.keys * 100 < r.client.input_sent * 95) return "input events went missing";
@@ -296,10 +352,10 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
 
     var hc: SideClock = .{ .net = net, .side = .a };
     var cc: SideClock = .{ .net = net, .side = .b };
-    const sh = try synthetic.openHost(gpa, .{ .clock = hc.clock(), .width = o.width, .height = o.height, .displays = o.displays, .audio = o.audio, .encoder_formats = o.encoder_formats, .hdr_display = o.hdr_source });
+    const sh = try synthetic.openHost(gpa, .{ .clock = hc.clock(), .width = o.width, .height = o.height, .displays = o.displays, .audio = o.audio, .encoder_formats = o.encoder_formats, .hdr_display = o.hdr_source, .text = o.text, .report_damage = o.report_damage });
     const hb = sh.backend();
     defer hb.deinit();
-    const sc = try synthetic.openClient(gpa, .{ .clock = cc.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio, .decoder_formats = o.decoder_formats, .display = o.client_display });
+    const sc = try synthetic.openClient(gpa, .{ .clock = cc.clock(), .input_interval_us = o.input_interval_us, .audio = o.audio, .decoder_formats = o.decoder_formats, .display = o.client_display, .text = o.text, .tiles = o.tiles });
     const cb = sc.backend();
     defer cb.deinit();
 
@@ -315,7 +371,10 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         if (cs.client_start.len > 0) try client_clip.set(cs.client_start);
     }
     const with_clip = o.clipboard != null;
+    sh.capture.still = o.still;
     var host = try apps.HostApp.init(gpa, hb, .{
+        .refine = o.refine,
+        .tiles = o.tiles,
         .fps = o.fps,
         .bitrate_bps = o.bitrate_bps,
         .slices = o.slices,
@@ -330,6 +389,7 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     }, pipes[0]);
     defer host.deinit();
     var client = try apps.ClientApp.init(gpa, cb, .{
+        .session = .{ .tiles = o.tiles },
         .content_ctx = sc,
         .contentFn = patternContent,
         .control_stream = if (with_clip) net.streamFor(.b) else null,
@@ -345,6 +405,8 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
     var next_progress: Micros = @as(Micros, o.progress_every_s) * simnet.SEC;
     var closing = false;
     var next_event: usize = 0;
+    var refine_steps_seen: u64 = 0;
+    var refine_latency: Micros = 0;
     while (!(host.done() and client.done())) : (t += o.step_us) {
         while (next_event < o.display_events.len and t >= o.display_events[next_event].at_us) : (next_event += 1) switch (o.display_events[next_event].what) {
             .select => |q| client.s.selectDisplay(q.display, q.max_width, q.max_height, q.max_fps, net.localTime(.b)),
@@ -376,6 +438,16 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
         };
         host.tick();
         client.tick();
+        if (host.refiner.still.stats.steps != refine_steps_seen) {
+            // The first step of a sequence: how long after its still window began.
+            if (host.refiner.still.step == 1) {
+                const hnow = net.localTime(.a);
+                for (o.still) |sw| if (hnow >= sw.from_us and hnow < sw.until_us) {
+                    refine_latency = @max(refine_latency, hnow - sw.from_us);
+                };
+            }
+            refine_steps_seen = host.refiner.still.stats.steps;
+        }
         if (log) |w| if (o.progress_every_s > 0 and t >= next_progress) {
             const fz = client.s.freeze.stats;
             try w.print("  t={d} s: presented {d}, freezes {d}, longest gap {d:.1} ms; host encoder {d} kbit/s, pacing {d} kbit/s, stream {d}x{d}@{d}\n", .{ @divTrunc(t, simnet.SEC), client.s.stats.frames_presented, fz.freezes, @as(f64, @floatFromInt(fz.longest_gap_us)) / 1000, host.s.bitrate_bps / 1000, host.s.last_pacing / 1000, host.s.cfg.width, host.s.cfg.height, host.s.cfg.fps });
@@ -431,6 +503,23 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .display_switches = host.s.stats.display_switches,
             .mode_changes = host.s.stats.mode_changes,
             .config_resends = host.s.stats.config_resends,
+            .damaged_frames = host.qp.damaged_frames,
+            .qp_maps = sh.encoder.stats.qp_maps,
+            .qp_blocks = sh.encoder.stats.qp_blocks,
+            .qp_bad = sh.encoder.stats.qp_bad,
+            .refines = host.s.stats.refines,
+            .refine_sequences = host.refiner.still.stats.sequences,
+            .refine_interrupted = host.refiner.still.stats.interrupted,
+            .refine_restarts = host.refiner.still.stats.restarts,
+            .forced_ltrs = sh.encoder.stats.forced_ltrs,
+            .refreshes_from_forced = sh.encoder.stats.refreshes_from_forced,
+            .refine_latency_us = refine_latency,
+            .tiles_encoded = if (host.s.tileEngine()) |e| e.stats.tiles else 0,
+            .tiles_sent = host.s.tile_peer.stats.tiles_sent,
+            .tile_resends = host.s.tile_peer.stats.resends,
+            .tiles_acked = host.s.tile_peer.stats.acked,
+            .tile_bytes = host.s.stats.tile_bytes,
+            .tile_resyncs = host.s.stats.tile_resyncs,
             .width = host.s.cfg.width,
             .height = host.s.cfg.height,
             .fps = host.s.cfg.fps,
@@ -461,6 +550,17 @@ pub fn run(gpa: std.mem.Allocator, o: Options, log: ?*std.Io.Writer) !Result {
             .height = if (sc.presenter.last_size) |z| z.height else 0,
             .format = if (client.s.config) |c| c.format else .{},
             .wrong_color = sc.presenter.stats.wrong_color,
+            .refines = client.s.stats.frames_refine,
+            .tiles = if (client.s.tiles) |l| l.stats.tiles else 0,
+            .tiles_shown = if (client.s.tiles) |l| l.stats.shown else 0,
+            .tiles_invalidated = if (client.s.tiles) |l| l.stats.invalidated else 0,
+            .tile_gaps = if (client.s.tiles) |l| l.stats.gaps else 0,
+            .tile_presents = sc.presenter.stats.tile_presents,
+            .tile_pixels = sc.presenter.stats.tile_pixels,
+            .tile_wrong_pixels = sc.presenter.stats.tile_wrong_pixels,
+            .tile_wrong_presents = sc.presenter.stats.tile_wrong_presents,
+            .tile_bad_ops = sc.presenter.stats.tile_bad_ops,
+            .tile_last_pixels = sc.presenter.stats.tile_last_pixels,
             .end = @tagName(client.s.end),
         },
         .sim_losses = net.linkStats(.a).random_losses + net.linkStats(.b).random_losses,

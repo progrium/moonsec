@@ -82,6 +82,10 @@ export interface VideoReport {
   decodeMs: number[];
   drawMs: number[];
   nonBlank: boolean;
+  /** Lossless tiles put on the layer, rectangles cleared, frames drawn with the layer over them. */
+  tilePuts: number;
+  tileClears: number;
+  tileFrames: number;
 }
 
 export interface AudioReport {

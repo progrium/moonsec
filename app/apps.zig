@@ -15,6 +15,13 @@
 //! the backend's display list about once a second. The client's decode stage configures
 //! the decoder and presenter again when a frame of a new size comes up.
 //!
+//! Idle refinement (core/still, design "Refine when idle"): when capture has had nothing new
+//! for `refine_after_us`, the capture stage repeats the last picture as a few refine frames
+//! with falling QP caps (`EncodeParams.refine_qp`), one per frame interval, the last marked
+//! a long-term reference; new content stops the sequence and an IDR or refresh restarts
+//! it. A step waits while the rate side says no (`HostSession.refineOk`). Only with an
+//! encoder that has `caps.refine`. `Refiner` is shared with the multi-user host.
+//!
 //! Audio rides the network stage: when the backend has an audio source (host) or sink
 //! (client), the Opus stage (codec/opus/stage.zig) encodes 10 ms frames from the source
 //! and sends them on the audio stream, and the client renders from its jitter buffer
@@ -31,6 +38,7 @@ const audio_stage = @import("audio_stage");
 const clipboard = @import("clipboard");
 const clipsync = @import("clipsync.zig");
 const control = @import("control.zig");
+const qprefine = @import("qprefine.zig");
 
 const proto = core.proto;
 
@@ -57,9 +65,13 @@ pub const HostOptions = struct {
     focus_window: bool = false,
     width: u32 = 0,
     height: u32 = 0,
-    /// Re-send the last picture when the screen has not changed for this long, so a
+    /// Re-send the last picture when nothing went out for this long, so a
     /// static desktop keeps streaming (and a lost frame on it still gets repaired).
     repeat_after_us: Micros = 100_000,
+    /// Idle refinement: sharpen a still screen with refine frames (when the encoder has
+    /// `caps.refine`), after this much stillness.
+    refine: bool = true,
+    refine_after_us: Micros = 150_000,
     /// Stream the backend's audio source, if it has one.
     audio: bool = true,
     session: struct { peer_timeout_us: Micros = 5_000_000, pace: bool = true, rate_control: bool = false, loss_policy: bool = false } = .{},
@@ -76,6 +88,126 @@ pub const HostOptions = struct {
     /// What the connected device may do (input, clipboard), asked again on every
     /// reconnect. Null: everything (lab runs, the sim).
     perms: ?control.PermsSource = null,
+    /// Send lossless tiles of still cells to clients that ask (core/refine).
+    tiles: bool = false,
+    tile_engine: core.refine.host.Config = .{},
+    /// Regional refine (core/qpmap): QP maps on still blocks when the encoder takes them.
+    qp_refine: bool = true,
+    qp_refine_cfg: core.qpmap.Config = .{},
+};
+
+/// The encode stage's side of lossless tiles: each captured frame's damage into the
+/// engine (the backend's, or hashed when it reports none and the frame is in memory),
+/// and after the encode, the cells the engine wants read from the frame before release.
+pub const TileReader = struct {
+    hasher: ?core.damage.Hasher = null,
+    buf: [core.refine.wire.cell_size * core.refine.wire.cell_size * 4]u8 = undefined,
+    stats: struct { reads: u64 = 0, read_errors: u64 = 0, hashed: u64 = 0 } = .{},
+
+    pub fn deinit(t: *TileReader) void {
+        if (t.hasher) |*h| h.deinit();
+    }
+
+    /// The frame's damage: what the backend reported, nothing for a repeat, else a hash
+    /// of its cells when the pixels are in memory, else null (unknown). Call outside the
+    /// session lock (hashing reads the whole frame); valid until the next call.
+    pub fn damage(t: *TileReader, gpa: std.mem.Allocator, f: *const api.CapturedFrame) ?[]const api.Rect {
+        if (f.repeat) return &.{};
+        if (f.damage) |d| return d;
+        const cpu = f.image.cpu orelse return null;
+        if (f.image.format != .bgra8) return null;
+        if (t.hasher) |h| if (h.width != f.image.width or h.height != f.image.height) {
+            t.hasher.?.deinit();
+            t.hasher = null;
+        };
+        if (t.hasher == null) t.hasher = core.damage.Hasher.init(gpa, f.image.width, f.image.height, core.refine.wire.cell_size) catch return null;
+        t.stats.hashed += 1;
+        return t.hasher.?.diff(cpu.data, cpu.stride);
+    }
+
+    /// After the frame's encode was committed (under the session lock): read and offer
+    /// the cells the engine wants, from `f` (still unreleased).
+    pub fn read(t: *TileReader, e: *core.refine.Engine, cap: api.Capture, f: *const api.CapturedFrame) void {
+        if (f.image.width != e.grid.width or f.image.height != e.grid.height) return;
+        if (f.image.color == .hdr10) return;
+        if (f.cursor) |c| if (c.visible and c.x >= 0 and c.y >= 0) {
+            e.pointer = .{ .x = @intCast(c.x), .y = @intCast(c.y) };
+        };
+        var want: [32]u32 = undefined;
+        const n = e.wanted(&want);
+        for (want[0..n]) |c| {
+            const r = e.grid.cellRect(c);
+            cap.readRect(f, r, &t.buf) catch {
+                t.stats.read_errors += 1;
+                continue;
+            };
+            e.offer(c, &t.buf, @as(usize, r.w) * 4);
+            t.stats.reads += 1;
+        }
+    }
+};
+
+/// A repeat goes out now: stamp it with the time it is sent, not its picture's capture
+/// time (which can be seconds old on a still screen), so the client doesn't drop it as
+/// stale and the encode-latency stats stay true.
+pub fn restamp(f: ?api.CapturedFrame, now: Micros) ?api.CapturedFrame {
+    var r = f orelse return null;
+    r.capture_start_us = now;
+    r.captured_us = now;
+    return r;
+}
+
+/// Idle refinement on the capture stage, for `HostApp` and `MultiHostApp`: decides when a
+/// repeat should be a refine step, fills its `EncodeParams`, and follows what was encoded.
+pub const Refiner = struct {
+    on: bool,
+    still: core.still.Still,
+    /// The step chosen for the repeat `grab` returned, until it is encoded.
+    step: ?core.still.Step = null,
+
+    pub fn init(o: HostOptions, caps: api.EncoderCaps) Refiner {
+        var cfg = core.still.Config.forFps(o.fps);
+        cfg.refine_after_us = o.refine_after_us;
+        return .{ .on = o.refine and caps.refine, .still = .init(cfg) };
+    }
+
+    /// Capture had nothing new: a step may be due by now (before asking the session).
+    pub fn mayBeDue(r: *const Refiner, now: Micros) bool {
+        if (!r.on) return false;
+        const t = r.still.wakeAt() orelse return false;
+        return now >= t;
+    }
+
+    /// Picks the step for the next repeat; `ok` is the session's `refineOk`.
+    pub fn pick(r: *Refiner, now: Micros, ok: bool) bool {
+        r.step = if (r.on) r.still.due(now, ok) else null;
+        return r.step != null;
+    }
+
+    /// Sets the refine fields of `p` for frame `f` when a step was picked for it and the
+    /// frame is not a recovery frame. True when it did.
+    pub fn apply(r: *Refiner, f: *const api.CapturedFrame, p: *api.EncodeParams, ltr: bool) bool {
+        const st = r.step orelse return false;
+        if (!f.repeat or p.force != .none) {
+            r.step = null;
+            return false;
+        }
+        p.refine_qp = st.qp;
+        p.force_ltr = st.last and ltr;
+        return true;
+    }
+
+    /// After the encode: `ef` is what came out (null: dropped, so the step is tried again
+    /// later), `applied` what `apply` said.
+    pub fn after(r: *Refiner, f: *const api.CapturedFrame, ef: ?*api.EncodedFrame, applied: bool, now: Micros) void {
+        defer r.step = null;
+        const e = ef orelse return;
+        if (applied) {
+            e.refine = true;
+            r.still.onRefined(now);
+        } else if (!f.repeat) r.still.onContent(now);
+        if (e.keyframe or e.ltr_refresh) r.still.onRecovery(now);
+    }
 };
 
 pub const HostApp = struct {
@@ -88,6 +220,8 @@ pub const HostApp = struct {
     last_frame_us: ?Micros = null,
     audio: ?*HostAudio = null,
     clip: ?clipsync.Sync = null,
+    /// Regional refine (QP maps), on the media stage.
+    qp: qprefine.Refiner,
     /// What capture runs at now: display, frame rate, and whether at the display's own
     /// size (the top of the ladder) or scaled. `cap` is the client's latest size and rate cap.
     display: u32,
@@ -98,6 +232,8 @@ pub const HostApp = struct {
     fps: u32,
     cap: struct { width: u32 = 0, height: u32 = 0, fps: u32 = 0 } = .{},
     next_display_poll: Micros = 0,
+    tiles: TileReader = .{},
+    refiner: Refiner,
     stats: struct { capture_timeouts: u64 = 0, encode_errors: u64 = 0, inject_errors: u64 = 0, reconfigure_errors: u64 = 0 } = .{},
 
     pub fn init(gpa: std.mem.Allocator, be: api.HostBackend, o: HostOptions, p: pipe_mod.PacketPipe) !HostApp {
@@ -111,7 +247,7 @@ pub const HostApp = struct {
         for ([_]api.Codec{ o.codec, .hevc, .h264, .av1, .passthrough }) |c| {
             if (caps.codecs.has(c)) order.add(@intFromEnum(c));
         }
-        var app: HostApp = .{ .be = be, .s = undefined, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr, .display = o.display, .fps = o.fps, .window = o.window };
+        var app: HostApp = .{ .be = be, .s = undefined, .opts = o, .size = size, .slices = slices, .ltr = caps.ltr, .display = o.display, .fps = o.fps, .window = o.window, .qp = .init(gpa, o.qp_refine_cfg), .refiner = .init(o, caps) };
         if (o.window != 0 and o.width == 0 and o.height == 0) app.window_size = size;
         var s = try HostSession.init(gpa, .{
             .negotiate = .{
@@ -139,6 +275,8 @@ pub const HostApp = struct {
             .loss_policy = o.session.loss_policy,
             .pause_on_stall = o.pause_on_stall,
             .control = .{ .perms = o.perms },
+            .tiles = o.tiles,
+            .tile_engine = o.tile_engine,
         }, p);
         var dl: [core.display.DisplayList.max_displays]api.DisplayInfo = undefined;
         if (be.capture.displays(&dl)) |n| s.setDisplays(dl[0..n], be.clock.now()) else |_| {}
@@ -154,8 +292,10 @@ pub const HostApp = struct {
     }
 
     pub fn deinit(a: *HostApp) void {
+        a.tiles.deinit();
         a.be.capture.stop();
         if (a.audio) |au| au.deinit();
+        a.qp.deinit();
         a.s.deinit();
     }
 
@@ -172,12 +312,20 @@ pub const HostApp = struct {
         }
     }
 
-    fn grab(a: *HostApp, timeout_us: Micros) api.Error!?api.CapturedFrame {
+    fn grab(a: *HostApp, timeout_us: Micros, lock: ?Lock) api.Error!?api.CapturedFrame {
+        a.refiner.step = null;
         if (try a.be.capture.acquire(timeout_us)) |f| return f;
         a.stats.capture_timeouts += 1;
         const last = a.last_frame_us orelse return null;
-        if (a.be.clock.now() - last < a.opts.repeat_after_us) return null;
-        return a.be.capture.repeatLast();
+        const now = a.be.clock.now();
+        if (a.refiner.mayBeDue(now)) {
+            if (lock) |l| l.lock();
+            const ok = a.s.refineOk(now);
+            if (lock) |l| l.unlock();
+            if (a.refiner.pick(now, ok)) return restamp(try a.be.capture.repeatLast(), now);
+        }
+        if (now - last < a.opts.repeat_after_us) return null;
+        return restamp(try a.be.capture.repeatLast(), now);
     }
 
     /// One encode, given a captured frame: the lock is taken around the session calls only.
@@ -197,13 +345,20 @@ pub const HostApp = struct {
                 return;
             }
         }
+        const dmg = if (a.opts.tiles) a.tiles.damage(a.s.gpa, f) else null;
         if (lock) |l| l.lock();
         const live = a.s.streaming();
         const change = if (live) a.s.takeFormat() else null;
         const bitrate = a.s.bitrate_bps;
-        const params = if (live) a.s.encodeParams() else api.EncodeParams{};
+        var params = if (live) a.s.encodeParams() else api.EncodeParams{};
+        const qp_ok = live and a.opts.qp_refine and a.s.refineOk(a.be.clock.now());
+        if (a.s.tileEngine()) |e| e.capture(dmg);
         if (lock) |l| l.unlock();
+        // Regional refine sees every frame's damage, streamed or not. A codec change
+        // below changes the caps' block size, which starts the ledger over next frame.
+        a.qp.observe(a.be.encoder.caps(), f);
         if (!live) return;
+        const refining = change == null and a.refiner.apply(f, &params, a.ltr);
         if (change) |c| a.be.encoder.configure(.{
             .codec = c.codec,
             .format = c.format,
@@ -221,14 +376,23 @@ pub const HostApp = struct {
             a.s.abort("the encoder rejected the negotiated codec or format");
             return;
         };
+        a.qp.plan(&params, qp_ok);
         const r = a.be.encoder.encode(f, params);
         if (lock) |l| l.lock();
         defer if (lock) |l| l.unlock();
+        a.qp.commit(if (r) |ef| ef else |_| null, a.s.refineOk(a.be.clock.now()));
         if (r) |ef_| {
-            if (ef_) |ef| {
-                a.s.onEncoded(ef, f, a.be.clock.now());
-                a.last_frame_us = f.captured_us;
-            } else a.s.onEncodeDropped();
+            if (ef_) |ef_v| {
+                var ef = ef_v;
+                const now = a.be.clock.now();
+                a.refiner.after(f, &ef, refining, now);
+                a.s.onEncoded(ef, f, now);
+                a.last_frame_us = now; // when it went out: a repeat keeps its picture's capture time
+                if (a.s.tileEngine()) |e| a.tiles.read(e, a.be.capture, f);
+            } else {
+                a.refiner.after(f, null, refining, a.be.clock.now());
+                a.s.onEncodeDropped();
+            }
         } else |_| {
             a.stats.encode_errors += 1;
             a.s.onEncodeDropped();
@@ -330,7 +494,7 @@ pub const HostApp = struct {
         a.network(a.be.clock.now());
         if (!a.s.streaming()) return;
         a.applyChanges(null);
-        const f = (a.grab(0) catch return) orelse return;
+        const f = (a.grab(0, null) catch return) orelse return;
         defer a.be.capture.release(&f);
         a.encodeOne(&f, null);
     }
@@ -372,7 +536,7 @@ pub const HostApp = struct {
             }
             a.applyChanges(lock);
             const interval = @divTrunc(1_000_000, @as(Micros, @max(a.fps, 1)));
-            const f = (a.grab(interval) catch {
+            const f = (a.grab(interval, lock) catch {
                 lock.io.sleep(.fromMilliseconds(2), .awake) catch {};
                 continue;
             }) orelse continue;
@@ -434,6 +598,8 @@ pub const ClientApp = struct {
         cfg.codecs = caps.codecs;
         cfg.formats = api.effectiveFormats(caps.codecs, caps.coded);
         cfg.display = be.display;
+        // Tiles only where the presenter can composite them.
+        cfg.tiles = cfg.tiles and be.presenter.hasTiles();
         var au: ?*ClientAudio = null;
         if (o.audio) if (be.audio) |sink| {
             au = try ClientAudio.init(gpa, sink);
@@ -531,6 +697,12 @@ pub const ClientApp = struct {
             return true;
         } orelse return true;
         defer a.be.decoder.release(&df);
+        if (lock) |l| l.lock();
+        const tu = a.s.tilePresent(au.frame_id);
+        if (lock) |l| l.unlock();
+        if (tu) |u| a.be.presenter.tiles(&u) catch {
+            a.stats.present_errors += 1;
+        };
         const pr = a.be.presenter.present(&df, &ov);
         const content = if (a.opts.contentFn) |f| f(a.opts.content_ctx, &df) else df.frame_id;
         if (lock) |l| l.lock();

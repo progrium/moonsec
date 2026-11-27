@@ -6,7 +6,8 @@
 //!               Output: NV12 ID3D11Texture2D (+ array slice) in `Image.gpu`.
 //!   Presenter   Flip-model swapchain, waitable object, max frame latency 1,
 //!               tearing in lowest-latency mode; video-processor NV12 -> BGRA;
-//!               the latency overlay drawn on the CPU (platform/client/common).
+//!               the lossless tile layer (`tiles`) blended over the video; the
+//!               latency overlay drawn on the CPU (platform/client/common).
 //!   AudioSink   WASAPI shared mode, f32; IAudioClient3's smallest period when the
 //!               mix format allows it.
 //!   InputSource Raw Input keyboard and mouse from the window's own thread; gamepads
@@ -251,6 +252,20 @@ pub const Presenter = struct {
         const now = nowUs();
         p.countFrame(now);
         return .{ .presented_us = now };
+    }
+
+    /// Lossless tiles (see `api.Presenter.VTable.tiles`): the ops go to the D3D11 tile
+    /// layer as they come, and `mswc_presenter_draw` blends it over the next pictures.
+    pub fn tiles(p: *Presenter, u: *const api.TileUpdate) api.Error!void {
+        for (u.ops) |op| switch (op) {
+            .clear_all => try ok("tiles", c.mswc_presenter_tiles_reset(p.pr, u.width, u.height)),
+            .clear => |r| try ok("tiles", c.mswc_presenter_tiles_put(p.pr, r.x, r.y, r.w, r.h, null, 0)),
+            .put => |t| {
+                std.debug.assert(t.pixels.len >= @as(usize, t.rect.w) * t.rect.h * 4);
+                try ok("tiles", c.mswc_presenter_tiles_put(p.pr, t.rect.x, t.rect.y, t.rect.w, t.rect.h, t.pixels.ptr, t.rect.w * 4));
+            },
+        };
+        c.mswc_presenter_tiles_show(p.pr, @intFromBool(u.visible));
     }
 
     fn countFrame(p: *Presenter, now: api.Micros) void {

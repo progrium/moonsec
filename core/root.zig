@@ -40,6 +40,18 @@ pub const display = @import("display/root.zig");
 /// (spec/multi-user-v0.md).
 pub const multi = @import("multi/root.zig");
 
+/// Capture damage on a cell grid (lossless tiles, regional refinement).
+pub const damage = @import("damage/root.zig");
+
+/// Lossless tiles: QOI cells on the refine stream, composited over video (core/refine).
+pub const refine = @import("refine/root.zig");
+
+/// Regional refine: per-block QP offsets for still regions (encoder QP maps).
+pub const qpmap = @import("qpmap/root.zig");
+
+/// Idle refinement: low-QP refine steps when the screen goes still (core/still).
+pub const still = @import("still/root.zig");
+
 /// Per-frame stage timing and rolling stats for the latency overlay.
 pub const telemetry = @import("telemetry/root.zig");
 
